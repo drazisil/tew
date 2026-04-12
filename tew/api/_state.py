@@ -13,6 +13,8 @@ import stat
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from tew.hardware.cpu import SavedCPUState
+
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
@@ -56,18 +58,6 @@ class DynamicModule:
 
 
 # ── Cooperative thread state ─────────────────────────────────────────────────
-
-@dataclass
-class SavedCPUState:
-    regs: list[int]
-    eip: int
-    eflags: int
-    fpu_stack: list[float]
-    fpu_top: int
-    fpu_status_word: int
-    fpu_control_word: int
-    fpu_tag_word: int
-
 
 @dataclass
 class PendingThreadInfo:

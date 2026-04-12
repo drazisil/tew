@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import struct
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from tew.hardware.memory import Memory
@@ -28,6 +29,18 @@ OF_BIT = 11
 FLAG = {"CF": CF_BIT, "PF": PF_BIT, "ZF": ZF_BIT, "SF": SF_BIT, "DF": DF_BIT, "OF": OF_BIT}
 
 OpcodeHandler = Callable[["CPU"], None]
+
+
+@dataclass
+class SavedCPUState:
+    regs: list[int]
+    eip: int
+    eflags: int
+    fpu_stack: list[float]
+    fpu_top: int
+    fpu_status_word: int
+    fpu_control_word: int
+    fpu_tag_word: int
 
 
 def _to_u32(n: int) -> int:
@@ -107,6 +120,30 @@ class CPU:
             self.fpu_set_cc(False, False, True)
         else:
             self.fpu_set_cc(True, False, False)
+
+    def save_state(self) -> SavedCPUState:
+        return SavedCPUState(
+            regs=list(self.regs),
+            eip=self.eip,
+            eflags=self.eflags,
+            fpu_stack=list(self.fpu_stack),
+            fpu_top=self.fpu_top,
+            fpu_status_word=self.fpu_status_word,
+            fpu_control_word=self.fpu_control_word,
+            fpu_tag_word=self.fpu_tag_word,
+        )
+
+    def restore_state(self, s: SavedCPUState) -> None:
+        for i, v in enumerate(s.regs):
+            self.regs[i] = v
+        self.eip = s.eip
+        self.eflags = s.eflags
+        for i, v in enumerate(s.fpu_stack):
+            self.fpu_stack[i] = v
+        self.fpu_top = s.fpu_top
+        self.fpu_status_word = s.fpu_status_word
+        self.fpu_control_word = s.fpu_control_word
+        self.fpu_tag_word = s.fpu_tag_word
 
     def read_double(self, addr: int) -> float:
         lo = self.memory.read32(addr)

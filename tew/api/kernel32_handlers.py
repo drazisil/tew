@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
 from tew.api._state import (
-    CRTState, FileHandleEntry, DynamicModule, SavedCPUState, PendingThreadInfo,
+    CRTState, FileHandleEntry, DynamicModule, PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
     THREAD_STACK_BASE, THREAD_STACK_SIZE,
 )
@@ -52,32 +52,6 @@ def _fake_dll_handle(name: str) -> int:
     for ch in name.lower():
         h = ((h << 5) - h + ord(ch)) & 0xFFFFFFFF
     return (h & 0x7FFFFFFF) | 0x10000000
-
-
-def _save_cpu_state(cpu: "CPU") -> SavedCPUState:
-    return SavedCPUState(
-        regs=list(cpu.regs),
-        eip=cpu.eip,
-        eflags=cpu.eflags,
-        fpu_stack=list(cpu.fpu_stack),
-        fpu_top=cpu.fpu_top,
-        fpu_status_word=cpu.fpu_status_word,
-        fpu_control_word=cpu.fpu_control_word,
-        fpu_tag_word=cpu.fpu_tag_word,
-    )
-
-
-def _restore_cpu_state(cpu: "CPU", s: SavedCPUState) -> None:
-    for i, v in enumerate(s.regs):
-        cpu.regs[i] = v
-    cpu.eip = s.eip
-    cpu.eflags = s.eflags
-    for i, v in enumerate(s.fpu_stack):
-        cpu.fpu_stack[i] = v
-    cpu.fpu_top = s.fpu_top
-    cpu.fpu_status_word = s.fpu_status_word
-    cpu.fpu_control_word = s.fpu_control_word
-    cpu.fpu_tag_word = s.fpu_tag_word
 
 
 def _run_thread_slice(cpu: "CPU", memory: "Memory",
@@ -129,7 +103,7 @@ def _run_thread_slice(cpu: "CPU", memory: "Memory",
     elif thread_error:
         thread.completed = True
     else:
-        thread.saved_state = _save_cpu_state(cpu)
+        thread.saved_state = cpu.save_state()
         logger.debug("scheduler",
             f"Thread {thread.thread_id} yielded after {steps} steps "
             f"(EIP=0x{cpu.eip:x})")
@@ -160,12 +134,12 @@ def _cooperative_sleep(
         f"Main thread Sleep #{state.sleep_count} - thread {runnable.thread_id} "
         f"(startAddr=0x{runnable.start_address:x})")
 
-    main_state = _save_cpu_state(cpu)
+    main_state = cpu.save_state()
     state.is_running_thread = True
     state.current_thread_idx = tidx
 
     if runnable.saved_state:
-        _restore_cpu_state(cpu, runnable.saved_state)
+        cpu.restore_state(runnable.saved_state)
     else:
         stack_top = state.thread_stack_next + THREAD_STACK_SIZE - 16
         state.thread_stack_next += THREAD_STACK_SIZE
@@ -187,7 +161,7 @@ def _cooperative_sleep(
 
     _run_thread_slice(cpu, memory, runnable, state)
 
-    _restore_cpu_state(cpu, main_state)
+    cpu.restore_state(main_state)
     cpu.halted = False
     state.is_running_thread = False
     state.current_thread_idx = -1
