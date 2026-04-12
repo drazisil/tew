@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from tew.hardware.cpu import EAX, ZF_BIT, CF_BIT, OF_BIT
 from tew.emulator.opcodes._helpers import u32
-from tew.emulator.opcodes.control_flow import _eval_condition
 
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU

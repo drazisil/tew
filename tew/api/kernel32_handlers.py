@@ -8,7 +8,6 @@ are in kernel32_io.py, called from register_kernel32_handlers.
 from __future__ import annotations
 
 import os
-import stat
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -21,7 +20,7 @@ from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMP
 from tew.api._state import (
     CRTState, FileHandleEntry, DynamicModule, PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
-    THREAD_STACK_BASE, THREAD_STACK_SIZE,
+    THREAD_STACK_SIZE,
 )
 from tew.logger import logger
 

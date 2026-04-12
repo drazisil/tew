@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
-from tew.logger import logger
 
 
 def register_oleaut32_ole32_handlers(
@@ -186,7 +185,7 @@ def register_oleaut32_ole32_handlers(
 
     # SafeArrayCreate(VARTYPE vt, UINT cDims, SAFEARRAYBOUND *rgsabound) -> SAFEARRAY*
     def _SafeArrayCreate(cpu: "CPU") -> None:
-        vt         = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        _vt        = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         c_dims     = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         rgsabound  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         header_size = 16 + c_dims * 8

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "tew"
 version = "0.6.0"
 description = "Motor City Online x86 Emulator with Graphics (Python port)"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]

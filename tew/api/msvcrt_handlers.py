@@ -15,9 +15,9 @@ if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
-from tew.api._state import CRTState, read_cstring, read_wide_string
+from tew.hardware.cpu import EAX, ESP
+from tew.api.win32_handlers import Win32Handlers
+from tew.api._state import CRTState, read_cstring
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────

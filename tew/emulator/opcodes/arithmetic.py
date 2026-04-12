@@ -4,9 +4,9 @@ NEG, NOT, XCHG, CDQ, ENTER, LEAVE, RET imm16, TEST, Group 1/3 handlers."""
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from tew.hardware.cpu import EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, CF_BIT, ZF_BIT
+from tew.hardware.cpu import EAX, ECX, EDX, ESP, EBP, CF_BIT
 
-from tew.emulator.opcodes._helpers import s32, u32, read_eaxv, write_eaxv
+from tew.emulator.opcodes._helpers import s32, u32, read_eaxv
 
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU

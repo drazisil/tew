@@ -12,9 +12,9 @@ if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, pending_timers, PendingTimer
-from tew.api._state import CRTState, read_cstring, read_wide_string, RegistryEntry
+from tew.api._state import CRTState, RegistryEntry
 from tew.logger import logger
 
 # ── Win32 error constants ────────────────────────────────────────────────────

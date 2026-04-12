@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import json
 import os
-import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from tew.hardware.cpu import SavedCPUState
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
 
 

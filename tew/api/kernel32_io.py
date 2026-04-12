@@ -19,10 +19,10 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import (
-    CRTState, FileHandleEntry, MutexHandle, EventHandle,
+    CRTState, MutexHandle, EventHandle,
     PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
-    THREAD_STACK_BASE, THREAD_STACK_SIZE,
+    THREAD_STACK_SIZE,
 )
 from tew.logger import logger
 
@@ -766,7 +766,6 @@ def register_kernel32_io_handlers(
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         for i in range(172):
             memory.write8(lp + i, 0)
-        import time as _time
         # Standard offset is the larger of jan/jul (further from UTC)
         now = datetime.datetime.now()
         jan = datetime.datetime(now.year, 1, 1).astimezone()

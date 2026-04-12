@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
 
-from tew.api.win32_handlers import Win32Handlers, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
+from tew.api.win32_handlers import Win32Handlers
 from tew.api._state import CRTState, THREAD_SENTINEL
 from tew.logger import logger
 

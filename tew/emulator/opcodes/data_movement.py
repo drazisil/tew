@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from tew.hardware.cpu import EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+from tew.hardware.cpu import EAX
 
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU

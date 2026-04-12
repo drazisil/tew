@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from tew.loader.dll_loader import DLLLoader, LoadedDLL
+from tew.loader.dll_loader import DLLLoader
 from tew.logger import logger
 
 if TYPE_CHECKING:

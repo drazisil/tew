@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from tew.hardware.cpu import CF_BIT, OF_BIT, ZF_BIT
-from tew.emulator.opcodes._helpers import s32, u32, clz32
+from tew.emulator.opcodes._helpers import s32, u32
 from tew.emulator.opcodes.control_flow import _eval_condition
 
 if TYPE_CHECKING:
