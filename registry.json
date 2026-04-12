@@ -1,0 +1,95 @@
+{
+  "_comment": "Fake Windows registry values for the x86 emulator. Keys are case-insensitive (stored lowercase). Value types: 1=REG_SZ, 4=REG_DWORD.",
+  "_install_dir": "C:\\MCity\\",
+
+  "SOFTWARE\\Electronic Arts\\Motor City\\1.0": {
+    "instLev":    { "type": 4, "value": 2 },
+    "installdir": { "type": 1, "value": "C:\\MCity\\" },
+    "Path":       { "type": 1, "value": "C:\\MCity\\" },
+    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
+    "SrcDrive":   { "type": 1, "value": "C:" },
+    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" },
+    "SrcDir":     { "type": 1, "value": "C:\\MCity\\" },
+    "ShardUrl":      { "type": 1, "value": "http://localhost/ShardList/" },
+    "ShardUrlDev":   { "type": 1, "value": "http://localhost/ShardList/" },
+    "Language":      { "type": 1, "value": "English" }
+  },
+
+  "SOFTWARE\\Electronic Arts\\Motor City": {
+    "GamePatch":       { "type": 1, "value": "games/EA_Seattle/MotorCity/MCO" },
+    "UpdateInfoPatch": { "type": 1, "value": "games/EA_Seattle/MotorCity/UpdateInfo" },
+    "NPSPatch":        { "type": 1, "value": "games/EA_Seattle/MotorCity/NPS" },
+    "PatchServerIP":   { "type": 1, "value": "localhost" },
+    "PatchServerPort": { "type": 1, "value": "80" },
+    "CreateAccount":   { "type": 1, "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO" },
+    "Language":        { "type": 1, "value": "English" }
+  },
+
+  "SOFTWARE\\Electronic Arts\\Motor City\\AuthAuth": {
+    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
+    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  },
+
+  "SOFTWARE\\Electronic Arts\\Motor City Online\\1.0": {
+    "instLev":    { "type": 4, "value": 2 },
+    "installdir": { "type": 1, "value": "C:\\MCity\\" },
+    "Path":       { "type": 1, "value": "C:\\MCity\\" },
+    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
+    "SrcDrive":   { "type": 1, "value": "C:" },
+    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" }
+  },
+
+  "SOFTWARE\\EACom\\AuthAuth": {
+    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
+    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  },
+
+  "SOFTWARE\\Electronic Arts\\Network Play System": {
+    "Log": { "type": 1, "value": "1" }
+  },
+
+  "SOFTWARE\\WOW6432Node\\EACom\\AuthAuth": {
+    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
+    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  },
+
+  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City": {
+    "GamePatch":       { "type": 1, "value": "games/EA_Seattle/MotorCity/MCO" },
+    "UpdateInfoPatch": { "type": 1, "value": "games/EA_Seattle/MotorCity/UpdateInfo" },
+    "NPSPatch":        { "type": 1, "value": "games/EA_Seattle/MotorCity/NPS" },
+    "PatchServerIP":   { "type": 1, "value": "localhost" },
+    "PatchServerPort": { "type": 1, "value": "80" },
+    "CreateAccount":   { "type": 1, "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO" },
+    "Language":        { "type": 1, "value": "English" }
+  },
+
+  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City\\1.0": {
+    "instLev":    { "type": 4, "value": 2 },
+    "installdir": { "type": 1, "value": "C:\\MCity\\" },
+    "Path":       { "type": 1, "value": "C:\\MCity\\" },
+    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
+    "SrcDrive":   { "type": 1, "value": "C:" },
+    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" },
+    "ShardUrl":      { "type": 1, "value": "http://localhost/ShardList/" },
+    "ShardUrlDev":   { "type": 1, "value": "http://localhost/ShardList/" }
+  },
+
+  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City\\AuthAuth": {
+    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
+    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  },
+
+  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Network Play System": {
+    "Log": { "type": 1, "value": "1" }
+  },
+
+  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mcity.exe": {
+    "Path": { "type": 1, "value": "C:\\MCity\\" },
+    "":     { "type": 1, "value": "C:\\MCity\\MCity_d.exe" }
+  },
+
+  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mcity_d.exe": {
+    "Path": { "type": 1, "value": "C:\\MCity\\" },
+    "":     { "type": 1, "value": "C:\\MCity\\MCity_d.exe" }
+  }
+}

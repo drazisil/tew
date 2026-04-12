@@ -1,0 +1,14 @@
+{
+    "_comment": "Emulator system configuration. Edit all paths to match your machine.",
+
+    "exePath": "/home/drazisil/.emu32/MCity/MCity_d.exe",
+    "_exePath_comment": "Path to the Windows .exe to emulate. Can also be passed as the first CLI argument to run-exe.ts.",
+
+    "pathMappings": {
+        "_comment": "Map Windows drive/path prefixes to Linux paths. Keys are Windows prefixes (backslash or forward slash, case-insensitive). Values are the corresponding Linux directory (must end with /).",
+        "C:\\": "/home/drazisil/.emu32/"
+    },
+
+    "interactiveOnMissingFile": true,
+    "_interactiveOnMissingFile_comment": "When true, pause emulation and prompt the user when a requested file is not found on disk. The user can add the file then retry, or continue without it."
+}

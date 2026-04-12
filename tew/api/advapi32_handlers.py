@@ -1,0 +1,434 @@
+"""advapi32.dll, winmm.dll, and shell32.dll handler registrations.
+
+Ported from Win32Handlers.ts lines 5709–6634.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tew.hardware.cpu import CPU
+    from tew.hardware.memory import Memory
+
+from tew.hardware.cpu import EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, pending_timers, PendingTimer
+from tew.api._state import CRTState, read_cstring, read_wide_string, RegistryEntry
+from tew.logger import logger
+
+# ── Win32 error constants ────────────────────────────────────────────────────
+
+ERROR_SUCCESS        = 0
+ERROR_FILE_NOT_FOUND = 2
+ERROR_MORE_DATA      = 234
+ERROR_NO_MORE_ITEMS  = 259
+
+# ── Registry key handle allocator (module-level, shared across calls) ────────
+
+_next_reg_key: int = 0xBEEF0200
+_reg_key_names: dict[int, str] = {}   # handle → full key name
+
+
+def _read_ansi_str(ptr: int, memory: "Memory", max_len: int = 256) -> str:
+    s = []
+    for i in range(max_len):
+        c = memory.read8(ptr + i)
+        if c == 0:
+            break
+        s.append(chr(c))
+    return "".join(s)
+
+
+def _write_ansi_str(ptr: int, s: str, memory: "Memory") -> None:
+    for i, ch in enumerate(s):
+        memory.write8(ptr + i, ord(ch))
+    memory.write8(ptr + len(s), 0)
+
+
+def _reg_query_value(
+    key_handle: int,
+    value_name: str,
+    state: "CRTState",
+) -> "RegistryEntry | None":
+    key_name = (_reg_key_names.get(key_handle) or "").lower()
+    lower_value = value_name.lower()
+    for pattern, values in state.registry_values.items():
+        if key_name.endswith(pattern) or key_name == pattern:
+            v = values.get(lower_value)
+            if v is not None:
+                return v
+    # key_handle == 0: global scan
+    if key_handle == 0:
+        for values in state.registry_values.values():
+            v = values.get(lower_value)
+            if v is not None:
+                return v
+    return None
+
+
+# ── Timer ID counter ─────────────────────────────────────────────────────────
+
+_next_timer_id: int = 1
+TIME_PERIODIC = 1
+
+
+# ── Registration entry point ─────────────────────────────────────────────────
+
+
+def register_advapi32_handlers(
+    stubs: "Win32Handlers",
+    memory: "Memory",
+    state: "CRTState",
+) -> None:
+    """Register all advapi32.dll (and winmm.dll) handlers."""
+
+    global _next_reg_key, _next_timer_id
+
+    # ── advapi32.dll: Registry API ────────────────────────────────────────────
+
+    # RegOpenKeyA(hKey, lpSubKey, phkResult) - stdcall, 3 args (12 bytes)
+    def _reg_open_key_a(cpu: "CPU") -> None:
+        global _next_reg_key
+        lp_sub_key  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        ph_result   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        key_name    = _read_ansi_str(lp_sub_key, memory) if lp_sub_key else ""
+        logger.debug("registry", f'RegOpenKeyA("{key_name}")')
+        handle = _next_reg_key
+        _next_reg_key += 1
+        _reg_key_names[handle] = key_name
+        if ph_result:
+            memory.write32(ph_result, handle)
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("advapi32.dll", "RegOpenKeyA", _reg_open_key_a)
+
+    # RegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult) - 5 args (20 bytes)
+    def _reg_open_key_ex_a(cpu: "CPU") -> None:
+        global _next_reg_key
+        h_key_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        ph_result  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        key_name   = _read_ansi_str(lp_sub_key, memory) if lp_sub_key else ""
+        parent_name = _reg_key_names.get(h_key_in, f"HKEY:{h_key_in:x}")
+        full_name   = f"{parent_name}\\{key_name}" if key_name else parent_name
+        logger.debug(
+            "registry",
+            f'RegOpenKeyExA(parent=0x{h_key_in:x}, "{key_name}") phkResult@0x{ph_result:x}',
+        )
+        handle = _next_reg_key
+        _next_reg_key += 1
+        _reg_key_names[handle] = full_name
+        if ph_result:
+            memory.write32(ph_result, handle)
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("advapi32.dll", "RegOpenKeyExA", _reg_open_key_ex_a)
+
+    # RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult) - 5 args (20 bytes)
+    def _reg_open_key_ex_w(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_FILE_NOT_FOUND
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("advapi32.dll", "RegOpenKeyExW", _reg_open_key_ex_w)
+
+    # RegCreateKeyA(hKey, lpSubKey, phkResult) - 3 args (12 bytes)
+    def _reg_create_key_a(cpu: "CPU") -> None:
+        ph_result = memory.read32(cpu.regs[ESP] + 12)
+        if ph_result:
+            memory.write32(ph_result, 0xBEEF0100)
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("advapi32.dll", "RegCreateKeyA", _reg_create_key_a)
+
+    # RegCreateKeyExA(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
+    #                 lpSecurityAttributes, phkResult, lpdwDisposition) - 9 args (36 bytes)
+    def _reg_create_key_ex_a(cpu: "CPU") -> None:
+        ph_result        = memory.read32(cpu.regs[ESP] + 32)  # 8th arg
+        lpdw_disposition = memory.read32(cpu.regs[ESP] + 36)  # 9th arg
+        if ph_result:
+            memory.write32(ph_result, 0xBEEF0101)
+        if lpdw_disposition:
+            memory.write32(lpdw_disposition, 2)  # REG_CREATED_NEW_KEY
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 36)
+
+    stubs.register_handler("advapi32.dll", "RegCreateKeyExA", _reg_create_key_ex_a)
+
+    # RegQueryValueA(hKey, lpSubKey, lpData, lpcbData) - 4 args (16 bytes)
+    def _reg_query_value_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_FILE_NOT_FOUND
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("advapi32.dll", "RegQueryValueA", _reg_query_value_a)
+
+    # RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData) - 6 args (24 bytes)
+    def _reg_query_value_ex_a(cpu: "CPU") -> None:
+        h_key        = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        lp_val_name  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_type      = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_data      = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        lpcb_data    = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        value_name   = _read_ansi_str(lp_val_name, memory) if lp_val_name else ""
+        entry        = _reg_query_value(h_key, value_name, state)
+        logger.debug(
+            "registry",
+            f'RegQueryValueExA(key=0x{h_key:x}, "{value_name}") -> '
+            f'{repr(entry.value) if entry else "NOT FOUND"}',
+        )
+        if entry is None:
+            cpu.regs[EAX] = ERROR_FILE_NOT_FOUND
+        elif entry.type == 4:  # REG_DWORD
+            needed = 4
+            if lpcb_data:
+                cb_data = memory.read32(lpcb_data)
+                memory.write32(lpcb_data, needed)
+                if lp_data and cb_data >= needed:
+                    memory.write32(lp_data, entry.value)  # type: ignore[arg-type]
+            if lp_type:
+                memory.write32(lp_type, 4)
+            cpu.regs[EAX] = ERROR_SUCCESS
+        else:  # REG_SZ (type 1)
+            s = entry.value  # type: ignore[assignment]
+            needed = len(s) + 1
+            if lpcb_data:
+                cb_data = memory.read32(lpcb_data)
+                memory.write32(lpcb_data, needed)
+                if lp_data and cb_data >= needed:
+                    _write_ansi_str(lp_data, s, memory)
+            if lp_type:
+                memory.write32(lp_type, 1)
+            cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("advapi32.dll", "RegQueryValueExA", _reg_query_value_ex_a)
+
+    # RegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData) - 6 args (24 bytes)
+    def _reg_query_value_ex_w(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_FILE_NOT_FOUND
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("advapi32.dll", "RegQueryValueExW", _reg_query_value_ex_w)
+
+    # RegSetValueExA(hKey, lpValueName, Reserved, dwType, lpData, cbData) - 6 args (24 bytes)
+    def _reg_set_value_ex_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("advapi32.dll", "RegSetValueExA", _reg_set_value_ex_a)
+
+    # RegDeleteValueA(hKey, lpValueName) - 2 args (8 bytes)
+    def _reg_delete_value_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_FILE_NOT_FOUND
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("advapi32.dll", "RegDeleteValueA", _reg_delete_value_a)
+
+    # RegCloseKey(hKey) - 1 arg (4 bytes)
+    def _reg_close_key(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("advapi32.dll", "RegCloseKey", _reg_close_key)
+
+    # RegFlushKey(hKey) - 1 arg (4 bytes)
+    def _reg_flush_key(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("advapi32.dll", "RegFlushKey", _reg_flush_key)
+
+    # RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
+    #               lpftLastWriteTime) - 8 args (32 bytes)
+    def _reg_enum_key_ex_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+        cleanup_stdcall(cpu, memory, 32)
+
+    stubs.register_handler("advapi32.dll", "RegEnumKeyExA", _reg_enum_key_ex_a)
+
+    # RegEnumValueA(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
+    #               lpData, lpcbData) - 8 args (32 bytes)
+    def _reg_enum_value_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+        cleanup_stdcall(cpu, memory, 32)
+
+    stubs.register_handler("advapi32.dll", "RegEnumValueA", _reg_enum_value_a)
+
+    # ── advapi32.dll: Event Log API ───────────────────────────────────────────
+
+    # OpenEventLogA(lpUNCServerName, lpSourceName) - 2 args (8 bytes)
+    def _open_event_log_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0xBEEF0200  # fake event log handle
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("advapi32.dll", "OpenEventLogA", _open_event_log_a)
+
+    # ReportEventA(hEventLog, wType, wCategory, dwEventID, lpUserSid, wNumStrings,
+    #              dwDataSize, lpStrings, lpRawData) - 9 args (36 bytes)
+    def _report_event_a(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 36)
+
+    stubs.register_handler("advapi32.dll", "ReportEventA", _report_event_a)
+
+    # CloseEventLog(hEventLog) - 1 arg (4 bytes)
+    def _close_event_log(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("advapi32.dll", "CloseEventLog", _close_event_log)
+
+    # ── advapi32.dll: Security/User API ──────────────────────────────────────
+
+    # GetUserNameA(lpBuffer, pcbBuffer) - 2 args (8 bytes)
+    def _get_user_name_a(cpu: "CPU") -> None:
+        lp_buffer  = memory.read32(cpu.regs[ESP] + 4)
+        pcb_buffer = memory.read32(cpu.regs[ESP] + 8)
+        username   = "Player\0"
+        if lp_buffer and pcb_buffer:
+            max_len = memory.read32(pcb_buffer)
+            for i in range(min(len(username), max_len)):
+                memory.write8(lp_buffer + i, ord(username[i]))
+            memory.write32(pcb_buffer, len(username))
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("advapi32.dll", "GetUserNameA", _get_user_name_a)
+
+    # ── winmm.dll: Audio device absence handlers ──────────────────────────────
+
+    MMSYSERR_NODRIVER = 10
+
+    # mixerGetNumDevs() -> UINT [stdcall, no args] — 0 = no mixer hardware
+    def _mixer_get_num_devs(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] mixerGetNumDevs -> 0 (no audio hardware)")
+        cpu.regs[EAX] = 0
+
+    stubs.register_handler("winmm.dll", "mixerGetNumDevs", _mixer_get_num_devs)
+
+    # mixerGetLineInfoA(hmxobj, pmxl, fdwInfo) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    def _mixer_get_line_info_a(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] mixerGetLineInfoA -> MMSYSERR_NODRIVER")
+        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("winmm.dll", "mixerGetLineInfoA", _mixer_get_line_info_a)
+
+    # mixerGetLineControlsA(hmxobj, pmxlc, fdwControls) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    def _mixer_get_line_controls_a(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] mixerGetLineControlsA -> MMSYSERR_NODRIVER")
+        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("winmm.dll", "mixerGetLineControlsA", _mixer_get_line_controls_a)
+
+    # mixerGetControlDetailsA(hmxobj, pmxcd, fdwDetails) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    def _mixer_get_control_details_a(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] mixerGetControlDetailsA -> MMSYSERR_NODRIVER")
+        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("winmm.dll", "mixerGetControlDetailsA", _mixer_get_control_details_a)
+
+    # mixerSetControlDetails(hmxobj, pmxcd, fdwDetails) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    def _mixer_set_control_details(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] mixerSetControlDetails -> MMSYSERR_NODRIVER")
+        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("winmm.dll", "mixerSetControlDetails", _mixer_set_control_details)
+
+    # waveOutGetDevCapsA(uDeviceID, pwoc, cbwoc) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    def _wave_out_get_dev_caps_a(cpu: "CPU") -> None:
+        logger.warn("handlers", "[winmm] waveOutGetDevCapsA -> MMSYSERR_NODRIVER")
+        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("winmm.dll", "waveOutGetDevCapsA", _wave_out_get_dev_caps_a)
+
+    # ── winmm.dll: Timer handlers ─────────────────────────────────────────────
+
+    TIMERR_NOERROR = 0
+
+    # timeGetDevCaps(ptc, cbtc) - 2 args (8 bytes)
+    # VERIFIED: _TIMER_init checks result != 0 → abortmessage("MULTIMEDIA TIMER NOT FOUND")
+    def _time_get_dev_caps(cpu: "CPU") -> None:
+        ptc = memory.read32(cpu.regs[ESP] + 4)
+        if ptc != 0:
+            memory.write32(ptc,     1)           # wPeriodMin = 1 ms
+            memory.write32(ptc + 4, 1_000_000)  # wPeriodMax = 1 s
+        cpu.regs[EAX] = TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("winmm.dll", "timeGetDevCaps", _time_get_dev_caps)
+
+    # timeBeginPeriod(uPeriod) - 1 arg (4 bytes)
+    # VERIFIED: _TIMER_init checks result != 0 → abortmessage("FAILED TO INITIALIZE MULTIMEDIA TIMER")
+    def _time_begin_period(cpu: "CPU") -> None:
+        period = memory.read32(cpu.regs[ESP] + 4)
+        logger.info("handlers", f"[winmm] timeBeginPeriod({period}) -> 0")
+        cpu.regs[EAX] = TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("winmm.dll", "timeBeginPeriod", _time_begin_period)
+
+    # timeEndPeriod(uPeriod) - 1 arg (4 bytes)
+    # VERIFIED: mmtimer_callback calls timeEndPeriod in shutdown path; return value not checked.
+    def _time_end_period(cpu: "CPU") -> None:
+        cpu.regs[EAX] = TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("winmm.dll", "timeEndPeriod", _time_end_period)
+
+    # timeGetTime() - no args, no stack cleanup
+    # VERIFIED: mmtimer_callback uses timeGetTime for scheduling next timeSetEvent delay.
+    def _time_get_time(cpu: "CPU") -> None:
+        now_ms = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        cpu.regs[EAX] = now_ms
+
+    stubs.register_handler("winmm.dll", "timeGetTime", _time_get_time)
+
+    # timeSetEvent(uDelay, uResolution, lpTimeProc, dwUser, fuEvent) - 5 args (20 bytes)
+    # VERIFIED: mmtimer_callback: if result == 0 → "timeSetEvent failed, shutting down timer".
+    #           Must return non-zero or game timer system shuts down permanently.
+    def _time_set_event(cpu: "CPU") -> None:
+        global _next_timer_id
+        base          = cpu.regs[ESP]
+        u_delay       = memory.read32(base + 4)
+        u_resolution  = memory.read32(base + 8)
+        lp_time_proc  = memory.read32(base + 12)
+        dw_user       = memory.read32(base + 16)
+        fu_event      = memory.read32(base + 20)
+        timer_id      = _next_timer_id
+        _next_timer_id += 1
+        now_ms        = time.monotonic() * 1000
+        period_ms     = u_delay if (fu_event & TIME_PERIODIC) != 0 else 0
+        pending_timers[timer_id] = PendingTimer(
+            id=timer_id,
+            due_at=now_ms + u_delay,
+            period_ms=period_ms,
+            cb_addr=lp_time_proc,
+            dw_user=dw_user,
+        )
+        logger.info(
+            "handlers",
+            f"[winmm] timeSetEvent(delay={u_delay}, res={u_resolution},"
+            f" cb=0x{lp_time_proc:x}, periodic={period_ms > 0}) -> id={timer_id}",
+        )
+        cpu.regs[EAX] = timer_id
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("winmm.dll", "timeSetEvent", _time_set_event)
+
+    # timeKillEvent(uTimerID) - 1 arg (4 bytes)
+    # VERIFIED: _TIMER_restore calls timeKillEvent to cancel the timer.
+    def _time_kill_event(cpu: "CPU") -> None:
+        timer_id = memory.read32(cpu.regs[ESP] + 4)
+        pending_timers.pop(timer_id, None)
+        cpu.regs[EAX] = TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("winmm.dll", "timeKillEvent", _time_kill_event)
