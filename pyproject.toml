@@ -18,5 +18,11 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
+[tool.ruff.lint]
+ignore = [
+    "E701",  # single-line if — used intentionally for compact condition code tables
+    "E702",  # semicolon-separated statements — used intentionally for paired flag sets
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["tew"]
