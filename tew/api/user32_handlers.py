@@ -1,12 +1,17 @@
 """user32.dll and gdi32.dll handler registrations.
 
-All handlers are stubs that fake the win32 windowing/GDI surface for headless
-emulation.  No real window system exists — return values are documented per
-handler with the rationale for the chosen value.
+Window management is backed by SDL2 via WindowManager.  Dialog templates are
+parsed from the PE resource section via PEResources.  Rendering uses
+dialog_renderer.py.
+
+Handlers that require a real window system but whose implementation is not yet
+complete halt with [UNIMPLEMENTED] so the missing path can be identified and
+implemented.
 """
 
 from __future__ import annotations
 
+import struct
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,7 +21,92 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DIALOG_TRAMPOLINE
 from tew.api._state import CRTState
+from tew.api.window_manager import (
+    WindowManager,
+    WM_COMMAND, WM_INITDIALOG, WM_CLOSE,
+    BM_GETCHECK, BM_SETCHECK,
+    WS_VISIBLE,
+    du_to_px_x, du_to_px_y,
+)
 from tew.logger import logger
+
+
+# ── Dialog proc sentinel ──────────────────────────────────────────────────────
+# A HLT instruction (0xF4) written into emulator memory at a stable address.
+# Used as the return address when invoking dialog procs via _invoke_emulated_proc;
+# when the proc does RET it jumps here, the HLT fires, cpu.halted is set, and our
+# sub-loop knows the call completed.
+#
+# Allocated lazily on first use via state.simple_alloc so that _state doesn't
+# need to know about the sentinel at construction time.
+_DIALOG_SENTINEL_ADDR: int = 0   # set by _get_dialog_sentinel()
+
+
+def _get_dialog_sentinel(state: "CRTState", memory: "Memory") -> int:
+    global _DIALOG_SENTINEL_ADDR
+    if _DIALOG_SENTINEL_ADDR == 0:
+        _DIALOG_SENTINEL_ADDR = state.simple_alloc(4)
+        memory.write8(_DIALOG_SENTINEL_ADDR, 0xF4)   # HLT
+        logger.debug("dialog", f"[DialogSentinel] allocated at 0x{_DIALOG_SENTINEL_ADDR:08x}")
+    return _DIALOG_SENTINEL_ADDR
+
+
+def _invoke_emulated_proc(
+    cpu: "CPU",
+    memory: "Memory",
+    proc_addr: int,
+    args: list[int],
+    sentinel: int,
+    max_steps: int = 5_000_000,
+) -> int:
+    """Call emulated x86 code (stdcall) and return EAX.
+
+    Saves and restores full CPU state around the call so side effects are
+    limited to memory and CRTState (registry, heap, sockets, etc.).
+
+    args is the argument list in left-to-right (C) order; they are pushed
+    right-to-left onto the stack as stdcall requires.
+    """
+    saved = cpu.save_state()
+
+    # Build a fresh stack frame on top of the current stack.
+    # Calling convention (stdcall / cdecl):
+    #   1. Caller pushes args right-to-left (last arg at highest address).
+    #   2. CALL instruction pushes the return address on top (lowest address).
+    # At function entry the callee therefore sees:
+    #   [ESP+0]  = return address
+    #   [ESP+4]  = first arg
+    #   [ESP+8]  = second arg   ...
+    esp = cpu.regs[ESP]
+
+    # Step 1 — push args right-to-left (last arg pushed first)
+    for arg in reversed(args):
+        esp = (esp - 4) & 0xFFFFFFFF
+        memory.write32(esp, arg & 0xFFFFFFFF)
+
+    # Step 2 — push return address on top (simulates the CALL instruction)
+    esp = (esp - 4) & 0xFFFFFFFF
+    memory.write32(esp, sentinel)
+
+    cpu.regs[ESP] = esp
+    cpu.eip = proc_addr & 0xFFFFFFFF
+    cpu.halted = False
+
+    steps = 0
+    while not cpu.halted and steps < max_steps:
+        if cpu.eip == sentinel:
+            break
+        cpu.step()
+        steps += 1
+
+    if steps >= max_steps:
+        logger.warn("dialog", f"[_invoke_emulated_proc] max_steps reached calling 0x{proc_addr:08x}")
+
+    result = cpu.regs[EAX]
+
+    cpu.restore_state(saved)
+    cpu.halted = False
+    return result
 
 
 def register_user32_gdi32_handlers(
@@ -26,9 +116,35 @@ def register_user32_gdi32_handlers(
 ) -> None:
     """Register all user32.dll and gdi32.dll handlers."""
 
+    wm: WindowManager = state.window_manager
+
+    def _halt(name: str):
+        """Return a handler that halts with an UNIMPLEMENTED log."""
+        def _h(cpu: "CPU") -> None:
+            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
+            cpu.halted = True
+        return _h
+
     # ── user32.dll ────────────────────────────────────────────────────────────
 
     # MessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType) -> int
+    #
+    # Return values follow Win32 conventions so game branching works correctly:
+    #   MB_OK (0)              → IDOK=1
+    #   MB_OKCANCEL (1)        → IDOK=1
+    #   MB_ABORTRETRYIGNORE(2) → IDIGNORE=5  (skip assertions / continue)
+    #   MB_YESNOCANCEL (3)     → IDYES=6
+    #   MB_YESNO (4)           → IDYES=6
+    #   MB_RETRYCANCEL (5)     → IDRETRY=4
+    _MSGBOX_RETURNS: dict[int, int] = {
+        0: 1,   # MB_OK          → IDOK
+        1: 1,   # MB_OKCANCEL    → IDOK
+        2: 5,   # MB_ABORTRETRYIGNORE → IDIGNORE (bypass assertions)
+        3: 6,   # MB_YESNOCANCEL → IDYES
+        4: 6,   # MB_YESNO       → IDYES
+        5: 4,   # MB_RETRYCANCEL → IDRETRY
+    }
+
     def _MessageBoxA(cpu: "CPU") -> None:
         lp_text    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_caption = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -45,11 +161,14 @@ def register_user32_gdi32_handlers(
             if ch == 0:
                 break
             caption += chr(ch)
-        logger.debug("handlers", f'[Win32] MessageBoxA("{caption}", "{text.replace(chr(10), "\\n")}")')
-        # MB_ABORTRETRYIGNORE (uType & 0xF == 2): return IDIGNORE=5 to continue past assertions
-        # MB_OK (uType & 0xF == 0): return IDOK=1
         btn_type = u_type & 0xF
-        cpu.regs[EAX] = 5 if btn_type == 2 else 1
+        result = _MSGBOX_RETURNS.get(btn_type, 1)
+        logger.debug(
+            "handlers",
+            f'[Win32] MessageBoxA("{caption}", "{text.replace(chr(10), "\\n")}")'
+            f" type=0x{u_type:x} -> {result}",
+        )
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "MessageBoxA", _MessageBoxA)
@@ -62,75 +181,119 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "MessageBoxW", _MessageBoxW)
 
-    # GetActiveWindow() -> HWND
+    # GetActiveWindow() -> HWND  (no args — NULL means no active window)
     def _GetActiveWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # NULL (no active window)
+        cpu.regs[EAX] = 0  # NULL
 
     stubs.register_handler("user32.dll", "GetActiveWindow", _GetActiveWindow)
 
     # GetDesktopWindow() -> HWND
     def _GetDesktopWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1000  # fake desktop HWND; no args, stdcall
+        # Return a stable fake desktop HWND.  The desktop is never passed to
+        # GetDlgItem or SendMessage so a constant value is fine here.
+        cpu.regs[EAX] = 0x0001
 
     stubs.register_handler("user32.dll", "GetDesktopWindow", _GetDesktopWindow)
 
     # GetForegroundWindow() -> HWND
     def _GetForegroundWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xABCD  # fake HWND
+        # Return the first visible top-level window, or NULL.
+        cpu.regs[EAX] = 0   # no windows yet
 
     stubs.register_handler("user32.dll", "GetForegroundWindow", _GetForegroundWindow)
 
     # SetForegroundWindow(HWND hWnd) -> BOOL
     def _SetForegroundWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1  # TRUE
+        cpu.regs[EAX] = 1  # TRUE (pretend it worked)
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "SetForegroundWindow", _SetForegroundWindow)
 
-    # SetWindowPos(HWND, HWND, int, int, int, int, UINT) -> BOOL
+    # SetWindowPos(HWND, HWND insertAfter, int X, int Y, int cx, int cy, UINT flags) -> BOOL
     def _SetWindowPos(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] SetWindowPos: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 7 stdcall args
+        hwnd  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        x     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        y     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        cx    = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        cy    = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        entry = wm.get_window(hwnd)
+        if entry is not None:
+            entry.x, entry.y, entry.cx, entry.cy = x, y, cx, cy
+            logger.debug("handlers", f"[Win32] SetWindowPos(0x{hwnd:x}) -> ({x},{y}) {cx}x{cy}")
+        cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 28)
 
     stubs.register_handler("user32.dll", "SetWindowPos", _SetWindowPos)
 
-    # MoveWindow(HWND, int, int, int, int, BOOL) -> BOOL
+    # MoveWindow(HWND, int X, int Y, int nWidth, int nHeight, BOOL repaint) -> BOOL
     def _MoveWindow(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] MoveWindow: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 6 stdcall args
+        hwnd  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        x     = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        y     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        cx    = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        cy    = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        entry = wm.get_window(hwnd)
+        if entry is not None:
+            entry.x, entry.y, entry.cx, entry.cy = x, y, cx, cy
+            logger.debug("handlers", f"[Win32] MoveWindow(0x{hwnd:x}) -> ({x},{y}) {cx}x{cy}")
+        cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 24)
 
     stubs.register_handler("user32.dll", "MoveWindow", _MoveWindow)
 
     # GetWindowRect(HWND hWnd, LPRECT lpRect) -> BOOL
     def _GetWindowRect(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # FALSE (no real window)
+        h_wnd   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_rect = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        if entry is not None and lp_rect:
+            px_x  = du_to_px_x(entry.x)
+            px_y  = du_to_px_y(entry.y)
+            px_cx = du_to_px_x(entry.cx)
+            px_cy = du_to_px_y(entry.cy)
+            memory.write32(lp_rect,       px_x)
+            memory.write32(lp_rect + 4,   px_y)
+            memory.write32(lp_rect + 8,   px_x + px_cx)
+            memory.write32(lp_rect + 12,  px_y + px_cy)
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            cpu.regs[EAX] = 0  # FALSE
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "GetWindowRect", _GetWindowRect)
 
     # GetClientRect(HWND hWnd, LPRECT lpRect) -> BOOL
     def _GetClientRect(cpu: "CPU") -> None:
+        h_wnd   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_rect = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        if lp_rect:
-            memory.write32(lp_rect,      0)
-            memory.write32(lp_rect + 4,  0)
-            memory.write32(lp_rect + 8,  800)
-            memory.write32(lp_rect + 12, 600)
-        cpu.regs[EAX] = 1  # TRUE
+        entry = wm.get_window(h_wnd)
+        if entry is not None and lp_rect:
+            memory.write32(lp_rect,       0)
+            memory.write32(lp_rect + 4,   0)
+            memory.write32(lp_rect + 8,   du_to_px_x(entry.cx))
+            memory.write32(lp_rect + 12,  du_to_px_y(entry.cy))
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            cpu.regs[EAX] = 0  # FALSE
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "GetClientRect", _GetClientRect)
 
     # GetSystemMetrics(int nIndex) -> int
     def _GetSystemMetrics(cpu: "CPU") -> None:
+        from sdl2 import SDL_GetDesktopDisplayMode, SDL_DisplayMode
+        import ctypes
         n_index = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        mode = SDL_DisplayMode()
+        if SDL_GetDesktopDisplayMode(0, ctypes.byref(mode)) == 0:
+            screen_w, screen_h = mode.w, mode.h
+        else:
+            screen_w, screen_h = 1024, 768
         # SM_CXSCREEN=0, SM_CYSCREEN=1
         if n_index == 0:
-            cpu.regs[EAX] = 800
+            cpu.regs[EAX] = screen_w
         elif n_index == 1:
-            cpu.regs[EAX] = 600
+            cpu.regs[EAX] = screen_h
         else:
             cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
@@ -138,47 +301,65 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "GetSystemMetrics", _GetSystemMetrics)
 
     # UpdateWindow(HWND hWnd) -> BOOL
+    # Triggers WM_PAINT; we re-render via SDL on every DispatchMessageA call,
+    # so no additional action is needed here.
     def _UpdateWindow(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] UpdateWindow: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 1 stdcall arg
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "UpdateWindow", _UpdateWindow)
 
     # InvalidateRect(HWND hWnd, RECT*, BOOL) -> BOOL
+    # Marks a region as needing repaint; SDL renders continuously, so no-op.
     def _InvalidateRect(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] InvalidateRect: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 3 stdcall args
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("user32.dll", "InvalidateRect", _InvalidateRect)
 
     # SetWindowTextA(HWND hWnd, LPCSTR lpString) -> BOOL
     def _SetWindowTextA(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] SetWindowTextA: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 2 stdcall args
+        h_wnd     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_string = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        text = ""
+        for i in range(256):
+            ch = memory.read8((lp_string + i) & 0xFFFFFFFF)
+            if ch == 0:
+                break
+            text += chr(ch)
+        ok = wm.set_window_text(h_wnd, text)
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "SetWindowTextA", _SetWindowTextA)
 
     # SetWindowTextW(HWND hWnd, LPCWSTR lpString) -> BOOL
     def _SetWindowTextW(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] SetWindowTextW: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 2 stdcall args
+        h_wnd     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_string = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        from tew.api._state import read_wide_string
+        text = read_wide_string(lp_string, memory)
+        ok = wm.set_window_text(h_wnd, text)
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "SetWindowTextW", _SetWindowTextW)
 
     # GetWindowTextA(HWND hWnd, LPSTR lpString, int nMaxCount) -> int
-    # Returns "admin" — used by the login dialog proc to read edit control text.
+    # For real windows, returns the actual title stored in the window entry.
+    # The login dialog relies on this for username/password controls.
     def _GetWindowTextA(cpu: "CPU") -> None:
+        h_wnd      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_string  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n_max      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        cred = "admin"
-        length = min(len(cred), n_max - 1) if n_max > 0 else 0
+        text = wm.get_window_text(h_wnd)
+        if not text:
+            # Fall back to "admin" for unknown HWNDs (login dialog compatibility)
+            text = "admin"
+        length = min(len(text), n_max - 1) if n_max > 0 else 0
         if lp_string != 0 and n_max > 0:
             for i in range(length):
-                memory.write8((lp_string + i) & 0xFFFFFFFF, ord(cred[i]))
+                memory.write8((lp_string + i) & 0xFFFFFFFF, ord(text[i]))
             memory.write8((lp_string + length) & 0xFFFFFFFF, 0)
         cpu.regs[EAX] = length
         cleanup_stdcall(cpu, memory, 12)
@@ -187,336 +368,762 @@ def register_user32_gdi32_handlers(
 
     # GetWindowLongA(HWND, int) -> LONG
     def _GetWindowLongA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # 2 stdcall args
+        h_wnd  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_index = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        GWL_WNDPROC = -4
+        GWL_STYLE   = -16
+        if entry is not None:
+            if n_index == GWL_WNDPROC:
+                cpu.regs[EAX] = entry.wnd_proc_addr
+            elif n_index == GWL_STYLE:
+                cpu.regs[EAX] = entry.style
+            else:
+                cpu.regs[EAX] = 0
+        else:
+            cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "GetWindowLongA", _GetWindowLongA)
 
     # SetWindowLongA(HWND, int, LONG) -> LONG (previous value)
     def _SetWindowLongA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # previous value; 3 stdcall args
+        h_wnd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        n_index  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        new_long = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        GWL_WNDPROC = -4
+        GWL_STYLE   = -16
+        prev = 0
+        if entry is not None:
+            if n_index == GWL_WNDPROC:
+                prev = entry.wnd_proc_addr
+                entry.wnd_proc_addr = new_long
+            elif n_index == GWL_STYLE:
+                prev = entry.style
+                entry.style = new_long
+        cpu.regs[EAX] = prev
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("user32.dll", "SetWindowLongA", _SetWindowLongA)
 
     # LoadCursorA(hInstance, lpCursorName) -> HCURSOR
     def _LoadCursorA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1001  # fake HCURSOR
+        # Return a sentinel; SDL cursor is set separately via SetCursor
+        cpu.regs[EAX] = 0x1001
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "LoadCursorA", _LoadCursorA)
 
     # LoadIconA(hInstance, lpIconName) -> HICON
     def _LoadIconA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1002  # fake HICON
+        cpu.regs[EAX] = 0x1002
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "LoadIconA", _LoadIconA)
 
-    # SetCursor(HCURSOR hCursor) -> HCURSOR
+    # SetCursor(HCURSOR hCursor) -> HCURSOR (previous cursor)
     def _SetCursor(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1001  # previous cursor
+        cpu.regs[EAX] = 0x1001
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "SetCursor", _SetCursor)
 
-    # ShowCursor(BOOL bShow) -> int
+    # ShowCursor(BOOL bShow) -> int (display counter)
     def _ShowCursor(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # display counter; 1 stdcall arg
+        from sdl2 import SDL_ShowCursor, SDL_ENABLE, SDL_DISABLE
+        b_show = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        SDL_ShowCursor(SDL_ENABLE if b_show else SDL_DISABLE)
+        cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "ShowCursor", _ShowCursor)
 
     # PeekMessageA(LPMSG lpMsg, HWND, UINT, UINT, UINT) -> BOOL
+    # Pump SDL events and check our message queue; return FALSE if nothing there.
     def _PeekMessageA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # FALSE = no message; 5 stdcall args
+        lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        wm.pump_sdl_events()
+        msg = wm.peek_message()
+        if msg is not None and lp_msg:
+            hwnd_msg, msg_id, wparam, lparam = msg
+            memory.write32(lp_msg,      hwnd_msg)
+            memory.write32(lp_msg + 4,  msg_id)
+            memory.write32(lp_msg + 8,  wparam)
+            memory.write32(lp_msg + 12, lparam)
+            memory.write32(lp_msg + 16, 0)  # time
+            memory.write32(lp_msg + 20, 0)  # pt.x
+            memory.write32(lp_msg + 24, 0)  # pt.y
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            cpu.regs[EAX] = 0  # FALSE = no message
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("user32.dll", "PeekMessageA", _PeekMessageA)
 
-    # GetMessageA(LPMSG lpMsg, HWND, UINT, UINT) -> BOOL
+    # GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) -> BOOL
+    # Blocking: pumps SDL events until a message is available or SDL_QUIT fires.
     def _GetMessageA(cpu: "CPU") -> None:
-        # Return WM_QUIT (0x12) to exit message loops
+        import time as _time
         lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if lp_msg:
-            memory.write32(lp_msg,     0xABCD)  # HWND
-            memory.write32(lp_msg + 4, 0x12)    # WM_QUIT
-        cpu.regs[EAX] = 0  # FALSE = WM_QUIT
-        cleanup_stdcall(cpu, memory, 16)
+
+        while True:
+            if not wm.pump_sdl_events():
+                # SDL_QUIT — synthesize WM_QUIT (0x0012) so the caller's loop exits
+                if lp_msg:
+                    memory.write32(lp_msg,      0)       # hwnd  = NULL
+                    memory.write32(lp_msg + 4,  0x0012)  # WM_QUIT
+                    memory.write32(lp_msg + 8,  0)       # wParam
+                    memory.write32(lp_msg + 12, 0)       # lParam
+                    memory.write32(lp_msg + 16, 0)       # time
+                    memory.write32(lp_msg + 20, 0)       # pt.x
+                    memory.write32(lp_msg + 24, 0)       # pt.y
+                cpu.regs[EAX] = 0   # FALSE — WM_QUIT received
+                cleanup_stdcall(cpu, memory, 16)
+                return
+
+            msg = wm.peek_message()
+            if msg is not None:
+                hwnd_msg, msg_id, wparam, lparam = msg
+                if lp_msg:
+                    memory.write32(lp_msg,      hwnd_msg)
+                    memory.write32(lp_msg + 4,  msg_id)
+                    memory.write32(lp_msg + 8,  wparam)
+                    memory.write32(lp_msg + 12, lparam)
+                    memory.write32(lp_msg + 16, 0)
+                    memory.write32(lp_msg + 20, 0)
+                    memory.write32(lp_msg + 24, 0)
+                cpu.regs[EAX] = 1   # TRUE — message available
+                cleanup_stdcall(cpu, memory, 16)
+                return
+
+            _time.sleep(0.001)  # yield briefly while the queue is empty
 
     stubs.register_handler("user32.dll", "GetMessageA", _GetMessageA)
 
     # TranslateMessage(MSG*) -> BOOL
     def _TranslateMessage(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # 1 stdcall arg
+        # For our purposes (no IME, no dead keys), TranslateMessage is a no-op.
+        cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "TranslateMessage", _TranslateMessage)
 
-    # DispatchMessageA(MSG*) -> LRESULT
+    # DispatchMessageA(const MSG* lpMsg) -> LRESULT
+    # Routes the message to the registered window proc or dialog proc.
     def _DispatchMessageA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # 1 stdcall arg
+        lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+
+        hwnd   = memory.read32(lp_msg        & 0xFFFFFFFF)
+        msg_id = memory.read32((lp_msg + 4)  & 0xFFFFFFFF)
+        wparam = memory.read32((lp_msg + 8)  & 0xFFFFFFFF)
+        lparam = memory.read32((lp_msg + 12) & 0xFFFFFFFF)
+
+        logger.debug("handlers",
+            f"[Win32] DispatchMessageA hwnd=0x{hwnd:x} msg=0x{msg_id:04x} "
+            f"wp=0x{wparam:x} lp=0x{lparam:x}"
+        )
+
+        # Stack must be cleaned before _invoke_emulated_proc modifies it
         cleanup_stdcall(cpu, memory, 4)
+
+        result = 0
+        entry = wm.get_window(hwnd)
+        if entry is not None:
+            proc = entry.dlg_proc_addr or entry.wnd_proc_addr
+            if proc:
+                sentinel = _get_dialog_sentinel(state, memory)
+                result = _invoke_emulated_proc(
+                    cpu, memory, proc,
+                    [hwnd, msg_id, wparam, lparam],
+                    sentinel,
+                )
+                # Re-render after each dispatch so the window reflects any state changes
+                if entry.sdl_renderer is not None:
+                    from tew.api.dialog_renderer import render_dialog
+                    render_dialog(wm, hwnd)
+            else:
+                logger.debug("handlers",
+                    f"[Win32] DispatchMessageA: hwnd=0x{hwnd:x} msg=0x{msg_id:04x} — no proc, skipping"
+                )
+        else:
+            logger.debug("handlers",
+                f"[Win32] DispatchMessageA: unknown hwnd=0x{hwnd:x}, ignoring"
+            )
+
+        cpu.regs[EAX] = result & 0xFFFFFFFF
 
     stubs.register_handler("user32.dll", "DispatchMessageA", _DispatchMessageA)
 
     # PostQuitMessage(int nExitCode) -> void
     def _PostQuitMessage(cpu: "CPU") -> None:
         logger.debug("handlers", "[Win32] PostQuitMessage()")
-        cleanup_stdcall(cpu, memory, 4)  # 1 stdcall arg, void return
+        cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "PostQuitMessage", _PostQuitMessage)
 
     # GetLastActivePopup(HWND hWnd) -> HWND
     def _GetLastActivePopup(cpu: "CPU") -> None:
         h_wnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = h_wnd  # return the same handle passed in
+        cpu.regs[EAX] = h_wnd  # no popups — return the input handle
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetLastActivePopup", _GetLastActivePopup)
 
     # DialogBoxParamA(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam) -> INT_PTR
     def _DialogBoxParamA(cpu: "CPU") -> None:
-        lp_template = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        name: str = f"#{lp_template}" if lp_template <= 0xFFFF else ""
-        if lp_template > 0xFFFF:
-            for i in range(64):
-                c = memory.read8(lp_template + i)
-                if not c:
-                    break
-                name += chr(c)
+        lp_template    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        h_wnd_parent   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_dialog_func = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        dw_init_param  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
 
-        # Login dialog (#114): invoke the dialog proc with WM_COMMAND/IDOK so it
-        # calls GetDlgItemTextA (which we stub to return "admin") and stores credentials.
-        # Stack trick: instead of cleanupStdcall + return IDOK directly, we set up the
-        # stack so that the stub's RET jumps to lpDialogFunc. After the dialog proc
-        # returns via RET 16, execution lands at DIALOG_TRAMPOLINE which sets EAX=1 (IDOK)
-        # and then RET returns to the original DialogBoxParamA call site.
-        if name == "#114":
-            ret_addr       = memory.read32((cpu.regs[ESP])      & 0xFFFFFFFF)
-            lp_dialog_func = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-            logger.debug(
-                "handlers",
-                f"[Win32] DialogBoxParamA(\"{name}\") - invoking dialog proc "
-                f"0x{lp_dialog_func:08x} with WM_COMMAND/IDOK",
-            )
-            # Shrink ESP by 4 to create one extra stack slot, then write:
-            #   [ESP+ 0] lpDialogFunc      <- stub RET pops → EIP jumps to dialog proc
-            #   [ESP+ 4] DIALOG_TRAMPOLINE <- return address seen by dialog proc (RET 16 pops this)
-            #   [ESP+ 8] 0xABCD            <- hwnd (arg1)
-            #   [ESP+12] 0x111             <- WM_COMMAND (arg2)
-            #   [ESP+16] 1                 <- wParam = IDOK (arg3)
-            #   [ESP+20] 0                 <- lParam (arg4)
-            #   [ESP+24] retAddr           <- trampoline's RET jumps here → original call site
-            cpu.regs[ESP] = (cpu.regs[ESP] - 4) & 0xFFFFFFFF
-            memory.write32((cpu.regs[ESP] +  0) & 0xFFFFFFFF, lp_dialog_func)
-            memory.write32((cpu.regs[ESP] +  4) & 0xFFFFFFFF, DIALOG_TRAMPOLINE)
-            memory.write32((cpu.regs[ESP] +  8) & 0xFFFFFFFF, 0xABCD)
-            memory.write32((cpu.regs[ESP] + 12) & 0xFFFFFFFF, 0x111)
-            memory.write32((cpu.regs[ESP] + 16) & 0xFFFFFFFF, 1)
-            memory.write32((cpu.regs[ESP] + 20) & 0xFFFFFFFF, 0)
-            memory.write32((cpu.regs[ESP] + 24) & 0xFFFFFFFF, ret_addr)
-            # Do NOT call cleanup_stdcall — RET at stub+2 goes directly to lpDialogFunc
+        # lp_template is either an ordinal (≤ 0xFFFF) or a pointer to a name string
+        template_id = lp_template & 0xFFFF if lp_template <= 0xFFFF else 0
+        template_name = f"#{template_id}" if template_id else "?"
+
+        if state.pe_resources is None:
+            logger.error("dialog", "[Win32] DialogBoxParamA: pe_resources not available — halting")
+            cpu.halted = True
             return
 
-        logger.debug("handlers", f'[Win32] DialogBoxParamA("{name}") -> IDOK')
-        cpu.regs[EAX] = 1  # IDOK=1
+        template = state.pe_resources.find_dialog(template_id)
+        if template is None:
+            logger.error("dialog",
+                f"[UNIMPLEMENTED] DialogBoxParamA({template_name}): "
+                f"dialog template not found — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("dialog",
+            f"[Win32] DialogBoxParamA({template_name}) proc=0x{lp_dialog_func:08x}")
+
+        # Initialize SDL2 if it hasn't been already
+        if not wm.initialize():
+            logger.error("dialog", "[Win32] DialogBoxParamA: SDL2 init failed — halting")
+            cpu.halted = True
+            return
+
+        # Create the dialog and all its child controls
+        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param)
+        if dlg_hwnd == 0:
+            logger.error("dialog", "[Win32] DialogBoxParamA: create_dialog failed — halting")
+            cpu.halted = True
+            return
+
+        # Clean up the stdcall arguments.  After this, EAX will be set at the
+        # end of the modal loop and the stub's RET will return to the call site.
         cleanup_stdcall(cpu, memory, 20)
+
+        sentinel = _get_dialog_sentinel(state, memory)
+
+        # Import renderer here to avoid circular imports at module level
+        from tew.api.dialog_renderer import render_dialog
+
+        # ── Modal loop ────────────────────────────────────────────────────────
+        # Deliver WM_INITDIALOG first (already in the queue from create_dialog),
+        # then pump SDL events and dispatch WM_COMMAND messages as they arrive.
+        import time as _time
+        while True:
+            dlg_entry = wm.get_window(dlg_hwnd)
+            if dlg_entry is None or dlg_entry.dlg_done:
+                break
+
+            # Pump SDL events → updates window manager's message queue
+            if not wm.pump_sdl_events():
+                # SDL_QUIT
+                wm.end_dialog(dlg_hwnd, -1)
+                break
+
+            # Render the current dialog state
+            render_dialog(wm, dlg_hwnd)
+
+            # Dispatch one pending message (if any)
+            msg = wm.peek_message()
+            if msg is None:
+                _time.sleep(0.016)  # ~60 fps; yield to system
+                continue
+
+            hwnd_msg, msg_id, wparam, lparam = msg
+
+            # Only deliver messages addressed to this dialog
+            if hwnd_msg != dlg_hwnd:
+                continue
+
+            logger.debug("dialog",
+                f"[DialogLoop] msg=0x{msg_id:04x} wparam=0x{wparam:04x} "
+                f"lparam=0x{lparam:08x} → proc 0x{lp_dialog_func:08x}")
+
+            # Invoke the dialog proc: DLGPROC(HWND hDlg, UINT uMsg, WPARAM, LPARAM)
+            _invoke_emulated_proc(
+                cpu, memory, lp_dialog_func,
+                [dlg_hwnd, msg_id, wparam, lparam],
+                sentinel,
+            )
+
+            # Check again after proc may have called EndDialog
+            dlg_entry = wm.get_window(dlg_hwnd)
+            if dlg_entry is not None and dlg_entry.dlg_done:
+                break
+
+        # Retrieve result before destroying
+        dlg_entry = wm.get_window(dlg_hwnd)
+        result = dlg_entry.dlg_result if dlg_entry is not None else -1
+
+        wm.destroy_window(dlg_hwnd)
+
+        logger.debug("dialog",
+            f"[Win32] DialogBoxParamA({template_name}) -> {result}")
+        cpu.regs[EAX] = result & 0xFFFFFFFF
 
     stubs.register_handler("user32.dll", "DialogBoxParamA", _DialogBoxParamA)
 
     # DialogBoxParamW(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam) -> INT_PTR
-    def _DialogBoxParamW(cpu: "CPU") -> None:
-        logger.debug("handlers", "[Win32] DialogBoxParamW() -> 0")
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 20)
+    stubs.register_handler("user32.dll", "DialogBoxParamW", _halt("DialogBoxParamW"))
 
-    stubs.register_handler("user32.dll", "DialogBoxParamW", _DialogBoxParamW)
-
-    # DialogBoxIndirectParamA(hInstance, hDialogTemplate, hWndParent, lpDialogFunc, dwInitParam) -> INT_PTR
-    def _DialogBoxIndirectParamA(cpu: "CPU") -> None:
-        logger.debug("handlers", "[Win32] DialogBoxIndirectParamA() -> 0")
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 20)
-
-    stubs.register_handler("user32.dll", "DialogBoxIndirectParamA", _DialogBoxIndirectParamA)
+    # DialogBoxIndirectParamA(...) -> INT_PTR
+    stubs.register_handler("user32.dll", "DialogBoxIndirectParamA", _halt("DialogBoxIndirectParamA"))
 
     # CreateDialogParamA(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam) -> HWND
+    # Modeless dialog: creates the window, fires WM_INITDIALOG, returns HWND immediately.
+    # The caller owns the message loop; DispatchMessageA routes subsequent messages.
     def _CreateDialogParamA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xABCE  # fake HWND for the main game dialog
-        logger.debug("handlers", "[Win32] CreateDialogParamA() -> 0xABCE")
+        lp_template    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        h_wnd_parent   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_dialog_func = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        dw_init_param  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+
+        template_id = lp_template & 0xFFFF if lp_template <= 0xFFFF else 0
+        template_name = f"#{template_id}" if template_id else "?"
+
+        if state.pe_resources is None:
+            logger.error("dialog", "[Win32] CreateDialogParamA: pe_resources not available — halting")
+            cpu.halted = True
+            return
+
+        template = state.pe_resources.find_dialog(template_id)
+        if template is None:
+            logger.error("dialog",
+                f"[UNIMPLEMENTED] CreateDialogParamA({template_name}): "
+                f"dialog template not found — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("dialog",
+            f"[Win32] CreateDialogParamA({template_name}) proc=0x{lp_dialog_func:08x}")
+
+        if not wm.initialize():
+            logger.error("dialog", "[Win32] CreateDialogParamA: SDL2 init failed — halting")
+            cpu.halted = True
+            return
+
+        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param)
+        if dlg_hwnd == 0:
+            logger.error("dialog", "[Win32] CreateDialogParamA: create_dialog failed — halting")
+            cpu.halted = True
+            return
+
+        # Clean up stdcall args before any _invoke_emulated_proc call
         cleanup_stdcall(cpu, memory, 20)
+
+        sentinel = _get_dialog_sentinel(state, memory)
+
+        # Deliver WM_INITDIALOG now (create_dialog posted it to the queue).
+        # Peek so we don't leave a stale WM_INITDIALOG for the caller's loop.
+        pending = wm.peek_message()
+        if pending is not None:
+            hwnd_msg, msg_id, wparam, lparam = pending
+            if hwnd_msg == dlg_hwnd and msg_id == WM_INITDIALOG:
+                _invoke_emulated_proc(
+                    cpu, memory, lp_dialog_func,
+                    [dlg_hwnd, msg_id, wparam, lparam],
+                    sentinel,
+                )
+            else:
+                # Unexpected message — put it back by re-appending
+                wm.post_message(hwnd_msg, msg_id, wparam, lparam)
+
+        # Render the initial state so something is visible right away
+        from tew.api.dialog_renderer import render_dialog
+        render_dialog(wm, dlg_hwnd)
+
+        cpu.regs[EAX] = dlg_hwnd
 
     stubs.register_handler("user32.dll", "CreateDialogParamA", _CreateDialogParamA)
 
     # EndDialog(HWND hDlg, INT_PTR nResult) -> BOOL
     def _EndDialog(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] EndDialog: no real dialog — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        h_dlg    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_result = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        ok = wm.end_dialog(h_dlg, n_result)
+        if not ok:
+            logger.warn("handlers", f"[USER32] EndDialog(0x{h_dlg:x}): unknown dialog")
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "EndDialog", _EndDialog)
 
     # RegisterClassA(WNDCLASSA*) -> ATOM
     def _RegisterClassA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xC001  # fake ATOM
+        lp_wndclass = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        # WNDCLASSA layout: cbSize(optional for ExA), style, lpfnWndProc, cbClsExtra,
+        #   cbWndExtra, hInstance, hIcon, hCursor, hbrBackground, lpszMenuName, lpszClassName
+        # For RegisterClassA (not Ex): no cbSize field.
+        # Offsets: [0]=style, [4]=lpfnWndProc, [8]=cbClsExtra, [12]=cbWndExtra,
+        #          [16]=hInstance, [20]=hIcon, [24]=hCursor, [28]=hbrBackground,
+        #          [32]=lpszMenuName, [36]=lpszClassName
+        lp_fn_wnd_proc   = memory.read32((lp_wndclass + 4)  & 0xFFFFFFFF)
+        h_br_background  = memory.read32((lp_wndclass + 28) & 0xFFFFFFFF)
+        lp_sz_class_name = memory.read32((lp_wndclass + 36) & 0xFFFFFFFF)
+        name = ""
+        for i in range(64):
+            ch = memory.read8((lp_sz_class_name + i) & 0xFFFFFFFF)
+            if ch == 0:
+                break
+            name += chr(ch)
+        atom = wm.register_class(name, lp_fn_wnd_proc, background=h_br_background)
+        cpu.regs[EAX] = atom
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "RegisterClassA", _RegisterClassA)
 
     # RegisterClassExA(WNDCLASSEXA*) -> ATOM
     def _RegisterClassExA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xC001  # fake ATOM
+        lp_wndclass = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        # WNDCLASSEXA: [0]=cbSize, [4]=style, [8]=lpfnWndProc, [12]=cbClsExtra,
+        #   [16]=cbWndExtra, [20]=hInstance, [24]=hIcon, [28]=hCursor,
+        #   [32]=hbrBackground, [36]=lpszMenuName, [40]=lpszClassName, [44]=hIconSm
+        lp_fn_wnd_proc   = memory.read32((lp_wndclass + 8)  & 0xFFFFFFFF)
+        h_br_background  = memory.read32((lp_wndclass + 32) & 0xFFFFFFFF)
+        lp_sz_class_name = memory.read32((lp_wndclass + 40) & 0xFFFFFFFF)
+        name = ""
+        for i in range(64):
+            ch = memory.read8((lp_sz_class_name + i) & 0xFFFFFFFF)
+            if ch == 0:
+                break
+            name += chr(ch)
+        atom = wm.register_class(name, lp_fn_wnd_proc, background=h_br_background)
+        cpu.regs[EAX] = atom
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "RegisterClassExA", _RegisterClassExA)
 
     # RegisterClassW(WNDCLASSW*) -> ATOM
     def _RegisterClassW(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xC002  # fake ATOM
+        lp_wndclass = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_fn_wnd_proc   = memory.read32((lp_wndclass + 4)  & 0xFFFFFFFF)
+        h_br_background  = memory.read32((lp_wndclass + 28) & 0xFFFFFFFF)
+        lp_sz_class_name = memory.read32((lp_wndclass + 36) & 0xFFFFFFFF)
+        from tew.api._state import read_wide_string
+        name = read_wide_string(lp_sz_class_name, memory, 64)
+        atom = wm.register_class(name, lp_fn_wnd_proc, background=h_br_background)
+        cpu.regs[EAX] = atom
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "RegisterClassW", _RegisterClassW)
 
     # RegisterClassExW(WNDCLASSEXW*) -> ATOM
     def _RegisterClassExW(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xC002  # fake ATOM
+        lp_wndclass = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_fn_wnd_proc   = memory.read32((lp_wndclass + 8)  & 0xFFFFFFFF)
+        h_br_background  = memory.read32((lp_wndclass + 32) & 0xFFFFFFFF)
+        lp_sz_class_name = memory.read32((lp_wndclass + 40) & 0xFFFFFFFF)
+        from tew.api._state import read_wide_string
+        name = read_wide_string(lp_sz_class_name, memory, 64)
+        atom = wm.register_class(name, lp_fn_wnd_proc, background=h_br_background)
+        cpu.regs[EAX] = atom
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "RegisterClassExW", _RegisterClassExW)
 
     # UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance) -> BOOL
     def _UnregisterClassA(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] UnregisterClassA: no real window class registry — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        from tew.api._state import read_cstring
+        lp_class = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        name = read_cstring(lp_class, memory) if lp_class > 0xFFFF else f"#{lp_class}"
+        atom = wm.get_class_atom(name)
+        if atom:
+            wm._classes.pop(atom, None)
+            wm._class_by_name.pop(name.lower(), None)
+            logger.debug("handlers", f"[Win32] UnregisterClassA('{name}') -> TRUE")
+        else:
+            logger.debug("handlers", f"[Win32] UnregisterClassA('{name}') -> FALSE (not found)")
+        cpu.regs[EAX] = 1 if atom else 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "UnregisterClassA", _UnregisterClassA)
 
-    # CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
-    #                 hWndParent, hMenu, hInstance, lpParam) -> HWND
+    # CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y,
+    #                 nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam) -> HWND
     def _CreateWindowExA(cpu: "CPU") -> None:
-        lp_class_name = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        name: str
-        if lp_class_name > 0xFFFF:
-            name = ""
+        dw_ex_style    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        lp_class_name  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_window_name = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        dw_style       = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        x              = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        y              = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        n_width        = memory.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        n_height       = memory.read32((cpu.regs[ESP] + 32) & 0xFFFFFFFF)
+        h_wnd_parent   = memory.read32((cpu.regs[ESP] + 36) & 0xFFFFFFFF)
+        h_menu         = memory.read32((cpu.regs[ESP] + 40) & 0xFFFFFFFF)
+
+        # lp_class_name ≤ 0xFFFF means the value IS an atom (MAKEINTATOM pattern).
+        # Look it up directly in the atom→class dict; don't stringify and do a
+        # name lookup, because "#N" was never inserted into _class_by_name.
+        if lp_class_name <= 0xFFFF:
+            class_name = f"#{lp_class_name}"
+            atom = lp_class_name if lp_class_name in wm._classes else 0
+        else:
+            class_name = ""
             for i in range(64):
-                c = memory.read8(lp_class_name + i)
+                c = memory.read8((lp_class_name + i) & 0xFFFFFFFF)
                 if not c:
                     break
-                name += chr(c)
-        else:
-            name = f"#{lp_class_name}"
-        logger.debug("handlers", f'[Win32] CreateWindowExA("{name}") -> 0xABCD')
-        cpu.regs[EAX] = 0xABCD  # fake HWND
+                class_name += chr(c)
+            atom = wm.get_class_atom(class_name)
+
+        window_name = ""
+        if lp_window_name:
+            for i in range(256):
+                c = memory.read8((lp_window_name + i) & 0xFFFFFFFF)
+                if not c:
+                    break
+                window_name += chr(c)
+
+        wnd_proc = wm._classes[atom].wnd_proc_addr if atom in wm._classes else 0
+
+        # x/y/cx/cy may be CW_USEDEFAULT (0x80000000) — treat as 0
+        px_x = 0 if x >= 0x80000000 else x
+        px_y = 0 if y >= 0x80000000 else y
+        px_cx = 640 if n_width >= 0x80000000 else n_width
+        px_cy = 480 if n_height >= 0x80000000 else n_height
+
+        if not wm.initialize():
+            logger.error("window", "[CreateWindowExA] SDL2 init failed — halting")
+            cpu.halted = True
+            return
+
+        hwnd = wm.create_window(
+            class_name, window_name, dw_style, dw_ex_style,
+            px_x, px_y, px_cx, px_cy,
+            h_wnd_parent, wnd_proc,
+        )
+        if hwnd == 0:
+            logger.error("window",
+                f"[CreateWindowExA] create_window failed for class '{class_name}' — halting")
+            cpu.halted = True
+            return
+
+        # Register as child with ctrl_id = low word of hMenu if this is a child window
+        if h_wnd_parent and (dw_style & 0x40000000):  # WS_CHILD
+            wm.register_child(h_wnd_parent, h_menu & 0xFFFF, hwnd)
+
+        logger.debug("window",
+            f"[CreateWindowExA] class='{class_name}' title='{window_name}' "
+            f"hwnd=0x{hwnd:x}")
+        cpu.regs[EAX] = hwnd
         cleanup_stdcall(cpu, memory, 48)
 
     stubs.register_handler("user32.dll", "CreateWindowExA", _CreateWindowExA)
 
-    # CreateWindowExW(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
-    #                 hWndParent, hMenu, hInstance, lpParam) -> HWND
-    def _CreateWindowExW(cpu: "CPU") -> None:
-        logger.debug("handlers", "[Win32] CreateWindowExW() -> 0xABCD")
-        cpu.regs[EAX] = 0xABCD  # fake HWND
-        cleanup_stdcall(cpu, memory, 48)
-
-    stubs.register_handler("user32.dll", "CreateWindowExW", _CreateWindowExW)
+    # CreateWindowExW — same logic, wide strings
+    stubs.register_handler("user32.dll", "CreateWindowExW", _halt("CreateWindowExW"))
 
     # DestroyWindow(HWND hWnd) -> BOOL
     def _DestroyWindow(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] DestroyWindow: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        h_wnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        ok = wm.destroy_window(h_wnd)
+        if not ok:
+            logger.warn("handlers", f"[USER32] DestroyWindow(0x{h_wnd:x}): unknown HWND")
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "DestroyWindow", _DestroyWindow)
 
     # ShowWindow(HWND hWnd, int nCmdShow) -> BOOL
     def _ShowWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # previously hidden
+        from sdl2 import SDL_ShowWindow, SDL_HideWindow
+        h_wnd     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_cmd_show = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        if entry is not None and entry.sdl_window is not None:
+            if n_cmd_show == 0:  # SW_HIDE
+                SDL_HideWindow(entry.sdl_window)
+            else:
+                SDL_ShowWindow(entry.sdl_window)
+        cpu.regs[EAX] = 0  # was previously hidden
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "ShowWindow", _ShowWindow)
 
-    # GetDC(HWND hWnd) -> HDC
+    # ── Device context (DC) handle pool ──────────────────────────────────────
+    # Win32 HDC is an opaque handle.  The only thing the game does with these
+    # DCs is pass them to GetDeviceCaps (which queries SDL for real display
+    # info) and then ReleaseDC.  No GDI drawing through these handles occurs.
+    # We allocate stable handle numbers and track them for ReleaseDC.
+    _next_hdc:   list[int]       = [0xDC01]   # mutable counter cell
+    _live_hdcs:  dict[int, int]  = {}          # hdc → hwnd
+
+    def _alloc_hdc(hwnd: int) -> int:
+        hdc = _next_hdc[0]
+        _next_hdc[0] += 1
+        _live_hdcs[hdc] = hwnd
+        return hdc
+
+    # GetDC(HWND hWnd) -> HDC  — client-area device context
     def _GetDC(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1DC  # fake HDC
+        hwnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        hdc  = _alloc_hdc(hwnd)
+        logger.debug("handlers", f"[Win32] GetDC(hwnd=0x{hwnd:x}) -> 0x{hdc:x}")
+        cpu.regs[EAX] = hdc
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetDC", _GetDC)
 
-    # ReleaseDC(HWND hWnd, HDC hDC) -> int
-    def _ReleaseDC(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] ReleaseDC: no real DC — returning 0")
-        cpu.regs[EAX] = 0  # not released (no real DC)
-        cleanup_stdcall(cpu, memory, 8)
-
-    stubs.register_handler("user32.dll", "ReleaseDC", _ReleaseDC)
-
-    # GetWindowDC(HWND hWnd) -> HDC
+    # GetWindowDC(HWND hWnd) -> HDC  — whole-window device context
+    # Used by Platform_SysStartUp (0x6b13b0) to probe HORZRES/VERTRES/BITSPIXEL
+    # via GetDeviceCaps and then immediately ReleaseDC — never drawn through.
     def _GetWindowDC(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1DC  # fake HDC; 1 stdcall arg
+        hwnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        hdc  = _alloc_hdc(hwnd)
+        logger.debug("handlers", f"[Win32] GetWindowDC(hwnd=0x{hwnd:x}) -> 0x{hdc:x}")
+        cpu.regs[EAX] = hdc
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetWindowDC", _GetWindowDC)
 
+    # ReleaseDC(HWND hWnd, HDC hDC) -> int  — 1 = released
+    def _ReleaseDC(cpu: "CPU") -> None:
+        hwnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        hdc  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        _live_hdcs.pop(hdc, None)
+        logger.debug("handlers", f"[Win32] ReleaseDC(hwnd=0x{hwnd:x}, hdc=0x{hdc:x})")
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "ReleaseDC", _ReleaseDC)
+
     # SendMessageA(HWND, UINT, WPARAM, LPARAM) -> LRESULT
     def _SendMessageA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        h_wnd  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        msg    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        wparam = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        result = 0
+        if msg == BM_GETCHECK:
+            result = wm.get_check_state(h_wnd)
+        elif msg == BM_SETCHECK:
+            wm.set_check_state(h_wnd, wparam)
+        elif msg == 0x000D:  # WM_GETTEXT / EM_GETTEXT
+            n_max  = wparam
+            lp_buf = lparam
+            text = wm.get_window_text(h_wnd)
+            length = min(len(text), n_max - 1) if n_max > 0 else 0
+            if lp_buf and n_max > 0:
+                for i in range(length):
+                    memory.write8((lp_buf + i) & 0xFFFFFFFF, ord(text[i]))
+                memory.write8((lp_buf + length) & 0xFFFFFFFF, 0)
+            result = length
+        elif msg == 0x000C:  # WM_SETTEXT / EM_SETTEXT
+            if lparam:
+                text = ""
+                for i in range(256):
+                    ch = memory.read8((lparam + i) & 0xFFFFFFFF)
+                    if ch == 0:
+                        break
+                    text += chr(ch)
+                wm.set_window_text(h_wnd, text)
+            result = 1
+        else:
+            logger.debug("handlers",
+                f"[Win32] SendMessageA(hwnd=0x{h_wnd:x}, msg=0x{msg:04x}, "
+                f"wp=0x{wparam:x}, lp=0x{lparam:x}) -> 0 (unhandled)")
+
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "SendMessageA", _SendMessageA)
 
     # SendMessageW(HWND, UINT, WPARAM, LPARAM) -> LRESULT
-    def _SendMessageW(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 16)
-
-    stubs.register_handler("user32.dll", "SendMessageW", _SendMessageW)
+    stubs.register_handler("user32.dll", "SendMessageW", _halt("SendMessageW"))
 
     # PostMessageA(HWND, UINT, WPARAM, LPARAM) -> BOOL
     def _PostMessageA(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] PostMessageA: no real message queue — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        hwnd   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        msg    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        wparam = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        ok = wm.post_message(hwnd, msg, wparam, lparam)
+        logger.debug("handlers",
+            f"[Win32] PostMessageA(hwnd=0x{hwnd:x}, msg=0x{msg:04x}, "
+            f"wp=0x{wparam:x}, lp=0x{lparam:x}) -> {'TRUE' if ok else 'FALSE (unknown hwnd)'}"
+        )
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "PostMessageA", _PostMessageA)
 
     # PostMessageW(HWND, UINT, WPARAM, LPARAM) -> BOOL
     def _PostMessageW(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] PostMessageW: no real message queue — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        hwnd   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        msg    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        wparam = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        ok = wm.post_message(hwnd, msg, wparam, lparam)
+        logger.debug("handlers",
+            f"[Win32] PostMessageW(hwnd=0x{hwnd:x}, msg=0x{msg:04x}) -> {'TRUE' if ok else 'FALSE (unknown hwnd)'}"
+        )
+        cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "PostMessageW", _PostMessageW)
 
     # GetDlgItem(HWND hDlg, int nIDDlgItem) -> HWND
     def _GetDlgItem(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xABCF  # fake child HWND
+        h_dlg       = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_id_dlg    = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        child_hwnd  = wm.get_dlg_item(h_dlg, n_id_dlg)
+        cpu.regs[EAX] = child_hwnd
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "GetDlgItem", _GetDlgItem)
 
     # SetDlgItemTextA(HWND hDlg, int nIDDlgItem, LPCSTR lpString) -> BOOL
     def _SetDlgItemTextA(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] SetDlgItemTextA: no real dialog — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        h_dlg    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        n_id     = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_str   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        child_hwnd = wm.get_dlg_item(h_dlg, n_id)
+        if child_hwnd and lp_str:
+            text = ""
+            for i in range(256):
+                ch = memory.read8((lp_str + i) & 0xFFFFFFFF)
+                if ch == 0:
+                    break
+                text += chr(ch)
+            wm.set_window_text(child_hwnd, text)
+        cpu.regs[EAX] = 1 if child_hwnd else 0
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("user32.dll", "SetDlgItemTextA", _SetDlgItemTextA)
 
     # GetDlgItemTextA(HWND hDlg, int nIDDlgItem, LPSTR lpString, int nMaxCount) -> UINT
-    # Returns "admin" for all controls — used by login dialog (#114) for username and password.
     def _GetDlgItemTextA(cpu: "CPU") -> None:
-        n_id_dlg_item = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        lp_string     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        n_max_count   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        cred = "admin"
-        length = min(len(cred), n_max_count - 1) if n_max_count > 0 else 0
-        if lp_string != 0 and n_max_count > 0:
+        h_dlg       = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        n_id        = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_string   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        n_max_count = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        child_hwnd = wm.get_dlg_item(h_dlg, n_id)
+        text = wm.get_window_text(child_hwnd) if child_hwnd else ""
+        if not text:
+            text = "admin"  # fallback for unknown controls
+        length = min(len(text), n_max_count - 1) if n_max_count > 0 else 0
+        if lp_string and n_max_count > 0:
             for i in range(length):
-                memory.write8((lp_string + i) & 0xFFFFFFFF, ord(cred[i]))
+                memory.write8((lp_string + i) & 0xFFFFFFFF, ord(text[i]))
             memory.write8((lp_string + length) & 0xFFFFFFFF, 0)
-        logger.debug("handlers", f'[Win32] GetDlgItemTextA(ctrl={n_id_dlg_item}) -> "{cred}"')
+        logger.debug("handlers",
+            f"[Win32] GetDlgItemTextA(dlg=0x{h_dlg:x}, ctrl=0x{n_id:x}) -> {repr(text)}")
         cpu.regs[EAX] = length
         cleanup_stdcall(cpu, memory, 16)
 
@@ -524,14 +1131,27 @@ def register_user32_gdi32_handlers(
 
     # SendDlgItemMessageA(HWND, int, UINT, WPARAM, LPARAM) -> LRESULT
     def _SendDlgItemMessageA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        h_dlg  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        n_id   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        msg    = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        wparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lparam = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        child_hwnd = wm.get_dlg_item(h_dlg, n_id)
+        result = 0
+        if child_hwnd:
+            if msg == BM_GETCHECK:
+                result = wm.get_check_state(child_hwnd)
+            elif msg == BM_SETCHECK:
+                wm.set_check_state(child_hwnd, wparam)
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("user32.dll", "SendDlgItemMessageA", _SendDlgItemMessageA)
 
     # EnableWindow(HWND hWnd, BOOL bEnable) -> BOOL
     def _EnableWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # was not disabled
+        # Return 0 (was not previously disabled); we don't track enabled state yet
+        cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "EnableWindow", _EnableWindow)
@@ -539,22 +1159,25 @@ def register_user32_gdi32_handlers(
     # IsWindow(HWND hWnd) -> BOOL
     def _IsWindow(cpu: "CPU") -> None:
         hwnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = 1 if hwnd != 0 else 0
+        cpu.regs[EAX] = 1 if wm.is_window(hwnd) else 0
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "IsWindow", _IsWindow)
 
     # SetFocus(HWND hWnd) -> HWND (previous focus)
     def _SetFocus(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xABCD  # previous focus
+        h_wnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        prev = wm._focused_hwnd
+        if wm.is_window(h_wnd):
+            wm._focused_hwnd = h_wnd
+        cpu.regs[EAX] = prev
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "SetFocus", _SetFocus)
 
     # GetFocus() -> HWND
     def _GetFocus(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0xABCE  # fake focused HWND
-        cleanup_stdcall(cpu, memory, 0)
+        cpu.regs[EAX] = wm._focused_hwnd
 
     stubs.register_handler("user32.dll", "GetFocus", _GetFocus)
 
@@ -581,52 +1204,62 @@ def register_user32_gdi32_handlers(
 
     # IsDialogMessageA(HWND hDlg, LPMSG lpMsg) -> BOOL
     def _IsDialogMessageA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # FALSE - not a dialog message
+        cpu.regs[EAX] = 0  # FALSE
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "IsDialogMessageA", _IsDialogMessageA)
 
     # CallWindowProcA(WNDPROC, HWND, UINT, WPARAM, LPARAM) -> LRESULT
-    def _CallWindowProcA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 20)
+    stubs.register_handler("user32.dll", "CallWindowProcA", _halt("CallWindowProcA"))
 
-    stubs.register_handler("user32.dll", "CallWindowProcA", _CallWindowProcA)
-
-    # CheckDlgButton(HWND, int, UINT) -> BOOL
+    # CheckDlgButton(HWND hDlg, int nIDButton, UINT uCheck) -> BOOL
     def _CheckDlgButton(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] CheckDlgButton: no real dialog — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        dlg_hwnd  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        id_button = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        u_check   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        btn_hwnd  = wm.get_dlg_item(dlg_hwnd, id_button)
+        if btn_hwnd:
+            wm.set_check_state(btn_hwnd, u_check)
+            logger.debug("handlers",
+                f"[Win32] CheckDlgButton(dlg=0x{dlg_hwnd:x}, id=0x{id_button:x}, check={u_check})"
+            )
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("user32.dll", "CheckDlgButton", _CheckDlgButton)
 
     # IsDlgButtonChecked(HWND, int) -> UINT
     def _IsDlgButtonChecked(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # BST_UNCHECKED
+        h_dlg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_id  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        child_hwnd = wm.get_dlg_item(h_dlg, n_id)
+        cpu.regs[EAX] = wm.get_check_state(child_hwnd) if child_hwnd else 0
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "IsDlgButtonChecked", _IsDlgButtonChecked)
 
-    # SetDlgItemInt(HWND, int, UINT, BOOL) -> BOOL
+    # SetDlgItemInt(HWND hDlg, int nIDDlgItem, UINT uValue, BOOL bSigned) -> BOOL
     def _SetDlgItemInt(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] SetDlgItemInt: no real dialog — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        dlg_hwnd = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        id_item  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        u_value  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        b_signed = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        text = str(u_value if not b_signed else (u_value if u_value < 0x80000000 else u_value - 0x100000000))
+        item_hwnd = wm.get_dlg_item(dlg_hwnd, id_item)
+        if item_hwnd:
+            wm.set_window_text(item_hwnd, text)
+        cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "SetDlgItemInt", _SetDlgItemInt)
 
     # GetDlgItemInt(HWND, int, BOOL*, BOOL) -> UINT
-    def _GetDlgItemInt(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 16)
-
-    stubs.register_handler("user32.dll", "GetDlgItemInt", _GetDlgItemInt)
+    stubs.register_handler("user32.dll", "GetDlgItemInt", _halt("GetDlgItemInt"))
 
     # RedrawWindow(HWND, RECT*, HRGN, UINT) -> BOOL
+    # SDL renders continuously; no explicit repaint needed.
     def _RedrawWindow(cpu: "CPU") -> None:
-        logger.warn("handlers", "[USER32] RedrawWindow: no real window — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE
+        cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "RedrawWindow", _RedrawWindow)
@@ -635,57 +1268,60 @@ def register_user32_gdi32_handlers(
 
     # DeleteDC(HDC hDC) -> BOOL
     def _DeleteDC(cpu: "CPU") -> None:
-        logger.warn("handlers", "[GDI32] DeleteDC: no real DC — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 1 stdcall arg
+        hdc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        _live_hdcs.pop(hdc, None)
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("gdi32.dll", "DeleteDC", _DeleteDC)
 
     # CreateCompatibleDC(HDC hDC) -> HDC
-    def _CreateCompatibleDC(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1DC  # fake HDC; 1 stdcall arg
-        cleanup_stdcall(cpu, memory, 4)
-
-    stubs.register_handler("gdi32.dll", "CreateCompatibleDC", _CreateCompatibleDC)
+    stubs.register_handler("gdi32.dll", "CreateCompatibleDC", _halt("CreateCompatibleDC"))
 
     # CreateCompatibleBitmap(HDC hDC, int cx, int cy) -> HBITMAP
-    def _CreateCompatibleBitmap(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1DB  # fake HBITMAP; 3 stdcall args
-        cleanup_stdcall(cpu, memory, 12)
-
-    stubs.register_handler("gdi32.dll", "CreateCompatibleBitmap", _CreateCompatibleBitmap)
+    stubs.register_handler("gdi32.dll", "CreateCompatibleBitmap", _halt("CreateCompatibleBitmap"))
 
     # SelectObject(HDC hDC, HGDIOBJ h) -> HGDIOBJ
-    def _SelectObject(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # NULL (previous object); 2 stdcall args
-        cleanup_stdcall(cpu, memory, 8)
-
-    stubs.register_handler("gdi32.dll", "SelectObject", _SelectObject)
+    stubs.register_handler("gdi32.dll", "SelectObject", _halt("SelectObject"))
 
     # DeleteObject(HGDIOBJ ho) -> BOOL
+    # GDI objects are not tracked; deletion is a no-op.
     def _DeleteObject(cpu: "CPU") -> None:
-        logger.warn("handlers", "[GDI32] DeleteObject: no real GDI object — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 1 stdcall arg
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("gdi32.dll", "DeleteObject", _DeleteObject)
 
-    # BitBlt(HDC hDC, int x, int y, int cx, int cy, HDC hSrcDC, int x1, int y1, DWORD rop) -> BOOL
+    # BitBlt(HDC, int, int, int, int, HDC, int, int, DWORD) -> BOOL
+    # GDI blit to our SDL surface is a no-op; rendering goes through SDL directly.
     def _BitBlt(cpu: "CPU") -> None:
-        logger.warn("handlers", "[GDI32] BitBlt: no real DC — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 9 stdcall args
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 36)
 
     stubs.register_handler("gdi32.dll", "BitBlt", _BitBlt)
 
     # GetDeviceCaps(HDC hDC, int nIndex) -> int
+    # nIndex constants: HORZRES=8, VERTRES=10, BITSPIXEL=12, PLANES=14,
+    #                   LOGPIXELSX=88, LOGPIXELSY=90
+    _DEVCAPS_NAMES: dict[int, str] = {
+        8: "HORZRES", 10: "VERTRES", 12: "BITSPIXEL",
+        14: "PLANES", 88: "LOGPIXELSX", 90: "LOGPIXELSY",
+    }
+
     def _GetDeviceCaps(cpu: "CPU") -> None:
+        from sdl2 import SDL_GetDesktopDisplayMode, SDL_DisplayMode
+        import ctypes
+        hdc     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_index = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        # HORZRES=8, VERTRES=10, BITSPIXEL=12, PLANES=14, LOGPIXELSX=88, LOGPIXELSY=90
+        mode = SDL_DisplayMode()
+        if SDL_GetDesktopDisplayMode(0, ctypes.byref(mode)) == 0:
+            screen_w, screen_h = mode.w, mode.h
+        else:
+            screen_w, screen_h = 1024, 768
         if n_index == 8:
-            val = 800
+            val = screen_w
         elif n_index == 10:
-            val = 600
+            val = screen_h
         elif n_index == 12:
             val = 32
         elif n_index == 14:
@@ -694,71 +1330,44 @@ def register_user32_gdi32_handlers(
             val = 96
         else:
             val = 0
+        cap_name = _DEVCAPS_NAMES.get(n_index, str(n_index))
+        logger.debug(
+            "handlers",
+            f"[Win32] GetDeviceCaps(hdc=0x{hdc:x}, {cap_name}) -> {val}",
+        )
         cpu.regs[EAX] = val
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("gdi32.dll", "GetDeviceCaps", _GetDeviceCaps)
 
-    # SetDIBitsToDevice(...) -> int (13 stdcall args)
-    def _SetDIBitsToDevice(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # 13 stdcall args
-        cleanup_stdcall(cpu, memory, 52)
+    # SetDIBitsToDevice(...) -> int  (13 stdcall args)
+    stubs.register_handler("gdi32.dll", "SetDIBitsToDevice", _halt("SetDIBitsToDevice"))
 
-    stubs.register_handler("gdi32.dll", "SetDIBitsToDevice", _SetDIBitsToDevice)
-
-    # StretchDIBits(...) -> int (13 stdcall args)
-    def _StretchDIBits(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # 13 stdcall args
-        cleanup_stdcall(cpu, memory, 52)
-
-    stubs.register_handler("gdi32.dll", "StretchDIBits", _StretchDIBits)
+    # StretchDIBits(...) -> int  (13 stdcall args)
+    stubs.register_handler("gdi32.dll", "StretchDIBits", _halt("StretchDIBits"))
 
     # CreateDIBSection(HDC, BITMAPINFO*, UINT, void**, HANDLE, DWORD) -> HBITMAP
-    def _CreateDIBSection(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # NULL HBITMAP; 6 stdcall args
-        cleanup_stdcall(cpu, memory, 24)
-
-    stubs.register_handler("gdi32.dll", "CreateDIBSection", _CreateDIBSection)
+    stubs.register_handler("gdi32.dll", "CreateDIBSection", _halt("CreateDIBSection"))
 
     # GetStockObject(int fnObject) -> HGDIOBJ
-    def _GetStockObject(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1DA  # fake HGDIOBJ; 1 stdcall arg
-        cleanup_stdcall(cpu, memory, 4)
-
-    stubs.register_handler("gdi32.dll", "GetStockObject", _GetStockObject)
+    stubs.register_handler("gdi32.dll", "GetStockObject", _halt("GetStockObject"))
 
     # CreateSolidBrush(COLORREF color) -> HBRUSH
-    def _CreateSolidBrush(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1D9  # fake HBRUSH; 1 stdcall arg
-        cleanup_stdcall(cpu, memory, 4)
+    stubs.register_handler("gdi32.dll", "CreateSolidBrush", _halt("CreateSolidBrush"))
 
-    stubs.register_handler("gdi32.dll", "CreateSolidBrush", _CreateSolidBrush)
-
-    # CreateFontA(...) -> HFONT (14 stdcall args)
-    def _CreateFontA(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x1D8  # fake HFONT; 14 stdcall args
-        cleanup_stdcall(cpu, memory, 56)
-
-    stubs.register_handler("gdi32.dll", "CreateFontA", _CreateFontA)
+    # CreateFontA(...) -> HFONT  (14 stdcall args)
+    stubs.register_handler("gdi32.dll", "CreateFontA", _halt("CreateFontA"))
 
     # TextOutA(HDC hDC, int x, int y, LPCSTR lpString, int c) -> BOOL
+    # GDI text output to our SDL surface is a no-op.
     def _TextOutA(cpu: "CPU") -> None:
-        logger.warn("handlers", "[GDI32] TextOutA: no real DC — returning FALSE")
-        cpu.regs[EAX] = 0  # FALSE; 5 stdcall args
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("gdi32.dll", "TextOutA", _TextOutA)
 
-    # SetBkMode(HDC hDC, int iMode) -> int
-    def _SetBkMode(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # previous mode; 2 stdcall args
-        cleanup_stdcall(cpu, memory, 8)
+    # SetBkMode(HDC hDC, int iMode) -> int (previous mode)
+    stubs.register_handler("gdi32.dll", "SetBkMode", _halt("SetBkMode"))
 
-    stubs.register_handler("gdi32.dll", "SetBkMode", _SetBkMode)
-
-    # SetTextColor(HDC hDC, COLORREF color) -> COLORREF
-    def _SetTextColor(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # previous color; 2 stdcall args
-        cleanup_stdcall(cpu, memory, 8)
-
-    stubs.register_handler("gdi32.dll", "SetTextColor", _SetTextColor)
+    # SetTextColor(HDC hDC, COLORREF color) -> COLORREF (previous color)
+    stubs.register_handler("gdi32.dll", "SetTextColor", _halt("SetTextColor"))

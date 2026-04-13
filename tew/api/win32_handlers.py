@@ -193,6 +193,23 @@ class Win32Handlers:
                 return entry
         return None
 
+    def get_stub_dll_handle(self, dll_name: str) -> int | None:
+        """Return a stable handle for a stub-only DLL, or None if not registered.
+
+        For DLLs implemented entirely by handler stubs (kernel32, user32, etc.)
+        there is no real LoadedDLL entry in the DLL loader.  The address of the
+        first registered handler for the DLL is a stable non-NULL value in our
+        memory space, so it works as a module handle that satisfies pointer
+        comparisons and NULL checks in the game.
+        """
+        norm = dll_name.lower()
+        if not norm.endswith(".dll"):
+            norm += ".dll"
+        for entry in self._handlers_by_id:
+            if entry.dll_name == norm:
+                return entry.address
+        return None
+
     def get_registered_handlers(self) -> list[dict]:
         """Return all registered stubs (for diagnostics)."""
         return [

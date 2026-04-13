@@ -8,6 +8,7 @@ are in kernel32_io.py, called from register_kernel32_handlers.
 from __future__ import annotations
 
 import os
+import time as _time_module
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -17,6 +18,9 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
+from tew.api.char_type import CT_CTYPE1, GetStringTypeArgs, classify_wide_string
+from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string
+from tew.api.win32_errors import Win32Error
 from tew.api._state import (
     CRTState, FileHandleEntry, DynamicModule, PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
@@ -101,6 +105,17 @@ def _run_thread_slice(cpu: "CPU", memory: "Memory",
         logger.debug("scheduler", f"Thread {thread.thread_id} completed ({steps} steps)")
     elif thread_error:
         thread.completed = True
+    elif cpu.halted:
+        # Halted unexpectedly — INT3, a halt-stub inside the thread, memory
+        # fault, or an explicit cpu.halted set by a handler.
+        # cpu.last_error carries the Python exception if step() caught one.
+        detail = f": {cpu.last_error}" if cpu.last_error else ""
+        logger.error(
+            "thread",
+            f"Thread {thread.thread_id} crashed: unexpected halt at "
+            f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
+        )
+        thread.completed = True
     else:
         thread.saved_state = cpu.save_state()
         logger.debug("scheduler",
@@ -114,7 +129,13 @@ def _cooperative_sleep(
     """Try to run a pending thread for one time slice.
     Returns True if a thread ran (caller should cleanup and return),
     False if no thread was available.
+
+    Guards against reentrance: if a background thread calls Sleep() during
+    its own slice, we do not recurse into another slice (that would blow
+    Python's call stack).  Just return False so the Sleep stub returns 0.
     """
+    if state.is_running_thread:
+        return False
     num = len(state.pending_threads)
     runnable: Optional[PendingThreadInfo] = None
     tidx = -1
@@ -264,43 +285,55 @@ def register_kernel32_handlers(
 
     # ── Module handles ────────────────────────────────────────────────────────
 
+    def _resolve_module_handle(name: str) -> int:
+        """Resolve a module name to a handle (base address).
+
+        Resolution order:
+          1. NULL name → main exe image base.
+          2. Name ends in .exe → main exe image base.
+          3. Loaded real DLL (from disk) → its base_address.
+          4. Stub-only system DLL (kernel32, user32, etc.) → first handler address.
+          5. Unresolvable → 0 (caller will warn).
+        """
+        if not name:
+            return 0x00400000
+        lower = name.lower()
+        if lower.endswith(".exe"):
+            return 0x00400000
+        if dll_loader:
+            # Normalise: strip .dll suffix then re-add so "KERNEL32" → "kernel32.dll"
+            canonical = lower.rstrip(".dll").rstrip(".") + ".dll"
+            dll = dll_loader.get_dll(name) or dll_loader.get_dll(canonical)
+            if dll:
+                return dll.base_address
+        # Stub-only DLLs (kernel32, user32, gdi32, etc.) have handler trampolines
+        # but no LoadedDLL entry.  Return the address of the first registered handler
+        # for that DLL — stable, non-NULL, and lives in our mapped address space.
+        stub_handle = stubs.get_stub_dll_handle(name)
+        if stub_handle is not None:
+            return stub_handle
+        return 0
+
     def _get_module_handle_a(cpu: "CPU") -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if lp == 0:
-            cpu.regs[EAX] = 0x00400000
+        name = read_cstring(lp, memory) if lp != 0 else ""
+        handle = _resolve_module_handle(name)
+        if handle:
+            logger.debug("handlers", f'GetModuleHandleA("{name}") -> 0x{handle:08x}')
         else:
-            name = read_cstring(lp, memory)
-            dll = None
-            if dll_loader:
-                dll = dll_loader.get_dll(name) or dll_loader.get_dll(
-                    name.lower().rstrip('.dll') + '.dll')
-            if dll:
-                cpu.regs[EAX] = dll.base_address
-            elif name.lower().endswith('.exe'):
-                logger.debug("handlers", f'GetModuleHandleA("{name}") -> 0x00400000 (main exe)')
-                cpu.regs[EAX] = 0x00400000
-            else:
-                logger.warn("handlers", f'GetModuleHandleA("{name}") -> NULL (not loaded)')
-                cpu.regs[EAX] = 0
+            logger.warn("handlers", f'GetModuleHandleA("{name}") -> NULL (not loaded)')
+        cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 4)
 
     def _get_module_handle_w(cpu: "CPU") -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if lp == 0:
-            cpu.regs[EAX] = 0x00400000
+        name = read_wide_string(lp, memory) if lp != 0 else ""
+        handle = _resolve_module_handle(name)
+        if handle:
+            logger.debug("handlers", f'GetModuleHandleW("{name}") -> 0x{handle:08x}')
         else:
-            name = read_wide_string(lp, memory)
-            dll = None
-            if dll_loader:
-                dll = dll_loader.get_dll(name) or dll_loader.get_dll(
-                    name.lower().rstrip('.dll') + '.dll')
-            if dll:
-                cpu.regs[EAX] = dll.base_address
-            elif name.lower().endswith('.exe'):
-                cpu.regs[EAX] = 0x00400000
-            else:
-                logger.warn("handlers", f'GetModuleHandleW("{name}") -> NULL')
-                cpu.regs[EAX] = 0
+            logger.warn("handlers", f'GetModuleHandleW("{name}") -> NULL (not loaded)')
+        cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "GetModuleHandleA", _get_module_handle_a)
@@ -451,12 +484,24 @@ def register_kernel32_handlers(
         cpu.regs[EAX] = sz if sz is not None else 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 12)
 
+    def _heap_validate(cpu: "CPU") -> None:
+        h_heap  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        # dw_flags (ESP+8) and lp_mem (ESP+12) are intentionally unused:
+        # our bump allocator has no fragmentation or corruption to check.
+        if h_heap not in state.heap_handles:
+            logger.error("handlers", f"[HeapValidate] invalid heap 0x{h_heap:x} — halting")
+            cpu.halted = True
+            return
+        cpu.regs[EAX] = 1  # TRUE — heap is always valid
+        cleanup_stdcall(cpu, memory, 12)
+
     stubs.register_handler("kernel32.dll", "HeapCreate",    _heap_create)
     stubs.register_handler("kernel32.dll", "GetProcessHeap", _get_process_heap)
     stubs.register_handler("kernel32.dll", "HeapAlloc",     _heap_alloc)
     stubs.register_handler("kernel32.dll", "HeapFree",      _heap_free)
     stubs.register_handler("kernel32.dll", "HeapReAlloc",   _heap_realloc)
     stubs.register_handler("kernel32.dll", "HeapSize",      _heap_size)
+    stubs.register_handler("kernel32.dll", "HeapValidate",  _heap_validate)
 
     # ── VirtualAlloc / VirtualFree ────────────────────────────────────────────
 
@@ -538,11 +583,57 @@ def register_kernel32_handlers(
             cpu.halted = True
         return _h
 
-    stubs.register_handler("kernel32.dll", "GetLastError",               _halt("GetLastError"))
-    stubs.register_handler("kernel32.dll", "SetLastError",               _halt("SetLastError"))
-    stubs.register_handler("kernel32.dll", "GetTickCount",               _halt("GetTickCount"))
-    stubs.register_handler("kernel32.dll", "QueryPerformanceCounter",    _halt("QueryPerformanceCounter"))
-    stubs.register_handler("kernel32.dll", "QueryPerformanceFrequency",  _halt("QueryPerformanceFrequency"))
+    def _get_last_error(cpu: "CPU") -> None:
+        cpu.regs[EAX] = state.last_error & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 0)
+
+    def _set_last_error(cpu: "CPU") -> None:
+        state.last_error = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cleanup_stdcall(cpu, memory, 4)
+
+    # ── Time / tick functions ─────────────────────────────────────────────────
+
+    # Monotonic start time captured once so tick counts are relative.
+    _start_time = _time_module.monotonic()
+
+    def _get_tick_count(cpu: "CPU") -> None:
+        """GetTickCount() -> DWORD  (milliseconds since emulator start).
+
+        The return value wraps after ~49.7 days.  Game code uses it for
+        timeouts and animation deltas, not absolute timestamps.
+        """
+        elapsed_ms = int((_time_module.monotonic() - _start_time) * 1000) & 0xFFFFFFFF
+        cpu.regs[EAX] = elapsed_ms
+        cleanup_stdcall(cpu, memory, 0)
+
+    # QPC frequency: we report 1 000 000 (1 MHz) so the counter value in
+    # microseconds stays within easy integer range.
+    _QPC_FREQ: int = 1_000_000
+
+    def _query_performance_counter(cpu: "CPU") -> None:
+        """QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) -> BOOL."""
+        p = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if p:
+            us = int((_time_module.monotonic() - _start_time) * _QPC_FREQ)
+            memory.write32(p,     us & 0xFFFFFFFF)         # low DWORD
+            memory.write32(p + 4, (us >> 32) & 0xFFFFFFFF) # high DWORD
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    def _query_performance_frequency(cpu: "CPU") -> None:
+        """QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) -> BOOL."""
+        p = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if p:
+            memory.write32(p,     _QPC_FREQ & 0xFFFFFFFF)
+            memory.write32(p + 4, 0)
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("kernel32.dll", "GetLastError",               _get_last_error)
+    stubs.register_handler("kernel32.dll", "SetLastError",               _set_last_error)
+    stubs.register_handler("kernel32.dll", "GetTickCount",               _get_tick_count)
+    stubs.register_handler("kernel32.dll", "QueryPerformanceCounter",    _query_performance_counter)
+    stubs.register_handler("kernel32.dll", "QueryPerformanceFrequency",  _query_performance_frequency)
 
     # ── GetSystemInfo ─────────────────────────────────────────────────────────
 
@@ -631,8 +722,10 @@ def register_kernel32_handlers(
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         val = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if idx not in state.tls_slots:
-            logger.error("handlers", f"[TlsSetValue] invalid slot {idx} — halting")
-            cpu.halted = True
+            # Win32: returns FALSE for an invalid index; never halts.
+            logger.warn("handlers", f"[TlsSetValue] invalid slot {idx} — returning FALSE")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
             return
         state.tls_thread_store(state.tls_current_thread_id())[idx] = val
         cpu.regs[EAX] = 1
@@ -641,8 +734,10 @@ def register_kernel32_handlers(
     def _tls_get_value(cpu: "CPU") -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if idx not in state.tls_slots:
-            logger.error("handlers", f"[TlsGetValue] invalid slot {idx} — halting")
-            cpu.halted = True
+            # Win32: returns 0 (NULL) for an invalid index; never halts.
+            logger.warn("handlers", f"[TlsGetValue] invalid slot {idx} — returning 0")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 4)
             return
         val = state.tls_thread_store(state.tls_current_thread_id()).get(idx, 0)
         cpu.regs[EAX] = val
@@ -651,8 +746,10 @@ def register_kernel32_handlers(
     def _tls_free(cpu: "CPU") -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if idx not in state.tls_slots:
-            logger.error("handlers", f"[TlsFree] invalid slot {idx} — halting")
-            cpu.halted = True
+            # Win32: returns FALSE for an unallocated index; never halts.
+            logger.warn("handlers", f"[TlsFree] invalid slot {idx} — returning FALSE")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 4)
             return
         state.tls_slots.discard(idx)
         for store in state.tls_store.values():
@@ -744,18 +841,19 @@ def register_kernel32_handlers(
                             f'LoadLibraryA("{name}") -> 0x{handle:x} '
                             f'(loaded at 0x{loaded.base_address:x})')
                         if not was_loaded and basename.lower() == "authlogin.dll":
-                            # Patch known-spinning heap allocator
+                            # authlogin.dll ships its own MSVC SBH (small-block heap).
+                            # The allocator at offset 0xca1e cannot run because our
+                            # HeapCreate/HeapAlloc stubs do not set up the SBH metadata
+                            # it expects.  Replace it with simple_alloc so the rest of
+                            # the DLL (TLS init, critical sections, etc.) can run
+                            # normally without any other patches.
                             base = loaded.base_address
-                            def _authlogin_alloc(cpu: "CPU",
-                                                  _b=base) -> None:
+                            def _authlogin_alloc(cpu: "CPU") -> None:
                                 sz = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
                                 cpu.regs[EAX] = state.simple_alloc(sz or 1)
+                                # __cdecl: caller cleans the stack — no cleanup_stdcall
                             stubs.patch_address(base + 0xca1e, "authlogin_heapAlloc",
                                                 _authlogin_alloc)
-                            def _authlogin_init(cpu: "CPU") -> None:
-                                cpu.regs[EAX] = 1
-                            stubs.patch_address(base + 0xa2ec, "authlogin_perThreadInit",
-                                                _authlogin_init)
                         if not was_loaded and loaded.entry_point != 0:
                             _load_dll_with_dllmain(cpu, memory, stubs, state,
                                                    dll_loader, loaded, handle, arg_bytes)
@@ -1000,10 +1098,47 @@ def register_kernel32_handlers(
     stubs.register_handler("kernel32.dll", "GetACP",                _get_acp)
     stubs.register_handler("kernel32.dll", "GetCPInfo",             _get_cp_info)
     stubs.register_handler("kernel32.dll", "IsValidCodePage",       _is_valid_code_page)
-    stubs.register_handler("kernel32.dll", "GetStringTypeW",        _halt("GetStringTypeW"))
+    def _get_string_type_w(cpu: "CPU") -> None:
+        args = GetStringTypeArgs(
+            info_type = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF),
+            src_ptr   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF),
+            cch_src   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF),
+            out_ptr   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF),
+        )
+        if not classify_wide_string(memory, args):
+            logger.error(
+                "handlers",
+                f"GetStringTypeW: unsupported dwInfoType {args.info_type:#010x} — halting",
+            )
+            cpu.halted = True
+            return
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("kernel32.dll", "GetStringTypeW",        _get_string_type_w)
     stubs.register_handler("kernel32.dll", "MultiByteToWideChar",   _multi_byte_to_wide)
     stubs.register_handler("kernel32.dll", "WideCharToMultiByte",   _wide_to_multi_byte)
-    stubs.register_handler("kernel32.dll", "LCMapStringW",          _halt("LCMapStringW"))
+    def _lc_map_string_w(cpu: "CPU") -> None:
+        args = LCMapStringArgs(
+            locale    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF),
+            map_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF),
+            src_ptr   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF),
+            cch_src   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF),
+            dest_ptr  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF),
+            cch_dest  = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF),
+        )
+        result = lc_map_wide_string(memory, args)
+        if result is None:
+            logger.error(
+                "handlers",
+                f"LCMapStringW: unsupported dwMapFlags {args.map_flags:#010x} — halting",
+            )
+            cpu.halted = True
+            return
+        cpu.regs[EAX] = result
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("kernel32.dll", "LCMapStringW",          _lc_map_string_w)
     stubs.register_handler("kernel32.dll", "GetLocaleInfoA",        _get_locale_info_a)
     stubs.register_handler("kernel32.dll", "FlsAlloc",              _halt("FlsAlloc"))
     stubs.register_handler("kernel32.dll", "FlsSetValue",           _halt("FlsSetValue"))

@@ -18,14 +18,81 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.api.win32_errors import Win32Error
+from tew.api.ini_file import (
+    GetPrivateProfileStringArgs, GetPrivateProfileIntArgs,
+    parse_ini, read_profile_string, read_profile_int,
+    write_profile_string, write_profile_section,
+)
 from tew.api._state import (
-    CRTState, MutexHandle, EventHandle,
+    CRTState, FileHandleEntry, MutexHandle, EventHandle,
     PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
     THREAD_STACK_SIZE,
 )
 from tew.logger import logger
 
+# ── Environment variable store ────────────────────────────────────────────────
+# Shared by Set/GetEnvironmentVariable{A,W} handlers.
+_env_vars: dict[str, str] = {}
+
+# ── Win32 handle constants ─────────────────────────────────────────────────────
+
+_CURRENT_PROCESS_HANDLE = 0xFFFFFFFF  # GetCurrentProcess() pseudo-handle
+_CURRENT_THREAD_HANDLE  = 0xFFFFFFFE  # GetCurrentThread() pseudo-handle
+_DUPLICATE_CLOSE_SOURCE = 0x00000001
+
+
+def _duplicate_handle_entry(state: CRTState, h_source: int, close_source: bool) -> int:
+    """Find h_source in the handle tables and register a duplicate entry.
+
+    Returns the new handle value.  All four source categories are handled:
+
+    * Pseudo-handles (0xFFFFFFFF / 0xFFFFFFFE) — converted to a real kernel
+      handle so the caller can later pass it to CloseHandle without errors.
+    * File handles  — new entry shares the same FileHandleEntry object so that
+      both handles advance the same file position (correct Win32 semantics).
+    * Kernel handles (mutex / event) — new entry shares the same object.
+    * Unknown handles (thread handles, module handles) — a dummy EventHandle is
+      registered under the new value so that CloseHandle succeeds silently.
+
+    When close_source is True the source handle is removed from both maps
+    (DUPLICATE_CLOSE_SOURCE semantics).  The caller is responsible for the
+    stack-cleanup and EAX=TRUE writeback.
+    """
+    new_handle: int
+
+    if h_source in (_CURRENT_PROCESS_HANDLE, _CURRENT_THREAD_HANDLE):
+        new_handle = state.next_kernel_handle
+        state.next_kernel_handle += 1
+        state.kernel_handle_map[new_handle] = EventHandle(signaled=True, manual_reset=True)
+
+    elif h_source in state.file_handle_map:
+        entry = state.file_handle_map[h_source]
+        new_handle = state.next_file_handle
+        state.next_file_handle += 1
+        state.file_handle_map[new_handle] = entry   # shared ref → shared file position
+
+    elif h_source in state.kernel_handle_map:
+        obj = state.kernel_handle_map[h_source]
+        new_handle = state.next_kernel_handle
+        state.next_kernel_handle += 1
+        state.kernel_handle_map[new_handle] = obj   # shared ref
+
+    else:
+        # Thread handle or other value not tracked in a lookup table.
+        # Register a dummy so CloseHandle on the result does not warn.
+        logger.debug("handlers",
+            f"DuplicateHandle: untracked src=0x{h_source:08x} — registering dummy")
+        new_handle = state.next_kernel_handle
+        state.next_kernel_handle += 1
+        state.kernel_handle_map[new_handle] = EventHandle(signaled=True, manual_reset=True)
+
+    if close_source:
+        state.file_handle_map.pop(h_source, None)
+        state.kernel_handle_map.pop(h_source, None)
+
+    return new_handle
 
 
 def _run_thread_slice(
@@ -66,6 +133,17 @@ def _run_thread_slice(
         logger.debug("scheduler", f"Thread {thread.thread_id} completed ({steps} steps)")
     elif thread_error:
         thread.completed = True
+    elif cpu.halted:
+        # Halted unexpectedly — INT3, a halt-stub, memory fault, or explicit
+        # cpu.halted set by a handler.  cpu.last_error carries the Python
+        # exception if step() caught one internally.
+        detail = f": {cpu.last_error}" if cpu.last_error else ""
+        logger.error(
+            "thread",
+            f"Thread {thread.thread_id} crashed: unexpected halt at "
+            f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
+        )
+        thread.completed = True
     else:
         thread.saved_state = cpu.save_state()
         logger.debug("scheduler",
@@ -76,7 +154,13 @@ def _run_thread_slice(
 def _cooperative_sleep_ex(
     cpu: "CPU", memory: "Memory", state: CRTState, arg_bytes: int, eax_val: int
 ) -> bool:
-    """Try to schedule a thread (SleepEx variant). Returns True if handled."""
+    """Try to schedule a thread (SleepEx variant). Returns True if handled.
+
+    Guards against reentrance: if a background thread calls SleepEx during
+    its own slice, do not recurse.  Return False so the stub returns 0.
+    """
+    if state.is_running_thread:
+        return False
     num = len(state.pending_threads)
     runnable: Optional[PendingThreadInfo] = None
     tidx = -1
@@ -208,7 +292,43 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "WriteFile",       _write_file)
     stubs.register_handler("kernel32.dll", "SetHandleCount",  _set_handle_count)
     stubs.register_handler("kernel32.dll", "SetStdHandle",    _set_std_handle)
-    stubs.register_handler("kernel32.dll", "GetModuleFileNameA", _halt("GetModuleFileNameA"))
+    def _get_module_file_name_a(cpu: "CPU") -> None:
+        h_module    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_filename = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        n_size      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+
+        if h_module == 0:
+            # NULL → return the path of the running executable.
+            if not state.exe_path:
+                logger.error("handlers", "GetModuleFileNameA: exe_path not set in CRTState — halting")
+                cpu.halted = True
+                return
+            win_path = state.reverse_translate_path(state.exe_path)
+        else:
+            mod = state.dynamic_modules.get(h_module)
+            if mod is None:
+                logger.error(
+                    "handlers",
+                    f"GetModuleFileNameA: unknown hModule 0x{h_module:x} — halting",
+                )
+                cpu.halted = True
+                return
+            # Use the stored full path when available; fall back to the bare DLL name.
+            win_path = mod.dll_path if mod.dll_path else mod.dll_name
+
+        # Encode as ANSI and write to the guest buffer.
+        encoded = win_path.encode("latin-1", errors="replace")
+        chars_to_copy = min(len(encoded), max(n_size - 1, 0))
+
+        for i in range(chars_to_copy):
+            memory.write8((lp_filename + i) & 0xFFFFFFFF, encoded[i])
+        memory.write8((lp_filename + chars_to_copy) & 0xFFFFFFFF, 0)  # null terminator
+
+        # Return chars copied (not including null), or n_size when truncated.
+        cpu.regs[EAX] = n_size if len(encoded) >= n_size else len(encoded)
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "GetModuleFileNameA", _get_module_file_name_a)
     stubs.register_handler("kernel32.dll", "GetModuleFileNameW", _halt("GetModuleFileNameW"))
 
     # ── Pointer validation ────────────────────────────────────────────────────
@@ -435,6 +555,10 @@ def register_kernel32_io_handlers(
     def _open_mutex_a(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory) if name_ptr else "(unnamed)"
+        # Named mutexes are process-local in this emulator; a named mutex opened
+        # before CreateMutexA creates it does not exist.  Signal this the same
+        # way Win32 does: return NULL and set ERROR_FILE_NOT_FOUND.
+        state.last_error = int(Win32Error.ERROR_FILE_NOT_FOUND)
         logger.warn("handlers",
             f'[Win32] OpenMutexA("{name}") -> NULL (no shared named mutexes)')
         cpu.regs[EAX] = 0
@@ -736,7 +860,37 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetWindowsDirectoryA", _get_windows_dir_a)
     stubs.register_handler("kernel32.dll", "GetDiskFreeSpaceA",    _get_disk_free_space_a)
     stubs.register_handler("kernel32.dll", "GetDriveTypeA",        _get_drive_type_a)
-    stubs.register_handler("kernel32.dll", "GlobalMemoryStatus",   _halt("GlobalMemoryStatus"))
+    def _global_memory_status(cpu: "CPU") -> None:
+        """
+        void GlobalMemoryStatus(LPMEMORYSTATUS lpBuffer)
+
+        Fills a MEMORYSTATUS structure (32 bytes) with plausible values.
+        The emulator reports 256 MB physical RAM, half available.
+
+        MEMORYSTATUS layout:
+            +0  dwLength          DWORD  (must be set to sizeof(MEMORYSTATUS) = 32)
+            +4  dwMemoryLoad      DWORD  percentage of memory in use
+            +8  dwTotalPhys       DWORD  total physical bytes
+            +12 dwAvailPhys       DWORD  available physical bytes
+            +16 dwTotalPageFile   DWORD  total paging file bytes
+            +20 dwAvailPageFile   DWORD  available paging file bytes
+            +24 dwTotalVirtual    DWORD  total virtual address space
+            +28 dwAvailVirtual    DWORD  available virtual address space
+        """
+        lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if lp:
+            MB = 1024 * 1024
+            memory.write32(lp +  0, 32)          # dwLength
+            memory.write32(lp +  4, 50)          # dwMemoryLoad (50%)
+            memory.write32(lp +  8, 256 * MB)    # dwTotalPhys
+            memory.write32(lp + 12, 128 * MB)    # dwAvailPhys
+            memory.write32(lp + 16, 512 * MB)    # dwTotalPageFile
+            memory.write32(lp + 20, 384 * MB)    # dwAvailPageFile
+            memory.write32(lp + 24, 0x7FFF0000)  # dwTotalVirtual
+            memory.write32(lp + 28, 0x7FF00000)  # dwAvailVirtual
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("kernel32.dll", "GlobalMemoryStatus", _global_memory_status)
 
     # ── Time ──────────────────────────────────────────────────────────────────
 
@@ -854,10 +1008,163 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "_lopen",          _lopen)
     stubs.register_handler("kernel32.dll", "_lclose",         _lclose)
 
-    stubs.register_handler("kernel32.dll", "GetPrivateProfileStringA",  _halt("GetPrivateProfileStringA"))
-    stubs.register_handler("kernel32.dll", "GetPrivateProfileIntA",     _halt("GetPrivateProfileIntA"))
-    stubs.register_handler("kernel32.dll", "WritePrivateProfileStringA", _halt("WritePrivateProfileStringA"))
-    stubs.register_handler("kernel32.dll", "WritePrivateProfileSectionA", _halt("WritePrivateProfileSectionA"))
+    # ── Private profile (INI file) ────────────────────────────────────────────
+
+    def _get_private_profile_string_a(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
+        lp_default   = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_returned  = memory.read32((esp + 16) & 0xFFFFFFFF)
+        n_size       = memory.read32((esp + 20) & 0xFFFFFFFF)
+        lp_file_name = memory.read32((esp + 24) & 0xFFFFFFFF)
+
+        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
+        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else None
+        default   = read_cstring(lp_default,   memory) if lp_default   else ""
+        file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
+
+        args = GetPrivateProfileStringArgs(
+            app_name=app_name, key_name=key_name, default=default,
+            out_ptr=lp_returned, n_size=n_size, file_name=file_name,
+        )
+
+        # Load and parse the INI file from the translated Linux path.
+        ini: dict = {}
+        if file_name:
+            linux_path = state.translate_windows_path(file_name)
+            real_path  = find_file_ci(linux_path)
+            if real_path:
+                try:
+                    with open(real_path, "r", encoding="latin-1") as fh:
+                        ini = parse_ini(fh.read())
+                except OSError:
+                    pass
+
+        value = read_profile_string(ini, args.app_name, args.key_name, args.default)
+
+        # Enumeration modes return null-separated names; Win32 callers expect
+        # double-null termination, so append one extra null byte.
+        is_enum = args.app_name is None or args.key_name is None
+        if is_enum:
+            value = value + "\0"
+
+        encoded = value.encode("latin-1", errors="replace")
+
+        if n_size == 0:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        # Clamp to buffer; always null-terminate.
+        if len(encoded) >= n_size:
+            encoded = encoded[:n_size - 1]
+        for i, b in enumerate(encoded):
+            memory.write8(lp_returned + i, b)
+        memory.write8(lp_returned + len(encoded), 0)
+
+        logger.debug(
+            "handlers",
+            f"GetPrivateProfileStringA({app_name!r}, {key_name!r}, "
+            f"file={file_name!r}) -> {value!r}",
+        )
+        cpu.regs[EAX] = len(encoded)
+        cleanup_stdcall(cpu, memory, 24)
+
+    def _get_private_profile_int_a(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
+        n_default    = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_file_name = memory.read32((esp + 16) & 0xFFFFFFFF)
+
+        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else ""
+        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else ""
+        file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
+        default   = n_default if n_default < 0x80000000 else n_default - 0x100000000
+
+        args = GetPrivateProfileIntArgs(
+            app_name=app_name, key_name=key_name,
+            default=default, file_name=file_name,
+        )
+
+        ini: dict = {}
+        if file_name:
+            linux_path = state.translate_windows_path(file_name)
+            real_path  = find_file_ci(linux_path)
+            if real_path:
+                try:
+                    with open(real_path, "r", encoding="latin-1") as fh:
+                        ini = parse_ini(fh.read())
+                except OSError:
+                    pass
+
+        result = read_profile_int(ini, args.app_name, args.key_name, args.default)
+        logger.debug(
+            "handlers",
+            f"GetPrivateProfileIntA({app_name!r}, {key_name!r}, "
+            f"file={file_name!r}) -> {result}",
+        )
+        cpu.regs[EAX] = result & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 16)
+
+    def _write_private_profile_string_a(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
+        lp_string    = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_file_name = memory.read32((esp + 16) & 0xFFFFFFFF)
+
+        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
+        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else None
+        value     = read_cstring(lp_string,    memory) if lp_string    else None
+        file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
+
+        linux_path = state.translate_windows_path(file_name) if file_name else ""
+        ok = write_profile_string(linux_path, app_name, key_name, value)
+        logger.debug(
+            "handlers",
+            f"WritePrivateProfileStringA({app_name!r}, {key_name!r}, "
+            f"{value!r}, file={file_name!r}) -> {ok}",
+        )
+        cpu.regs[EAX] = 1 if ok else 0
+        cleanup_stdcall(cpu, memory, 16)
+
+    def _write_private_profile_section_a(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_string    = memory.read32((esp +  8) & 0xFFFFFFFF)
+        lp_file_name = memory.read32((esp + 12) & 0xFFFFFFFF)
+
+        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
+        file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
+
+        # lpString is a double-null-terminated list of "key=value" entries.
+        pairs: dict[str, str] = {}
+        if lp_string and app_name:
+            ptr = lp_string
+            while True:
+                entry = read_cstring(ptr, memory)
+                if not entry:
+                    break                   # hit the double-null terminator
+                if "=" in entry:
+                    k, _, v = entry.partition("=")
+                    pairs[k.strip().lower()] = v.strip()
+                ptr += len(entry.encode("latin-1")) + 1   # advance past the null
+
+        linux_path = state.translate_windows_path(file_name) if file_name else ""
+        ok = write_profile_section(linux_path, app_name, pairs)
+        logger.debug(
+            "handlers",
+            f"WritePrivateProfileSectionA({app_name!r}, file={file_name!r}) -> {ok}",
+        )
+        cpu.regs[EAX] = 1 if ok else 0
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "GetPrivateProfileStringA",   _get_private_profile_string_a)
+    stubs.register_handler("kernel32.dll", "GetPrivateProfileIntA",      _get_private_profile_int_a)
+    stubs.register_handler("kernel32.dll", "WritePrivateProfileStringA",  _write_private_profile_string_a)
+    stubs.register_handler("kernel32.dll", "WritePrivateProfileSectionA", _write_private_profile_section_a)
 
     # ── Interlocked operations ────────────────────────────────────────────────
 
@@ -975,11 +1282,34 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GlobalAlloc",  _global_alloc)
     stubs.register_handler("kernel32.dll", "GlobalFree",   _global_free)
 
-    # ── Unimplemented heap/handle ops ─────────────────────────────────────────
+    # ── Heap / handle ops ─────────────────────────────────────────────────────
 
     stubs.register_handler("kernel32.dll", "HeapValidate",     _halt("HeapValidate"))
     stubs.register_handler("kernel32.dll", "HeapDestroy",      _halt("HeapDestroy"))
-    stubs.register_handler("kernel32.dll", "DuplicateHandle",  _halt("DuplicateHandle"))
+
+    def _duplicate_handle(cpu: "CPU") -> None:
+        """DuplicateHandle(hSourceProcess, hSource, hTargetProcess, lpTarget, access, inherit, options)
+
+        stdcall, 7 args (28 bytes).  hSourceProcess and hTargetProcessHandle are
+        ignored — the emulator is single-process and both are always the
+        current-process pseudo-handle.
+        """
+        h_source   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        lp_target  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        dw_options = memory.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+
+        close_source = bool(dw_options & _DUPLICATE_CLOSE_SOURCE)
+        new_handle   = _duplicate_handle_entry(state, h_source, close_source)
+
+        if lp_target:
+            memory.write32(lp_target & 0xFFFFFFFF, new_handle)
+
+        logger.debug("handlers",
+            f"DuplicateHandle(src=0x{h_source:08x}) -> 0x{new_handle:08x}")
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 28)
+
+    stubs.register_handler("kernel32.dll", "DuplicateHandle", _duplicate_handle)
 
     # ── Locale / string type ──────────────────────────────────────────────────
 
@@ -1059,6 +1389,89 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "EnumSystemLocalesA",   _halt("EnumSystemLocalesA"))
     stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)
     stubs.register_handler("kernel32.dll", "SetConsoleCtrlHandler", _halt("SetConsoleCtrlHandler"))
-    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableA", _halt("SetEnvironmentVariableA"))
-    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableW", _halt("SetEnvironmentVariableW"))
-    stubs.register_handler("kernel32.dll", "VirtualProtect",       _halt("VirtualProtect"))
+    def _set_environment_variable_a(cpu: "CPU") -> None:
+        """BOOL SetEnvironmentVariableA(LPCSTR lpName, LPCSTR lpValue)"""
+        esp      = cpu.regs[ESP]
+        lp_name  = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_value = memory.read32((esp + 8) & 0xFFFFFFFF)
+        name = read_cstring(lp_name, memory) if lp_name else ""
+        if name:
+            if lp_value:
+                _env_vars[name.upper()] = read_cstring(lp_value, memory)
+            else:
+                _env_vars.pop(name.upper(), None)
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _set_environment_variable_w(cpu: "CPU") -> None:
+        """BOOL SetEnvironmentVariableW(LPCWSTR lpName, LPCWSTR lpValue)"""
+        esp      = cpu.regs[ESP]
+        lp_name  = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_value = memory.read32((esp + 8) & 0xFFFFFFFF)
+        name = read_wide_string(lp_name, memory) if lp_name else ""
+        if name:
+            if lp_value:
+                _env_vars[name.upper()] = read_wide_string(lp_value, memory)
+            else:
+                _env_vars.pop(name.upper(), None)
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _get_environment_variable_a(cpu: "CPU") -> None:
+        """DWORD GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer, DWORD nSize)"""
+        esp     = cpu.regs[ESP]
+        lp_name = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_buf  = memory.read32((esp +  8) & 0xFFFFFFFF)
+        n_size  = memory.read32((esp + 12) & 0xFFFFFFFF)
+        name  = read_cstring(lp_name, memory).upper() if lp_name else ""
+        value = _env_vars.get(name, "")
+        encoded = value.encode("latin-1", errors="replace")
+        if n_size > len(encoded):
+            for i, b in enumerate(encoded):
+                memory.write8(lp_buf + i, b)
+            memory.write8(lp_buf + len(encoded), 0)
+            cpu.regs[EAX] = len(encoded)
+        else:
+            # Buffer too small: return required size (including null).
+            cpu.regs[EAX] = len(encoded) + 1
+        cleanup_stdcall(cpu, memory, 12)
+
+    def _get_environment_variable_w(cpu: "CPU") -> None:
+        """DWORD GetEnvironmentVariableW(LPCWSTR lpName, LPWSTR lpBuffer, DWORD nSize)"""
+        esp     = cpu.regs[ESP]
+        lp_name = memory.read32((esp +  4) & 0xFFFFFFFF)
+        lp_buf  = memory.read32((esp +  8) & 0xFFFFFFFF)
+        n_size  = memory.read32((esp + 12) & 0xFFFFFFFF)
+        name  = read_wide_string(lp_name, memory).upper() if lp_name else ""
+        value = _env_vars.get(name, "")
+        if n_size > len(value):
+            for i, ch in enumerate(value):
+                memory.write16(lp_buf + i * 2, ord(ch))
+            memory.write16(lp_buf + len(value) * 2, 0)
+            cpu.regs[EAX] = len(value)
+        else:
+            cpu.regs[EAX] = len(value) + 1
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableA",  _set_environment_variable_a)
+    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableW",  _set_environment_variable_w)
+    stubs.register_handler("kernel32.dll", "GetEnvironmentVariableA",  _get_environment_variable_a)
+    stubs.register_handler("kernel32.dll", "GetEnvironmentVariableW",  _get_environment_variable_w)
+    def _virtual_protect(cpu: "CPU") -> None:
+        """
+        BOOL VirtualProtect(LPVOID lpAddress, SIZE_T dwSize,
+                            DWORD flNewProtect, PDWORD lpflOldProtect)
+
+        The emulator uses a flat, unprotected memory model — all pages are
+        always read/write/execute.  We record the "old" protection as
+        PAGE_EXECUTE_READ_WRITE (0x40) so callers that save and restore it
+        get a consistent value, and return TRUE.
+        """
+        esp            = cpu.regs[ESP]
+        lp_old_protect = memory.read32((esp + 16) & 0xFFFFFFFF)
+        if lp_old_protect:
+            memory.write32(lp_old_protect, 0x40)   # PAGE_EXECUTE_READWRITE
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("kernel32.dll", "VirtualProtect", _virtual_protect)
