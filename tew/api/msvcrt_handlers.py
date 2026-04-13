@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, read_cstring
+from tew.api._state import CRTState, read_cstring, THREAD_SENTINEL
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────
@@ -244,23 +244,119 @@ def register_msvcrt_handlers(
 ) -> None:
     """Register all msvcrt.dll handlers."""
 
-    # ── Static initializers — UNIMPLEMENTED (halt loudly) ────────────────────
+    # ── Static initializers ───────────────────────────────────────────────────
+
+    # Maximum steps to allow per initializer function.
+    _INITTERM_STEP_LIMIT = 10_000_000
+
+    def _call_guest_void(cpu: "CPU", fn_addr: int) -> bool:
+        """
+        Call a no-arg guest function by pushing the THREAD_SENTINEL as the
+        return address and stepping the CPU until the function returns.
+
+        Returns True if the function returned normally (hit the sentinel),
+        False if the CPU halted due to an error or exceeded the step limit.
+
+        Assumption: this helper is only called from main-thread context
+        (state.current_thread_idx == -1), so hitting the sentinel does not
+        corrupt cooperative-thread bookkeeping.
+        """
+        # Push sentinel return address and jump to fn_addr.
+        cpu.regs[ESP] = (cpu.regs[ESP] - 4) & 0xFFFFFFFF
+        memory.write32(cpu.regs[ESP], THREAD_SENTINEL)
+        cpu.eip    = fn_addr
+        cpu.halted = False
+
+        for _ in range(_INITTERM_STEP_LIMIT):
+            cpu.step()
+            if cpu.halted:
+                break
+        else:
+            # Step limit exhausted without halting — treat as runaway.
+            logger.error(
+                "handlers",
+                f"_call_guest_void: 0x{fn_addr:08x} exceeded {_INITTERM_STEP_LIMIT} steps",
+            )
+            cpu.halted = True
+            return False
+
+        # A normal return via sentinel sets EIP = THREAD_SENTINEL + 2
+        # (the INT 0xFE dispatch advances EIP by 2 bytes past the INT instruction).
+        if cpu.eip != (THREAD_SENTINEL + 2) & 0xFFFFFFFF:
+            logger.error(
+                "handlers",
+                f"_call_guest_void: 0x{fn_addr:08x} halted at unexpected EIP=0x{cpu.eip:08x}",
+            )
+            return False
+
+        cpu.halted = False
+        return True
 
     # _initterm(PVOID* pfbegin, PVOID* pfend) -> void [cdecl]
-    # Spec: calls each non-null function pointer in [pfbegin, pfend) — C++ static initializers.
-    # UNIMPLEMENTED: cannot call back into game code from handler yet.
+    # Calls each non-null function pointer in [pfbegin, pfend) — C++ static
+    # initializers.  Each function takes no arguments and returns void.
     def _initterm(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] _initterm — halting")
-        cpu.halted = True
+        esp          = cpu.regs[ESP]
+        trampoline   = cpu.eip          # = stub_addr + 2 (the RET byte); restore after callbacks
+        pf_begin     = memory.read32((esp + 4) & 0xFFFFFFFF)
+        pf_end       = memory.read32((esp + 8) & 0xFFFFFFFF)
+
+        n_slots = (pf_end - pf_begin) // 4
+        logger.debug(
+            "handlers",
+            f"_initterm: {n_slots} slots @ [{pf_begin:#010x}, {pf_end:#010x})",
+        )
+
+        for i in range(n_slots):
+            fn_addr = memory.read32((pf_begin + i * 4) & 0xFFFFFFFF)
+            if fn_addr == 0:
+                continue
+            logger.debug("handlers", f"_initterm: slot {i} calling 0x{fn_addr:08x}")
+            if not _call_guest_void(cpu, fn_addr):
+                # Error halt inside the initializer — propagate.
+                logger.error("handlers", f"_initterm: slot {i} (0x{fn_addr:08x}) halted emulation")
+                return
+
+        # All initializers completed — restore the trampoline's RET address so
+        # the CPU executes the stub's RET and returns to the original caller.
+        cpu.eip = trampoline
+        logger.debug("handlers", "_initterm: done")
 
     stubs.register_handler("msvcrt.dll", "_initterm", _initterm)
 
     # _initterm_e(PVOID* pfbegin, PVOID* pfend) -> int [cdecl]
-    # Spec: same as _initterm but each function returns int; non-zero aborts startup.
-    # UNIMPLEMENTED: same reasoning as _initterm.
+    # Same as _initterm but each function returns int.  A non-zero return value
+    # aborts CRT startup and is returned from _initterm_e.
     def _initterm_e(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] _initterm_e — halting")
-        cpu.halted = True
+        esp        = cpu.regs[ESP]
+        trampoline = cpu.eip
+        pf_begin   = memory.read32((esp + 4) & 0xFFFFFFFF)
+        pf_end     = memory.read32((esp + 8) & 0xFFFFFFFF)
+
+        n_slots = (pf_end - pf_begin) // 4
+        logger.debug(
+            "handlers",
+            f"_initterm_e: {n_slots} slots @ [{pf_begin:#010x}, {pf_end:#010x})",
+        )
+
+        for i in range(n_slots):
+            fn_addr = memory.read32((pf_begin + i * 4) & 0xFFFFFFFF)
+            if fn_addr == 0:
+                continue
+            logger.debug("handlers", f"_initterm_e: slot {i} calling 0x{fn_addr:08x}")
+            if not _call_guest_void(cpu, fn_addr):
+                logger.error("handlers", f"_initterm_e: slot {i} (0x{fn_addr:08x}) halted emulation")
+                return
+            err = cpu.regs[EAX] & 0xFFFFFFFF
+            if err != 0:
+                logger.error("handlers", f"_initterm_e: slot {i} (0x{fn_addr:08x}) returned error 0x{err:08x}")
+                cpu.eip = trampoline
+                cpu.regs[EAX] = err
+                return
+
+        cpu.eip = trampoline
+        cpu.regs[EAX] = 0
+        logger.debug("handlers", "_initterm_e: done")
 
     stubs.register_handler("msvcrt.dll", "_initterm_e", _initterm_e)
 

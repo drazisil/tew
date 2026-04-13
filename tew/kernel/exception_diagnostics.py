@@ -84,3 +84,55 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
     stack_status = "valid" if cpu.memory.is_valid_address(esp_val) else "INVALID"
     logger.error("exception", f"Stack: ESP=0x{esp_val:08x} EBP=0x{ebp_val:08x} ({stack_status})")
     logger.error("exception", "Execution stopped.")
+
+
+def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
+    """
+    Called after the run loop detects cpu.halted == True without a CPU fault.
+
+    Prints the register state and a shallow stack walk so the cause of the
+    halt (usually an unimplemented Win32 handler) can be traced back to the
+    calling game code.
+    """
+    logger.error("exception", "--- Halt Diagnostic ---")
+    logger.error("exception", f"EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
+
+    if import_resolver:
+        dll = import_resolver.find_dll_for_address(cpu.eip)
+        if dll:
+            logger.error(
+                "exception",
+                f"Location: {dll['name']}+0x{cpu.eip - dll['base_address']:x}",
+            )
+
+    logger.error("exception", "General Purpose Registers:")
+    for i in range(8):
+        val = cpu.regs[i] & 0xFFFFFFFF
+        logger.error("exception", f"  {REG_NAMES[i]}: 0x{val:08x}")
+
+    esp = cpu.regs[ESP] & 0xFFFFFFFF
+    ebp = cpu.regs[EBP] & 0xFFFFFFFF
+    logger.error("exception", f"Stack: ESP=0x{esp:08x}  EBP=0x{ebp:08x}")
+    logger.error("exception", "Stack walk (top 16 slots):")
+    for i in range(16):
+        slot_addr = esp + i * 4
+        try:
+            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
+        except Exception:
+            logger.error("exception", f"  [ESP+{i*4:02x}] (read error)")
+            break
+        annotation = ""
+        if import_resolver:
+            dll = import_resolver.find_dll_for_address(value)
+            if dll:
+                annotation = f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
+        if not annotation:
+            if 0x00400000 <= value < 0x00700000:
+                annotation = "  ← exe"
+            elif 0x00200000 <= value < 0x00220000:
+                annotation = "  ← stub"
+            elif 0x7FFF0000 <= value:
+                annotation = "  ← main stack"
+            elif 0x08000000 <= value < 0x09000000:
+                annotation = "  ← thread stack"
+        logger.error("exception", f"  [ESP+{i*4:02x}] 0x{value:08x}{annotation}")

@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from tew.hardware.cpu import SavedCPUState
+from tew.api.window_manager import WindowManager
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
+    from tew.api.pe_resources import PEResources
 
 
 # ── File handle types ─────────────────────────────────────────────────────────
@@ -53,6 +55,7 @@ KernelHandle = MutexHandle | EventHandle
 class DynamicModule:
     dll_name: str
     base_address: int
+    dll_path: str = ""   # full Windows-style path when known; empty if unknown
 
 
 # ── Cooperative thread state ─────────────────────────────────────────────────
@@ -175,6 +178,17 @@ class CRTState:
         # ── Emulator config ───────────────────────────────────────────────
         self.config: EmulatorConfig = load_emulator_config()
 
+        # ── Last Win32 error (per-process; set by SetLastError / handlers) ──
+        # Win32 is per-thread in reality; a single slot is sufficient for MCO
+        # because the game is cooperative-threaded and checks errors immediately
+        # after the call that set them.
+        self.last_error: int = 0
+
+        # ── Exe path (set by run_exe.py after construction) ───────────────
+        # Linux path to the executable being emulated.  Used by the
+        # GetModuleFileNameA handler to return the Windows-style exe path.
+        self.exe_path: str = ""
+
         # ── Heap allocator ────────────────────────────────────────────────
         self.next_heap_alloc: int = 0x04000000
         self.heap_alloc_sizes: dict[int, int] = {}   # addr → user size
@@ -228,6 +242,11 @@ class CRTState:
         # ── Local/GlobalAlloc tracking ────────────────────────────────────
         self.local_alloc_map: dict[int, int] = {}   # addr → size
 
+        # ── Window / dialog system ────────────────────────────────────────
+        self.window_manager: WindowManager = WindowManager()
+        # pe_resources is set by run_exe.py after the PE is loaded
+        self.pe_resources: Optional["PEResources"] = None
+
     # ── Heap allocation ───────────────────────────────────────────────────────
 
     def simple_alloc(self, size: int) -> int:
@@ -249,6 +268,28 @@ class CRTState:
                 result = linux_prefix + p[len(win_prefix):]
                 return result.replace("//", "/")
         return p.replace("//", "/")
+
+    def reverse_translate_path(self, linux_path: str) -> str:
+        """
+        Convert a Linux path back to a Windows-style path.
+
+        Reverses the config path_mappings (linux_prefix → Windows prefix).
+        Longest Linux prefix wins so that nested mappings are handled correctly.
+
+        Example with mapping ``{"c:/": "/home/user/.emu32/"}``:
+            ``/home/user/.emu32/MCO/MCity_d.exe``  →  ``C:\\MCO\\MCity_d.exe``
+        """
+        # Sort by Linux prefix length descending (longest match first).
+        mappings = sorted(self.config.path_mappings.items(), key=lambda kv: -len(kv[1]))
+        for win_prefix_lower, linux_prefix in mappings:
+            if linux_path.startswith(linux_prefix):
+                # win_prefix_lower is like "c:/" or "d:/game/" — strip trailing slash,
+                # convert forward slashes to backslashes, then uppercase.
+                win_base = win_prefix_lower.rstrip("/").replace("/", "\\").upper()  # "C:" or "D:\GAME"
+                remaining = linux_path[len(linux_prefix):]        # "MCO/MCity_d.exe"
+                return win_base + "\\" + remaining.replace("/", "\\")
+        # No mapping matched — return as-is with backslashes.
+        return linux_path.replace("/", "\\")
 
     def open_file_handle(self, win_name: str, writable: bool) -> int:
         """Open a file and register it in file_handle_map. Returns the handle."""

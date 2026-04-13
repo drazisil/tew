@@ -17,6 +17,7 @@ LogCategory = Literal[
     "cpu", "dll", "loader", "handlers", "thread", "wininet",
     "d3d8", "graphics", "fileio", "registry", "exception",
     "startup", "scheduler", "winsock", "calls",
+    "window", "dialog",
 ]
 
 ERROR = 0
@@ -78,11 +79,11 @@ def _emit(level: int, category: str, msg: str) -> None:
 
     line = f"{_LEVEL_PREFIX[level]} [{category}] {msg}"
     if level == ERROR:
-        print(line, file=sys.stderr)
+        print(line, file=sys.stderr, flush=True)
     elif level == WARN:
-        print(line, file=sys.stderr)
+        print(line, file=sys.stderr, flush=True)
     else:
-        print(line)
+        print(line, flush=True)
 
     if _emit_hook is not None:
         _emit_hook(level, line)

@@ -20,7 +20,7 @@ from os.path import dirname
 from tew.hardware.memory import Memory
 from tew.hardware.cpu import CPU, ESP, EBP
 from tew.kernel.kernel_structures import KernelStructures
-from tew.kernel.exception_diagnostics import diagnose_fault
+from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.emulator.opcodes import register_all_opcodes
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
@@ -84,6 +84,14 @@ register_all_opcodes(cpu)
 
 win32_handlers = Win32Handlers(mem)
 crt_state = register_crt_handlers(win32_handlers, mem, exe.import_resolver.get_dll_loader())
+crt_state.exe_path = exe_path   # used by GetModuleFileNameA
+
+# Attach PE resources so dialog templates and bitmap controls can be loaded
+from tew.api.pe_resources import PEResources
+with open(exe_path, "rb") as _f:
+    _pe_resources = PEResources(_f.read())
+crt_state.pe_resources = _pe_resources
+crt_state.window_manager.set_pe_resources(_pe_resources)
 
 win32_handlers.install(cpu)
 
@@ -243,6 +251,8 @@ for call in win32_handlers.get_call_log()[-50:]:
 
 if cpu.faulted:
     diagnose_fault(cpu, exe.import_resolver)
+elif cpu.halted:
+    diagnose_halt(cpu, exe.import_resolver)
 
 logger.info("startup", f"Final EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
 

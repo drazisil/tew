@@ -80,6 +80,9 @@ def register_crt_handlers(
     from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
     from tew.api.advapi32_handlers import register_advapi32_handlers
     from tew.api.d3d8_handlers import register_d3d8_handlers
+    from tew.api.version_handlers import register_version_handlers
+    from tew.api.wininet_handlers import register_wininet_handlers
+    from tew.api.wsock32_handlers import register_wsock32_handlers
 
     register_kernel32_handlers(stubs, memory, state, dll_loader)
     register_msvcrt_handlers(stubs, memory, state)
@@ -87,6 +90,9 @@ def register_crt_handlers(
     register_oleaut32_ole32_handlers(stubs, memory, state)
     register_advapi32_handlers(stubs, memory, state)
     register_d3d8_handlers(stubs, memory)
+    register_version_handlers(stubs, memory, state)
+    register_wininet_handlers(stubs, memory, state)
+    register_wsock32_handlers(stubs, memory, state)
 
     logger.info("handlers", f"Registered {stubs.count} Win32 stubs")
 
