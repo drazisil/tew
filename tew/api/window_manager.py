@@ -108,7 +108,8 @@ class WindowEntry:
     cx: int
     cy: int
     parent_hwnd: int                           # 0 = top-level
-    children: dict[int, int] = field(default_factory=dict)  # ctrl_id → child hwnd
+    children: dict[int, int] = field(default_factory=dict)  # ctrl_id → child hwnd (unique IDs only; excludes 0xFFFF)
+    children_list: list[tuple[int, int]] = field(default_factory=list)  # (ctrl_id, hwnd) ordered, includes all
     wnd_proc_addr: int = 0                     # WNDPROC addr in emulator, if registered
     dlg_proc_addr: int = 0                     # DLGPROC addr, non-zero means this is a dialog
     dlg_result: int = 0
@@ -387,17 +388,13 @@ class WindowManager:
                 parent_hwnd=hwnd,
             )
             self._windows[child_hwnd] = child
+            entry.children_list.append((ctrl.id, child_hwnd))
             if ctrl.id != 0xFFFF:
                 entry.children[ctrl.id] = child_hwnd
-                logger.debug("dialog",
-                    f"[WindowManager]   ctrl id=0x{ctrl.id:04x} '{ctrl.class_name}' "
-                    f"'{ctrl.title}' hwnd=0x{child_hwnd:x}"
-                )
-            else:
-                logger.debug("dialog",
-                    f"[WindowManager]   ctrl id=0xFFFF '{ctrl.class_name}' "
-                    f"'{ctrl.title}' hwnd=0x{child_hwnd:x}"
-                )
+            logger.debug("dialog",
+                f"[WindowManager]   ctrl id=0x{ctrl.id:04x} '{ctrl.class_name}' "
+                f"'{ctrl.title}' hwnd=0x{child_hwnd:x}"
+            )
 
             # Pre-load bitmap texture for SS_BITMAP STATIC controls.
             # The title is "#N" (from _read_var_field 0xFFFF ordinal encoding)
@@ -438,8 +435,8 @@ class WindowManager:
             logger.warn("window", f"[WindowManager] destroy_window: unknown hwnd=0x{hwnd:x}")
             return False
 
-        # Destroy children first
-        for _ctrl_id, child_hwnd in list(entry.children.items()):
+        # Destroy children first (use children_list to include 0xFFFF-id controls)
+        for _ctrl_id, child_hwnd in list(entry.children_list):
             self.destroy_window(child_hwnd)
 
         # Tear down SDL2 resources
@@ -639,10 +636,10 @@ class WindowManager:
 
         logger.debug("dialog",
             f"[WindowManager] click ({px},{py}) on dlg=0x{dlg_hwnd:x} "
-            f"({len(dlg_entry.children)} children)"
+            f"({len(dlg_entry.children_list)} children)"
         )
 
-        for ctrl_id, child_hwnd in dlg_entry.children.items():
+        for ctrl_id, child_hwnd in dlg_entry.children_list:
             child = self._windows.get(child_hwnd)
             if child is None:
                 continue
@@ -690,7 +687,7 @@ class WindowManager:
 
         edit_hwnds = [
             child_hwnd
-            for child_hwnd in parent.children.values()
+            for _ctrl_id, child_hwnd in parent.children_list
             if (
                 child_hwnd in self._windows
                 and self._windows[child_hwnd].class_name.lower() == "edit"

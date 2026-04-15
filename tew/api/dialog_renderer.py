@@ -618,7 +618,7 @@ def render_dialog(wm: WindowManager, dlg_hwnd: int) -> None:
     render_text(renderer, entry.title, 4, (TITLE_BAR_H - 8) // 2, COLOR_TITLE_TEXT)
 
     # ── Child controls ────────────────────────────────────────────────────────
-    for ctrl_id, child_hwnd in entry.children.items():
+    for ctrl_id, child_hwnd in entry.children_list:
         child = wm.get_window(child_hwnd)
         if child is None:
             continue
