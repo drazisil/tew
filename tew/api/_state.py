@@ -70,6 +70,9 @@ class PendingThreadInfo:
     completed: bool
     calls_seen: Optional[set[str]] = None     # dedup set for call logging
     saved_state: Optional[SavedCPUState] = None
+    # When non-empty the thread is blocked waiting for one of these handles.
+    # The scheduler will skip it until an event in this set is signaled.
+    waiting_on_handles: Optional[frozenset[int]] = None
 
 
 # ── Registry types ────────────────────────────────────────────────────────────
@@ -106,8 +109,9 @@ def find_file_ci(linux_path: str) -> Optional[str]:
         for entry in entries:
             if entry.lower() == name_lower:
                 return os.path.join(dir_path, entry)
-    except OSError:
-        pass
+    except OSError as e:
+        from tew.logger import logger
+        logger.debug("fileio", f"find_file_ci: cannot list {dir_path!r}: {e}")
     return None
 
 
@@ -139,6 +143,38 @@ def load_registry_json() -> RegistryMap:
         from tew.logger import logger
         logger.warn("registry", f"Could not load registry.json: {e} — using empty registry")
         return {}
+
+
+def save_registry_json(registry_values: RegistryMap) -> None:
+    """Persist current in-memory registry values back to registry.json.
+
+    Preserves any ``_``-prefixed comment/metadata keys that were in the
+    original file.  All registry key paths and value names are written in
+    the normalised (lowercase) form that load_registry_json expects.
+    """
+    from tew.logger import logger
+    file_path = os.path.join(os.getcwd(), "registry.json")
+    existing: dict = {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        pass
+    result: dict = {}
+    for k, v in existing.items():
+        if k.startswith("_"):
+            result[k] = v
+    for key_path, values in registry_values.items():
+        result[key_path] = {
+            vname: {"type": entry.type, "value": entry.value}
+            for vname, entry in values.items()
+        }
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+        logger.debug("registry", f"Persisted {len(registry_values)} keys to registry.json")
+    except Exception as e:
+        logger.warn("registry", f"Could not save registry.json: {e}")
 
 
 def load_emulator_config() -> EmulatorConfig:
@@ -226,6 +262,12 @@ class CRTState:
         self.current_thread_idx: int = -1
         self.last_scheduled_idx: int = -1
 
+        # ── Thread yield-without-death flag ──────────────────────────────
+        # Set by wait handlers (WaitForSingle/Multiple) when a background
+        # thread must block: _run_thread_slice saves state instead of
+        # marking the thread dead, then clears this flag.
+        self.thread_yield_requested: bool = False
+
         # ── TLS ───────────────────────────────────────────────────────────
         self.tls_slots: set[int] = set()
         self.next_tls_slot: int = 0
@@ -294,15 +336,21 @@ class CRTState:
     def open_file_handle(self, win_name: str, writable: bool) -> int:
         """Open a file and register it in file_handle_map. Returns the handle."""
         from tew.logger import logger
+        # Device namespace paths (\\.\xxx) are kernel driver handles — never a
+        # real file.  Return INVALID_HANDLE_VALUE without touching the OS.
+        normalized = win_name.replace("\\", "/")
+        if normalized.startswith("/./") or normalized.startswith("//./"):
+            logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (device path, not emulated)')
+            return 0xFFFFFFFF
         handle = self.next_file_handle
         self.next_file_handle += 1
         if writable:
             real_path = self.translate_windows_path(win_name)
-            fd: Optional[int] = None
             try:
                 fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
+                return 0xFFFFFFFF
             self.file_handle_map[handle] = FileHandleEntry(
                 path=real_path, data=b"", position=0, writable=True, fd=fd
             )

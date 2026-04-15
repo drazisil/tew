@@ -23,6 +23,7 @@ from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string
 from tew.api.win32_errors import Win32Error
 from tew.api._state import (
     CRTState, FileHandleEntry, DynamicModule, PendingThreadInfo,
+    EventHandle, MutexHandle,
     find_file_ci, read_cstring, read_wide_string,
     THREAD_STACK_SIZE,
 )
@@ -106,16 +107,23 @@ def _run_thread_slice(cpu: "CPU", memory: "Memory",
     elif thread_error:
         thread.completed = True
     elif cpu.halted:
-        # Halted unexpectedly — INT3, a halt-stub inside the thread, memory
-        # fault, or an explicit cpu.halted set by a handler.
-        # cpu.last_error carries the Python exception if step() caught one.
-        detail = f": {cpu.last_error}" if cpu.last_error else ""
-        logger.error(
-            "thread",
-            f"Thread {thread.thread_id} crashed: unexpected halt at "
-            f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
-        )
-        thread.completed = True
+        if state.thread_yield_requested:
+            state.thread_yield_requested = False
+            thread.saved_state = cpu.save_state()
+            logger.debug("scheduler",
+                f"Thread {thread.thread_id} blocked (waiting on handles) after {steps} steps "
+                f"(EIP=0x{cpu.eip & 0xFFFFFFFF:08x})")
+        else:
+            # Halted unexpectedly — INT3, a halt-stub inside the thread, memory
+            # fault, or an explicit cpu.halted set by a handler.
+            # cpu.last_error carries the Python exception if step() caught one.
+            detail = f": {cpu.last_error}" if cpu.last_error else ""
+            logger.error(
+                "thread",
+                f"Thread {thread.thread_id} crashed: unexpected halt at "
+                f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
+            )
+            thread.completed = True
     else:
         thread.saved_state = cpu.save_state()
         logger.debug("scheduler",
@@ -142,10 +150,25 @@ def _cooperative_sleep(
     for i in range(1, num + 1):
         idx = (state.last_scheduled_idx + i) % num
         t = state.pending_threads[idx]
-        if not t.suspended and not t.completed:
-            runnable = t
-            tidx = idx
-            break
+        if t.suspended or t.completed:
+            continue
+        if t.waiting_on_handles:
+            # Thread is blocked until one of its handles is signaled.
+            unblocked = False
+            for wh in t.waiting_on_handles:
+                obj = state.kernel_handle_map.get(wh)
+                if obj is None or (isinstance(obj, EventHandle) and obj.signaled):
+                    unblocked = True
+                    break
+                if isinstance(obj, MutexHandle) and not obj.locked:
+                    unblocked = True
+                    break
+            if not unblocked:
+                continue
+            t.waiting_on_handles = None
+        runnable = t
+        tidx = idx
+        break
     if runnable is None or tidx < 0:
         return False
 
@@ -1175,14 +1198,39 @@ def register_kernel32_handlers(
     # ── Cooperative Sleep scheduler ───────────────────────────────────────────
 
     def _sleep(cpu: "CPU") -> None:
+        if state.is_running_thread:
+            # Background thread: can't yield to another thread from within a
+            # thread slice.  Treat sleep as instant so the thread keeps running.
+            cleanup_stdcall(cpu, memory, 4)
+            return
+        # Fire all pending timer callbacks before cooperative sleep.
+        # The game uses timeSetEvent+Sleep as a yield primitive; 9ms delay is a
+        # Windows minimum that means nothing in an emulator — fire on any Sleep.
+        from tew.api.win32_handlers import pending_timers
+        due = list(pending_timers.values())
+        if due:
+            from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+            sentinel = _get_dialog_sentinel(state, memory)
+            for timer in due:
+                _invoke_emulated_proc(
+                    cpu, memory, timer.cb_addr,
+                    [timer.id, 0, timer.dw_user, 0, 0],
+                    sentinel,
+                )
+                if timer.period_ms > 0:
+                    timer.due_at += timer.period_ms
+                else:
+                    pending_timers.pop(timer.id, None)
+        # Fall through: yield to background threads so the timer thread can run.
         state.sleep_count += 1
         if _cooperative_sleep(cpu, memory, state, 4):
+            state.sleep_count = 0
             return
-        if state.sleep_count >= 50:
+        # Main thread, no runnable threads.  Warn periodically but do not halt —
+        # the game may legitimately be waiting on a network response.
+        if state.sleep_count % 50 == 0:
             logger.warn("handlers",
-                f"[Win32] Sleep() called {state.sleep_count} times with no runnable threads — halting")
-            cpu.halted = True
-            return
+                f"[Win32] Sleep() called {state.sleep_count} times with no runnable threads")
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "Sleep", _sleep)

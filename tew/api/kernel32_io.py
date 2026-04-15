@@ -134,16 +134,27 @@ def _run_thread_slice(
     elif thread_error:
         thread.completed = True
     elif cpu.halted:
-        # Halted unexpectedly — INT3, a halt-stub, memory fault, or explicit
-        # cpu.halted set by a handler.  cpu.last_error carries the Python
-        # exception if step() caught one internally.
-        detail = f": {cpu.last_error}" if cpu.last_error else ""
-        logger.error(
-            "thread",
-            f"Thread {thread.thread_id} crashed: unexpected halt at "
-            f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
-        )
-        thread.completed = True
+        if state.thread_yield_requested:
+            # A wait handler asked to yield the slice without killing the
+            # thread (e.g. blocking WaitForSingleObject/WaitForMultipleObjectsEx).
+            # Save CPU state so the thread resumes from the same INT 0xFE on
+            # the next schedule.
+            state.thread_yield_requested = False
+            thread.saved_state = cpu.save_state()
+            logger.debug("scheduler",
+                f"Thread {thread.thread_id} blocked (waiting on handles) after {steps} steps "
+                f"(EIP=0x{cpu.eip & 0xFFFFFFFF:08x})")
+        else:
+            # Halted unexpectedly — INT3, a halt-stub, memory fault, or explicit
+            # cpu.halted set by a handler.  cpu.last_error carries the Python
+            # exception if step() caught one internally.
+            detail = f": {cpu.last_error}" if cpu.last_error else ""
+            logger.error(
+                "thread",
+                f"Thread {thread.thread_id} crashed: unexpected halt at "
+                f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
+            )
+            thread.completed = True
     else:
         thread.saved_state = cpu.save_state()
         logger.debug("scheduler",
@@ -167,10 +178,27 @@ def _cooperative_sleep_ex(
     for i in range(1, num + 1):
         idx = (state.last_scheduled_idx + i) % num
         t = state.pending_threads[idx]
-        if not t.suspended and not t.completed:
-            runnable = t
-            tidx = idx
-            break
+        if t.suspended or t.completed:
+            continue
+        if t.waiting_on_handles:
+            # Thread is blocked until one of its handles is signaled.
+            # Check if any are now signaled; if not, skip.
+            unblocked = False
+            for wh in t.waiting_on_handles:
+                obj = state.kernel_handle_map.get(wh)
+                if obj is None or (isinstance(obj, EventHandle) and obj.signaled):
+                    unblocked = True
+                    break
+                if isinstance(obj, MutexHandle) and not obj.locked:
+                    unblocked = True
+                    break
+            if not unblocked:
+                continue
+            # At least one handle is ready — clear the block so it can run.
+            t.waiting_on_handles = None
+        runnable = t
+        tidx = idx
+        break
     if runnable is None or tidx < 0:
         return False
 
@@ -237,8 +265,8 @@ def register_kernel32_io_handlers(
         if entry is not None and entry.fd is not None and entry.fd >= 3:
             try:
                 os.close(entry.fd)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warn("fileio", f"CloseHandle: os.close(fd={entry.fd}) failed: {e}")
         state.file_handle_map.pop(h, None)
         state.kernel_handle_map.pop(h, None)
         cpu.regs[EAX] = 1
@@ -459,14 +487,36 @@ def register_kernel32_io_handlers(
     # ── SleepEx ───────────────────────────────────────────────────────────────
 
     def _sleep_ex(cpu: "CPU") -> None:
+        if state.is_running_thread:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        # Fire all pending timer callbacks — _THREAD_yield calls SleepEx, not Sleep,
+        # and the timer fire logic must live here too.
+        # After firing, fall through to cooperative sleep so the timer thread
+        # (which waits on the signal set by mmtimer_callback) gets CPU time.
+        from tew.api.win32_handlers import pending_timers
+        due = list(pending_timers.values())
+        if due:
+            from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+            sentinel = _get_dialog_sentinel(state, memory)
+            for timer in due:
+                _invoke_emulated_proc(
+                    cpu, memory, timer.cb_addr,
+                    [timer.id, 0, timer.dw_user, 0, 0],
+                    sentinel,
+                )
+                if timer.period_ms > 0:
+                    timer.due_at += timer.period_ms
+                else:
+                    pending_timers.pop(timer.id, None)
         state.sleep_count += 1
         if _cooperative_sleep_ex(cpu, memory, state, 8, 0):
+            state.sleep_count = 0
             return
-        if state.sleep_count >= 50:
+        if state.sleep_count % 50 == 0:
             logger.warn("handlers",
-                f"[Win32] SleepEx() called {state.sleep_count} times — halting")
-            cpu.halted = True
-            return
+                f"[Win32] SleepEx() called {state.sleep_count} times with no runnable threads")
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
@@ -475,32 +525,55 @@ def register_kernel32_io_handlers(
     # ── Wait functions ────────────────────────────────────────────────────────
 
     def _wait_for_single(cpu: "CPU") -> None:
-        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h          = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        timeout_ms = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         obj = state.kernel_handle_map.get(h)
         if obj is not None:
             if isinstance(obj, MutexHandle):
                 obj.locked = True
                 cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 8)
+                return
             else:  # EventHandle
                 if obj.signaled:
                     if not obj.manual_reset:
                         obj.signaled = False
                     cpu.regs[EAX] = 0
-                else:
-                    cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
-        else:
-            cpu.regs[EAX] = 0  # thread handle or unknown — assume signaled
+                    cleanup_stdcall(cpu, memory, 8)
+                    return
+                # Not signaled.
+                if state.is_running_thread and timeout_ms == _WAIT_INFINITE:
+                    # Block this thread: rewind EIP so the wait is retried on
+                    # the next schedule, record which handle it's waiting on,
+                    # and yield the slice without killing the thread.
+                    cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
+                    tidx = state.current_thread_idx
+                    if 0 <= tidx < len(state.pending_threads):
+                        state.pending_threads[tidx].waiting_on_handles = frozenset([h])
+                    state.thread_yield_requested = True
+                    cpu.halted = True
+                    return
+                cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
+                cleanup_stdcall(cpu, memory, 8)
+                return
+        # Unknown handle (thread handle etc.) — treat as signaled.
+        cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
+    _WAIT_INFINITE = 0xFFFFFFFF
+
     def _wait_for_multiple_ex(cpu: "CPU") -> None:
-        base      = cpu.regs[ESP]
-        n_count   = memory.read32((base +  4) & 0xFFFFFFFF)
+        base       = cpu.regs[ESP]
+        n_count    = memory.read32((base +  4) & 0xFFFFFFFF)
         lp_handles = memory.read32((base +  8) & 0xFFFFFFFF)
         b_wait_all = memory.read32((base + 12) & 0xFFFFFFFF) != 0
+        timeout_ms = memory.read32((base + 16) & 0xFFFFFFFF)
+        all_ready  = True
         for i in range(n_count):
             h   = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
             obj = state.kernel_handle_map.get(h)
             if obj is None:
+                # Unknown handle (e.g. thread handle) — treat as always-ready.
                 if not b_wait_all:
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
@@ -517,11 +590,11 @@ def register_kernel32_io_handlers(
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
-            elif b_wait_all:
-                cpu.regs[EAX] = 0x102
-                cleanup_stdcall(cpu, memory, 20)
-                return
-        if b_wait_all:
+            else:
+                all_ready = False
+                if b_wait_all:
+                    break
+        if b_wait_all and all_ready:
             for i in range(n_count):
                 h   = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
                 obj = state.kernel_handle_map.get(h)
@@ -531,8 +604,24 @@ def register_kernel32_io_handlers(
                     if isinstance(obj, MutexHandle):
                         obj.locked = True
             cpu.regs[EAX] = 0
-        else:
-            cpu.regs[EAX] = 0x102
+            cleanup_stdcall(cpu, memory, 20)
+            return
+        # Not yet ready.
+        if state.is_running_thread and timeout_ms == _WAIT_INFINITE:
+            # Block this thread: rewind EIP so the wait is retried on
+            # the next schedule, record all handles being waited on, and
+            # yield the slice without killing the thread.
+            cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF  # rewind past INT 0xFE
+            handles_set: set[int] = set()
+            for i in range(n_count):
+                handles_set.add(memory.read32((lp_handles + i * 4) & 0xFFFFFFFF))
+            tidx = state.current_thread_idx
+            if 0 <= tidx < len(state.pending_threads):
+                state.pending_threads[tidx].waiting_on_handles = frozenset(handles_set)
+            state.thread_yield_requested = True
+            cpu.halted = True
+            return  # no cleanup — stack stays for retry
+        cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("kernel32.dll", "WaitForSingleObject",     _wait_for_single)
@@ -594,6 +683,13 @@ def register_kernel32_io_handlers(
         obj = state.kernel_handle_map.get(h)
         if isinstance(obj, EventHandle):
             obj.signaled = True
+            # Unblock any threads waiting on this handle so the scheduler
+            # will pick them up on the next SleepEx/cooperative yield.
+            for t in state.pending_threads:
+                if t.waiting_on_handles and h in t.waiting_on_handles:
+                    t.waiting_on_handles = None
+                    logger.debug("scheduler",
+                        f"SetEvent(0x{h:x}) unblocked thread {t.thread_id}")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -688,8 +784,8 @@ def register_kernel32_io_handlers(
     # ── Find file / attributes ────────────────────────────────────────────────
 
     def _find_close(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1
-        cleanup_stdcall(cpu, memory, 4)
+        logger.error("handlers", "[UNIMPLEMENTED] FindClose — find handle tracking not implemented, halting")
+        cpu.halted = True
 
     def _get_file_attributes_a(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -825,8 +921,8 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _set_current_dir_a(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1
-        cleanup_stdcall(cpu, memory, 4)
+        logger.error("handlers", "[UNIMPLEMENTED] SetCurrentDirectoryA — halting")
+        cpu.halted = True
 
     def _get_windows_dir_a(cpu: "CPU") -> None:
         lp_buf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -852,7 +948,22 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 20)
 
     def _get_drive_type_a(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 3  # DRIVE_FIXED
+        # GetDriveTypeA(lpRootPathName) -> UINT
+        # DRIVE_UNKNOWN=0, DRIVE_NO_ROOT_DIR=1, DRIVE_REMOVABLE=2,
+        # DRIVE_FIXED=3, DRIVE_REMOTE=4, DRIVE_CDROM=5, DRIVE_RAMDISK=6
+        DRIVE_NO_ROOT_DIR = 1
+        DRIVE_FIXED       = 3
+        lp_root = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if lp_root == 0:
+            # NULL → drive type of current directory; we report fixed
+            cpu.regs[EAX] = DRIVE_FIXED
+        else:
+            root_path = read_cstring(lp_root, memory, 16)
+            linux_path = state.translate_windows_path(root_path)
+            if os.path.isdir(linux_path.rstrip("/") or "/"):
+                cpu.regs[EAX] = DRIVE_FIXED
+            else:
+                cpu.regs[EAX] = DRIVE_NO_ROOT_DIR
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "GetCurrentDirectoryA", _get_current_dir_a)
@@ -1035,11 +1146,12 @@ def register_kernel32_io_handlers(
             linux_path = state.translate_windows_path(file_name)
             real_path  = find_file_ci(linux_path)
             if real_path:
+                # find_file_ci confirmed the path exists — any OSError here is not ENOENT.
                 try:
                     with open(real_path, "r", encoding="latin-1") as fh:
                         ini = parse_ini(fh.read())
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.error("fileio", f"GetPrivateProfileStringA: file exists but cannot be read {real_path!r}: {e}")
 
         value = read_profile_string(ini, args.app_name, args.key_name, args.default)
 
@@ -1093,11 +1205,12 @@ def register_kernel32_io_handlers(
             linux_path = state.translate_windows_path(file_name)
             real_path  = find_file_ci(linux_path)
             if real_path:
+                # find_file_ci confirmed the path exists — any OSError here is not ENOENT.
                 try:
                     with open(real_path, "r", encoding="latin-1") as fh:
                         ini = parse_ini(fh.read())
-                except OSError:
-                    pass
+                except OSError as e:
+                    logger.error("fileio", f"GetPrivateProfileIntA: file exists but cannot be read {real_path!r}: {e}")
 
         result = read_profile_int(ini, args.app_name, args.key_name, args.default)
         logger.debug(
