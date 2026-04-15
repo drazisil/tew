@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
+from tew.logger import logger
 
 
 def register_oleaut32_ole32_handlers(
@@ -178,8 +179,8 @@ def register_oleaut32_ole32_handlers(
 
     # VariantChangeType(pvargDest, pvarSrc, wFlags, vt) -> HRESULT
     def _VariantChangeType(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 16)
+        logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType — halting")
+        cpu.halted = True
 
     stubs.register_handler("oleaut32.dll", "VariantChangeType", _VariantChangeType)
 
@@ -267,6 +268,7 @@ def register_oleaut32_ole32_handlers(
 
     # SafeArrayUnaccessData(SAFEARRAY *psa) -> HRESULT
     def _SafeArrayUnaccessData(cpu: "CPU") -> None:
+        # Spec: decrements lock count. We don't track locks — no-op is harmless.
         cpu.regs[EAX] = 0  # S_OK
         cleanup_stdcall(cpu, memory, 4)
 
@@ -274,15 +276,15 @@ def register_oleaut32_ole32_handlers(
 
     # SafeArrayRedim(SAFEARRAY *psa, SAFEARRAYBOUND *psaboundNew) -> HRESULT
     def _SafeArrayRedim(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 8)
+        logger.error("handlers", "[UNIMPLEMENTED] SafeArrayRedim — halting")
+        cpu.halted = True
 
     stubs.register_handler("oleaut32.dll", "SafeArrayRedim", _SafeArrayRedim)
 
     # SafeArrayPutElement(SAFEARRAY *psa, LONG *rgIndices, void *pv) -> HRESULT
     def _SafeArrayPutElement(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 12)
+        logger.error("handlers", "[UNIMPLEMENTED] SafeArrayPutElement — halting")
+        cpu.halted = True
 
     stubs.register_handler("oleaut32.dll", "SafeArrayPutElement", _SafeArrayPutElement)
 
@@ -358,22 +360,22 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 10 — VariantCopy(pvargDest, pvargSrc) -> HRESULT
     def _ord10(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 8)
+        logger.error("handlers", "[UNIMPLEMENTED] VariantCopy (Ordinal 10) — halting")
+        cpu.halted = True
 
     _ole_ord(10, _ord10)
 
     # Ordinal 12 — VariantChangeType(pvargDest, pvarSrc, wFlags, vt) -> HRESULT
     def _ord12(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 16)
+        logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType (Ordinal 12) — halting")
+        cpu.halted = True
 
     _ole_ord(12, _ord12)
 
     # Ordinal 82 — VarR8FromCy(cyIn, pdblOut) -> HRESULT
     def _ord82(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK (returns 0.0 implicitly)
-        cleanup_stdcall(cpu, memory, 8)
+        logger.error("handlers", "[UNIMPLEMENTED] VarR8FromCy (Ordinal 82) — halting")
+        cpu.halted = True
 
     _ole_ord(82, _ord82)
 
@@ -386,8 +388,8 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 113 — VarBstrFromCy(cyIn, lcid, dwFlags, pbstrOut) -> HRESULT
     def _ord113(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 16)
+        logger.error("handlers", "[UNIMPLEMENTED] VarBstrFromCy (Ordinal 113) — halting")
+        cpu.halted = True
 
     _ole_ord(113, _ord113)
 
@@ -401,7 +403,16 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 150 — SysAllocStringByteLen(psz, len) -> BSTR
     def _ord150(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0  # NULL — no-op stub
+        psz      = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        byte_len = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        # Layout: [4-byte byte-count][byte_len bytes][2-byte WCHAR null]
+        block = state.simple_alloc(byte_len + 6)
+        memory.write32(block, byte_len)
+        for i in range(byte_len):
+            b = memory.read8((psz + i) & 0xFFFFFFFF) if psz else 0
+            memory.write8((block + 4 + i) & 0xFFFFFFFF, b)
+        memory.write16((block + 4 + byte_len) & 0xFFFFFFFF, 0)
+        cpu.regs[EAX] = (block + 4) & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 8)
 
     _ole_ord(150, _ord150)

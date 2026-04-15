@@ -127,15 +127,15 @@ def patch_crt_internals(
         if filename_ptr > 0x1000:
             try:
                 filename = read_cstring(filename_ptr, memory)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("exception", f"_CrtDbgReport: read_cstring(filename) failed: {e}")
 
         fmt = "(null)"
         if format_ptr > 0x1000:
             try:
                 fmt = read_cstring(format_ptr, memory)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("exception", f"_CrtDbgReport: read_cstring(fmt) failed: {e}")
 
         logger.error(
             "exception",
@@ -159,8 +159,8 @@ def patch_crt_internals(
         if fmt_ptr > 0x1000:
             try:
                 fmt = read_cstring(fmt_ptr, memory)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("exception", f"abortmessage: read_cstring(fmt) failed: {e}")
 
         # _REALabortfilename (0x020d84b4) and _REALabortlinenum (0x020d84b8) set by caller
         filename_ptr = memory.read32(0x020D84B4)
@@ -169,8 +169,8 @@ def patch_crt_internals(
         if filename_ptr > 0x1000:
             try:
                 filename = read_cstring(filename_ptr, memory)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("exception", f"abortmessage: read_cstring(filename) failed: {e}")
 
         logger.error("exception", f"abortmessage: {filename}:{line_num} — {fmt}")
         cpu.halted = True

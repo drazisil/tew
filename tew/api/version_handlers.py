@@ -35,61 +35,22 @@ def register_version_handlers(
     """Register all version.dll API handlers."""
 
     def _get_file_version_info_size_a(cpu: "CPU") -> None:
-        """
-        DWORD GetFileVersionInfoSizeA(LPCSTR lpstrFilename, LPDWORD lpdwHandle)
-
-        Returns the byte-size of the version-information resource in *lpstrFilename*,
-        or 0 if the file has no such resource.  *lpdwHandle* is always set to 0
-        (the Win32 docs require this but the value is ignored by callers).
-        """
-        esp          = cpu.regs[ESP]
-        lp_filename  = memory.read32((esp + 4) & 0xFFFFFFFF)
-        lpdw_handle  = memory.read32((esp + 8) & 0xFFFFFFFF)
-
+        lp_filename = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lpdw_handle = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         filename = read_cstring(lp_filename, memory) if lp_filename else ""
-
-        # Win32 mandates that *lpdwHandle is always written to 0.
+        logger.debug("handlers", f"GetFileVersionInfoSizeA({filename!r}) -> 0 (RT_VERSION parsing not implemented)")
         if lpdw_handle:
             memory.write32(lpdw_handle, 0)
-
-        logger.debug(
-            "handlers",
-            f"GetFileVersionInfoSizeA({filename!r}) -> 0 (version resources not parsed)",
-        )
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
     def _get_file_version_info_a(cpu: "CPU") -> None:
-        """
-        BOOL GetFileVersionInfoA(LPCSTR lpstrFilename, DWORD dwHandle,
-                                 DWORD dwLen, LPVOID lpData)
-
-        Fills *lpData* with the version-information resource.  Returns FALSE (0)
-        when the resource is unavailable — callers should only reach this function
-        after GetFileVersionInfoSizeA returned a non-zero size, so in practice
-        this handler will not be called.
-        """
-        esp         = cpu.regs[ESP]
-        lp_filename = memory.read32((esp + 4) & 0xFFFFFFFF)
-
-        filename = read_cstring(lp_filename, memory) if lp_filename else ""
-        logger.debug(
-            "handlers",
-            f"GetFileVersionInfoA({filename!r}) -> FALSE (version resources not parsed)",
-        )
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 16)
+        logger.error("handlers", "[UNIMPLEMENTED] GetFileVersionInfoA — RT_VERSION parsing not implemented, halting")
+        cpu.halted = True
 
     def _ver_query_value_a(cpu: "CPU") -> None:
-        """
-        BOOL VerQueryValueA(LPCVOID pBlock, LPCSTR lpSubBlock,
-                            LPVOID *lplpBuffer, PUINT puLen)
-
-        Retrieves a value from a version-information block.  Returns FALSE (0)
-        when the block is NULL or the sub-block is not found.
-        """
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 16)
+        logger.error("handlers", "[UNIMPLEMENTED] VerQueryValueA — RT_VERSION parsing not implemented, halting")
+        cpu.halted = True
 
     stubs.register_handler("version.dll", "GetFileVersionInfoSizeA", _get_file_version_info_size_a)
     stubs.register_handler("version.dll", "GetFileVersionInfoA",     _get_file_version_info_a)

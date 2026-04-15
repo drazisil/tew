@@ -18,7 +18,7 @@ import sys
 from os.path import dirname
 
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import CPU, ESP, EBP
+from tew.hardware.cpu import CPU, ESP, EBP, REG_NAMES
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.emulator.opcodes import register_all_opcodes
@@ -230,6 +230,18 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
             logger.error("cpu", f"  Bytes at EIP: {' '.join(raw)}")
         except Exception:
             logger.error("cpu", "  Bytes at EIP: (out of bounds)")
+        logger.error("cpu", "  Registers at crash:")
+        for i in range(8):
+            val = cpu.regs[i] & 0xFFFFFFFF
+            logger.error("cpu", f"    {REG_NAMES[i]}: 0x{val:08x}")
+        esp_val = cpu.regs[ESP] & 0xFFFFFFFF
+        logger.error("cpu", "  Stack at crash (top 8):")
+        for i in range(8):
+            try:
+                slot = mem.read32(esp_val + i * 4) & 0xFFFFFFFF
+                logger.error("cpu", f"    [ESP+{i*4:02x}] 0x{slot:08x}")
+            except Exception:
+                break
         # Run a few more steps to capture the pattern
         for _ in range(20):
             if cpu.halted:

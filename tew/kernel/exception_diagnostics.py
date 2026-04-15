@@ -83,6 +83,27 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
     ebp_val = cpu.regs[EBP] & 0xFFFFFFFF
     stack_status = "valid" if cpu.memory.is_valid_address(esp_val) else "INVALID"
     logger.error("exception", f"Stack: ESP=0x{esp_val:08x} EBP=0x{ebp_val:08x} ({stack_status})")
+    logger.error("exception", "Stack walk (top 16 slots):")
+    for i in range(16):
+        slot_addr = esp_val + i * 4
+        try:
+            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
+        except Exception:
+            logger.error("exception", f"  [ESP+{i*4:02x}] (read error)")
+            break
+        annotation = ""
+        if import_resolver:
+            dll = import_resolver.find_dll_for_address(value)
+            if dll:
+                annotation = f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
+        if not annotation:
+            if 0x00400000 <= value < 0x00700000:
+                annotation = "  ← exe"
+            elif 0x00200000 <= value < 0x00220000:
+                annotation = "  ← stub"
+            elif 0x7FFF0000 <= value:
+                annotation = "  ← main stack"
+        logger.error("exception", f"  [ESP+{i*4:02x}] 0x{value:08x}{annotation}")
     logger.error("exception", "Execution stopped.")
 
 

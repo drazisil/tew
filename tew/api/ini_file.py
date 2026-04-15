@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from tew.logger import logger
 
 
 # Parsed INI data: {section_lower: {key_lower: value_original_case}}
@@ -172,13 +173,15 @@ def _serialise_ini(ini: IniData) -> str:
 
 
 def _read_ini_from_disk(linux_path: str) -> IniData:
-    """Read and parse an INI file from disk; return empty dict if absent/unreadable."""
+    """Read and parse an INI file from disk; return empty dict if absent."""
     if not os.path.exists(linux_path):
         return {}
+    # File exists — any OSError here is not ENOENT; it is a real read failure.
     try:
         with open(linux_path, "r", encoding="latin-1") as fh:
             return parse_ini(fh.read())
-    except OSError:
+    except OSError as e:
+        logger.error("fileio", f"load_ini_file: file exists but cannot be read {linux_path!r}: {e}")
         return {}
 
 
@@ -191,7 +194,8 @@ def _write_ini_to_disk(linux_path: str, ini: IniData) -> bool:
         with open(linux_path, "w", encoding="latin-1") as fh:
             fh.write(_serialise_ini(ini))
         return True
-    except OSError:
+    except OSError as e:
+        logger.error("fileio", f"_write_ini_to_disk: write failed for {linux_path!r}: {e}")
         return False
 
 

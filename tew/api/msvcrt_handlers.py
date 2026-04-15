@@ -364,7 +364,8 @@ def register_msvcrt_handlers(
 
     # __set_app_type(int apptype) -> void [cdecl]
     def _set_app_type(cpu: "CPU") -> None:
-        pass  # cdecl: caller cleans up args; no state change needed
+        app_type = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        logger.debug("handlers", f"__set_app_type({app_type}) — no-op (bump allocator has no app-type state)")
 
     stubs.register_handler("msvcrt.dll", "__set_app_type", _set_app_type)
 
@@ -470,7 +471,8 @@ def register_msvcrt_handlers(
     # free(void* ptr) -> void [cdecl]
     # No-op: bump allocator does not support freeing.
     def _free(cpu: "CPU") -> None:
-        pass  # bump allocator; nothing to free
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        logger.debug("handlers", f"free(0x{ptr:08x}) — no-op (bump allocator)")
 
     stubs.register_handler("msvcrt.dll", "free", _free)
 
@@ -484,7 +486,8 @@ def register_msvcrt_handlers(
     # operator delete(void* ptr) -> void [cdecl]  (MSVC mangled name)
     # No-op: bump allocator has no free.
     def _operator_delete(cpu: "CPU") -> None:
-        pass
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        logger.debug("handlers", f"operator delete(0x{ptr:08x}) — no-op (bump allocator)")
 
     stubs.register_handler("msvcrt.dll", "??3@YAXPAX@Z", _operator_delete)
 
@@ -543,10 +546,30 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "fread", _fread)
 
     # fwrite(const void* ptr, size_t size, size_t count, FILE* stream) -> size_t [cdecl]
-    # Claims all items written; discards data (no real file output needed here).
     def _fwrite(cpu: "CPU") -> None:
-        count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        cpu.regs[EAX] = count  # claim all items written
+        lp_ptr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        size    = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        count   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        stream  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        if size == 0 or count == 0:
+            cpu.regs[EAX] = 0
+            return
+        total = size * count
+        data  = bytes(memory.read8((lp_ptr + i) & 0xFFFFFFFF) for i in range(total))
+        entry = state.file_handle_map.get(stream)
+        if entry is not None and entry.writable and entry.fd >= 0:
+            import os as _os
+            _os.write(entry.fd, data)
+            entry.position += total
+        else:
+            # stdout/stderr or unknown handle — route to logger
+            try:
+                text = data.decode("latin-1").rstrip("\r\n")
+            except Exception:
+                text = repr(data)
+            if text:
+                logger.info("handlers", f"[fwrite] {text}")
+        cpu.regs[EAX] = count
 
     stubs.register_handler("msvcrt.dll", "fwrite", _fwrite)
 
@@ -620,9 +643,27 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "rewind", _rewind)
 
     # fprintf(FILE* stream, const char* format, ...) -> int [cdecl]
-    # Discards output; returns 0.
     def _fprintf(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        stream  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        fmt_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        fmt     = read_cstring(fmt_ptr, memory, 4096)
+        arg_off = [12]
+
+        def get_arg() -> int:
+            v = memory.read32((cpu.regs[ESP] + arg_off[0]) & 0xFFFFFFFF)
+            arg_off[0] += 4
+            return v
+
+        result = _sprintf_format(fmt, get_arg, memory)
+        entry  = state.file_handle_map.get(stream)
+        if entry is not None and entry.writable and entry.fd >= 0:
+            import os as _os
+            data = result.encode("latin-1", errors="replace")
+            _os.write(entry.fd, data)
+            entry.position += len(data)
+        else:
+            logger.info("handlers", f"[fprintf] {result.rstrip(chr(10) + chr(13))}")
+        cpu.regs[EAX] = len(result)
 
     stubs.register_handler("msvcrt.dll", "fprintf", _fprintf)
 
@@ -650,9 +691,9 @@ def register_msvcrt_handlers(
     # ── Character classification ───────────────────────────────────────────────
 
     # _isctype(int c, int type) -> int [cdecl]
-    # Returns 0; game uses this for locale-aware classification which we don't support.
     def _isctype(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        logger.error("handlers", "[UNIMPLEMENTED] _isctype — halting")
+        cpu.halted = True
 
     stubs.register_handler("msvcrt.dll", "_isctype", _isctype)
 

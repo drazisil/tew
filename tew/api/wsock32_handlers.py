@@ -58,6 +58,7 @@ SOCK_DGRAM       = 2
 SOCKET_ERROR     = 0xFFFFFFFF   # -1 as DWORD
 INVALID_SOCKET   = 0xFFFFFFFF
 
+WSAEFAULT        = 10014
 WSAEWOULDBLOCK   = 10035
 WSAENOTSOCK      = 10038
 WSAEADDRINUSE    = 10048
@@ -177,7 +178,8 @@ def register_wsock32_handlers(
     #   +80  h_aliases array (4 bytes: one NULL pointer = empty list)
     #   +84  h_addr_list array (8 bytes: one addr pointer + NULL)
     #   +92  IP address bytes (4 bytes)
-    _hostent_buf = state.simple_alloc(96)
+    _hostent_buf    = state.simple_alloc(96)
+    _inet_ntoa_buf  = state.simple_alloc(16)   # "255.255.255.255\0"
 
     def _reg(name: str, fn, dll: str = "wsock32.dll") -> None:
         stubs.register_handler(dll, name, fn)
@@ -296,8 +298,8 @@ def register_wsock32_handlers(
         if entry and entry.py_sock:
             try:
                 entry.py_sock.close()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warn("socket", f"closesocket: py_sock.close() failed: {e}")
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
@@ -347,13 +349,13 @@ def register_wsock32_handlers(
 
     def _bind(cpu: "CPU") -> None:
         """bind(s, addr, namelen) -> int."""
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 12)
+        logger.error("handlers", "[UNIMPLEMENTED] bind — halting")
+        cpu.halted = True
 
     def _listen(cpu: "CPU") -> None:
         """listen(s, backlog) -> int."""
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 8)
+        logger.error("handlers", "[UNIMPLEMENTED] listen — halting")
+        cpu.halted = True
 
     def _accept(cpu: "CPU") -> None:
         """accept(s, addr, addrlen) -> SOCKET.  Not supported."""
@@ -369,8 +371,8 @@ def register_wsock32_handlers(
         if entry and entry.py_sock:
             try:
                 entry.py_sock.shutdown(_socket_module.SHUT_RDWR)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warn("socket", f"shutdown: py_sock.shutdown() failed: {e}")
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
@@ -657,8 +659,21 @@ def register_wsock32_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     def _inet_ntoa(cpu: "CPU") -> None:
-        """inet_ntoa(in) -> char*.  Returns NULL (no static char buffer)."""
-        cpu.regs[EAX] = 0
+        """inet_ntoa(in) -> char*.
+        in_addr is passed by value (4-byte IP, network byte order = big-endian).
+        Returns pointer to static 16-byte buffer with dotted-decimal string.
+        """
+        in_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        # memory.read32 is little-endian; network-byte-order IP has first octet in LSB
+        a =  in_addr        & 0xFF
+        b = (in_addr >>  8) & 0xFF
+        c = (in_addr >> 16) & 0xFF
+        d = (in_addr >> 24) & 0xFF
+        dot = f"{a}.{b}.{c}.{d}"
+        for i, ch in enumerate(dot):
+            memory.write8((_inet_ntoa_buf + i) & 0xFFFFFFFF, ord(ch))
+        memory.write8((_inet_ntoa_buf + len(dot)) & 0xFFFFFFFF, 0)
+        cpu.regs[EAX] = _inet_ntoa_buf
         cleanup_stdcall(cpu, memory, 4)
 
     def _gethostbyname(cpu: "CPU") -> None:
@@ -721,12 +736,30 @@ def register_wsock32_handlers(
 
     def _gethostbyaddr(cpu: "CPU") -> None:
         """gethostbyaddr(addr, len, type) -> HOSTENT*."""
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 12)
+        logger.error("handlers", "[UNIMPLEMENTED] gethostbyaddr — halting")
+        cpu.halted = True
 
     def _gethostname(cpu: "CPU") -> None:
         """gethostname(name, namelen) -> int."""
-        cpu.regs[EAX] = SOCKET_ERROR
+        lp_name  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        name_len = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        try:
+            hostname = _socket_module.gethostname()
+        except OSError as e:
+            global _wsa_last_error
+            _wsa_last_error = WSAHOST_NOT_FOUND
+            logger.warn("socket", f"gethostname() failed: {e}")
+            cpu.regs[EAX] = SOCKET_ERROR
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        encoded = hostname.encode("ascii", errors="replace") + b"\x00"
+        if name_len < len(encoded):
+            _wsa_last_error = WSAEFAULT
+            cpu.regs[EAX] = SOCKET_ERROR
+        else:
+            for i, b in enumerate(encoded):
+                memory.write8((lp_name + i) & 0xFFFFFFFF, b)
+            cpu.regs[EAX] = 0  # 0 = success
         cleanup_stdcall(cpu, memory, 8)
 
     def _getservbyname(cpu: "CPU") -> None:
