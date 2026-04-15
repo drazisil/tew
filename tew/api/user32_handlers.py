@@ -127,43 +127,105 @@ def register_user32_gdi32_handlers(
 
     # ── user32.dll ────────────────────────────────────────────────────────────
 
-    # MessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType) -> int
+    # MessageBoxA / MessageBoxW — show a real SDL2 dialog so errors are visible.
     #
-    # Return values follow Win32 conventions so game branching works correctly:
-    #   MB_OK (0)              → IDOK=1
-    #   MB_OKCANCEL (1)        → IDOK=1
-    #   MB_ABORTRETRYIGNORE(2) → IDIGNORE=5  (skip assertions / continue)
-    #   MB_YESNOCANCEL (3)     → IDYES=6
-    #   MB_YESNO (4)           → IDYES=6
-    #   MB_RETRYCANCEL (5)     → IDRETRY=4
-    _MSGBOX_RETURNS: dict[int, int] = {
-        0: 1,   # MB_OK          → IDOK
-        1: 1,   # MB_OKCANCEL    → IDOK
-        2: 5,   # MB_ABORTRETRYIGNORE → IDIGNORE (bypass assertions)
-        3: 6,   # MB_YESNOCANCEL → IDYES
-        4: 6,   # MB_YESNO       → IDYES
-        5: 4,   # MB_RETRYCANCEL → IDRETRY
+    # Win32 button-type → list of (label, buttonid, flags) tuples.
+    # buttonid is the Win32 IDOK/IDYES/etc. value returned to the caller.
+    # SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT marks the Enter key default.
+    # SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT marks the Escape key default.
+    from sdl2 import (
+        SDL_ShowMessageBox,
+        SDL_MessageBoxData,
+        SDL_MessageBoxButtonData,
+        SDL_MESSAGEBOX_ERROR,
+        SDL_MESSAGEBOX_WARNING,
+        SDL_MESSAGEBOX_INFORMATION,
+        SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT,
+        SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
+    )
+    import ctypes as _ctypes
+
+    # (label, win32_id, sdl_flags)
+    _MSGBOX_BUTTONS: dict[int, list[tuple[bytes, int, int]]] = {
+        0: [(b"OK",     1, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
+        1: [(b"OK",     1, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            (b"Cancel", 2, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
+        2: [(b"Abort",  3, 0),
+            (b"Retry",  4, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            (b"Ignore", 5, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
+        3: [(b"Yes",    6, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            (b"No",     7, 0),
+            (b"Cancel", 2, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
+        4: [(b"Yes",    6, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            (b"No",     7, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
+        5: [(b"Retry",  4, SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT),
+            (b"Cancel", 2, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
     }
+
+    # MB_ICON* flags occupy bits 4-7 of uType.
+    _MSGBOX_ICON_FLAGS: dict[int, int] = {
+        0x10: SDL_MESSAGEBOX_ERROR,        # MB_ICONERROR / MB_ICONSTOP
+        0x20: SDL_MESSAGEBOX_ERROR,        # MB_ICONHAND
+        0x30: SDL_MESSAGEBOX_WARNING,      # MB_ICONWARNING / MB_ICONEXCLAMATION
+        0x40: SDL_MESSAGEBOX_INFORMATION,  # MB_ICONINFORMATION / MB_ICONASTERISK
+    }
+
+    def _show_messagebox(caption: str, text: str, u_type: int) -> int:
+        btn_type  = u_type & 0x0F
+        icon_key  = u_type & 0x70
+        sdl_flags = _MSGBOX_ICON_FLAGS.get(icon_key, SDL_MESSAGEBOX_INFORMATION)
+        buttons   = _MSGBOX_BUTTONS.get(btn_type, _MSGBOX_BUTTONS[0])
+
+        btn_array = (SDL_MessageBoxButtonData * len(buttons))()
+        for i, (label, bid, bflags) in enumerate(buttons):
+            btn_array[i].flags    = bflags
+            btn_array[i].buttonid = bid
+            btn_array[i].text     = label
+
+        data = SDL_MessageBoxData()
+        data.flags      = sdl_flags
+        data.window     = None
+        data.title      = caption.encode("latin-1", errors="replace")
+        data.message    = text.encode("latin-1", errors="replace")
+        data.numbuttons = len(buttons)
+        data.buttons    = btn_array
+        data.colorScheme = None
+
+        button_id = _ctypes.c_int(-1)
+        ret = SDL_ShowMessageBox(data, _ctypes.byref(button_id))
+        if ret < 0:
+            logger.error("handlers", f"[Win32] SDL_ShowMessageBox failed (ret={ret}); defaulting to first button")
+            return buttons[0][1]
+        return button_id.value
+
+    def _read_cstr(addr: int, max_len: int = 1024) -> str:
+        out = []
+        for i in range(max_len):
+            ch = memory.read8(addr + i)
+            if ch == 0:
+                break
+            out.append(chr(ch))
+        return "".join(out)
+
+    def _read_wstr(addr: int, max_len: int = 512) -> str:
+        out = []
+        for i in range(max_len):
+            lo = memory.read8(addr + i * 2)
+            hi = memory.read8(addr + i * 2 + 1)
+            cp = lo | (hi << 8)
+            if cp == 0:
+                break
+            out.append(chr(cp))
+        return "".join(out)
 
     def _MessageBoxA(cpu: "CPU") -> None:
         lp_text    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_caption = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         u_type     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        text: str = ""
-        caption: str = ""
-        for i in range(1024):
-            ch = memory.read8(lp_text + i)
-            if ch == 0:
-                break
-            text += chr(ch)
-        for i in range(256):
-            ch = memory.read8(lp_caption + i)
-            if ch == 0:
-                break
-            caption += chr(ch)
-        btn_type = u_type & 0xF
-        result = _MSGBOX_RETURNS.get(btn_type, 1)
-        logger.debug(
+        text    = _read_cstr(lp_text)
+        caption = _read_cstr(lp_caption)
+        result  = _show_messagebox(caption, text, u_type)
+        logger.info(
             "handlers",
             f'[Win32] MessageBoxA("{caption}", "{text.replace(chr(10), "\\n")}")'
             f" type=0x{u_type:x} -> {result}",
@@ -175,8 +237,18 @@ def register_user32_gdi32_handlers(
 
     # MessageBoxW(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType) -> int
     def _MessageBoxW(cpu: "CPU") -> None:
-        logger.debug("handlers", "[Win32] MessageBoxW() called")
-        cpu.regs[EAX] = 1  # IDOK
+        lp_text    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_caption = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        u_type     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        text    = _read_wstr(lp_text)
+        caption = _read_wstr(lp_caption)
+        result  = _show_messagebox(caption, text, u_type)
+        logger.info(
+            "handlers",
+            f'[Win32] MessageBoxW("{caption}", "{text.replace(chr(10), "\\n")}")'
+            f" type=0x{u_type:x} -> {result}",
+        )
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "MessageBoxW", _MessageBoxW)

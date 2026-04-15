@@ -1,95 +1,246 @@
 {
-  "_comment": "Fake Windows registry values for the x86 emulator. Keys are case-insensitive (stored lowercase). Value types: 1=REG_SZ, 4=REG_DWORD.",
+  "_comment": "Fake Windows registry values for the x86 emulator. Keys are prefixed with the hive short name (hklm, hkcu, hkcr, hku). All path components are lowercase.",
   "_install_dir": "C:\\MCity\\",
-
-  "SOFTWARE\\Electronic Arts\\Motor City\\1.0": {
-    "instLev":    { "type": 4, "value": 2 },
-    "installdir": { "type": 1, "value": "C:\\MCity\\" },
-    "Path":       { "type": 1, "value": "C:\\MCity\\" },
-    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
-    "SrcDrive":   { "type": 1, "value": "C:" },
-    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" },
-    "SrcDir":     { "type": 1, "value": "C:\\MCity\\" },
-    "ShardUrl":      { "type": 1, "value": "http://localhost/ShardList/" },
-    "ShardUrlDev":   { "type": 1, "value": "http://localhost/ShardList/" },
-    "Language":      { "type": 1, "value": "English" }
+  "hklm\\software\\electronic arts\\motor city\\1.0": {
+    "instlev": {
+      "type": 4,
+      "value": 2
+    },
+    "installdir": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "path": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "datapath": {
+      "type": 1,
+      "value": "C:\\MCity\\Data\\"
+    },
+    "srcdrive": {
+      "type": 1,
+      "value": "C:"
+    },
+    "srcpath": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "srcdir": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "shardurl": {
+      "type": 1,
+      "value": "http://localhost/ShardList/"
+    },
+    "shardurldev": {
+      "type": 1,
+      "value": "http://localhost/ShardList/"
+    },
+    "language": {
+      "type": 1,
+      "value": "English"
+    }
   },
-
-  "SOFTWARE\\Electronic Arts\\Motor City": {
-    "GamePatch":       { "type": 1, "value": "games/EA_Seattle/MotorCity/MCO" },
-    "UpdateInfoPatch": { "type": 1, "value": "games/EA_Seattle/MotorCity/UpdateInfo" },
-    "NPSPatch":        { "type": 1, "value": "games/EA_Seattle/MotorCity/NPS" },
-    "PatchServerIP":   { "type": 1, "value": "localhost" },
-    "PatchServerPort": { "type": 1, "value": "80" },
-    "CreateAccount":   { "type": 1, "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO" },
-    "Language":        { "type": 1, "value": "English" }
+  "hklm\\software\\electronic arts\\motor city": {
+    "gamepatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/MCO"
+    },
+    "updateinfopatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/UpdateInfo"
+    },
+    "npspatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/NPS"
+    },
+    "patchserverip": {
+      "type": 1,
+      "value": "localhost"
+    },
+    "patchserverport": {
+      "type": 1,
+      "value": "80"
+    },
+    "createaccount": {
+      "type": 1,
+      "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO"
+    },
+    "language": {
+      "type": 1,
+      "value": "English"
+    },
+    "loginname": {
+      "type": 1,
+      "value": "admin"
+    },
+    "loginpw": {
+      "type": 1,
+      "value": "admin"
+    }
   },
-
-  "SOFTWARE\\Electronic Arts\\Motor City\\AuthAuth": {
-    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
-    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  "hklm\\software\\electronic arts\\motor city\\authauth": {
+    "authloginbaseservice": {
+      "type": 1,
+      "value": "AuthLogin"
+    },
+    "authloginserver": {
+      "type": 1,
+      "value": "localhost"
+    }
   },
-
-  "SOFTWARE\\Electronic Arts\\Motor City Online\\1.0": {
-    "instLev":    { "type": 4, "value": 2 },
-    "installdir": { "type": 1, "value": "C:\\MCity\\" },
-    "Path":       { "type": 1, "value": "C:\\MCity\\" },
-    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
-    "SrcDrive":   { "type": 1, "value": "C:" },
-    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" }
+  "hklm\\software\\electronic arts\\motor city online\\1.0": {
+    "instlev": {
+      "type": 4,
+      "value": 2
+    },
+    "installdir": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "path": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "datapath": {
+      "type": 1,
+      "value": "C:\\MCity\\Data\\"
+    },
+    "srcdrive": {
+      "type": 1,
+      "value": "C:"
+    },
+    "srcpath": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    }
   },
-
-  "SOFTWARE\\EACom\\AuthAuth": {
-    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
-    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  "hklm\\software\\eacom\\authauth": {
+    "authloginbaseservice": {
+      "type": 1,
+      "value": "AuthLogin"
+    },
+    "authloginserver": {
+      "type": 1,
+      "value": "localhost"
+    }
   },
-
-  "SOFTWARE\\Electronic Arts\\Network Play System": {
-    "Log": { "type": 1, "value": "1" }
+  "hklm\\software\\electronic arts\\network play system": {
+    "log": {
+      "type": 1,
+      "value": "1"
+    }
   },
-
-  "SOFTWARE\\WOW6432Node\\EACom\\AuthAuth": {
-    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
-    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  "hklm\\software\\wow6432node\\eacom\\authauth": {
+    "authloginbaseservice": {
+      "type": 1,
+      "value": "AuthLogin"
+    },
+    "authloginserver": {
+      "type": 1,
+      "value": "localhost"
+    }
   },
-
-  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City": {
-    "GamePatch":       { "type": 1, "value": "games/EA_Seattle/MotorCity/MCO" },
-    "UpdateInfoPatch": { "type": 1, "value": "games/EA_Seattle/MotorCity/UpdateInfo" },
-    "NPSPatch":        { "type": 1, "value": "games/EA_Seattle/MotorCity/NPS" },
-    "PatchServerIP":   { "type": 1, "value": "localhost" },
-    "PatchServerPort": { "type": 1, "value": "80" },
-    "CreateAccount":   { "type": 1, "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO" },
-    "Language":        { "type": 1, "value": "English" }
+  "hklm\\software\\wow6432node\\electronic arts\\motor city": {
+    "gamepatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/MCO"
+    },
+    "updateinfopatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/UpdateInfo"
+    },
+    "npspatch": {
+      "type": 1,
+      "value": "games/EA_Seattle/MotorCity/NPS"
+    },
+    "patchserverip": {
+      "type": 1,
+      "value": "localhost"
+    },
+    "patchserverport": {
+      "type": 1,
+      "value": "80"
+    },
+    "createaccount": {
+      "type": 1,
+      "value": "localhost/SubscribeEntry.jsp?prodID=REG-MCO"
+    },
+    "language": {
+      "type": 1,
+      "value": "English"
+    }
   },
-
-  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City\\1.0": {
-    "instLev":    { "type": 4, "value": 2 },
-    "installdir": { "type": 1, "value": "C:\\MCity\\" },
-    "Path":       { "type": 1, "value": "C:\\MCity\\" },
-    "datapath":   { "type": 1, "value": "C:\\MCity\\Data\\" },
-    "SrcDrive":   { "type": 1, "value": "C:" },
-    "SrcPath":    { "type": 1, "value": "C:\\MCity\\" },
-    "ShardUrl":      { "type": 1, "value": "http://localhost/ShardList/" },
-    "ShardUrlDev":   { "type": 1, "value": "http://localhost/ShardList/" }
+  "hklm\\software\\wow6432node\\electronic arts\\motor city\\1.0": {
+    "instlev": {
+      "type": 4,
+      "value": 2
+    },
+    "installdir": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "path": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "datapath": {
+      "type": 1,
+      "value": "C:\\MCity\\Data\\"
+    },
+    "srcdrive": {
+      "type": 1,
+      "value": "C:"
+    },
+    "srcpath": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "shardurl": {
+      "type": 1,
+      "value": "http://localhost/ShardList/"
+    },
+    "shardurldev": {
+      "type": 1,
+      "value": "http://localhost/ShardList/"
+    }
   },
-
-  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Motor City\\AuthAuth": {
-    "AuthLoginBaseService": { "type": 1, "value": "AuthLogin" },
-    "AuthLoginServer":      { "type": 1, "value": "localhost" }
+  "hklm\\software\\wow6432node\\electronic arts\\motor city\\authauth": {
+    "authloginbaseservice": {
+      "type": 1,
+      "value": "AuthLogin"
+    },
+    "authloginserver": {
+      "type": 1,
+      "value": "localhost"
+    }
   },
-
-  "SOFTWARE\\WOW6432Node\\Electronic Arts\\Network Play System": {
-    "Log": { "type": 1, "value": "1" }
+  "hklm\\software\\wow6432node\\electronic arts\\network play system": {
+    "log": {
+      "type": 1,
+      "value": "1"
+    }
   },
-
-  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mcity.exe": {
-    "Path": { "type": 1, "value": "C:\\MCity\\" },
-    "":     { "type": 1, "value": "C:\\MCity\\MCity_d.exe" }
+  "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity.exe": {
+    "path": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "": {
+      "type": 1,
+      "value": "C:\\MCity\\MCity_d.exe"
+    }
   },
-
-  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mcity_d.exe": {
-    "Path": { "type": 1, "value": "C:\\MCity\\" },
-    "":     { "type": 1, "value": "C:\\MCity\\MCity_d.exe" }
+  "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity_d.exe": {
+    "path": {
+      "type": 1,
+      "value": "C:\\MCity\\"
+    },
+    "": {
+      "type": 1,
+      "value": "C:\\MCity\\MCity_d.exe"
+    }
   }
 }

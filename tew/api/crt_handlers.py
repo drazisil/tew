@@ -79,7 +79,7 @@ def register_crt_handlers(
     from tew.api.user32_handlers import register_user32_gdi32_handlers
     from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
     from tew.api.advapi32_handlers import register_advapi32_handlers
-    from tew.api.d3d8_handlers import register_d3d8_handlers
+    from tew.api.d3d8 import register_d3d8_handlers
     from tew.api.version_handlers import register_version_handlers
     from tew.api.wininet_handlers import register_wininet_handlers
     from tew.api.wsock32_handlers import register_wsock32_handlers
