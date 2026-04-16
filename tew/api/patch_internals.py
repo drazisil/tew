@@ -177,3 +177,4 @@ def patch_crt_internals(
         # cdecl variadic — no stack cleanup by callee
 
     stubs.patch_address(0x00A30140, "abortmessage", _abort_message)
+

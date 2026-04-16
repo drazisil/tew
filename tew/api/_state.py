@@ -258,6 +258,7 @@ class CRTState:
         self.next_thread_handle: int = 0x0000BEEF
         self.thread_stack_next: int = THREAD_STACK_BASE
         self.sleep_count: int = 0
+        self.virtual_ticks_ms: int = 0   # virtual clock: advanced by dwMilliseconds per Sleep/SleepEx
         self.is_running_thread: bool = False
         self.current_thread_idx: int = -1
         self.last_scheduled_idx: int = -1

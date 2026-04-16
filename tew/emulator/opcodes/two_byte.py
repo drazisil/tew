@@ -131,6 +131,30 @@ def register_two_byte_opcodes(cpu: "CPU") -> None:
                 cpu.write_rm32(d["mod"], d["rm"], (val ^ (1 << bit)) & 0xFFFFFFFF)
             # reg==4 is BT (no write)
 
+        elif op2 == 0xA2: # CPUID
+            # Report only what this emulator actually implements.
+            # Leaf 0: max standard leaf = 1, vendor = "GenuineIntel"
+            # Leaf 1: EDX = FPU (bit 0) | CMOV (bit 15) — the only instruction
+            #         families with opcode coverage in this emulator.
+            #         All other feature bits are 0: no TSC, CX8, MMX, SSE, SSE2, etc.
+            # All other leaves: all zeros (not implemented).
+            leaf = cpu.regs[0] & 0xFFFFFFFF  # EAX
+            if leaf == 0:
+                cpu.regs[0] = 1           # EAX: max standard leaf
+                cpu.regs[3] = 0x756E6547  # EBX: "Genu"
+                cpu.regs[2] = 0x49656E69  # EDX: "ineI"
+                cpu.regs[1] = 0x6C65746E  # ECX: "ntel"
+            elif leaf == 1:
+                cpu.regs[0] = 0x00000600  # EAX: family 6, model 0, stepping 0
+                cpu.regs[3] = 0x00000000  # EBX: brand=0, CLFLUSH=0, 1 logical, APIC ID=0
+                cpu.regs[1] = 0x00000000  # ECX: no extended features
+                cpu.regs[2] = 0x00008001  # EDX: FPU (bit 0) + CMOV (bit 15)
+            else:
+                cpu.regs[0] = 0
+                cpu.regs[3] = 0
+                cpu.regs[1] = 0
+                cpu.regs[2] = 0
+
         else:
             raise RuntimeError(
                 f"Unknown two-byte opcode: 0x0F 0x{op2:02x} at EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"

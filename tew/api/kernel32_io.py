@@ -488,15 +488,64 @@ def register_kernel32_io_handlers(
 
     def _sleep_ex(cpu: "CPU") -> None:
         if state.is_running_thread:
+            # We are inside a cooperative thread slice.  We cannot schedule
+            # another cooperative slice (that would corrupt the main-thread
+            # save state), but we CAN fire due timer callbacks in-place via
+            # _invoke_emulated_proc (which saves/restores the current CPU
+            # state around the call).
+            #
+            # We ALWAYS yield after this, even when no callbacks fired.
+            # On real Windows, SleepEx(n) suspends the calling thread and
+            # gives other threads a chance to run.  In our cooperative
+            # scheduler the timer thread body (FUN_00a30ea0) must run at
+            # least once before mmtimer_callback fires so that
+            # _SIGNAL_alloc() has been called and DAT_020d84cc holds a
+            # valid event handle.  If we return immediately when no
+            # callbacks are due, the timer thread never gets a slice and
+            # SetEvent(0) is a no-op forever.
+            #
+            # cleanup_stdcall is called before yielding so the saved EIP
+            # points to the return address (after the SleepEx call site)
+            # rather than back at INT 0xFE, which would cause an infinite
+            # re-entry loop on the next schedule.
+            #
+            # Note: we do NOT advance virtual_ticks_ms from the background
+            # thread path — only the main thread drives the virtual clock.
+            from tew.api.win32_handlers import pending_timers
+            due = [t for t in pending_timers.values() if t.due_at <= state.virtual_ticks_ms]
+            if due:
+                from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+                sentinel = _get_dialog_sentinel(state, memory)
+                for timer in due:
+                    _invoke_emulated_proc(
+                        cpu, memory, timer.cb_addr,
+                        [timer.id, 0, timer.dw_user, 0, 0],
+                        sentinel,
+                    )
+                    if timer.period_ms > 0:
+                        timer.due_at += timer.period_ms
+                    else:
+                        pending_timers.pop(timer.id, None)
+            # Always yield: return EAX=0 from SleepEx, then suspend this
+            # thread so the scheduler can run newly-unblocked threads.
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 8)
+            state.thread_yield_requested = True
+            cpu.halted = True
             return
-        # Fire all pending timer callbacks — _THREAD_yield calls SleepEx, not Sleep,
-        # and the timer fire logic must live here too.
-        # After firing, fall through to cooperative sleep so the timer thread
-        # (which waits on the signal set by mmtimer_callback) gets CPU time.
+        # Advance virtual clock by the requested sleep duration before yielding.
+        # GetTickCount/timeGetTime return this virtual counter so that the
+        # emulated binary sees time advance in proportion to emulated execution,
+        # not Python wall time.  This prevents GetTickCount-based timeouts from
+        # expiring during cooperative thread slices (each of which takes ~1-2s
+        # of Python wall time but represents only dwMilliseconds of emulated time).
+        dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.virtual_ticks_ms = (state.virtual_ticks_ms + dw_ms) & 0xFFFFFFFF
+        # Fire timer callbacks whose due_at has elapsed.  The due_at guard
+        # ensures mmtimer_callback does not fire before the timer thread has
+        # run its first slice and set DAT_020d84cc via _SIGNAL_alloc().
         from tew.api.win32_handlers import pending_timers
-        due = list(pending_timers.values())
+        due = [t for t in pending_timers.values() if t.due_at <= state.virtual_ticks_ms]
         if due:
             from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
             sentinel = _get_dialog_sentinel(state, memory)
@@ -1588,3 +1637,94 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("kernel32.dll", "VirtualProtect", _virtual_protect)
+
+
+def register_winmm_handlers(
+    stubs: "Win32Handlers",
+    memory: "Memory",
+    state: "CRTState",
+) -> None:
+    """Register WINMM.DLL multimedia timer stubs.
+
+    The game uses a self-rescheduling one-shot timer pattern:
+      mmtimer_callback → timeSetEvent(delay, 1, mmtimer_callback, 0, TIME_ONESHOT)
+    Each callback fires once, signals the timer thread, then reschedules itself.
+    _sleep_ex fires due PendingTimers cooperatively during SleepEx calls.
+    """
+    from tew.api.win32_handlers import pending_timers, PendingTimer
+
+    _next_timer_id = [1]
+
+    # ── timeGetDevCaps ────────────────────────────────────────────────────────
+    # MMRESULT timeGetDevCaps(LPTIMECAPS ptc, UINT cbtc)
+    # TIMECAPS: {UINT wPeriodMin, UINT wPeriodMax} = 8 bytes
+    def _time_get_dev_caps(cpu: "CPU") -> None:
+        ptc  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cbtc = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        if ptc and cbtc >= 8:
+            memory.write32(ptc,     1)       # wPeriodMin = 1 ms
+            memory.write32(ptc + 4, 0x7FFF)  # wPeriodMax = 32767 ms
+        cpu.regs[EAX] = 0  # TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("winmm.dll", "timeGetDevCaps", _time_get_dev_caps)
+
+    # ── timeBeginPeriod / timeEndPeriod ───────────────────────────────────────
+    def _time_begin_period(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    def _time_end_period(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("winmm.dll", "timeBeginPeriod", _time_begin_period)
+    stubs.register_handler("winmm.dll", "timeEndPeriod",   _time_end_period)
+
+    # ── timeSetEvent ──────────────────────────────────────────────────────────
+    # MMRESULT timeSetEvent(UINT uDelay, UINT uResolution,
+    #                       LPTIMECALLBACK lpTimeProc, DWORD_PTR dwUser, UINT fuEvent)
+    # fuEvent: TIME_ONESHOT=0x0000, TIME_PERIODIC=0x0001
+    _TIME_PERIODIC = 0x0001
+
+    def _time_set_event(cpu: "CPU") -> None:
+        sp           = cpu.regs[ESP]
+        u_delay      = memory.read32((sp +  4) & 0xFFFFFFFF)
+        lp_time_proc = memory.read32((sp + 12) & 0xFFFFFFFF)
+        dw_user      = memory.read32((sp + 16) & 0xFFFFFFFF)
+        fu_event     = memory.read32((sp + 20) & 0xFFFFFFFF)
+
+        if u_delay == 0:
+            u_delay = 1
+        period_ms = u_delay if (fu_event & _TIME_PERIODIC) else 0
+        due_at    = state.virtual_ticks_ms + u_delay
+
+        tid = _next_timer_id[0]
+        _next_timer_id[0] += 1
+        pending_timers[tid] = PendingTimer(
+            id=tid, due_at=due_at, period_ms=period_ms,
+            cb_addr=lp_time_proc, dw_user=dw_user,
+        )
+        logger.debug("handlers",
+            f"timeSetEvent(delay={u_delay}ms, proc=0x{lp_time_proc:08x}) -> id={tid}")
+        cpu.regs[EAX] = tid
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("winmm.dll", "timeSetEvent", _time_set_event)
+
+    # ── timeKillEvent ─────────────────────────────────────────────────────────
+    def _time_kill_event(cpu: "CPU") -> None:
+        tid = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pending_timers.pop(tid, None)
+        cpu.regs[EAX] = 0  # TIMERR_NOERROR
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("winmm.dll", "timeKillEvent", _time_kill_event)
+
+    # ── timeGetTime ───────────────────────────────────────────────────────────
+    # DWORD timeGetTime(void) — milliseconds since system start
+    def _time_get_time(cpu: "CPU") -> None:
+        cpu.regs[EAX] = state.virtual_ticks_ms & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 0)
+
+    stubs.register_handler("winmm.dll", "timeGetTime", _time_get_time)

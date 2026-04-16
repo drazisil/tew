@@ -210,6 +210,17 @@ class Win32Handlers:
                 return entry.address
         return None
 
+    def get_dll_name_for_stub_handle(self, handle: int) -> str | None:
+        """Reverse of get_stub_dll_handle: given a stub-region address, return the DLL name.
+
+        GetModuleHandleA returns the first stub address for a DLL (i.e. get_stub_dll_handle).
+        GetProcAddress then passes that address back as hModule.  This method resolves it.
+        """
+        for entry in self._handlers_by_id:
+            if entry.address == handle:
+                return entry.dll_name
+        return None
+
     def get_registered_handlers(self) -> list[dict]:
         """Return all registered stubs (for diagnostics)."""
         return [

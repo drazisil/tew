@@ -578,8 +578,7 @@ def register_advapi32_handlers(
     # timeGetTime() - no args, no stack cleanup
     # VERIFIED: mmtimer_callback uses timeGetTime for scheduling next timeSetEvent delay.
     def _time_get_time(cpu: "CPU") -> None:
-        now_ms = int(time.monotonic() * 1000) & 0xFFFFFFFF
-        cpu.regs[EAX] = now_ms
+        cpu.regs[EAX] = state.virtual_ticks_ms & 0xFFFFFFFF
 
     stubs.register_handler("winmm.dll", "timeGetTime", _time_get_time)
 

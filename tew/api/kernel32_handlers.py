@@ -622,11 +622,13 @@ def register_kernel32_handlers(
     def _get_tick_count(cpu: "CPU") -> None:
         """GetTickCount() -> DWORD  (milliseconds since emulator start).
 
-        The return value wraps after ~49.7 days.  Game code uses it for
-        timeouts and animation deltas, not absolute timestamps.
+        Returns the virtual tick clock, which advances by dwMilliseconds per
+        Sleep/SleepEx call rather than by real wall time.  This matches the
+        emulated binary's expectation: GetTickCount should advance in step
+        with emulated execution, not with Python wall time.
+        The return value wraps after ~49.7 days.
         """
-        elapsed_ms = int((_time_module.monotonic() - _start_time) * 1000) & 0xFFFFFFFF
-        cpu.regs[EAX] = elapsed_ms
+        cpu.regs[EAX] = state.virtual_ticks_ms & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 0)
 
     # QPC frequency: we report 1 000 000 (1 MHz) so the counter value in
@@ -807,6 +809,10 @@ def register_kernel32_handlers(
                 loaded = dll_loader.find_dll_for_address(h_module)
                 if loaded:
                     dll_name = loaded.name
+            if dll_name is None:
+                # Handle is in the stub region (e.g. returned by GetModuleHandleA
+                # for a DLL with no real binary — first registered stub address).
+                dll_name = stubs.get_dll_name_for_stub_handle(h_module)
 
         if dll_name is None:
             logger.warn("handlers",
@@ -1203,11 +1209,15 @@ def register_kernel32_handlers(
             # thread slice.  Treat sleep as instant so the thread keeps running.
             cleanup_stdcall(cpu, memory, 4)
             return
-        # Fire all pending timer callbacks before cooperative sleep.
-        # The game uses timeSetEvent+Sleep as a yield primitive; 9ms delay is a
-        # Windows minimum that means nothing in an emulator — fire on any Sleep.
+        # Advance virtual clock by the requested sleep duration before yielding.
+        # GetTickCount/timeGetTime return this virtual counter so that the
+        # emulated binary sees time advance in proportion to emulated execution,
+        # not Python wall time.
+        dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.virtual_ticks_ms = (state.virtual_ticks_ms + dw_ms) & 0xFFFFFFFF
+        # Fire timer callbacks whose due_at has elapsed.
         from tew.api.win32_handlers import pending_timers
-        due = list(pending_timers.values())
+        due = [t for t in pending_timers.values() if t.due_at <= state.virtual_ticks_ms]
         if due:
             from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
             sentinel = _get_dialog_sentinel(state, memory)

@@ -75,6 +75,7 @@ def register_crt_handlers(
     # Import here to keep top-level imports free of circular dependencies and
     # to allow individual modules to be loaded/tested in isolation.
     from tew.api.kernel32_handlers import register_kernel32_handlers
+    from tew.api.kernel32_io import register_winmm_handlers
     from tew.api.msvcrt_handlers import register_msvcrt_handlers
     from tew.api.user32_handlers import register_user32_gdi32_handlers
     from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
@@ -85,6 +86,7 @@ def register_crt_handlers(
     from tew.api.wsock32_handlers import register_wsock32_handlers
 
     register_kernel32_handlers(stubs, memory, state, dll_loader)
+    register_winmm_handlers(stubs, memory, state)
     register_msvcrt_handlers(stubs, memory, state)
     register_user32_gdi32_handlers(stubs, memory, state)
     register_oleaut32_ole32_handlers(stubs, memory, state)
