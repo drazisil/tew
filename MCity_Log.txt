@@ -1,0 +1,12 @@
+TimeStamp: Thu Apr 16 18:59:02 2026
+
+Start NPSLogin Log
+-Loading: AuthLogin.Dll
+-Load Path = C:\MCity\nps\authlogin.Dll
+  Setting AuthLoginBaseService = AuthLogin
+  Setting AuthLoginServer = localhost
+  Loaded C:\MCity\nps\authlogin.Dll
+  Getting Auth Ticket for (admin,admin) aaiServiceId=2176
+  AuthLogin using: AuthLogin , localhost
+  GetTicketSync() success, result Ticket = d316cd2dd6bf870893dfbaaf17f965884e
+  outTicket: d316cd2dd6bf870893dfbaaf17f965884e

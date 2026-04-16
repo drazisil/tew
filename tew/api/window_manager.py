@@ -295,6 +295,10 @@ class WindowManager:
                 pass
 
         self._windows[hwnd] = entry
+        logger.warn("window",
+            f"[WindowManager] HWND registered: 0x{hwnd:x} class='{class_name}' "
+            f"title='{title}' parent=0x{parent_hwnd:x}"
+        )
         self._message_queue.append((hwnd, WM_CREATE, 0, 0))
         return hwnd
 
@@ -365,6 +369,10 @@ class WindowManager:
             sdl_renderer=sdl_rend,
         )
         self._windows[hwnd] = entry
+        logger.warn("window",
+            f"[WindowManager] HWND registered: 0x{hwnd:x} class='#32770' "
+            f"title='{template.title}' (dialog)"
+        )
 
         win_id = SDL_GetWindowID(sdl_win)
         self._sdl_window_id_to_hwnd[win_id] = hwnd
@@ -455,7 +463,9 @@ class WindowManager:
             self._focused_hwnd = 0
 
         del self._windows[hwnd]
-        self._message_queue.append((hwnd, WM_DESTROY, 0, 0))
+        # WM_DESTROY is sent synchronously by DestroyWindow on Win32, not posted.
+        # Do not queue it here — the HWND is already gone and any queued message
+        # for a dead HWND is undeliverable and pollutes the message queue.
         logger.debug("window", f"[WindowManager] Destroyed hwnd=0x{hwnd:x}")
         return True
 

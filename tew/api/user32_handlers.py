@@ -800,19 +800,27 @@ def register_user32_gdi32_handlers(
         sentinel = _get_dialog_sentinel(state, memory)
 
         # Deliver WM_INITDIALOG now (create_dialog posted it to the queue).
-        # Peek so we don't leave a stale WM_INITDIALOG for the caller's loop.
-        pending = wm.peek_message()
-        if pending is not None:
+        # Drain the queue until we find it: re-save messages for live HWNDs,
+        # silently drop anything else (e.g. messages posted before this dialog
+        # was created that arrived out of order).
+        requeue: list[tuple[int, int, int, int]] = []
+        while True:
+            pending = wm.peek_message()
+            if pending is None:
+                break
             hwnd_msg, msg_id, wparam, lparam = pending
             if hwnd_msg == dlg_hwnd and msg_id == WM_INITDIALOG:
+                for saved in requeue:
+                    wm.post_message(*saved)
                 _invoke_emulated_proc(
                     cpu, memory, lp_dialog_func,
                     [dlg_hwnd, msg_id, wparam, lparam],
                     sentinel,
                 )
-            else:
-                # Unexpected message — put it back by re-appending
-                wm.post_message(hwnd_msg, msg_id, wparam, lparam)
+                break
+            elif wm.is_window(hwnd_msg):
+                requeue.append(pending)
+            # else: message for a non-existent HWND — discard
 
         # Render the initial state so something is visible right away
         from tew.api.dialog_renderer import render_dialog
@@ -1126,10 +1134,16 @@ def register_user32_gdi32_handlers(
         wparam = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         ok = wm.post_message(hwnd, msg, wparam, lparam)
-        logger.debug("handlers",
-            f"[Win32] PostMessageA(hwnd=0x{hwnd:x}, msg=0x{msg:04x}, "
-            f"wp=0x{wparam:x}, lp=0x{lparam:x}) -> {'TRUE' if ok else 'FALSE (unknown hwnd)'}"
-        )
+        if not ok:
+            logger.warn("handlers",
+                f"[Win32] PostMessageA FAILED: hwnd=0x{hwnd:x} msg=0x{msg:04x} "
+                f"wp=0x{wparam:x} lp=0x{lparam:x} (unknown hwnd)"
+            )
+        else:
+            logger.debug("handlers",
+                f"[Win32] PostMessageA(hwnd=0x{hwnd:x}, msg=0x{msg:04x}, "
+                f"wp=0x{wparam:x}, lp=0x{lparam:x}) -> TRUE"
+            )
         cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 16)
 
