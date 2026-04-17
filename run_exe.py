@@ -25,6 +25,7 @@ from tew.emulator.opcodes import register_all_opcodes
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
+from tew.api.pe_resources import PEResources
 from tew.logger import logger
 
 
@@ -87,7 +88,6 @@ crt_state = register_crt_handlers(win32_handlers, mem, exe.import_resolver.get_d
 crt_state.exe_path = exe_path   # used by GetModuleFileNameA
 
 # Attach PE resources so dialog templates and bitmap controls can be loaded
-from tew.api.pe_resources import PEResources
 with open(exe_path, "rb") as _f:
     _pe_resources = PEResources(_f.read())
 crt_state.pe_resources = _pe_resources
