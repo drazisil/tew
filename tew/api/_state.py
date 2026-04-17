@@ -71,8 +71,16 @@ class PendingThreadInfo:
     calls_seen: Optional[set[str]] = None     # dedup set for call logging
     saved_state: Optional[SavedCPUState] = None
     # When non-empty the thread is blocked waiting for one of these handles.
-    # The scheduler will skip it until an event in this set is signaled.
+    # The scheduler will skip it until an event in this set is signaled OR
+    # the virtual clock reaches wait_deadline_ms.
     waiting_on_handles: Optional[frozenset[int]] = None
+    # virtual_ticks_ms value at which a finite-timeout wait expires.
+    # None means the wait has no deadline (INFINITE or thread is not waiting).
+    wait_deadline_ms: Optional[int] = None
+    # Set to True by the scheduler when a finite-timeout wait expires before
+    # the handle was signaled.  The retried WaitForSingle/Multiple handler
+    # reads this, clears it, and returns WAIT_TIMEOUT (0x102).
+    wait_timed_out: bool = False
 
 
 # ── Registry types ────────────────────────────────────────────────────────────

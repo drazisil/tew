@@ -477,8 +477,8 @@ def register_advapi32_handlers(
 
     # GetUserNameA(lpBuffer, pcbBuffer) - 2 args (8 bytes)
     def _get_user_name_a(cpu: "CPU") -> None:
-        lp_buffer  = memory.read32(cpu.regs[ESP] + 4)
-        pcb_buffer = memory.read32(cpu.regs[ESP] + 8)
+        lp_buffer  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pcb_buffer = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         username   = "Player\0"
         if lp_buffer and pcb_buffer:
             max_len = memory.read32(pcb_buffer)
@@ -548,7 +548,7 @@ def register_advapi32_handlers(
     # timeGetDevCaps(ptc, cbtc) - 2 args (8 bytes)
     # VERIFIED: _TIMER_init checks result != 0 → abortmessage("MULTIMEDIA TIMER NOT FOUND")
     def _time_get_dev_caps(cpu: "CPU") -> None:
-        ptc = memory.read32(cpu.regs[ESP] + 4)
+        ptc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if ptc != 0:
             memory.write32(ptc,     1)           # wPeriodMin = 1 ms
             memory.write32(ptc + 4, 1_000_000)  # wPeriodMax = 1 s
@@ -560,7 +560,7 @@ def register_advapi32_handlers(
     # timeBeginPeriod(uPeriod) - 1 arg (4 bytes)
     # VERIFIED: _TIMER_init checks result != 0 → abortmessage("FAILED TO INITIALIZE MULTIMEDIA TIMER")
     def _time_begin_period(cpu: "CPU") -> None:
-        period = memory.read32(cpu.regs[ESP] + 4)
+        period = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.info("handlers", f"[winmm] timeBeginPeriod({period}) -> 0")
         cpu.regs[EAX] = TIMERR_NOERROR
         cleanup_stdcall(cpu, memory, 4)
@@ -617,7 +617,7 @@ def register_advapi32_handlers(
     # timeKillEvent(uTimerID) - 1 arg (4 bytes)
     # VERIFIED: _TIMER_restore calls timeKillEvent to cancel the timer.
     def _time_kill_event(cpu: "CPU") -> None:
-        timer_id = memory.read32(cpu.regs[ESP] + 4)
+        timer_id = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         pending_timers.pop(timer_id, None)
         cpu.regs[EAX] = TIMERR_NOERROR
         cleanup_stdcall(cpu, memory, 4)

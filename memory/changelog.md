@@ -4,6 +4,32 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-17 — Timer unblock + handler correctness audit
+
+**Progress:**
+Game now runs through full startup: login dialog → HTTP auth (200 OK) → authlogin.dll →
+options.ini defaults → dx8z.dll/D3D8 init → timer thread created. Halts at
+`GetStockObject(BLACK_BRUSH)` in gdi32. Next milestone: GDI object table.
+
+**Timer / scheduler fixes (unblocked _TIMER_waitticks spin):**
+- `_run_background_slice` extracted as module-level function in `kernel32_io.py`
+- `WaitForSingleObject(INFINITE)` on main thread now drives background threads
+  (process-zero pattern) instead of halting emulation
+- Timer heartbeat in `run_exe.py` fires every 100K steps: advances `virtual_ticks_ms`,
+  invokes due timer callbacks, runs one background slice — unblocks tid=1006 ticks
+
+**Handler correctness audit:**
+- `_lclose`: was silently returning 0; now reads handle, closes host fd, returns
+  correct value (handle on success, HFILE_ERROR on unknown)
+- `advapi32_handlers.py`: five stack reads missing `& 0xFFFFFFFF` mask — fixed
+- `SetForegroundWindow`: misleading "pretend it worked" comment replaced with
+  explanation (SDL2 owns the window; Win32 focus mechanics don't apply)
+- `GetStockObject`: a fake-handle implementation was written and reverted — kept
+  as `_halt` until a real GDI object table exists
+- Unused imports and dead variable cleaned (ruff)
+
+---
+
 ## 2026-04-13 (third pass) — Bitmap rendering for STATIC controls
 
 **What was broken:**

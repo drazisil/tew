@@ -11,7 +11,6 @@ implemented.
 
 from __future__ import annotations
 
-import struct
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -19,13 +18,11 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 from tew.hardware.cpu import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DIALOG_TRAMPOLINE
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
 from tew.api.window_manager import (
     WindowManager,
-    WM_COMMAND, WM_INITDIALOG, WM_CLOSE,
-    BM_GETCHECK, BM_SETCHECK,
-    WS_VISIBLE,
+    WM_INITDIALOG, BM_GETCHECK, BM_SETCHECK,
     du_to_px_x, du_to_px_y,
 )
 from tew.logger import logger
@@ -275,8 +272,9 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "GetForegroundWindow", _GetForegroundWindow)
 
     # SetForegroundWindow(HWND hWnd) -> BOOL
+    # SDL2 owns the window; Win32 focus mechanics have no effect in this emulator.
     def _SetForegroundWindow(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1  # TRUE (pretend it worked)
+        cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "SetForegroundWindow", _SetForegroundWindow)
@@ -1221,7 +1219,6 @@ def register_user32_gdi32_handlers(
         n_id   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         msg    = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         wparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        lparam = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         child_hwnd = wm.get_dlg_item(h_dlg, n_id)
         result = 0
         if child_hwnd:

@@ -25,7 +25,7 @@ from tew.api.ini_file import (
     write_profile_string, write_profile_section,
 )
 from tew.api._state import (
-    CRTState, FileHandleEntry, MutexHandle, EventHandle,
+    CRTState, MutexHandle, EventHandle,
     PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
     THREAD_STACK_SIZE,
@@ -162,13 +162,14 @@ def _run_thread_slice(
             f"(EIP=0x{cpu.eip:x})")
 
 
-def _cooperative_sleep_ex(
-    cpu: "CPU", memory: "Memory", state: CRTState, arg_bytes: int, eax_val: int
+def _run_background_slice(
+    cpu: "CPU", memory: "Memory", state: CRTState
 ) -> bool:
-    """Try to schedule a thread (SleepEx variant). Returns True if handled.
+    """Find a runnable background thread, execute one slice, restore main state.
 
-    Guards against reentrance: if a background thread calls SleepEx during
-    its own slice, do not recurse.  Return False so the stub returns 0.
+    Returns True if a thread ran, False if all threads are suspended/blocked/complete.
+    Does NOT set EAX or call cleanup_stdcall — the caller owns its own stack frame.
+    Guards against reentrance: returns False if already inside a thread slice.
     """
     if state.is_running_thread:
         return False
@@ -181,8 +182,6 @@ def _cooperative_sleep_ex(
         if t.suspended or t.completed:
             continue
         if t.waiting_on_handles:
-            # Thread is blocked until one of its handles is signaled.
-            # Check if any are now signaled; if not, skip.
             unblocked = False
             for wh in t.waiting_on_handles:
                 obj = state.kernel_handle_map.get(wh)
@@ -192,9 +191,13 @@ def _cooperative_sleep_ex(
                 if isinstance(obj, MutexHandle) and not obj.locked:
                     unblocked = True
                     break
+            if not unblocked and t.wait_deadline_ms is not None:
+                if state.virtual_ticks_ms >= t.wait_deadline_ms:
+                    t.wait_timed_out = True
+                    t.wait_deadline_ms = None
+                    unblocked = True
             if not unblocked:
                 continue
-            # At least one handle is ready — clear the block so it can run.
             t.waiting_on_handles = None
         runnable = t
         tidx = idx
@@ -203,9 +206,6 @@ def _cooperative_sleep_ex(
         return False
 
     state.last_scheduled_idx = tidx
-    logger.debug("scheduler",
-        f"Main thread SleepEx #{state.sleep_count} - thread {runnable.thread_id}")
-
     main_state = cpu.save_state()
     state.is_running_thread = True
     state.current_thread_idx = tidx
@@ -232,12 +232,27 @@ def _cooperative_sleep_ex(
         cpu.eflags = 0x202
 
     _run_thread_slice(cpu, memory, runnable, state)
-
+    state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
     cpu.restore_state(main_state)
     cpu.halted = False
     state.is_running_thread = False
     state.current_thread_idx = -1
+    return True
 
+
+def _cooperative_sleep_ex(
+    cpu: "CPU", memory: "Memory", state: CRTState, arg_bytes: int, eax_val: int
+) -> bool:
+    """Try to schedule a thread (SleepEx variant). Returns True if handled.
+
+    Guards against reentrance: if a background thread calls SleepEx during
+    its own slice, do not recurse.  Return False so the stub returns 0.
+    """
+    if not _run_background_slice(cpu, memory, state):
+        return False
+    last_thread = state.pending_threads[state.last_scheduled_idx]
+    logger.debug("scheduler",
+        f"Main thread SleepEx #{state.sleep_count} - thread {last_thread.thread_id}")
     cpu.regs[EAX] = eax_val
     cleanup_stdcall(cpu, memory, arg_bytes)
     return True
@@ -591,16 +606,55 @@ def register_kernel32_io_handlers(
                     cleanup_stdcall(cpu, memory, 8)
                     return
                 # Not signaled.
-                if state.is_running_thread and timeout_ms == _WAIT_INFINITE:
-                    # Block this thread: rewind EIP so the wait is retried on
-                    # the next schedule, record which handle it's waiting on,
-                    # and yield the slice without killing the thread.
-                    cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
+                if state.is_running_thread:
                     tidx = state.current_thread_idx
                     if 0 <= tidx < len(state.pending_threads):
-                        state.pending_threads[tidx].waiting_on_handles = frozenset([h])
+                        t = state.pending_threads[tidx]
+                        # Woken by timeout expiry (scheduler set wait_timed_out).
+                        if t.wait_timed_out:
+                            t.wait_timed_out = False
+                            cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
+                            cleanup_stdcall(cpu, memory, 8)
+                            return
+                    # Block this thread: rewind EIP so the wait is retried on the
+                    # next schedule, record the handle, yield the slice.
+                    cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
+                    if 0 <= tidx < len(state.pending_threads):
+                        t = state.pending_threads[tidx]
+                        t.waiting_on_handles = frozenset([h])
+                        if timeout_ms != _WAIT_INFINITE:
+                            t.wait_deadline_ms = state.virtual_ticks_ms + timeout_ms
+                            t.wait_timed_out = False
                     state.thread_yield_requested = True
                     cpu.halted = True
+                    return
+                # Main thread — drive background threads until the handle is
+                # signaled (process-zero pattern).  Without this, the main
+                # thread would halt and nothing could ever call SetEvent.
+                if timeout_ms == _WAIT_INFINITE:
+                    while True:
+                        if not _run_background_slice(cpu, memory, state):
+                            logger.warn("scheduler",
+                                f"WaitForSingleObject(0x{h:x}) INFINITE: "
+                                f"deadlock — no runnable threads, returning TIMEOUT")
+                            cpu.regs[EAX] = 0x102
+                            cleanup_stdcall(cpu, memory, 8)
+                            return
+                        obj = state.kernel_handle_map.get(h)
+                        if obj is None:
+                            break
+                        if isinstance(obj, EventHandle) and obj.signaled:
+                            break
+                        if isinstance(obj, MutexHandle) and not obj.locked:
+                            break
+                    # Handle is now ready — acquire and return WAIT_OBJECT_0.
+                    obj = state.kernel_handle_map.get(h)
+                    if isinstance(obj, EventHandle) and not obj.manual_reset:
+                        obj.signaled = False
+                    elif isinstance(obj, MutexHandle):
+                        obj.locked = True
+                    cpu.regs[EAX] = 0
+                    cleanup_stdcall(cpu, memory, 8)
                     return
                 cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
                 cleanup_stdcall(cpu, memory, 8)
@@ -1160,7 +1214,14 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _lclose(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        hfile = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        entry = state.file_handle_map.pop(hfile, None)
+        if entry is not None:
+            if entry.fd is not None:
+                os.close(entry.fd)
+            cpu.regs[EAX] = hfile
+        else:
+            cpu.regs[EAX] = 0xFFFFFFFF  # HFILE_ERROR
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "DeviceIoControl", _device_io_control)

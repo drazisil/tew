@@ -153,7 +153,7 @@ def _cooperative_sleep(
         if t.suspended or t.completed:
             continue
         if t.waiting_on_handles:
-            # Thread is blocked until one of its handles is signaled.
+            # Thread is blocked until one of its handles is signaled or deadline expires.
             unblocked = False
             for wh in t.waiting_on_handles:
                 obj = state.kernel_handle_map.get(wh)
@@ -163,6 +163,11 @@ def _cooperative_sleep(
                 if isinstance(obj, MutexHandle) and not obj.locked:
                     unblocked = True
                     break
+            if not unblocked and t.wait_deadline_ms is not None:
+                if state.virtual_ticks_ms >= t.wait_deadline_ms:
+                    t.wait_timed_out = True
+                    t.wait_deadline_ms = None
+                    unblocked = True
             if not unblocked:
                 continue
             t.waiting_on_handles = None
@@ -203,6 +208,10 @@ def _cooperative_sleep(
         cpu.eflags = 0x202
 
     _run_thread_slice(cpu, memory, runnable, state)
+
+    # Advance the virtual clock by 1ms per background slice so finite-timeout
+    # waits can expire even when the main thread spins on Sleep(0).
+    state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
 
     cpu.restore_state(main_state)
     cpu.halted = False
