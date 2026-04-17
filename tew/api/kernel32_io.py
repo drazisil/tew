@@ -98,7 +98,7 @@ def _duplicate_handle_entry(state: CRTState, h_source: int, close_source: bool) 
 def _run_thread_slice(
     cpu: "CPU", memory: "Memory", thread: PendingThreadInfo, state: CRTState
 ) -> None:
-    step_limit = 1_000_000
+    step_limit = 10_000
     cpu.halted = False
     steps = 0
     thread_error = None
@@ -632,6 +632,7 @@ def register_kernel32_io_handlers(
                 # signaled (process-zero pattern).  Without this, the main
                 # thread would halt and nothing could ever call SetEvent.
                 if timeout_ms == _WAIT_INFINITE:
+                    _wfso_slice_count = 0
                     while True:
                         if not _run_background_slice(cpu, memory, state):
                             logger.warn("scheduler",
@@ -640,6 +641,13 @@ def register_kernel32_io_handlers(
                             cpu.regs[EAX] = 0x102
                             cleanup_stdcall(cpu, memory, 8)
                             return
+                        _wfso_slice_count += 1
+                        if _wfso_slice_count % 10 == 0:
+                            # Advance virtual clock so deadline-based waits and
+                            # timer threads can make progress.  Mirrors the
+                            # main-loop heartbeat rate (1ms per 100K steps at
+                            # 10K steps/slice × 10 slices = 100K steps/ms).
+                            state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
                         obj = state.kernel_handle_map.get(h)
                         if obj is None:
                             break

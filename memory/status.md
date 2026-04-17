@@ -22,14 +22,15 @@ Game progresses through full startup sequence and opens a game window:
 Threads 1001–1005 alive but blocked on WaitForSingleObject. Not on critical path.
 
 ## Current blocker
-`GetKeyState` (user32.dll) on tid=1007.
-Simple fix: return 0 (key not pressed, not toggled). Implement with `cleanup_stdcall(cpu, memory, 4)`.
+Thread 1004 crashes after 89 steps with `_CRT_ASSERT dbgheap.c:1017 —
+_BLOCK_TYPE_IS_VALID(pHead->nBlockUse)`. Classic MSVC debug heap check:
+double-free or corrupted block header. EIP=0x009f9302 at crash.
+Investigate: which free() call triggers it and what the heap state is at that point.
 
-## Next issue after that
-Window created at full display resolution (e.g. 5160×2340) because `GetSystemMetrics`
-returns the real SDL desktop size. Game wants 800×600 (from OutputDebugString).
-Fix: cap `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` at a fixed resolution (e.g. 1024×768)
-so the game creates a reasonably-sized window.
+## Queued issues
+- `GetKeyState` (user32.dll) on tid=1007 — return 0, trivial
+- Window created at full display resolution (e.g. 5160×2340); cap
+  `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` at 1024×768
 
 ## Fixed this session (2026-04-17)
 
