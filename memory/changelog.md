@@ -4,6 +4,36 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-17 — GDI object table + step-loop performance
+
+**Progress:**
+Game now opens a real SDL window ('Motor City Online') and runs further into startup.
+Halts at `GetKeyState(VK_CAPITAL)` on tid=1007 — next blocker.
+
+**GDI object table (user32_handlers.py):**
+- `_GdiObj` dataclass: kind/color/style/is_stock
+- Stock objects pre-populated at registration (WHITE_BRUSH=0 through DC_PEN=19),
+  handles 0x2001+fnObject — stable and traceable
+- `GetStockObject`: O(1) lookup into `_stock_handles` dict, returns real handle
+- `SelectObject`: real per-DC selection tracking (`_dc_selected`), returns previous handle
+- `CreateSolidBrush`: allocates dynamic `_GdiObj` entry from counter 0x3001+
+- `DeleteObject`: removes dynamic objects; stock objects survive
+- DC state initialized in `_alloc_hdc`, cleaned up in `ReleaseDC`/`DeleteDC`
+
+**Performance:**
+- `is_valid_eip`: O(N) linear scan → O(1) dict keyed on 4KB page number (~29K entries,
+  built once at startup); major win at 123M+ calls per run
+- `cpu.step()`: merged `_skip_prefix` — fetch opcode first, handle prefix inline;
+  eliminates one wasted memory read per non-prefix instruction (~99% of steps);
+  `_clear_prefixes` only called when a prefix was actually set
+- Main loop: modulo → countdown counters; removed dead `prev_eip` assignment
+
+**Next blockers (status.md updated):**
+1. `GetKeyState` on tid=1007 — return 0 (key not pressed), 2 lines
+2. `GetSystemMetrics` returns real display resolution → window too large (cap at 1024×768)
+
+---
+
 ## 2026-04-17 — Timer unblock + handler correctness audit
 
 **Progress:**
