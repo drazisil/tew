@@ -39,6 +39,19 @@ from tew.logger import logger
 _DIALOG_SENTINEL_ADDR: int = 0   # set by _get_dialog_sentinel()
 
 
+class _GdiObj:
+    """GDI object record in the emulator's handle table."""
+    __slots__ = ("kind", "color", "style", "is_stock")
+
+    def __init__(
+        self, kind: str, color: int = 0, style: int = 0, *, is_stock: bool = False
+    ) -> None:
+        self.kind     = kind      # "brush" | "pen" | "font" | "palette"
+        self.color    = color     # COLORREF (0x00BBGGRR)
+        self.style    = style     # BS_NULL=1, PS_NULL=5; 0 = solid
+        self.is_stock = is_stock
+
+
 def _get_dialog_sentinel(state: "CRTState", memory: "Memory") -> int:
     global _DIALOG_SENTINEL_ADDR
     if _DIALOG_SENTINEL_ADDR == 0:
@@ -1033,18 +1046,57 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "ShowWindow", _ShowWindow)
 
+    # ── GDI object table ─────────────────────────────────────────────────────
+    # Maps HGDIOBJ → _GdiObj.  Stock objects are pre-populated here with
+    # stable handles (0x2001 + fnObject index) so GetStockObject returns a
+    # traceable handle backed by a real record.  Dynamic objects (brushes,
+    # fonts, etc.) use handles from _next_hgdi and are removed by DeleteObject.
+    _gdi_objects:   dict[int, _GdiObj] = {}
+    _next_hgdi:     list[int]          = [0x3001]
+    _stock_handles: dict[int, int]     = {}   # fnObject → HGDIOBJ
+
+    for _fn, _kd, _cl, _st in [
+        (0,  "brush",   0x00FFFFFF, 0),   # WHITE_BRUSH
+        (1,  "brush",   0x00C0C0C0, 0),   # LTGRAY_BRUSH
+        (2,  "brush",   0x00808080, 0),   # GRAY_BRUSH
+        (3,  "brush",   0x00404040, 0),   # DKGRAY_BRUSH
+        (4,  "brush",   0x00000000, 0),   # BLACK_BRUSH
+        (5,  "brush",   0x00000000, 1),   # NULL_BRUSH   (BS_NULL)
+        (6,  "pen",     0x00FFFFFF, 0),   # WHITE_PEN
+        (7,  "pen",     0x00000000, 0),   # BLACK_PEN
+        (8,  "pen",     0x00000000, 5),   # NULL_PEN     (PS_NULL)
+        (10, "font",    0,           0),  # OEM_FIXED_FONT
+        (11, "font",    0,           0),  # ANSI_FIXED_FONT
+        (12, "font",    0,           0),  # ANSI_VAR_FONT
+        (13, "font",    0,           0),  # SYSTEM_FONT
+        (14, "font",    0,           0),  # DEVICE_DEFAULT_FONT
+        (15, "palette", 0,           0),  # DEFAULT_PALETTE
+        (16, "font",    0,           0),  # SYSTEM_FIXED_FONT
+        (17, "font",    0,           0),  # DEFAULT_GUI_FONT
+        (18, "brush",   0x00000000, 0),  # DC_BRUSH
+        (19, "pen",     0x00000000, 0),  # DC_PEN
+    ]:
+        _h = 0x2001 + _fn
+        _gdi_objects[_h] = _GdiObj(_kd, _cl, _st, is_stock=True)
+        _stock_handles[_fn] = _h
+
+    # Per-DC selected GDI objects: hdc → {kind: HGDIOBJ}.
+    # Win32 defaults: white brush, black pen, system font.
+    _dc_selected: dict[int, dict[str, int]] = {}
+
     # ── Device context (DC) handle pool ──────────────────────────────────────
-    # Win32 HDC is an opaque handle.  The only thing the game does with these
-    # DCs is pass them to GetDeviceCaps (which queries SDL for real display
-    # info) and then ReleaseDC.  No GDI drawing through these handles occurs.
-    # We allocate stable handle numbers and track them for ReleaseDC.
-    _next_hdc:   list[int]       = [0xDC01]   # mutable counter cell
-    _live_hdcs:  dict[int, int]  = {}          # hdc → hwnd
+    _next_hdc:   list[int]       = [0xDC01]
+    _live_hdcs:  dict[int, int]  = {}   # hdc → hwnd
 
     def _alloc_hdc(hwnd: int) -> int:
         hdc = _next_hdc[0]
         _next_hdc[0] += 1
         _live_hdcs[hdc] = hwnd
+        _dc_selected[hdc] = {
+            "brush":   _stock_handles[0],   # WHITE_BRUSH
+            "pen":     _stock_handles[7],   # BLACK_PEN
+            "font":    _stock_handles[13],  # SYSTEM_FONT
+        }
         return hdc
 
     # GetDC(HWND hWnd) -> HDC  — client-area device context
@@ -1074,6 +1126,7 @@ def register_user32_gdi32_handlers(
         hwnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         hdc  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         _live_hdcs.pop(hdc, None)
+        _dc_selected.pop(hdc, None)
         logger.debug("handlers", f"[Win32] ReleaseDC(hwnd=0x{hwnd:x}, hdc=0x{hdc:x})")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
@@ -1353,6 +1406,7 @@ def register_user32_gdi32_handlers(
     def _DeleteDC(cpu: "CPU") -> None:
         hdc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         _live_hdcs.pop(hdc, None)
+        _dc_selected.pop(hdc, None)
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
@@ -1364,12 +1418,33 @@ def register_user32_gdi32_handlers(
     # CreateCompatibleBitmap(HDC hDC, int cx, int cy) -> HBITMAP
     stubs.register_handler("gdi32.dll", "CreateCompatibleBitmap", _halt("CreateCompatibleBitmap"))
 
-    # SelectObject(HDC hDC, HGDIOBJ h) -> HGDIOBJ
-    stubs.register_handler("gdi32.dll", "SelectObject", _halt("SelectObject"))
+    # SelectObject(HDC hDC, HGDIOBJ h) -> HGDIOBJ (previously selected obj of same type)
+    def _SelectObject(cpu: "CPU") -> None:
+        hdc  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        hgdi = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj = _gdi_objects.get(hgdi)
+        if obj is None:
+            logger.warn("handlers", f"[GDI] SelectObject: unknown HGDIOBJ 0x{hgdi:x}")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        sel  = _dc_selected.get(hdc, {})
+        prev = sel.get(obj.kind, 0)
+        if hdc in _dc_selected:
+            _dc_selected[hdc][obj.kind] = hgdi
+        logger.debug("handlers",
+            f"[GDI] SelectObject(hdc=0x{hdc:x}, 0x{hgdi:x} {obj.kind}) -> prev=0x{prev:x}")
+        cpu.regs[EAX] = prev
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("gdi32.dll", "SelectObject", _SelectObject)
 
     # DeleteObject(HGDIOBJ ho) -> BOOL
-    # GDI objects are not tracked; deletion is a no-op.
     def _DeleteObject(cpu: "CPU") -> None:
+        ho  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        obj = _gdi_objects.get(ho)
+        if obj is not None and not obj.is_stock:
+            del _gdi_objects[ho]
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
@@ -1433,10 +1508,31 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("gdi32.dll", "CreateDIBSection", _halt("CreateDIBSection"))
 
     # GetStockObject(int fnObject) -> HGDIOBJ
-    stubs.register_handler("gdi32.dll", "GetStockObject", _halt("GetStockObject"))
+    def _GetStockObject(cpu: "CPU") -> None:
+        fn_object = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        handle = _stock_handles.get(fn_object, 0)
+        if handle == 0:
+            logger.warn("handlers", f"[GDI] GetStockObject({fn_object}) — unknown stock object")
+        else:
+            obj = _gdi_objects[handle]
+            logger.debug("handlers",
+                f"[GDI] GetStockObject({fn_object}) -> 0x{handle:x} ({obj.kind})")
+        cpu.regs[EAX] = handle
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("gdi32.dll", "GetStockObject", _GetStockObject)
 
     # CreateSolidBrush(COLORREF color) -> HBRUSH
-    stubs.register_handler("gdi32.dll", "CreateSolidBrush", _halt("CreateSolidBrush"))
+    def _CreateSolidBrush(cpu: "CPU") -> None:
+        color  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        hbrush = _next_hgdi[0]
+        _next_hgdi[0] += 1
+        _gdi_objects[hbrush] = _GdiObj("brush", color, 0)
+        logger.debug("handlers", f"[GDI] CreateSolidBrush(0x{color:06x}) -> 0x{hbrush:x}")
+        cpu.regs[EAX] = hbrush
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("gdi32.dll", "CreateSolidBrush", _CreateSolidBrush)
 
     # CreateFontA(...) -> HFONT  (14 stdcall args)
     stubs.register_handler("gdi32.dll", "CreateFontA", _halt("CreateFontA"))

@@ -176,10 +176,19 @@ valid_ranges.append((0x001FE000, 0x001FE004, "thread-sentinel"))
 valid_ranges.append((0x08000000, 0x09000000, "thread-stacks"))
 
 
+# O(1) EIP validity check: map 4KB page numbers to region names.
+# Built once from valid_ranges; dynamically-loaded DLLs fall through to
+# is_in_dll_range which handles them via the import resolver.
+_eip_page_to_name: dict[int, str] = {}
+for _vr_start, _vr_end, _vr_name in valid_ranges:
+    for _page in range(_vr_start >> 12, (_vr_end + 0xFFF) >> 12):
+        _eip_page_to_name[_page] = _vr_name
+
+
 def is_valid_eip(eip: int) -> str | None:
-    for start, end, name in valid_ranges:
-        if start <= eip < end:
-            return name
+    name = _eip_page_to_name.get(eip >> 12)
+    if name:
+        return name
     if exe.import_resolver.is_in_dll_range(eip):
         return "dll:dynamic"
     return None
@@ -200,7 +209,6 @@ last_valid_step = 0
 last_valid_eip = 0
 last_valid_region = ""
 detected_runaway = False
-prev_eip = 0
 
 # Resolved once on first heartbeat call.
 _pending_timers = None
@@ -240,17 +248,23 @@ def _run_timer_heartbeat() -> None:
     _run_background_slice_fn(cpu, mem, crt_state)
 
 
+_heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
+_sample_countdown = 1_000_000
+
 while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     eip_before = cpu.eip
 
     cpu.step()
     step_count += 1
-    prev_eip = eip_before
 
-    if step_count % _TIMER_HEARTBEAT_INTERVAL == 0:
+    _heartbeat_countdown -= 1
+    if _heartbeat_countdown == 0:
+        _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
         _run_timer_heartbeat()
 
-    if step_count % 1_000_000 == 0:
+    _sample_countdown -= 1
+    if _sample_countdown == 0:
+        _sample_countdown = 1_000_000
         logger.debug(
             "watch",
             f"[EIP sample @ {step_count}] EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"

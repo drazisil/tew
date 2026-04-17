@@ -490,18 +490,40 @@ class CPU:
 
     def step(self) -> None:
         try:
-            self._skip_prefix()
-            instr_addr = self.eip
             opcode = self.fetch8()
-            if self._step_handler:
-                self._step_handler(instr_addr, opcode, self)
-            handler = self._opcode_table.get(opcode)
-            if not handler:
-                raise RuntimeError(
-                    f"Unknown opcode: 0x{opcode:02x} at EIP=0x{(self.eip - 1) & 0xFFFFFFFF:08x}"
-                )
-            handler(self)
-            self._clear_prefixes()
+            if opcode in self._PREFIX_BYTES:
+                # Prefix loop: handle all leading prefixes, then fetch real opcode.
+                # Avoids the separate peek-then-fetch of the old _skip_prefix path.
+                while opcode in self._PREFIX_BYTES:
+                    if opcode == 0x64:
+                        self._segment_override = "FS"
+                    elif opcode == 0x65:
+                        self._segment_override = "GS"
+                    elif opcode == 0xF3:
+                        self._rep_prefix = "REP"
+                    elif opcode == 0xF2:
+                        self._rep_prefix = "REPNE"
+                    elif opcode == 0x66:
+                        self._operand_size_override = True
+                    opcode = self.fetch8()
+                if self._step_handler:
+                    self._step_handler((self.eip - 1) & 0xFFFFFFFF, opcode, self)
+                handler = self._opcode_table.get(opcode)
+                if not handler:
+                    raise RuntimeError(
+                        f"Unknown opcode: 0x{opcode:02x} at EIP=0x{(self.eip - 1) & 0xFFFFFFFF:08x}"
+                    )
+                handler(self)
+                self._clear_prefixes()
+            else:
+                if self._step_handler:
+                    self._step_handler((self.eip - 1) & 0xFFFFFFFF, opcode, self)
+                handler = self._opcode_table.get(opcode)
+                if not handler:
+                    raise RuntimeError(
+                        f"Unknown opcode: 0x{opcode:02x} at EIP=0x{(self.eip - 1) & 0xFFFFFFFF:08x}"
+                    )
+                handler(self)
             self._step_count += 1
         except Exception as error:
             self._clear_prefixes()

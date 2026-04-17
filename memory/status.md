@@ -9,21 +9,27 @@ Path: ~/Documents/i386.pdf (421 pages)
 
 ## Current state (2026-04-17)
 
-Game progresses through full startup sequence before halting:
+Game progresses through full startup sequence and opens a game window:
 - Login dialog shown, admin/admin credentials filled from registry
 - HTTP GET localhost:443 → 200 OK (auth succeeds)
 - authlogin.dll loaded and IAT patched
 - options.ini read (SaveData dir missing, all values default — harmless)
 - dx8z.dll (THRASH) loaded; Direct3DCreate8 called; Vulkan instance up, 2 devices
-- Timer thread (tid=1006) created
-- Halts at `GetStockObject(BLACK_BRUSH)` — gdi32, requires GDI object table
+- Timer threads (tid=1006, tid=1007) created
+- SDL window 'Motor City Online' created (currently black)
+- Halts: tid=1007 calls `GetKeyState(VK_CAPITAL=0x14)` → `_halt` → thread dies → main spins in SleepEx
 
 Threads 1001–1005 alive but blocked on WaitForSingleObject. Not on critical path.
 
 ## Current blocker
-`GetStockObject` (gdi32.dll) — kept as `_halt` intentionally.
-Implementing it requires a GDI object table so handles are real and traceable.
-Returning a fake handle lets the game walk forward on lies — violates project rules.
+`GetKeyState` (user32.dll) on tid=1007.
+Simple fix: return 0 (key not pressed, not toggled). Implement with `cleanup_stdcall(cpu, memory, 4)`.
+
+## Next issue after that
+Window created at full display resolution (e.g. 5160×2340) because `GetSystemMetrics`
+returns the real SDL desktop size. Game wants 800×600 (from OutputDebugString).
+Fix: cap `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` at a fixed resolution (e.g. 1024×768)
+so the game creates a reasonably-sized window.
 
 ## Fixed this session (2026-04-17)
 
