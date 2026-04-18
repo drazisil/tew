@@ -4,6 +4,53 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-17 — Heap fix, VirtualAlloc accuracy, user32 handlers, hook dispatch
+
+**Progress:**
+Game now enters the main message loop (GetMessageA/PeekMessageA). Blocked by
+sporadic SDL_QUIT of unknown origin — not user-triggered. All previously queued
+issues (GetKeyState, GetSystemMetrics cap, SetActiveWindow, SystemParametersInfoA)
+resolved.
+
+**`__free_dbg` patch (`patch_internals.py`):**
+- 0x009F6E20 patched to no-op: MSVC debug CRT internal free validates block headers
+  that our bump allocator never writes. `__freeptd` (called by `__endthread`) was
+  asserting on every thread exit. Consistent with existing `free()` IAT no-op.
+
+**VirtualAlloc accuracy (`kernel32_handlers.py`):**
+- `MEM_RESERVE` with non-zero `lp_addr` now honors the requested address instead of
+  ignoring it and using the bump allocator. Bump pointer advanced past the reserved
+  region to prevent future overlap.
+- `MEM_COMMIT` only: range check against all reserved regions instead of exact-base
+  lookup. Game's custom allocator commits sub-pages of a block reserved as a whole.
+
+**New user32 handlers (`user32_handlers.py`):**
+- `GetKeyState` → 0 (all keys up)
+- `GetSystemMetrics` → SM_CXSCREEN/SM_CYSCREEN capped at 1024×768
+- `SetActiveWindow` → NULL
+- `SystemParametersInfoA` → SPI_GETSCREENSAVEACTIVE (FALSE), SPI_GETWORKAREA
+  (0,0,1024,768), TRUE for others
+- `SetWindowsHookExA` → real registration in `_winhooks` dict
+- `UnhookWindowsHookEx` → removes from `_winhooks`
+- `CallNextHookEx` → 0 (no chain)
+
+**Hook dispatch (`user32_handlers.py`):**
+- `_dispatch_winhooks`: called from `PeekMessageA` and `GetMessageA` after writing
+  MSG struct. Fires WH_GETMESSAGE hooks with (HC_ACTION, PM_REMOVE, lp_msg) and
+  WH_KEYBOARD hooks with (HC_ACTION, vk, 0) for WM_KEYDOWN/WM_KEYUP messages.
+
+**Keyboard input pipeline (`window_manager.py`):**
+- WM_KEYDOWN/WM_KEYUP/WM_CHAR/WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP constants added
+- `_sdl_sym_to_vk`: maps SDL keysyms to Win32 VK codes
+- SDL_KEYDOWN/SDL_KEYUP now post WM_KEYDOWN/WM_KEYUP to message queue in addition to
+  existing dialog-specific handling
+
+**Progress heartbeat (`run_exe.py`):**
+- `[alive]` INFO log every 5M `cpu.step()` calls: step count, EIP, virtual time
+- Does NOT fire during `GetMessageA` host-sleep (see status.md queued issues)
+
+---
+
 ## 2026-04-17 — GDI object table + step-loop performance
 
 **Progress:**

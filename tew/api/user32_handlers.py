@@ -128,6 +128,19 @@ def register_user32_gdi32_handlers(
 
     wm: WindowManager = state.window_manager
 
+    # ── Win32 hook infrastructure ─────────────────────────────────────────────
+    # idHook constants
+    _WH_KEYBOARD   = 2
+    _WH_CBT        = 5
+    _WH_MOUSE      = 7
+    _WH_GETMESSAGE = 8
+    _HC_ACTION     = 0
+    _PM_REMOVE     = 1
+
+    # Active hooks: hhook handle → (idHook, lpfn)
+    _winhooks: dict[int, tuple[int, int]] = {}
+    _next_hhook = [0xA000]
+
     def _halt(name: str):
         """Return a handler that halts with an UNIMPLEMENTED log."""
         def _h(cpu: "CPU") -> None:
@@ -292,6 +305,65 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "SetForegroundWindow", _SetForegroundWindow)
 
+    # SetActiveWindow(HWND hWnd) -> HWND  (previously active window)
+    def _SetActiveWindow(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # NULL — no previously active window
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "SetActiveWindow", _SetActiveWindow)
+
+    # SetWindowsHookExA(int idHook, HOOKPROC lpfn, HINSTANCE hmod, DWORD dwThreadId) -> HHOOK
+    def _SetWindowsHookExA(cpu: "CPU") -> None:
+        id_hook = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_fn   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        handle  = _next_hhook[0]
+        _next_hhook[0] += 1
+        _winhooks[handle] = (id_hook, lp_fn)
+        logger.debug("handlers", f"SetWindowsHookExA(idHook={id_hook}, lpfn=0x{lp_fn:x}) -> 0x{handle:x}")
+        cpu.regs[EAX] = handle
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("user32.dll", "SetWindowsHookExA", _SetWindowsHookExA)
+
+    # UnhookWindowsHookEx(HHOOK hhk) -> BOOL
+    def _UnhookWindowsHookEx(cpu: "CPU") -> None:
+        hhk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        _winhooks.pop(hhk, None)
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "UnhookWindowsHookEx", _UnhookWindowsHookEx)
+
+    # CallNextHookEx(HHOOK hhk, int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT
+    # We maintain a flat hook list (no chain), so there is no next hook.
+    def _CallNextHookEx(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("user32.dll", "CallNextHookEx", _CallNextHookEx)
+
+    # SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni) -> BOOL
+    _SPI_GETSCREENSAVEACTIVE = 0x0010
+    _SPI_GETWORKAREA         = 0x0030
+
+    def _SystemParametersInfoA(cpu: "CPU") -> None:
+        ui_action = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        pv_param  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if ui_action == _SPI_GETSCREENSAVEACTIVE:
+            if pv_param:
+                memory.write32(pv_param & 0xFFFFFFFF, 0)  # FALSE — screensaver off
+        elif ui_action == _SPI_GETWORKAREA:
+            if pv_param:
+                # RECT {left, top, right, bottom}
+                memory.write32((pv_param +  0) & 0xFFFFFFFF, 0)
+                memory.write32((pv_param +  4) & 0xFFFFFFFF, 0)
+                memory.write32((pv_param +  8) & 0xFFFFFFFF, _SM_CXSCREEN_MAX)
+                memory.write32((pv_param + 12) & 0xFFFFFFFF, _SM_CYSCREEN_MAX)
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("user32.dll", "SystemParametersInfoA", _SystemParametersInfoA)
+
     # SetWindowPos(HWND, HWND insertAfter, int X, int Y, int cx, int cy, UINT flags) -> BOOL
     def _SetWindowPos(cpu: "CPU") -> None:
         hwnd  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -363,25 +435,31 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "GetClientRect", _GetClientRect)
 
     # GetSystemMetrics(int nIndex) -> int
+    # Cap SM_CXSCREEN/SM_CYSCREEN at 1024x768; the game sets its render target from
+    # these values and a full-resolution window (e.g. 5160x2340) wastes resources.
+    _SM_CXSCREEN_MAX = 1024
+    _SM_CYSCREEN_MAX = 768
+
     def _GetSystemMetrics(cpu: "CPU") -> None:
-        from sdl2 import SDL_GetDesktopDisplayMode, SDL_DisplayMode
-        import ctypes
         n_index = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        mode = SDL_DisplayMode()
-        if SDL_GetDesktopDisplayMode(0, ctypes.byref(mode)) == 0:
-            screen_w, screen_h = mode.w, mode.h
-        else:
-            screen_w, screen_h = 1024, 768
-        # SM_CXSCREEN=0, SM_CYSCREEN=1
-        if n_index == 0:
-            cpu.regs[EAX] = screen_w
-        elif n_index == 1:
-            cpu.regs[EAX] = screen_h
+        if n_index == 0:        # SM_CXSCREEN
+            cpu.regs[EAX] = _SM_CXSCREEN_MAX
+        elif n_index == 1:      # SM_CYSCREEN
+            cpu.regs[EAX] = _SM_CYSCREEN_MAX
         else:
             cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetSystemMetrics", _GetSystemMetrics)
+
+    # GetKeyState(int nVirtKey) -> SHORT
+    # Returns key state: high bit set = key down, low bit = toggle state.
+    # We have no real keyboard input path; report all keys up and untoggled.
+    def _GetKeyState(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "GetKeyState", _GetKeyState)
 
     # UpdateWindow(HWND hWnd) -> BOOL
     # Triggers WM_PAINT; we re-render via SDL on every DispatchMessageA call,
@@ -522,6 +600,23 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "ShowCursor", _ShowCursor)
 
+    def _dispatch_winhooks(cpu: "CPU", msg_id: int, wparam: int, lp_msg: int) -> None:
+        """Call any registered hooks appropriate for this message."""
+        if not _winhooks:
+            return
+        sentinel = _get_dialog_sentinel(state, memory)
+        for id_hook, lp_fn in list(_winhooks.values()):
+            if id_hook == _WH_GETMESSAGE:
+                _invoke_emulated_proc(
+                    cpu, memory, lp_fn,
+                    [_HC_ACTION, _PM_REMOVE, lp_msg], sentinel,
+                )
+            elif id_hook == _WH_KEYBOARD and msg_id in (0x0100, 0x0101):  # WM_KEYDOWN/WM_KEYUP
+                _invoke_emulated_proc(
+                    cpu, memory, lp_fn,
+                    [_HC_ACTION, wparam, 0], sentinel,
+                )
+
     # PeekMessageA(LPMSG lpMsg, HWND, UINT, UINT, UINT) -> BOOL
     # Pump SDL events and check our message queue; return FALSE if nothing there.
     def _PeekMessageA(cpu: "CPU") -> None:
@@ -537,6 +632,7 @@ def register_user32_gdi32_handlers(
             memory.write32(lp_msg + 16, 0)  # time
             memory.write32(lp_msg + 20, 0)  # pt.x
             memory.write32(lp_msg + 24, 0)  # pt.y
+            _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
             cpu.regs[EAX] = 1  # TRUE
         else:
             cpu.regs[EAX] = 0  # FALSE = no message
@@ -576,6 +672,7 @@ def register_user32_gdi32_handlers(
                     memory.write32(lp_msg + 16, 0)
                     memory.write32(lp_msg + 20, 0)
                     memory.write32(lp_msg + 24, 0)
+                    _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
                 cpu.regs[EAX] = 1   # TRUE — message available
                 cleanup_stdcall(cpu, memory, 16)
                 return

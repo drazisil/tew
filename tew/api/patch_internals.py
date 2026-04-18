@@ -178,3 +178,13 @@ def patch_crt_internals(
 
     stubs.patch_address(0x00A30140, "abortmessage", _abort_message)
 
+    # __free_dbg (0x009f6e20): internal MSVC debug CRT free, called by __freeptd and
+    # other CRT internals. Validates an MSVC debug block header (_BLOCK_TYPE_IS_VALID)
+    # before the pointer — our bump allocator never writes those headers, so any call
+    # would assert. No-op matches our existing free() IAT handler behavior.
+    # __cdecl (void*, int) — caller cleans args.
+    def _free_dbg_noop(cpu: "CPU") -> None:
+        pass
+
+    stubs.patch_address(0x009F6E20, "__free_dbg", _free_dbg_noop)
+

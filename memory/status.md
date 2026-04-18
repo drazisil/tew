@@ -9,55 +9,74 @@ Path: ~/Documents/i386.pdf (421 pages)
 
 ## Current state (2026-04-17)
 
-Game progresses through full startup sequence and opens a game window:
+Game progresses through full startup sequence, opens a game window, installs
+Windows hooks, and enters its main message loop:
 - Login dialog shown, admin/admin credentials filled from registry
 - HTTP GET localhost:443 → 200 OK (auth succeeds)
 - authlogin.dll loaded and IAT patched
 - options.ini read (SaveData dir missing, all values default — harmless)
 - dx8z.dll (THRASH) loaded; Direct3DCreate8 called; Vulkan instance up, 2 devices
 - Timer threads (tid=1006, tid=1007) created
-- SDL window 'Motor City Online' created (currently black)
-- Halts: tid=1007 calls `GetKeyState(VK_CAPITAL=0x14)` → `_halt` → thread dies → main spins in SleepEx
-
-Threads 1001–1005 alive but blocked on WaitForSingleObject. Not on critical path.
+- SDL window 'Motor City Online' created (1536x1248)
+- `SetWindowsHookExA` called from tid=1007 — hook registered, proc will be dispatched
+- Game enters message loop (GetMessageA/PeekMessageA)
 
 ## Current blocker
-Thread 1004 crashes after 89 steps with `_CRT_ASSERT dbgheap.c:1017 —
-_BLOCK_TYPE_IS_VALID(pHead->nBlockUse)`. Classic MSVC debug heap check:
-double-free or corrupted block header. EIP=0x009f9302 at crash.
-Investigate: which free() call triggers it and what the heap state is at that point.
+Sporadic `SDL_QUIT` received during the message loop — not triggered by user input.
+Source unknown: possibly Wayland/X11 compositor sending close event to idle window,
+or a bug in our SDL event handling. Investigate `pump_sdl_events` and SDL window
+lifetime when no SDL events are expected.
 
 ## Queued issues
-- `GetKeyState` (user32.dll) on tid=1007 — return 0, trivial
-- Window created at full display resolution (e.g. 5160×2340); cap
-  `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` at 1024×768
+- **`[alive]` heartbeat dead during GetMessageA**: `_progress_countdown` only ticks
+  on `cpu.step()`, but `GetMessageA` blocks in host `_time.sleep(0.001)` between
+  SDL polls. Add alive logging inside `GetMessageA`'s sleep loop, or use a
+  Python-level periodic log.
+- `GetSystemMetrics` cap at 1024×768 applied, but window is still 1536×1248 —
+  game has additional sizing logic. Not critical.
 
 ## Fixed this session (2026-04-17)
 
-### Timer / scheduler (earlier in session)
-- **`_run_background_slice` extracted** (`kernel32_io.py`): module-level function that
-  runs one background thread slice without touching the caller's stack frame or calling
-  `cleanup_stdcall`. `_cooperative_sleep_ex` now delegates to it.
+### Memory / heap (earlier)
+- **`__free_dbg` patched** (`patch_internals.py`, 0x009F6E20): internal MSVC debug
+  CRT free validates debug block headers our bump allocator never writes → assertion
+  `_BLOCK_TYPE_IS_VALID` in `__freeptd` → `_CrtDbgReport` halt. Patch to no-op,
+  consistent with existing `free()` IAT handler.
 
-- **`WaitForSingleObject(INFINITE)` on main thread** (`kernel32_io.py`, `_wait_for_single`):
-  previously did `cpu.halted = True` → killed emulation entirely. Now drives background
-  threads in a loop (process-zero pattern) until the handle is signaled. Logs deadlock
-  warning and returns WAIT_TIMEOUT if all threads are blocked.
+### VirtualAlloc accuracy
+- **Honored `lp_addr` for MEM_RESERVE** (`kernel32_handlers.py`): previously always
+  used bump allocator, ignoring requested address. Now uses `lp_addr` when non-zero
+  and advances bump pointer past the reserved region to prevent future overlap.
+- **MEM_COMMIT range check** (`kernel32_handlers.py`): was exact-base lookup only.
+  Now checks if `lp_addr` falls within any reserved region (game's allocator commits
+  sub-pages of a previously reserved block).
 
-- **Timer heartbeat** (`run_exe.py`, `_run_timer_heartbeat`): `_TIMER_waitticks` spins
-  without Sleep/SleepEx so multimedia timers never fired from the normal SleepEx path.
-  Heartbeat fires every 100K main-loop steps: advances `virtual_ticks_ms` by 1ms, invokes
-  any due timer callbacks via `_invoke_emulated_proc`, then runs one background slice.
-  This unblocks the `_ticks` increment inside the timer thread (FUN_00a30ea0, tid=1006).
+### New user32 handlers
+- **`GetKeyState`**: return 0 (all keys up/untoggled) — was halting tid=1007 at 223 steps
+- **`GetSystemMetrics`**: cap SM_CXSCREEN/SM_CYSCREEN at 1024×768 (was returning real
+  display resolution 5160×2340)
+- **`SetActiveWindow`**: return NULL (no previously active window)
+- **`SystemParametersInfoA`**: handle SPI_GETSCREENSAVEACTIVE (write FALSE) and
+  SPI_GETWORKAREA (write RECT 0,0,1024,768); return TRUE for others
+- **`SetWindowsHookExA`**: real registration — stores (idHook, lpfn) in `_winhooks` dict
+- **`UnhookWindowsHookEx`**: removes from `_winhooks`
+- **`CallNextHookEx`**: returns 0 (no chain)
 
-### Handler correctness audit (later in session)
-- **`_lclose`** (`kernel32_io.py`): was returning 0 unconditionally. Now reads handle,
-  closes host fd if open, returns handle on success or HFILE_ERROR (0xFFFFFFFF) on unknown.
-- **Stack read masks** (`advapi32_handlers.py`): five `memory.read32(ESP + N)` calls
-  were missing `& 0xFFFFFFFF`. Fixed for correctness if ESP sits near 0xFFFFFFFF.
-- **`SetForegroundWindow` comment** (`user32_handlers.py`): "pretend it worked" replaced
-  with explanation of why TRUE is correct (SDL2 owns the window; Win32 focus N/A).
-- **Unused imports and dead variable** cleaned up (ruff).
+### Hook dispatch
+- `_dispatch_winhooks` called from `PeekMessageA` and `GetMessageA` after writing MSG
+  struct: fires WH_GETMESSAGE hooks with (HC_ACTION, PM_REMOVE, lp_msg) and
+  WH_KEYBOARD hooks with (HC_ACTION, vk, 0) for WM_KEYDOWN/WM_KEYUP
+
+### Keyboard input pipeline
+- **WM_KEYDOWN/WM_KEYUP** added to `window_manager.py` constants
+- **`_sdl_sym_to_vk`** added: maps SDL keysyms to Win32 VK codes (letters, digits,
+  arrows, F-keys, modifiers)
+- **SDL_KEYDOWN/SDL_KEYUP** → WM_KEYDOWN/WM_KEYUP now posted to message queue for
+  every key event (in addition to existing dialog-specific direct handling)
+
+### Progress heartbeat
+- **`[alive]` log** added to main step loop (`run_exe.py`): logs every 5M steps at
+  INFO level. NOTE: does not fire during `GetMessageA` host-sleep — see queued issues.
 
 ## Run command
 ```bash

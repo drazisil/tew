@@ -42,6 +42,50 @@ from tew.logger import logger
 from tew.api.pe_resources import DialogTemplate
 
 
+def _sdl_sym_to_vk(sym: int) -> int:
+    """Map SDL2 keysym to Win32 virtual key code."""
+    if 97 <= sym <= 122:    # SDL a-z → VK A-Z
+        return sym - 32
+    if 48 <= sym <= 57:     # SDL 0-9 = VK_0-VK_9
+        return sym
+    _MAP = {
+        8:          0x08,   # BACKSPACE → VK_BACK
+        9:          0x09,   # TAB → VK_TAB
+        13:         0x0D,   # RETURN → VK_RETURN
+        27:         0x1B,   # ESCAPE → VK_ESCAPE
+        32:         0x20,   # SPACE → VK_SPACE
+        127:        0x2E,   # DELETE → VK_DELETE
+        0x40000047: 0x24,   # SDLK_HOME → VK_HOME
+        0x4000004B: 0x21,   # SDLK_PAGEUP → VK_PRIOR
+        0x4000004E: 0x22,   # SDLK_PAGEDOWN → VK_NEXT
+        0x4000004F: 0x27,   # SDLK_RIGHT → VK_RIGHT
+        0x40000050: 0x25,   # SDLK_LEFT → VK_LEFT
+        0x40000051: 0x28,   # SDLK_DOWN → VK_DOWN
+        0x40000052: 0x26,   # SDLK_UP → VK_UP
+        0x40000077: 0x23,   # SDLK_END → VK_END
+        0x40000049: 0x2D,   # SDLK_INSERT → VK_INSERT
+        0x4000003A: 0x70,   # SDLK_F1 → VK_F1
+        0x4000003B: 0x71,   # SDLK_F2 → VK_F2
+        0x4000003C: 0x72,   # SDLK_F3 → VK_F3
+        0x4000003D: 0x73,   # SDLK_F4 → VK_F4
+        0x4000003E: 0x74,   # SDLK_F5 → VK_F5
+        0x4000003F: 0x75,   # SDLK_F6 → VK_F6
+        0x40000040: 0x76,   # SDLK_F7 → VK_F7
+        0x40000041: 0x77,   # SDLK_F8 → VK_F8
+        0x40000042: 0x78,   # SDLK_F9 → VK_F9
+        0x40000043: 0x79,   # SDLK_F10 → VK_F10
+        0x40000044: 0x7A,   # SDLK_F11 → VK_F11
+        0x40000045: 0x7B,   # SDLK_F12 → VK_F12
+        0x400000E1: 0xA0,   # SDLK_LSHIFT → VK_LSHIFT
+        0x400000E5: 0xA1,   # SDLK_RSHIFT → VK_RSHIFT
+        0x400000E0: 0xA2,   # SDLK_LCTRL → VK_LCONTROL
+        0x400000E4: 0xA3,   # SDLK_RCTRL → VK_RCONTROL
+        0x400000E2: 0xA4,   # SDLK_LALT → VK_LMENU
+        0x400000E6: 0xA5,   # SDLK_RALT → VK_RMENU
+    }
+    return _MAP.get(sym, sym & 0xFF)
+
+
 # ── Win32 message constants ────────────────────────────────────────────────────
 
 WM_CREATE       = 0x0001
@@ -49,6 +93,12 @@ WM_DESTROY      = 0x0002
 WM_SETTEXT      = 0x000C
 WM_GETTEXT      = 0x000D
 WM_CLOSE        = 0x0010
+WM_KEYDOWN      = 0x0100
+WM_KEYUP        = 0x0101
+WM_CHAR         = 0x0102
+WM_MOUSEMOVE    = 0x0200
+WM_LBUTTONDOWN  = 0x0201
+WM_LBUTTONUP    = 0x0202
 WM_COMMAND      = 0x0111
 WM_INITDIALOG   = 0x0110
 BM_GETCHECK     = 0x00F0
@@ -576,14 +626,15 @@ class WindowManager:
             if hwnd == 0:
                 return
             sym = key.keysym.sym
+            vk  = _sdl_sym_to_vk(sym)
 
+            # Dialog-specific direct handling (text editing, Enter/Esc/Tab)
             if sym == SDLK_BACKSPACE:
                 entry = self._windows.get(hwnd)
                 if entry is not None and len(entry.title) > 0:
                     entry.title = entry.title[:-1]
 
             elif sym in (SDLK_RETURN, SDLK_KP_ENTER):
-                # Find parent dialog and simulate pressing the default button (id=1)
                 entry = self._windows.get(hwnd)
                 if entry is not None:
                     parent = self._windows.get(entry.parent_hwnd)
@@ -608,6 +659,17 @@ class WindowManager:
                 entry = self._windows.get(hwnd)
                 if entry is not None:
                     entry.title = ""
+
+            # Post WM_KEYDOWN for every key so hooks and wndprocs receive it
+            self._message_queue.append((hwnd, WM_KEYDOWN, vk, 0))
+
+        elif etype == SDL_KEYUP:
+            key = event.key
+            hwnd = self._focused_hwnd
+            if hwnd == 0:
+                return
+            vk = _sdl_sym_to_vk(key.keysym.sym)
+            self._message_queue.append((hwnd, WM_KEYUP, vk, 0))
 
         elif etype == SDL_TEXTINPUT:
             hwnd = self._focused_hwnd

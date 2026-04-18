@@ -555,20 +555,37 @@ def register_kernel32_handlers(
             cpu.halted = True
             return
         page_size = ((dw_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)) & 0xFFFFFFFF
-        if (fl_type & _MEM_COMMIT) and not (fl_type & _MEM_RESERVE) and lp_addr != 0:
-            if lp_addr in state.virtual_reserved:
-                state.virtual_committed[lp_addr] = page_size
-                cpu.regs[EAX] = lp_addr
-                cleanup_stdcall(cpu, memory, 16)
+        if (fl_type & _MEM_COMMIT) and not (fl_type & _MEM_RESERVE):
+            # MEM_COMMIT only: lp_addr must fall within an existing reserved region
+            if lp_addr == 0:
+                logger.error("handlers", "[VirtualAlloc] MEM_COMMIT with NULL address — halting")
+                cpu.halted = True
                 return
-            logger.error("handlers",
-                f"[VirtualAlloc] MEM_COMMIT on unreserved 0x{lp_addr:x} — halting")
-            cpu.halted = True
+            in_reserved = any(
+                base <= lp_addr < base + sz
+                for base, sz in state.virtual_reserved.items()
+            )
+            if not in_reserved:
+                logger.error("handlers",
+                    f"[VirtualAlloc] MEM_COMMIT on unreserved 0x{lp_addr:x} — halting")
+                cpu.halted = True
+                return
+            state.virtual_committed[lp_addr] = page_size
+            cpu.regs[EAX] = lp_addr
+            cleanup_stdcall(cpu, memory, 16)
             return
-        addr = state.next_virtual_alloc
-        state.next_virtual_alloc = (
-            (state.next_virtual_alloc + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
-        ) & 0xFFFFFFFF
+        # MEM_RESERVE (with optional MEM_COMMIT): honor requested address if given
+        if lp_addr != 0:
+            addr = lp_addr
+            # Advance bump pointer past this region to avoid future overlap
+            end = (lp_addr + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
+            if end > state.next_virtual_alloc:
+                state.next_virtual_alloc = end & 0xFFFFFFFF
+        else:
+            addr = state.next_virtual_alloc
+            state.next_virtual_alloc = (
+                (state.next_virtual_alloc + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
+            ) & 0xFFFFFFFF
         if fl_type & _MEM_RESERVE:
             state.virtual_reserved[addr] = page_size
         if fl_type & _MEM_COMMIT:

@@ -250,6 +250,7 @@ def _run_timer_heartbeat() -> None:
 
 _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
 _sample_countdown = 1_000_000
+_progress_countdown = 5_000_000
 
 while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     eip_before = cpu.eip
@@ -269,6 +270,15 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
             "watch",
             f"[EIP sample @ {step_count}] EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
             f" ESP=0x{cpu.regs[ESP] & 0xFFFFFFFF:08x}",
+        )
+
+    _progress_countdown -= 1
+    if _progress_countdown == 0:
+        _progress_countdown = 5_000_000
+        logger.info(
+            "startup",
+            f"[alive] step={step_count:,} EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
+            f" vtime={crt_state.virtual_ticks_ms}ms",
         )
 
     region = is_valid_eip(cpu.eip)
