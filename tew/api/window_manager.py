@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from sdl2 import (
     SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS,
+    SDL_SetHint,
     SDL_CreateWindow, SDL_DestroyWindow,
     SDL_CreateRenderer, SDL_DestroyRenderer,
     SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE,
@@ -37,6 +38,8 @@ from sdl2 import (
     SDLK_ESCAPE, SDLK_DELETE,
     SDL_BUTTON_LEFT,
 )
+
+from sdl2.hints import SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
 
 from tew.logger import logger
 from tew.api.pe_resources import DialogTemplate
@@ -198,6 +201,7 @@ class WindowManager:
         creating any windows.  Safe to call multiple times."""
         if self._initialized:
             return True
+        SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, b"0")
         rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)
         if rc != 0:
             logger.error("window", f"[WindowManager] SDL_Init failed: {rc}")

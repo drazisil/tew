@@ -18,7 +18,7 @@ import sys
 from os.path import dirname
 
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import CPU, ESP, EBP, REG_NAMES
+from tew.hardware.cpu_zig import ZigCPU as CPU, ESP, EBP, REG_NAMES
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.emulator.opcodes import register_all_opcodes
@@ -199,7 +199,7 @@ def is_valid_eip(eip: int) -> str | None:
 logger.info("startup", "=== Starting Emulation ===")
 
 MAX_STEPS = 500_000_000
-# How many of our cpu.step() calls between virtual-clock ticks.
+# Steps per batch (also the virtual-clock tick interval).
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
 # from the normal SleepEx path.  Advancing the clock here lets due callbacks fire.
 _TIMER_HEARTBEAT_INTERVAL = 100_000
@@ -254,17 +254,17 @@ _progress_countdown = 5_000_000
 
 while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     eip_before = cpu.eip
+    batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
+    cpu.run(batch)
+    step_count += batch
 
-    cpu.step()
-    step_count += 1
-
-    _heartbeat_countdown -= 1
-    if _heartbeat_countdown == 0:
+    _heartbeat_countdown -= batch
+    if _heartbeat_countdown <= 0:
         _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
         _run_timer_heartbeat()
 
-    _sample_countdown -= 1
-    if _sample_countdown == 0:
+    _sample_countdown -= batch
+    if _sample_countdown <= 0:
         _sample_countdown = 1_000_000
         logger.debug(
             "watch",
@@ -272,8 +272,8 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
             f" ESP=0x{cpu.regs[ESP] & 0xFFFFFFFF:08x}",
         )
 
-    _progress_countdown -= 1
-    if _progress_countdown == 0:
+    _progress_countdown -= batch
+    if _progress_countdown <= 0:
         _progress_countdown = 5_000_000
         logger.info(
             "startup",
