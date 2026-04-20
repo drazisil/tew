@@ -631,40 +631,41 @@ def register_kernel32_io_handlers(
                 # Main thread — drive background threads until the handle is
                 # signaled (process-zero pattern).  Without this, the main
                 # thread would halt and nothing could ever call SetEvent.
-                if timeout_ms == _WAIT_INFINITE:
-                    _wfso_slice_count = 0
-                    while True:
-                        if not _run_background_slice(cpu, memory, state):
+                _wfso_slice_count = 0
+                _wfso_deadline = (
+                    None if timeout_ms == _WAIT_INFINITE
+                    else (state.virtual_ticks_ms + timeout_ms) & 0xFFFFFFFF
+                )
+                while True:
+                    if not _run_background_slice(cpu, memory, state):
+                        if timeout_ms == _WAIT_INFINITE:
                             logger.warn("scheduler",
                                 f"WaitForSingleObject(0x{h:x}) INFINITE: "
                                 f"deadlock — no runnable threads, returning TIMEOUT")
-                            cpu.regs[EAX] = 0x102
-                            cleanup_stdcall(cpu, memory, 8)
-                            return
-                        _wfso_slice_count += 1
-                        if _wfso_slice_count % 10 == 0:
-                            # Advance virtual clock so deadline-based waits and
-                            # timer threads can make progress.  Mirrors the
-                            # main-loop heartbeat rate (1ms per 100K steps at
-                            # 10K steps/slice × 10 slices = 100K steps/ms).
-                            state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
-                        obj = state.kernel_handle_map.get(h)
-                        if obj is None:
-                            break
-                        if isinstance(obj, EventHandle) and obj.signaled:
-                            break
-                        if isinstance(obj, MutexHandle) and not obj.locked:
-                            break
-                    # Handle is now ready — acquire and return WAIT_OBJECT_0.
+                        cpu.regs[EAX] = 0x102
+                        cleanup_stdcall(cpu, memory, 8)
+                        return
+                    _wfso_slice_count += 1
+                    if _wfso_slice_count % 10 == 0:
+                        state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
                     obj = state.kernel_handle_map.get(h)
-                    if isinstance(obj, EventHandle) and not obj.manual_reset:
-                        obj.signaled = False
-                    elif isinstance(obj, MutexHandle):
-                        obj.locked = True
-                    cpu.regs[EAX] = 0
-                    cleanup_stdcall(cpu, memory, 8)
-                    return
-                cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
+                    if obj is None:
+                        break
+                    if isinstance(obj, EventHandle) and obj.signaled:
+                        break
+                    if isinstance(obj, MutexHandle) and not obj.locked:
+                        break
+                    if _wfso_deadline is not None and state.virtual_ticks_ms >= _wfso_deadline:
+                        cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
+                        cleanup_stdcall(cpu, memory, 8)
+                        return
+                # Handle is now ready — acquire and return WAIT_OBJECT_0.
+                obj = state.kernel_handle_map.get(h)
+                if isinstance(obj, EventHandle) and not obj.manual_reset:
+                    obj.signaled = False
+                elif isinstance(obj, MutexHandle):
+                    obj.locked = True
+                cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 8)
                 return
         # Unknown handle (thread handle etc.) — treat as signaled.

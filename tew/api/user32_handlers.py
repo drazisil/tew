@@ -547,6 +547,23 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetWindowLongA", _GetWindowLongA)
 
+    # GetWindowThreadProcessId(HWND, LPDWORD) -> DWORD
+    # Returns the TID that created the window; optionally writes PID to lpdwProcessId.
+    def _GetWindowThreadProcessId(cpu: "CPU") -> None:
+        h_wnd           = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lpdw_process_id = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        if entry is None:
+            logger.error("handlers", f"[GetWindowThreadProcessId] unknown hwnd=0x{h_wnd:08x} — halting")
+            cpu.halted = True
+            return
+        if lpdw_process_id:
+            memory.write32(lpdw_process_id & 0xFFFFFFFF, 1)  # our fake PID
+        cpu.regs[EAX] = entry.creator_tid
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "GetWindowThreadProcessId", _GetWindowThreadProcessId)
+
     # SetWindowLongA(HWND, int, LONG) -> LONG (previous value)
     def _SetWindowLongA(cpu: "CPU") -> None:
         h_wnd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -621,7 +638,19 @@ def register_user32_gdi32_handlers(
     # Pump SDL events and check our message queue; return FALSE if nothing there.
     def _PeekMessageA(cpu: "CPU") -> None:
         lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        wm.pump_sdl_events()
+        if not wm.pump_sdl_events():
+            # SDL_QUIT — post WM_QUIT so the caller's loop sees it
+            if lp_msg:
+                memory.write32(lp_msg,      0)
+                memory.write32(lp_msg + 4,  0x0012)  # WM_QUIT
+                memory.write32(lp_msg + 8,  0)
+                memory.write32(lp_msg + 12, 0)
+                memory.write32(lp_msg + 16, 0)
+                memory.write32(lp_msg + 20, 0)
+                memory.write32(lp_msg + 24, 0)
+            cpu.regs[EAX] = 1  # message available (WM_QUIT)
+            cleanup_stdcall(cpu, memory, 20)
+            return
         msg = wm.peek_message()
         if msg is not None and lp_msg:
             hwnd_msg, msg_id, wparam, lparam = msg
@@ -642,42 +671,76 @@ def register_user32_gdi32_handlers(
 
     # GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) -> BOOL
     # Blocking: pumps SDL events until a message is available or SDL_QUIT fires.
+    # When running as a cooperative background thread (state.is_running_thread),
+    # does one pump-and-check then yields back to the scheduler so the main
+    # thread can make progress. Re-executes from INT 0xFE on next slice.
     def _GetMessageA(cpu: "CPU") -> None:
         import time as _time
         lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
 
-        while True:
+        def _write_quit() -> None:
+            if lp_msg:
+                memory.write32(lp_msg,      0)
+                memory.write32(lp_msg + 4,  0x0012)  # WM_QUIT
+                memory.write32(lp_msg + 8,  0)
+                memory.write32(lp_msg + 12, 0)
+                memory.write32(lp_msg + 16, 0)
+                memory.write32(lp_msg + 20, 0)
+                memory.write32(lp_msg + 24, 0)
+
+        def _write_msg(hwnd_msg: int, msg_id: int, wparam: int, lparam: int) -> None:
+            if lp_msg:
+                memory.write32(lp_msg,      hwnd_msg)
+                memory.write32(lp_msg + 4,  msg_id)
+                memory.write32(lp_msg + 8,  wparam)
+                memory.write32(lp_msg + 12, lparam)
+                memory.write32(lp_msg + 16, 0)
+                memory.write32(lp_msg + 20, 0)
+                memory.write32(lp_msg + 24, 0)
+
+        if state.is_running_thread:
+            # Cooperative path: one pump-and-check, then yield.
             if not wm.pump_sdl_events():
-                # SDL_QUIT — synthesize WM_QUIT (0x0012) so the caller's loop exits
-                if lp_msg:
-                    memory.write32(lp_msg,      0)       # hwnd  = NULL
-                    memory.write32(lp_msg + 4,  0x0012)  # WM_QUIT
-                    memory.write32(lp_msg + 8,  0)       # wParam
-                    memory.write32(lp_msg + 12, 0)       # lParam
-                    memory.write32(lp_msg + 16, 0)       # time
-                    memory.write32(lp_msg + 20, 0)       # pt.x
-                    memory.write32(lp_msg + 24, 0)       # pt.y
-                cpu.regs[EAX] = 0   # FALSE — WM_QUIT received
+                _write_quit()
+                cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 16)
                 return
-
             msg = wm.peek_message()
             if msg is not None:
                 hwnd_msg, msg_id, wparam, lparam = msg
-                if lp_msg:
-                    memory.write32(lp_msg,      hwnd_msg)
-                    memory.write32(lp_msg + 4,  msg_id)
-                    memory.write32(lp_msg + 8,  wparam)
-                    memory.write32(lp_msg + 12, lparam)
-                    memory.write32(lp_msg + 16, 0)
-                    memory.write32(lp_msg + 20, 0)
-                    memory.write32(lp_msg + 24, 0)
-                    _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
-                cpu.regs[EAX] = 1   # TRUE — message available
+                _write_msg(hwnd_msg, msg_id, wparam, lparam)
+                _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
+                cpu.regs[EAX] = 1
                 cleanup_stdcall(cpu, memory, 16)
                 return
+            # No message yet — rewind to INT 0xFE and yield to scheduler.
+            # The thread will re-enter GetMessageA on its next slice.
+            cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
+            cpu.halted = True
+            state.thread_yield_requested = True
+            return
 
-            _time.sleep(0.001)  # yield briefly while the queue is empty
+        # Main-thread blocking path: sleep until a message or SDL_QUIT.
+        caller_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        idle_iters = 0
+        while True:
+            if not wm.pump_sdl_events():
+                _write_quit()
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 16)
+                return
+            msg = wm.peek_message()
+            if msg is not None:
+                hwnd_msg, msg_id, wparam, lparam = msg
+                _write_msg(hwnd_msg, msg_id, wparam, lparam)
+                _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
+                cpu.regs[EAX] = 1
+                cleanup_stdcall(cpu, memory, 16)
+                return
+            idle_iters += 1
+            if idle_iters % 500 == 0:
+                logger.debug("handlers", f"[GetMessageA] idle {idle_iters} iters, caller EIP=0x{caller_eip:08x}, ESP=0x{cpu.regs[ESP]:08x}")
+            _time.sleep(0.001)
 
     stubs.register_handler("user32.dll", "GetMessageA", _GetMessageA)
 
@@ -784,7 +847,8 @@ def register_user32_gdi32_handlers(
             return
 
         # Create the dialog and all its child controls
-        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param)
+        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param,
+                                    creator_tid=state.tls_current_thread_id())
         if dlg_hwnd == 0:
             logger.error("dialog", "[Win32] DialogBoxParamA: create_dialog failed — halting")
             cpu.halted = True
@@ -896,7 +960,8 @@ def register_user32_gdi32_handlers(
             cpu.halted = True
             return
 
-        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param)
+        dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param,
+                                    creator_tid=state.tls_current_thread_id())
         if dlg_hwnd == 0:
             logger.error("dialog", "[Win32] CreateDialogParamA: create_dialog failed — halting")
             cpu.halted = True
@@ -1094,6 +1159,7 @@ def register_user32_gdi32_handlers(
             class_name, window_name, dw_style, dw_ex_style,
             px_x, px_y, px_cx, px_cy,
             h_wnd_parent, wnd_proc,
+            creator_tid=state.tls_current_thread_id(),
         )
         if hwnd == 0:
             logger.error("window",

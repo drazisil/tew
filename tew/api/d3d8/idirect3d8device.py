@@ -111,7 +111,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import EAX, ECX, ESP
 from tew.logger import logger
-from tew.api.d3d8._layout import D3D8_OBJ, S_OK
+from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
 from tew.api.d3d8._helpers import _alloc_resource_obj, _com_stub, _set_eax
 from tew.api.d3d8._caps import _fill_d3d_caps8
 
@@ -121,15 +121,21 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
     def _ok(name: str, arg_bytes: int) -> int:
         return _com_stub(stubs, "d3d8dev", name,
-            lambda cpu, mem: _set_eax(cpu, S_OK), arg_bytes, memory)
+            lambda cpu, mem: _set_eax(cpu, S_OK), arg_bytes, memory, D3DDEV_OBJ)
 
     def _void(name: str, arg_bytes: int) -> int:
         return _com_stub(stubs, "d3d8dev", name,
-            lambda cpu, mem: None, arg_bytes, memory)
+            lambda cpu, mem: None, arg_bytes, memory, D3DDEV_OBJ)
 
     def _uint(name: str, arg_bytes: int, val: int) -> int:
         return _com_stub(stubs, "d3d8dev", name,
-            lambda cpu, mem: _set_eax(cpu, val), arg_bytes, memory)
+            lambda cpu, mem: _set_eax(cpu, val), arg_bytes, memory, D3DDEV_OBJ)
+
+    def _halt(name: str, arg_bytes: int) -> int:
+        def _handler(cpu: "CPU", mem: "Memory") -> None:
+            logger.error("d3d8", f"UNIMPLEMENTED: {name} — halting")
+            cpu.halted = True
+        return _com_stub(stubs, "d3d8dev", name, _handler, arg_bytes, memory, D3DDEV_OBJ)
 
     # [6] GetDirect3D(IDirect3D8**)
     def _get_direct3d(cpu: "CPU", mem: "Memory") -> None:
@@ -166,12 +172,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
     # [14] Reset(D3DPRESENT_PARAMETERS*)
     def _reset(cpu: "CPU", mem: "Memory") -> None:
-        logger.debug("d3d8", "IDirect3DDevice8::Reset")
-        cpu.regs[EAX] = S_OK
-
-    # [15] Present(pSrc, pDest, hWnd, pRegion)
-    def _present(cpu: "CPU", mem: "Memory") -> None:
-        logger.debug("d3d8", "IDirect3DDevice8::Present")
+        logger.info("d3d8", "IDirect3DDevice8::Reset")
         cpu.regs[EAX] = S_OK
 
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)
@@ -263,11 +264,6 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(pp_surf, _alloc_resource_obj(800 * 600 * 4, mem))
         cpu.regs[EAX] = S_OK
 
-    # [36] Clear(Count, pRects, Flags, Color, Z, Stencil)
-    def _clear(cpu: "CPU", mem: "Memory") -> None:
-        color = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        logger.debug("d3d8", f"Clear color=0x{color & 0xFFFFFFFF:08x}")
-        cpu.regs[EAX] = S_OK
 
     # [51] GetRenderState(State, DWORD* pValue)
     def _get_render_state(cpu: "CPU", mem: "Memory") -> None:
@@ -311,19 +307,6 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(p_passes, 1)
         cpu.regs[EAX] = S_OK
 
-    # [70] DrawPrimitive(PrimType, StartVertex, PrimCount)
-    def _draw_primitive(cpu: "CPU", mem: "Memory") -> None:
-        prim_type  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
-        prim_count = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        logger.debug("d3d8", f"DrawPrimitive type={prim_type} count={prim_count}")
-        cpu.regs[EAX] = S_OK
-
-    # [71] DrawIndexedPrimitive(PrimType, minIndex, NumVerts, startIndex, primCount)
-    def _draw_indexed_primitive(cpu: "CPU", mem: "Memory") -> None:
-        prim_type  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
-        prim_count = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
-        logger.debug("d3d8", f"DrawIndexedPrimitive type={prim_type} count={prim_count}")
-        cpu.regs[EAX] = S_OK
 
     # [75] CreateVertexShader(pDecl, pFunction, DWORD* pHandle, Usage)
     def _create_vertex_shader(cpu: "CPU", mem: "Memory") -> None:
@@ -363,59 +346,59 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev = [0] * 97
 
     dev[0]  = _com_stub(stubs, "d3d8dev", "Dev::QueryInterface",
-                lambda cpu, mem: _set_eax(cpu, 0x80004002), 8, memory)
+                lambda cpu, mem: _set_eax(cpu, 0x80004002), 8, memory, D3DDEV_OBJ)
     dev[1]  = _uint("Dev::AddRef",  0, 1)
     dev[2]  = _uint("Dev::Release", 0, 0)
     dev[3]  = _ok  ("Dev::TestCooperativeLevel",        0)
     dev[4]  = _uint("Dev::GetAvailableTextureMem",      0, 128 * 1024 * 1024)
     dev[5]  = _ok  ("Dev::ResourceManagerDiscardBytes", 4)
     dev[6]  = _com_stub(stubs, "d3d8dev", "Dev::GetDirect3D",
-                _get_direct3d, 4, memory)
+                _get_direct3d, 4, memory, D3DDEV_OBJ)
     dev[7]  = _com_stub(stubs, "d3d8dev", "Dev::GetDeviceCaps",
-                _get_device_caps, 4, memory)
+                _get_device_caps, 4, memory, D3DDEV_OBJ)
     dev[8]  = _com_stub(stubs, "d3d8dev", "Dev::GetDisplayMode",
-                _get_display_mode, 4, memory)
+                _get_display_mode, 4, memory, D3DDEV_OBJ)
     dev[9]  = _com_stub(stubs, "d3d8dev", "Dev::GetCreationParameters",
-                _get_creation_params, 4, memory)
+                _get_creation_params, 4, memory, D3DDEV_OBJ)
     dev[10] = _ok  ("Dev::SetCursorProperties",       12)
     dev[11] = _void("Dev::SetCursorPosition",         12)
     dev[12] = _uint("Dev::ShowCursor",                 4, 0)
     dev[13] = _ok  ("Dev::CreateAdditionalSwapChain",  8)
-    dev[14] = _com_stub(stubs, "d3d8dev", "Dev::Reset",   _reset,   4, memory)
-    dev[15] = _com_stub(stubs, "d3d8dev", "Dev::Present", _present, 16, memory)
+    dev[14] = _com_stub(stubs, "d3d8dev", "Dev::Reset",   _reset,   4, memory, D3DDEV_OBJ)
+    dev[15] = _halt("Dev::Present", 16)
     dev[16] = _com_stub(stubs, "d3d8dev", "Dev::GetBackBuffer",
-                _get_back_buffer, 12, memory)
+                _get_back_buffer, 12, memory, D3DDEV_OBJ)
     dev[17] = _ok  ("Dev::GetRasterStatus",   4)
     dev[18] = _void("Dev::SetGammaRamp",      8)
     dev[19] = _void("Dev::GetGammaRamp",      4)
     dev[20] = _com_stub(stubs, "d3d8dev", "Dev::CreateTexture",
-                _create_texture, 28, memory)
+                _create_texture, 28, memory, D3DDEV_OBJ)
     dev[21] = _com_stub(stubs, "d3d8dev", "Dev::CreateVolumeTexture",
-                _create_volume_texture, 32, memory)
+                _create_volume_texture, 32, memory, D3DDEV_OBJ)
     dev[22] = _com_stub(stubs, "d3d8dev", "Dev::CreateCubeTexture",
-                _create_cube_texture, 24, memory)
+                _create_cube_texture, 24, memory, D3DDEV_OBJ)
     dev[23] = _com_stub(stubs, "d3d8dev", "Dev::CreateVertexBuffer",
-                _create_vertex_buffer, 20, memory)
+                _create_vertex_buffer, 20, memory, D3DDEV_OBJ)
     dev[24] = _com_stub(stubs, "d3d8dev", "Dev::CreateIndexBuffer",
-                _create_index_buffer, 20, memory)
+                _create_index_buffer, 20, memory, D3DDEV_OBJ)
     dev[25] = _com_stub(stubs, "d3d8dev", "Dev::CreateRenderTarget",
-                _create_render_target, 24, memory)
+                _create_render_target, 24, memory, D3DDEV_OBJ)
     dev[26] = _com_stub(stubs, "d3d8dev", "Dev::CreateDepthStencilSurface",
-                _create_depth_stencil, 20, memory)
+                _create_depth_stencil, 20, memory, D3DDEV_OBJ)
     dev[27] = _com_stub(stubs, "d3d8dev", "Dev::CreateImageSurface",
-                _create_image_surface, 16, memory)
+                _create_image_surface, 16, memory, D3DDEV_OBJ)
     dev[28] = _ok  ("Dev::CopyRects",     20)
     dev[29] = _ok  ("Dev::UpdateTexture",  8)
     dev[30] = _com_stub(stubs, "d3d8dev", "Dev::GetFrontBuffer",
-                lambda cpu, mem: _set_eax(cpu, S_OK), 4, memory)
+                lambda cpu, mem: _set_eax(cpu, S_OK), 4, memory, D3DDEV_OBJ)
     dev[31] = _ok  ("Dev::SetRenderTarget", 8)
     dev[32] = _com_stub(stubs, "d3d8dev", "Dev::GetRenderTarget",
-                _get_render_target, 4, memory)
+                _get_render_target, 4, memory, D3DDEV_OBJ)
     dev[33] = _com_stub(stubs, "d3d8dev", "Dev::GetDepthStencilSurface",
-                _get_depth_stencil, 4, memory)
-    dev[34] = _ok  ("Dev::BeginScene", 0)
-    dev[35] = _ok  ("Dev::EndScene",   0)
-    dev[36] = _com_stub(stubs, "d3d8dev", "Dev::Clear",  _clear,  24, memory)
+                _get_depth_stencil, 4, memory, D3DDEV_OBJ)
+    dev[34] = _halt("Dev::BeginScene", 0)
+    dev[35] = _halt("Dev::EndScene",   0)
+    dev[36] = _halt("Dev::Clear",     24)
     dev[37] = _ok  ("Dev::SetTransform",      8)
     dev[38] = _ok  ("Dev::GetTransform",      8)
     dev[39] = _ok  ("Dev::MultiplyTransform",  8)
@@ -431,44 +414,40 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev[49] = _ok  ("Dev::GetClipPlane",       8)
     dev[50] = _ok  ("Dev::SetRenderState",     8)
     dev[51] = _com_stub(stubs, "d3d8dev", "Dev::GetRenderState",
-                _get_render_state, 8, memory)
+                _get_render_state, 8, memory, D3DDEV_OBJ)
     dev[52] = _ok  ("Dev::BeginStateBlock", 0)
     dev[53] = _com_stub(stubs, "d3d8dev", "Dev::EndStateBlock",
-                _end_state_block, 4, memory)
+                _end_state_block, 4, memory, D3DDEV_OBJ)
     dev[54] = _ok  ("Dev::ApplyStateBlock",   4)
     dev[55] = _ok  ("Dev::CaptureStateBlock", 4)
     dev[56] = _ok  ("Dev::DeleteStateBlock",  4)
     dev[57] = _com_stub(stubs, "d3d8dev", "Dev::CreateStateBlock",
-                _create_state_block, 8, memory)
+                _create_state_block, 8, memory, D3DDEV_OBJ)
     dev[58] = _ok  ("Dev::SetClipStatus", 4)
     dev[59] = _ok  ("Dev::GetClipStatus", 4)
     dev[60] = _com_stub(stubs, "d3d8dev", "Dev::GetTexture",
-                _get_texture, 8, memory)
+                _get_texture, 8, memory, D3DDEV_OBJ)
     dev[61] = _ok  ("Dev::SetTexture", 8)
     dev[62] = _com_stub(stubs, "d3d8dev", "Dev::GetTextureStageState",
-                _get_texture_stage_state, 12, memory)
+                _get_texture_stage_state, 12, memory, D3DDEV_OBJ)
     dev[63] = _ok  ("Dev::SetTextureStageState", 12)
     dev[64] = _com_stub(stubs, "d3d8dev", "Dev::ValidateDevice",
-                _validate_device, 4, memory)
+                _validate_device, 4, memory, D3DDEV_OBJ)
     dev[65] = _ok  ("Dev::GetInfo",                   12)
     dev[66] = _ok  ("Dev::SetPaletteEntries",          8)
     dev[67] = _ok  ("Dev::GetPaletteEntries",          8)
     dev[68] = _ok  ("Dev::SetCurrentTexturePalette",   4)
     dev[69] = _ok  ("Dev::GetCurrentTexturePalette",   4)
-    dev[70] = _com_stub(stubs, "d3d8dev", "Dev::DrawPrimitive",
-                _draw_primitive, 12, memory)
-    dev[71] = _com_stub(stubs, "d3d8dev", "Dev::DrawIndexedPrimitive",
-                _draw_indexed_primitive, 20, memory)
-    dev[72] = _com_stub(stubs, "d3d8dev", "Dev::DrawPrimitiveUP",
-                lambda cpu, mem: _set_eax(cpu, S_OK), 16, memory)
-    dev[73] = _com_stub(stubs, "d3d8dev", "Dev::DrawIndexedPrimitiveUP",
-                lambda cpu, mem: _set_eax(cpu, S_OK), 32, memory)
+    dev[70] = _halt("Dev::DrawPrimitive",          12)
+    dev[71] = _halt("Dev::DrawIndexedPrimitive",   20)
+    dev[72] = _halt("Dev::DrawPrimitiveUP",        16)
+    dev[73] = _halt("Dev::DrawIndexedPrimitiveUP", 32)
     dev[74] = _ok  ("Dev::ProcessVertices", 20)
     dev[75] = _com_stub(stubs, "d3d8dev", "Dev::CreateVertexShader",
-                _create_vertex_shader, 16, memory)
+                _create_vertex_shader, 16, memory, D3DDEV_OBJ)
     dev[76] = _ok  ("Dev::SetVertexShader", 4)
     dev[77] = _com_stub(stubs, "d3d8dev", "Dev::GetVertexShader",
-                _get_vertex_shader, 4, memory)
+                _get_vertex_shader, 4, memory, D3DDEV_OBJ)
     dev[78] = _ok  ("Dev::DeleteVertexShader",         4)
     dev[79] = _ok  ("Dev::SetVertexShaderConstant",   12)
     dev[80] = _ok  ("Dev::GetVertexShaderConstant",   12)
@@ -476,14 +455,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev[82] = _ok  ("Dev::GetVertexShaderFunction",    12)
     dev[83] = _ok  ("Dev::SetStreamSource",            12)
     dev[84] = _com_stub(stubs, "d3d8dev", "Dev::GetStreamSource",
-                _get_stream_source, 12, memory)
+                _get_stream_source, 12, memory, D3DDEV_OBJ)
     dev[85] = _ok  ("Dev::SetIndices", 8)
     dev[86] = _ok  ("Dev::GetIndices", 8)
     dev[87] = _com_stub(stubs, "d3d8dev", "Dev::CreatePixelShader",
-                _create_pixel_shader, 8, memory)
+                _create_pixel_shader, 8, memory, D3DDEV_OBJ)
     dev[88] = _ok  ("Dev::SetPixelShader", 4)
     dev[89] = _com_stub(stubs, "d3d8dev", "Dev::GetPixelShader",
-                _get_pixel_shader, 4, memory)
+                _get_pixel_shader, 4, memory, D3DDEV_OBJ)
     dev[90] = _ok  ("Dev::DeletePixelShader",          4)
     dev[91] = _ok  ("Dev::SetPixelShaderConstant",    12)
     dev[92] = _ok  ("Dev::GetPixelShaderConstant",    12)

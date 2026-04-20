@@ -38,9 +38,21 @@ def _com_stub(
     handler,
     arg_bytes: int,
     memory: "Memory",
+    expected_this: "int | None" = None,
 ) -> int:
     """Register a COM vtable handler and return its trampoline address."""
+    from tew.logger import logger as _logger
+
     def _h(cpu: "CPU") -> None:
+        if expected_this is not None:
+            this = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+            if this != expected_this:
+                _logger.error(
+                    "d3d8",
+                    f"{name}: invalid this=0x{this:08x} (expected 0x{expected_this:08x}) — halting",
+                )
+                cpu.halted = True
+                return
         handler(cpu, memory)
         _cleanup_com(cpu, memory, arg_bytes)
 

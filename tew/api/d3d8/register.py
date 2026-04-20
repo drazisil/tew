@@ -38,7 +38,7 @@ def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory") -> None:
     d3d8_vtable = _make_d3d8_vtable(stubs, memory)
     for i, addr in enumerate(d3d8_vtable):
         memory.write32(D3D8_VTABLE + i * 4, addr)
-        logger.info("d3d8", f"  IDirect3D8 vtable[{i}] @ 0x{D3D8_VTABLE + i * 4:08x} = 0x{addr:08x}")
+        logger.trace("d3d8", f"  IDirect3D8 vtable[{i}] @ 0x{D3D8_VTABLE + i * 4:08x} = 0x{addr:08x}")
     memory.write32(D3D8_OBJ, D3D8_VTABLE)
 
     # ── IDirect3DDevice8 vtable + object ──────────────────────────────────────

@@ -39,6 +39,12 @@ from tew.api.d3d8._helpers import _com_stub, _set_eax
 from tew.api.d3d8._caps import _fill_adapter_identifier, _fill_d3d_caps8
 import tew.api.d3d8._state as _state
 
+# Offset of DAT_6001c080 from dx8z.dll's preferred base (0x60000000).
+# This flag controls whether setvideomode takes the CreateDevice (1) or Reset (0) path.
+# BSS default is 0 (Reset), but no device exists on first init — must be 1 for CreateDevice.
+_DX8Z_PREFERRED_BASE   = 0x60000000
+_DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
+
 
 def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     """Return the 16 trampoline addresses for the IDirect3D8 vtable."""
@@ -84,7 +90,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         pp_device = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
-        logger.debug("d3d8", f"IDirect3D8::CreateDevice -> 0x{D3DDEV_OBJ:08x}")
+        logger.info("d3d8", f"IDirect3D8::CreateDevice -> 0x{D3DDEV_OBJ:08x}")
         cpu.regs[EAX] = S_OK
 
     return [

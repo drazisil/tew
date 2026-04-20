@@ -163,6 +163,7 @@ class WindowEntry:
     parent_hwnd: int                           # 0 = top-level
     children: dict[int, int] = field(default_factory=dict)  # ctrl_id → child hwnd (unique IDs only; excludes 0xFFFF)
     children_list: list[tuple[int, int]] = field(default_factory=list)  # (ctrl_id, hwnd) ordered, includes all
+    creator_tid: int = 0                        # TID of the thread that called CreateWindow/CreateDialog
     wnd_proc_addr: int = 0                     # WNDPROC addr in emulator, if registered
     dlg_proc_addr: int = 0                     # DLGPROC addr, non-zero means this is a dialog
     dlg_result: int = 0
@@ -283,6 +284,7 @@ class WindowManager:
         cy: int,
         parent_hwnd: int,
         wnd_proc_addr: int,
+        creator_tid: int = 0,
     ) -> int:
         """Create a window entry.  For WS_VISIBLE top-level windows (no parent)
         an SDL2 window is created.  Returns a non-zero HWND or 0 on failure."""
@@ -300,6 +302,7 @@ class WindowManager:
             x=x, y=y, cx=cx, cy=cy,
             parent_hwnd=parent_hwnd,
             wnd_proc_addr=wnd_proc_addr,
+            creator_tid=creator_tid,
         )
 
         is_top_level = (parent_hwnd == 0)
@@ -372,6 +375,7 @@ class WindowManager:
         parent_hwnd: int,
         dlg_proc_addr: int,
         init_param: int,
+        creator_tid: int = 0,
     ) -> int:
         """Create a dialog and all its child controls from a DialogTemplate.
         Returns the HWND of the dialog window (>= 0x1000) or 0 on failure."""
@@ -421,6 +425,7 @@ class WindowManager:
             dlg_proc_addr=dlg_proc_addr,
             sdl_window=sdl_win,
             sdl_renderer=sdl_rend,
+            creator_tid=creator_tid,
         )
         self._windows[hwnd] = entry
         logger.warn("window",

@@ -305,13 +305,16 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
             val = cpu.regs[i] & 0xFFFFFFFF
             logger.error("cpu", f"    {REG_NAMES[i]}: 0x{val:08x}")
         esp_val = cpu.regs[ESP] & 0xFFFFFFFF
-        logger.error("cpu", "  Stack at crash (top 8):")
-        for i in range(8):
+        logger.error("cpu", "  Stack at crash (top 32):")
+        for i in range(32):
             try:
                 slot = mem.read32(esp_val + i * 4) & 0xFFFFFFFF
                 logger.error("cpu", f"    [ESP+{i*4:02x}] 0x{slot:08x}")
             except Exception:
                 break
+        logger.error("cpu", "  Last 30 Win32 handler calls:")
+        for call in win32_handlers.get_call_log()[-30:]:
+            logger.error("cpu", f"    {call}")
         # Run a few more steps to capture the pattern
         for _ in range(20):
             if cpu.halted:

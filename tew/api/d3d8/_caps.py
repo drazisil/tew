@@ -178,7 +178,19 @@ def _fill_d3d_caps8(p_caps: int, memory: "Memory") -> None:
 
 
 def _fill_adapter_identifier(p_ident: int, memory: "Memory") -> None:
-    """Write D3DADAPTER_IDENTIFIER8 struct into emulator memory (~1256 bytes)."""
+    """Write D3DADAPTER_IDENTIFIER8 struct (1068 bytes) into emulator memory.
+
+    Layout (D3D8 SDK):
+      [   0] Driver[512]          — display driver filename
+      [ 512] Description[512]     — human-readable adapter name
+      [1024] DriverVersion        — LARGE_INTEGER (8 bytes), leave 0
+      [1032] VendorId             — PCI vendor ID
+      [1036] DeviceId             — PCI device ID
+      [1040] SubSysId             — PCI subsystem ID
+      [1044] Revision             — PCI revision
+      [1048] DeviceIdentifier     — GUID (16 bytes), leave 0
+      [1064] WHQLLevel            — WHQL certification level
+    """
     if not p_ident:
         return
 
@@ -187,7 +199,11 @@ def _fill_adapter_identifier(p_ident: int, memory: "Memory") -> None:
             memory.write8(p_ident + offset + i, ord(ch))
         memory.write8(p_ident + offset + min(len(s), 511), 0)
 
-    _write_str(0,   "NVIDIA GeForce4 Ti 4200")  # Driver  (512 bytes)
-    _write_str(512, "NVIDIA GeForce4 Ti 4200")  # Description (512 bytes)
-    # DeviceIdentifier GUID (16 bytes at offset 1024): leave zero
-    memory.write32(p_ident + 1040, 6)  # WHQLLevel
+    _write_str(0,   "nv4_disp.dll")            # Driver  — XP-era NVIDIA driver filename
+    _write_str(512, "NVIDIA GeForce4 Ti 4200")  # Description
+    memory.write32(p_ident + 1032, 0x10DE)      # VendorId  — NVIDIA
+    memory.write32(p_ident + 1036, 0x0253)      # DeviceId  — GeForce4 Ti 4200 (NV28)
+    memory.write32(p_ident + 1040, 0)           # SubSysId
+    memory.write32(p_ident + 1044, 0)           # Revision
+    # DeviceIdentifier GUID at offset 1048: leave zero
+    memory.write32(p_ident + 1064, 1)           # WHQLLevel — WHQL certified

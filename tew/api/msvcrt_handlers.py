@@ -1702,7 +1702,15 @@ def register_msvcrt_handlers(
     # ── getenv — no environment variables configured ──────────────────────────
 
     # getenv(const char* name) -> char* [cdecl]
+    _getenv_caller_logged: set[int] = set()
+
     def _getenv(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        name = read_cstring(name_ptr, memory) if name_ptr else "(null)"
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        if caller not in _getenv_caller_logged:
+            _getenv_caller_logged.add(caller)
+            logger.info("handlers", f"getenv first caller: 0x{caller:08x} var={name!r}")
         cpu.regs[EAX] = 0  # NULL — no environment variables
 
     stubs.register_handler("msvcrt.dll", "getenv", _getenv)
