@@ -745,23 +745,37 @@ def register_kernel32_io_handlers(
     def _create_mutex_a(cpu: "CPU") -> None:
         b_owner  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         name_ptr = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        name = read_cstring(name_ptr, memory) if name_ptr else "(unnamed)"
+        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        if name:
+            for h_existing, obj in state.kernel_handle_map.items():
+                if isinstance(obj, MutexHandle) and obj.name == name:
+                    memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ALREADY_EXISTS))
+                    logger.debug("handlers",
+                        f'[Win32] CreateMutexA("{name}") -> 0x{h_existing:x} (already exists)')
+                    cpu.regs[EAX] = h_existing
+                    cleanup_stdcall(cpu, memory, 12)
+                    return
         h = state.next_kernel_handle
         state.next_kernel_handle += 1
-        state.kernel_handle_map[h] = MutexHandle(locked=b_owner != 0)
-        logger.debug("handlers", f'[Win32] CreateMutexA("{name}") -> 0x{h:x}')
+        state.kernel_handle_map[h] = MutexHandle(locked=b_owner != 0, name=name)
+        logger.debug("handlers", f'[Win32] CreateMutexA("{name or "(unnamed)"}") -> 0x{h:x}')
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 12)
 
     def _open_mutex_a(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        name = read_cstring(name_ptr, memory) if name_ptr else "(unnamed)"
-        # Named mutexes are process-local in this emulator; a named mutex opened
-        # before CreateMutexA creates it does not exist.  Signal this the same
-        # way Win32 does: return NULL and set ERROR_FILE_NOT_FOUND.
+        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        if name:
+            for h_existing, obj in state.kernel_handle_map.items():
+                if isinstance(obj, MutexHandle) and obj.name == name:
+                    logger.debug("handlers",
+                        f'[Win32] OpenMutexA("{name}") -> 0x{h_existing:x}')
+                    cpu.regs[EAX] = h_existing
+                    cleanup_stdcall(cpu, memory, 12)
+                    return
         memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.warn("handlers",
-            f'[Win32] OpenMutexA("{name}") -> NULL (no shared named mutexes)')
+            f'[Win32] OpenMutexA("{name or "(unnamed)"}") -> NULL (not found)')
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 12)
 

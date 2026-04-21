@@ -37,6 +37,7 @@ class FileHandleEntry:
 class MutexHandle:
     type: str = "mutex"
     locked: bool = False
+    name: str = ""
 
 
 @dataclass
