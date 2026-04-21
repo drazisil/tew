@@ -50,17 +50,17 @@ def register_kernel32_sync_handlers(
     def _enter_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         tid = state.tls_current_thread_id()
-        lock_count = (memory.read32(ptr + 0x04) + 1) & 0xFFFFFFFF
-        memory.write32(ptr + 0x04, lock_count)
-        if lock_count == 0:
-            # Acquired (LockCount was -1 → 0): first entry.
-            memory.write32(ptr + 0x08, 1)
-            memory.write32(ptr + 0x0C, tid)
+        owner = memory.read32(ptr + 0x0C)
+        if owner == tid:
+            # Recursive entry — same thread, deepen RecursionCount only.
+            memory.write32(ptr + 0x08, (memory.read32(ptr + 0x08) + 1) & 0xFFFFFFFF)
         else:
-            owner = memory.read32(ptr + 0x0C)
-            if owner == tid:
-                # Recursive entry by the same thread.
-                memory.write32(ptr + 0x08, (memory.read32(ptr + 0x08) + 1) & 0xFFFFFFFF)
+            lock_count = (memory.read32(ptr + 0x04) + 1) & 0xFFFFFFFF
+            memory.write32(ptr + 0x04, lock_count)
+            if lock_count == 0:
+                # Acquired (LockCount was -1 → 0): first entry.
+                memory.write32(ptr + 0x08, 1)
+                memory.write32(ptr + 0x0C, tid)
             else:
                 logger.error("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested: owner=0x{owner:08x} caller=0x{tid:08x} — blocking not implemented — halting")
                 cpu.halted = True
