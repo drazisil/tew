@@ -1,13 +1,14 @@
 """
-Tests for Win32 last-error support: Win32Error constants and CRTState.last_error.
+Tests for Win32 last-error support: Win32Error constants and TEB-backed last error.
 
-GetLastError and SetLastError are closures — they cannot be called without a full
-CPU setup.  These tests verify the state invariants they depend on and confirm
-that the error code constants match the Win32 specification.
+LastErrorValue lives at TEB+0x34 (FS:[0x34]).  SetLastError writes there;
+GetLastError reads from there.  These tests verify the layout directly.
 """
 
 import pytest
-from tew.api._state import CRTState
+from tew.hardware.memory import Memory
+from tew.kernel.kernel_structures import KernelStructures
+from tew.api._state import TEB_BASE
 from tew.api.win32_errors import Win32Error
 
 
@@ -32,42 +33,41 @@ class TestWin32ErrorValues:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CRTState.last_error field
+# LastErrorValue lives in TEB memory at TEB_BASE + 0x34
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def state():
-    return CRTState()
+def mem():
+    m = Memory(0x1000000)
+    ks = KernelStructures(m)
+    ks.initialize_kernel_structures(stack_base=0x00200000, stack_limit=0x001F0000)
+    return m
 
 
-class TestLastErrorState:
+class TestLastErrorTEB:
 
-    def test_initialises_to_zero(self, state):
-        """last_error must be ERROR_SUCCESS (0) at startup — no error yet."""
-        assert state.last_error == int(Win32Error.ERROR_SUCCESS)
+    def test_initialises_to_zero(self, mem):
+        """KernelStructures must write 0 to TEB+0x34 at init — no error yet."""
+        assert mem.read32(TEB_BASE + 0x34) == int(Win32Error.ERROR_SUCCESS)
 
-    def test_can_be_set(self, state):
-        state.last_error = int(Win32Error.ERROR_FILE_NOT_FOUND)
-        assert state.last_error == 2
+    def test_can_be_set(self, mem):
+        mem.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        assert mem.read32(TEB_BASE + 0x34) == 2
 
-    def test_can_be_reset_to_zero(self, state):
-        state.last_error = int(Win32Error.ERROR_ACCESS_DENIED)
-        state.last_error = 0
-        assert state.last_error == 0
+    def test_can_be_reset_to_zero(self, mem):
+        mem.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
+        mem.write32(TEB_BASE + 0x34, 0)
+        assert mem.read32(TEB_BASE + 0x34) == 0
 
-    def test_stores_arbitrary_dword(self, state):
-        state.last_error = 0xDEAD
-        assert state.last_error == 0xDEAD
+    def test_stores_arbitrary_dword(self, mem):
+        mem.write32(TEB_BASE + 0x34, 0xDEAD)
+        assert mem.read32(TEB_BASE + 0x34) == 0xDEAD
 
-    # ── OpenMutexA contract ───────────────────────────────────────────────────
-
-    def test_open_mutex_sets_file_not_found(self, state):
+    def test_open_mutex_sets_file_not_found(self, mem):
         """
-        When OpenMutexA returns NULL for a non-existent named mutex, it must
-        set last_error to ERROR_FILE_NOT_FOUND (2).  MCO checks this to
-        determine whether it is the first running instance.
+        When OpenMutexA returns NULL for a non-existent named mutex it must
+        set ERROR_FILE_NOT_FOUND (2) in TEB+0x34 so GetLastError returns 2.
         """
-        # Simulate what the handler does.
-        state.last_error = int(Win32Error.ERROR_FILE_NOT_FOUND)
-        assert state.last_error == int(Win32Error.ERROR_FILE_NOT_FOUND)
-        assert state.last_error == 2
+        mem.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        assert mem.read32(TEB_BASE + 0x34) == int(Win32Error.ERROR_FILE_NOT_FOUND)
+        assert mem.read32(TEB_BASE + 0x34) == 2

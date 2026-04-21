@@ -33,7 +33,9 @@ class KernelStructures:
         self._peb: PEBStructure | None = None
         self._fs_base: int = 0
 
-    def initialize_kernel_structures(self, stack_base: int, stack_limit: int) -> None:
+    def initialize_kernel_structures(
+        self, stack_base: int, stack_limit: int, process_heap: int = 0
+    ) -> None:
         """
         Allocate and initialise TEB/PEB at fixed addresses just below the main executable.
         PEB at 0x00300000, TEB at 0x00320000.
@@ -50,6 +52,7 @@ class KernelStructures:
         )
         self._fs_base = teb_addr
         self._write_teb_to_memory()
+        self._write_peb_to_memory(process_heap)
 
     def _write_teb_to_memory(self) -> None:
         if not self._teb:
@@ -70,6 +73,12 @@ class KernelStructures:
         self._memory.write32(addr + 0x0024, 0x00000001)  # ClientId.ThreadId  = 1
         self._memory.write32(addr + 0x0030, teb.peb_address)
         self._memory.write32(addr + 0x0034, 0)           # LastErrorValue
+
+    def _write_peb_to_memory(self, process_heap: int) -> None:
+        if not self._peb:
+            return
+        addr = self._peb.base_address
+        self._memory.write32(addr + 0x0018, process_heap)   # ProcessHeap
 
     def resolve_fs_relative_address(self, offset: int) -> int:
         return (self._fs_base + offset) & 0xFFFFFFFF

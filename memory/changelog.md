@@ -4,6 +4,41 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-20 — TEB/PEB truthfulness, CriticalSection fix, kernel32 split
+
+**Progress:**
+Game was already reaching BeginScene (D3D8 vtable slot 34). This session fixed
+correctness issues that would cause failures under any multi-threaded or
+error-checking code path. No step-count regression; correctness improved.
+
+**TEB/PEB truthfulness (`kernel32_system.py`, `kernel32_sync.py`, `kernel32_io.py`,
+`kernel_structures.py`, `_state.py`):**
+- `SetLastError`/`GetLastError` now read/write TEB memory at `TEB_BASE + 0x34`.
+  Previously used Python `state.last_error` field — binary code doing `MOV EAX, FS:[0x34]`
+  directly would get stale zero. `state.last_error` removed entirely.
+- `TlsSetValue`/`TlsGetValue` now read/write TEB memory at `TEB_BASE + 0xE0 + slot*4`.
+  `TlsFree` zeros the TEB slot. `_cooperative_sleep` saves/restores TLS in TEB memory
+  around background thread slices so FS:[0xE0+] is always correct for the active thread.
+- `PEB+0x18` (ProcessHeap) now populated: `initialize_kernel_structures` takes a
+  `process_heap` argument and writes it into PEB memory.
+- `TEB_BASE = 0x00320000` and `PEB_BASE = 0x00300000` added as module constants to `_state.py`.
+
+**CriticalSection fix (`kernel32_sync.py`):**
+- `EnterCriticalSection`: correctly increments LockCount (+0x04), sets RecursionCount (+0x08)
+  and OwningThread (+0x0C) on first acquisition; increments RecursionCount on recursive entry
+  by the same thread. Halts loudly if contested (blocked thread — not implemented).
+- `LeaveCriticalSection`: decrements RecursionCount; on full release clears OwningThread
+  and decrements LockCount. Halts loudly if waiters exist (LockSemaphore signal — not implemented).
+
+**kernel32_handlers.py split:**
+- Monolithic `kernel32_handlers.py` (~1295 lines) split into orchestrator (~329 lines)
+  + 5 focused sub-modules: `kernel32_memory.py`, `kernel32_sync.py`, `kernel32_locale.py`,
+  `kernel32_system.py`, `kernel32_io.py`. All 388 tests pass.
+
+**Tests:** 388 (up from 386; 2 new: PEB ProcessHeap layout, LastError TEB address).
+
+---
+
 ## 2026-04-17 — Heap fix, VirtualAlloc accuracy, user32 handlers, hook dispatch
 
 **Progress:**

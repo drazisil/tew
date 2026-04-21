@@ -28,7 +28,7 @@ from tew.api._state import (
     CRTState, MutexHandle, EventHandle,
     PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
-    THREAD_STACK_SIZE,
+    THREAD_STACK_SIZE, TEB_BASE,
 )
 from tew.logger import logger
 
@@ -759,7 +759,7 @@ def register_kernel32_io_handlers(
         # Named mutexes are process-local in this emulator; a named mutex opened
         # before CreateMutexA creates it does not exist.  Signal this the same
         # way Win32 does: return NULL and set ERROR_FILE_NOT_FOUND.
-        state.last_error = int(Win32Error.ERROR_FILE_NOT_FOUND)
+        memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.warn("handlers",
             f'[Win32] OpenMutexA("{name}") -> NULL (no shared named mutexes)')
         cpu.regs[EAX] = 0

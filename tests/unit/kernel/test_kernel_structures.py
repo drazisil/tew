@@ -13,6 +13,16 @@ def ks():
     return k, mem
 
 
+@pytest.fixture
+def ks_with_heap():
+    mem = Memory(0x1000000)
+    k = KernelStructures(mem)
+    k.initialize_kernel_structures(
+        stack_base=0x00200000, stack_limit=0x001F0000, process_heap=0x9000
+    )
+    return k, mem
+
+
 class TestTEBLayout:
     def test_teb_at_0x00320000(self, ks):
         k, mem = ks
@@ -52,6 +62,15 @@ class TestPEBLayout:
         peb = k.get_peb()
         assert peb is not None
         assert peb.base_address == 0x00300000
+
+    def test_process_heap_written(self, ks_with_heap):
+        _, mem = ks_with_heap
+        # ProcessHeap at PEB+0x18
+        assert mem.read32(0x00300018) == 0x9000
+
+    def test_process_heap_default_zero(self, ks):
+        _, mem = ks
+        assert mem.read32(0x00300018) == 0
 
 
 class TestFSBase:

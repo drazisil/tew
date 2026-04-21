@@ -150,7 +150,7 @@ cpu.regs[EBP] = stack_base & 0xFFFFFFFF
 cpu.regs[ESP] -= 4
 mem.write32(cpu.regs[ESP], SENTINEL_ADDR)
 
-kernel_structures.initialize_kernel_structures(stack_base, stack_limit)
+kernel_structures.initialize_kernel_structures(stack_base, stack_limit, crt_state.process_heap)
 
 # ── Build valid EIP range table ───────────────────────────────────────────────
 

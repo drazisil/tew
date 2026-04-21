@@ -206,6 +206,11 @@ def load_emulator_config() -> EmulatorConfig:
         return EmulatorConfig(path_mappings={}, interactive_on_missing_file=False)
 
 
+# ── Fixed kernel structure addresses ─────────────────────────────────────────
+
+TEB_BASE = 0x00320000   # Thread Environment Block (FS base)
+PEB_BASE = 0x00300000   # Process Environment Block (TEB+0x30 points here)
+
 # ── Thread / stack constants ──────────────────────────────────────────────────
 
 THREAD_STACK_BASE = 0x08000000
@@ -221,12 +226,6 @@ class CRTState:
     def __init__(self) -> None:
         # ── Emulator config ───────────────────────────────────────────────
         self.config: EmulatorConfig = load_emulator_config()
-
-        # ── Last Win32 error (per-process; set by SetLastError / handlers) ──
-        # Win32 is per-thread in reality; a single slot is sufficient for MCO
-        # because the game is cooperative-threaded and checks errors immediately
-        # after the call that set them.
-        self.last_error: int = 0
 
         # ── Exe path (set by run_exe.py after construction) ───────────────
         # Linux path to the executable being emulated.  Used by the

@@ -150,8 +150,12 @@ timeout 60 env LOG_LEVEL=debug LOG_CATEGORIES=fileio,registry .venv/bin/python r
 run_exe.py                          — Entry point: handler setup, validRanges, step loop
 tew/
   api/
-    kernel32_handlers.py            — Process/system/heap/thread/scheduler handlers
-    kernel32_io.py                  — File I/O, sync objects, time, misc handlers
+    kernel32_handlers.py            — Orchestrator: module handles, GetProcAddress, LoadLibrary
+    kernel32_memory.py              — HeapAlloc/Free/ReAlloc/Size/Validate, VirtualAlloc/Free
+    kernel32_sync.py                — CriticalSection, TLS (TEB-backed at FS:[0xE0+])
+    kernel32_locale.py              — Code pages, MultiByteToWideChar/WideCharToMultiByte
+    kernel32_system.py              — Version, time, LastError (TEB-backed at FS:[0x34]), Sleep
+    kernel32_io.py                  — File I/O, sync objects, threading primitives
     msvcrt_handlers.py              — CRT: malloc/free/string/file/time
     user32_handlers.py              — User32/GDI32 handlers
     oleaut32_handlers.py            — OleAut32/Ole32 handlers
@@ -160,11 +164,13 @@ tew/
     wininet_handlers.py             — WinInet handlers
     version_handlers.py             — Version API handlers
     crt_handlers.py                 — Orchestrates handler registration; returns CRTState
-    _state.py                       — CRTState shared mutable state (heap/files/threads/TLS/registry)
+    _state.py                       — CRTState shared mutable state; TEB_BASE/PEB_BASE constants
     win32_handlers.py               — Win32Handlers class + INT 0xFE dispatch
     patch_internals.py              — CRT internal function patches (post-load)
     char_type.py, lc_map.py         — Pure-logic modules
     win32_errors.py, ini_file.py    — Pure-logic modules
+  kernel/
+    kernel_structures.py            — TEB/PEB layout; initialize_kernel_structures writes TEB+PEB
   loader/
     dll_loader.py                   — PE loading + base relocations
     import_resolver.py              — IAT population
