@@ -1180,7 +1180,11 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "CreateWindowExA", _CreateWindowExA)
 
     # CreateWindowExW — same logic, wide strings
-    stubs.register_handler("user32.dll", "CreateWindowExW", _halt("CreateWindowExW"))
+    stubs.register_handler("user32.dll", "CreateWindowExW",  _halt("CreateWindowExW"))
+    stubs.register_handler("user32.dll", "FindWindowA",      _halt("FindWindowA"))
+    stubs.register_handler("user32.dll", "FindWindowW",      _halt("FindWindowW"))
+    stubs.register_handler("user32.dll", "FindWindowExA",    _halt("FindWindowExA"))
+    stubs.register_handler("user32.dll", "FindWindowExW",    _halt("FindWindowExW"))
 
     # DestroyWindow(HWND hWnd) -> BOOL
     def _DestroyWindow(cpu: "CPU") -> None:
