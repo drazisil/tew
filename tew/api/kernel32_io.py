@@ -1221,8 +1221,14 @@ def register_kernel32_io_handlers(
     # ── Misc ──────────────────────────────────────────────────────────────────
 
     stubs.register_handler("kernel32.dll", "FormatMessageA",        _halt("FormatMessageA"))
+    stubs.register_handler("kernel32.dll", "GlobalAddAtom",         _halt("GlobalAddAtom"))
+    stubs.register_handler("kernel32.dll", "GlobalFindAtom",        _halt("GlobalFindAtom"))
     stubs.register_handler("kernel32.dll", "GlobalGetAtomNameA",    _halt("GlobalGetAtomNameA"))
     stubs.register_handler("kernel32.dll", "GlobalDeleteAtom",      _halt("GlobalDeleteAtom"))
+    stubs.register_handler("kernel32.dll", "AddAtom",               _halt("AddAtom"))
+    stubs.register_handler("kernel32.dll", "FindAtom",              _halt("FindAtom"))
+    stubs.register_handler("kernel32.dll", "GetAtomName",           _halt("GetAtomName"))
+    stubs.register_handler("kernel32.dll", "DeleteAtom",            _halt("DeleteAtom"))
 
     def _device_io_control(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0
