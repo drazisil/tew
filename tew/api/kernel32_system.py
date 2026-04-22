@@ -121,7 +121,7 @@ def _cooperative_sleep(
                 if obj is None or (isinstance(obj, EventHandle) and obj.signaled):
                     unblocked = True
                     break
-                if isinstance(obj, MutexHandle) and not obj.locked:
+                if isinstance(obj, MutexHandle) and obj.owner_tid is None:
                     unblocked = True
                     break
             if not unblocked and t.wait_deadline_ms is not None:
@@ -132,6 +132,11 @@ def _cooperative_sleep(
             if not unblocked:
                 continue
             t.waiting_on_handles = None
+        if t.waiting_on_cs is not None:
+            owner = memory.read32(t.waiting_on_cs + 0x0C)
+            if owner != 0:
+                continue
+            t.waiting_on_cs = None  # CS is free; thread will retry _enter_cs via EIP at stub
         runnable = t
         tidx = idx
         break

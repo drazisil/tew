@@ -61,10 +61,22 @@ def register_kernel32_sync_handlers(
                 # Acquired (LockCount was -1 → 0): first entry.
                 memory.write32(ptr + 0x08, 1)
                 memory.write32(ptr + 0x0C, tid)
+                if state.is_running_thread:
+                    state.pending_threads[state.current_thread_idx].waiting_on_cs = None
             else:
-                logger.error("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested: owner=0x{owner:08x} caller=0x{tid:08x} — blocking not implemented — halting")
-                cpu.halted = True
-                return
+                # CS is held by another thread.
+                memory.write32(ptr + 0x04, (lock_count - 1) & 0xFFFFFFFF)  # undo increment
+                if state.is_running_thread:
+                    t = state.pending_threads[state.current_thread_idx]
+                    t.waiting_on_cs = ptr
+                    state.thread_yield_requested = True
+                    cpu.halted = True
+                    logger.debug("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested: owner=0x{owner:08x} tid=0x{tid:08x} — suspending slice")
+                    return  # no cleanup_stdcall: EIP stays at stub for retry
+                else:
+                    logger.error("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested on main thread: owner=0x{owner:08x} — halting")
+                    cpu.halted = True
+                    return
         cleanup_stdcall(cpu, memory, 4)
 
     def _leave_cs(cpu: "CPU") -> None:
@@ -72,14 +84,10 @@ def register_kernel32_sync_handlers(
         rec = (memory.read32(ptr + 0x08) - 1) & 0xFFFFFFFF
         memory.write32(ptr + 0x08, rec)
         if rec == 0:
-            memory.write32(ptr + 0x0C, 0)
-            new_lock = (memory.read32(ptr + 0x04) - 1) & 0xFFFFFFFF
-            memory.write32(ptr + 0x04, new_lock)
-            if new_lock < 0x80000000:
-                # LockCount >= 0 as signed means waiters exist; must signal LockSemaphore.
-                logger.error("kernel32", f"[LeaveCriticalSection] 0x{ptr:08x} has waiters — LockSemaphore signal not implemented — halting")
-                cpu.halted = True
-                return
+            # Full release: reset to free state. Threads with waiting_on_cs == ptr
+            # will detect OwningThread == 0 on the next scheduler pass and retry.
+            memory.write32(ptr + 0x0C, 0x00000000)  # OwningThread = 0
+            memory.write32(ptr + 0x04, 0xFFFFFFFF)  # LockCount = -1 (free)
         cleanup_stdcall(cpu, memory, 4)
 
     def _delete_cs(cpu: "CPU") -> None:

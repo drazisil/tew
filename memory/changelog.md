@@ -4,12 +4,35 @@ Entries are newest-first.
 
 ---
 
-## 2026-04-20 — TEB/PEB truthfulness, CriticalSection fix, kernel32 split
+## 2026-04-21 — Cooperative CS blocking, mutex owner tracking
 
-**Progress:**
-Game was already reaching BeginScene (D3D8 vtable slot 34). This session fixed
-correctness issues that would cause failures under any multi-threaded or
-error-checking code path. No step-count regression; correctness improved.
+**Cooperative CriticalSection blocking (`kernel32_sync.py`, `kernel32_system.py`, `kernel32_io.py`, `_state.py`):**
+- `_enter_cs`: contested background thread now suspends cleanly — undoes LockCount
+  increment, sets `thread.waiting_on_cs = ptr`, sets `thread_yield_requested = True`,
+  halts without `cleanup_stdcall` so EIP stays at stub for retry on resume.
+  `_leave_cs`: full release resets LockCount = -1 and OwningThread = 0 (replaces old
+  decrement + halt-if-waiters). Removed noisy per-release debug log.
+- Scheduler (`_cooperative_sleep` + `_run_background_slice`): added `waiting_on_cs`
+  check — if `OwningThread == 0`, clears `waiting_on_cs` and allows thread to retry.
+- `PendingThreadInfo`: added `waiting_on_cs: Optional[int] = None`.
+- Result: NPS networking threads (tid=0x3ec, 0x3ed) survive CS contention; game
+  reaches and sustains the rendering loop (BeginScene/SetRenderState cycling) at 129M+ steps.
+
+**Mutex owner tracking (`kernel32_io.py`, `_state.py`):**
+- `MutexHandle`: added `owner_tid: Optional[int]` and `recursion_count: int`.
+- `WaitForSingleObject`: mutex now checks `owner_tid is None` before acquiring.
+  Contested mutex blocks via `waiting_on_handles` (same path as unsignaled event).
+  Recursive acquisition by owning thread increments `recursion_count` and returns 0.
+- `WaitForMultipleObjectsEx`: mutex ready only when `owner_tid is None`.
+- `ReleaseMutex`: decrements `recursion_count`; clears `owner_tid`/`locked` on zero.
+- `CreateMutexA`: sets `owner_tid` + `recursion_count = 1` when `bInitialOwner != 0`.
+- Scheduler checks updated to use `owner_tid is None` instead of `not obj.locked`.
+
+**Tests:** 388 (unchanged).
+
+---
+
+## 2026-04-20 — TEB/PEB truthfulness, CriticalSection fix, kernel32 split
 
 **TEB/PEB truthfulness (`kernel32_system.py`, `kernel32_sync.py`, `kernel32_io.py`,
 `kernel_structures.py`, `_state.py`):**

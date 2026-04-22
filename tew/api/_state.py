@@ -38,6 +38,8 @@ class MutexHandle:
     type: str = "mutex"
     locked: bool = False
     name: str = ""
+    owner_tid: Optional[int] = None   # thread ID holding the mutex; None = unowned
+    recursion_count: int = 0          # depth of recursive acquisitions by owner_tid
 
 
 @dataclass
@@ -82,6 +84,9 @@ class PendingThreadInfo:
     # the handle was signaled.  The retried WaitForSingle/Multiple handler
     # reads this, clears it, and returns WAIT_TIMEOUT (0x102).
     wait_timed_out: bool = False
+    # CS address this thread is blocking on (set by _enter_cs, cleared by scheduler).
+    # EIP is saved at the EnterCriticalSection stub so the handler retries on resume.
+    waiting_on_cs: Optional[int] = None
 
 
 # ── Registry types ────────────────────────────────────────────────────────────

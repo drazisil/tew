@@ -188,7 +188,7 @@ def _run_background_slice(
                 if obj is None or (isinstance(obj, EventHandle) and obj.signaled):
                     unblocked = True
                     break
-                if isinstance(obj, MutexHandle) and not obj.locked:
+                if isinstance(obj, MutexHandle) and obj.owner_tid is None:
                     unblocked = True
                     break
             if not unblocked and t.wait_deadline_ms is not None:
@@ -199,6 +199,11 @@ def _run_background_slice(
             if not unblocked:
                 continue
             t.waiting_on_handles = None
+        if t.waiting_on_cs is not None:
+            owner = memory.read32(t.waiting_on_cs + 0x0C)
+            if owner != 0:
+                continue
+            t.waiting_on_cs = None  # CS is free; thread will retry _enter_cs via EIP at stub
         runnable = t
         tidx = idx
         break
@@ -597,81 +602,85 @@ def register_kernel32_io_handlers(
         timeout_ms = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         obj = state.kernel_handle_map.get(h)
         if obj is not None:
-            if isinstance(obj, MutexHandle):
-                obj.locked = True
+            tid = state.tls_current_thread_id()
+            # Recursive mutex acquisition by the owning thread always succeeds immediately.
+            if isinstance(obj, MutexHandle) and obj.owner_tid == tid:
+                obj.recursion_count += 1
                 cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 8)
                 return
-            else:  # EventHandle
-                if obj.signaled:
-                    if not obj.manual_reset:
-                        obj.signaled = False
-                    cpu.regs[EAX] = 0
-                    cleanup_stdcall(cpu, memory, 8)
-                    return
-                # Not signaled.
-                if state.is_running_thread:
-                    tidx = state.current_thread_idx
-                    if 0 <= tidx < len(state.pending_threads):
-                        t = state.pending_threads[tidx]
-                        # Woken by timeout expiry (scheduler set wait_timed_out).
-                        if t.wait_timed_out:
-                            t.wait_timed_out = False
-                            cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
-                            cleanup_stdcall(cpu, memory, 8)
-                            return
-                    # Block this thread: rewind EIP so the wait is retried on the
-                    # next schedule, record the handle, yield the slice.
-                    cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
-                    if 0 <= tidx < len(state.pending_threads):
-                        t = state.pending_threads[tidx]
-                        t.waiting_on_handles = frozenset([h])
-                        if timeout_ms != _WAIT_INFINITE:
-                            t.wait_deadline_ms = state.virtual_ticks_ms + timeout_ms
-                            t.wait_timed_out = False
-                    state.thread_yield_requested = True
-                    cpu.halted = True
-                    return
-                # Main thread — drive background threads until the handle is
-                # signaled (process-zero pattern).  Without this, the main
-                # thread would halt and nothing could ever call SetEvent.
-                _wfso_slice_count = 0
-                _wfso_deadline = (
-                    None if timeout_ms == _WAIT_INFINITE
-                    else (state.virtual_ticks_ms + timeout_ms) & 0xFFFFFFFF
-                )
-                while True:
-                    if not _run_background_slice(cpu, memory, state):
-                        if timeout_ms == _WAIT_INFINITE:
-                            logger.warn("scheduler",
-                                f"WaitForSingleObject(0x{h:x}) INFINITE: "
-                                f"deadlock — no runnable threads, returning TIMEOUT")
-                        cpu.regs[EAX] = 0x102
-                        cleanup_stdcall(cpu, memory, 8)
-                        return
-                    _wfso_slice_count += 1
-                    if _wfso_slice_count % 10 == 0:
-                        state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
-                    obj = state.kernel_handle_map.get(h)
-                    if obj is None:
-                        break
-                    if isinstance(obj, EventHandle) and obj.signaled:
-                        break
-                    if isinstance(obj, MutexHandle) and not obj.locked:
-                        break
-                    if _wfso_deadline is not None and state.virtual_ticks_ms >= _wfso_deadline:
+            ready = (
+                (isinstance(obj, MutexHandle) and obj.owner_tid is None) or
+                (isinstance(obj, EventHandle) and obj.signaled)
+            )
+            if ready:
+                if isinstance(obj, MutexHandle):
+                    obj.owner_tid = tid
+                    obj.recursion_count = 1
+                    obj.locked = True
+                elif isinstance(obj, EventHandle) and not obj.manual_reset:
+                    obj.signaled = False
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 8)
+                return
+            # Not ready: block background thread or spin driving background slices.
+            if state.is_running_thread:
+                tidx = state.current_thread_idx
+                if 0 <= tidx < len(state.pending_threads):
+                    t = state.pending_threads[tidx]
+                    if t.wait_timed_out:
+                        t.wait_timed_out = False
                         cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
                         cleanup_stdcall(cpu, memory, 8)
                         return
-                # Handle is now ready — acquire and return WAIT_OBJECT_0.
-                obj = state.kernel_handle_map.get(h)
-                if isinstance(obj, EventHandle) and not obj.manual_reset:
-                    obj.signaled = False
-                elif isinstance(obj, MutexHandle):
-                    obj.locked = True
-                cpu.regs[EAX] = 0
-                cleanup_stdcall(cpu, memory, 8)
+                cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
+                if 0 <= tidx < len(state.pending_threads):
+                    t = state.pending_threads[tidx]
+                    t.waiting_on_handles = frozenset([h])
+                    if timeout_ms != _WAIT_INFINITE:
+                        t.wait_deadline_ms = state.virtual_ticks_ms + timeout_ms
+                        t.wait_timed_out = False
+                state.thread_yield_requested = True
+                cpu.halted = True
                 return
+            _wfso_slice_count = 0
+            _wfso_deadline = (
+                None if timeout_ms == _WAIT_INFINITE
+                else (state.virtual_ticks_ms + timeout_ms) & 0xFFFFFFFF
+            )
+            while True:
+                if not _run_background_slice(cpu, memory, state):
+                    if timeout_ms == _WAIT_INFINITE:
+                        logger.warn("scheduler",
+                            f"WaitForSingleObject(0x{h:x}) INFINITE: "
+                            f"deadlock — no runnable threads, returning TIMEOUT")
+                    cpu.regs[EAX] = 0x102
+                    cleanup_stdcall(cpu, memory, 8)
+                    return
+                _wfso_slice_count += 1
+                if _wfso_slice_count % 10 == 0:
+                    state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
+                obj = state.kernel_handle_map.get(h)
+                if obj is None:
+                    break
+                if isinstance(obj, MutexHandle) and obj.owner_tid is None:
+                    break
+                if isinstance(obj, EventHandle) and obj.signaled:
+                    break
+                if _wfso_deadline is not None and state.virtual_ticks_ms >= _wfso_deadline:
+                    cpu.regs[EAX] = 0x102
+                    cleanup_stdcall(cpu, memory, 8)
+                    return
+            obj = state.kernel_handle_map.get(h)
+            if isinstance(obj, MutexHandle):
+                obj.owner_tid = tid
+                obj.recursion_count = 1
+                obj.locked = True
+            elif isinstance(obj, EventHandle) and not obj.manual_reset:
+                obj.signaled = False
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
         # Unknown handle (thread handle etc.) — treat as signaled.
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
@@ -684,6 +693,7 @@ def register_kernel32_io_handlers(
         lp_handles = memory.read32((base +  8) & 0xFFFFFFFF)
         b_wait_all = memory.read32((base + 12) & 0xFFFFFFFF) != 0
         timeout_ms = memory.read32((base + 16) & 0xFFFFFFFF)
+        tid        = state.tls_current_thread_id()
         all_ready  = True
         for i in range(n_count):
             h   = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
@@ -695,13 +705,15 @@ def register_kernel32_io_handlers(
                     cleanup_stdcall(cpu, memory, 20)
                     return
                 continue
-            ready = isinstance(obj, MutexHandle) or (
+            ready = (isinstance(obj, MutexHandle) and obj.owner_tid is None) or (
                 isinstance(obj, EventHandle) and obj.signaled)
             if ready:
                 if not b_wait_all:
                     if isinstance(obj, EventHandle) and not obj.manual_reset:
                         obj.signaled = False
                     if isinstance(obj, MutexHandle):
+                        obj.owner_tid = tid
+                        obj.recursion_count = 1
                         obj.locked = True
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
@@ -718,6 +730,8 @@ def register_kernel32_io_handlers(
                     if isinstance(obj, EventHandle) and not obj.manual_reset:
                         obj.signaled = False
                     if isinstance(obj, MutexHandle):
+                        obj.owner_tid = tid
+                        obj.recursion_count = 1
                         obj.locked = True
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 20)
@@ -761,7 +775,13 @@ def register_kernel32_io_handlers(
                     return
         h = state.next_kernel_handle
         state.next_kernel_handle += 1
-        state.kernel_handle_map[h] = MutexHandle(locked=b_owner != 0, name=name)
+        owner_tid = state.tls_current_thread_id() if b_owner != 0 else None
+        state.kernel_handle_map[h] = MutexHandle(
+            locked=b_owner != 0,
+            name=name,
+            owner_tid=owner_tid,
+            recursion_count=1 if b_owner != 0 else 0,
+        )
         logger.debug("handlers", f'[Win32] CreateMutexA("{name or "(unnamed)"}") -> 0x{h:x}')
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 12)
@@ -787,7 +807,11 @@ def register_kernel32_io_handlers(
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         obj = state.kernel_handle_map.get(h)
         if isinstance(obj, MutexHandle):
-            obj.locked = False
+            obj.recursion_count -= 1
+            if obj.recursion_count <= 0:
+                obj.owner_tid = None
+                obj.locked = False
+                obj.recursion_count = 0
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
