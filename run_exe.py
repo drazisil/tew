@@ -214,25 +214,20 @@ detected_runaway = False
 _pending_timers = None
 _invoke_emulated_proc_fn = None
 _get_dialog_sentinel_fn = None
-_run_background_slice_fn = None
 _heartbeat_count = 0
 
 
 def _run_timer_heartbeat() -> None:
     global _heartbeat_count
-    global _pending_timers, _invoke_emulated_proc_fn, _get_dialog_sentinel_fn, _run_background_slice_fn
+    global _pending_timers, _invoke_emulated_proc_fn, _get_dialog_sentinel_fn
     _heartbeat_count += 1
-    if crt_state.is_running_thread:
-        return
     if _pending_timers is None:
         from tew.api.win32_handlers import pending_timers as _pt
         from tew.api.user32_handlers import _invoke_emulated_proc as _iep, _get_dialog_sentinel as _gds
-        from tew.api.kernel32_io import _run_background_slice as _rbs
         _pending_timers = _pt
         _invoke_emulated_proc_fn = _iep
         _get_dialog_sentinel_fn = _gds
-        _run_background_slice_fn = _rbs
-    crt_state.virtual_ticks_ms = (crt_state.virtual_ticks_ms + 1) & 0xFFFFFFFF
+    crt_state.scheduler.tick(1, mem)
     if not _pending_timers:
         return
     due = [t for t in list(_pending_timers.values()) if t.due_at <= crt_state.virtual_ticks_ms]
@@ -245,7 +240,6 @@ def _run_timer_heartbeat() -> None:
             timer.due_at += timer.period_ms
         else:
             _pending_timers.pop(timer.id, None)
-    _run_background_slice_fn(cpu, mem, crt_state)
 
 
 _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL

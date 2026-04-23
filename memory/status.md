@@ -7,7 +7,7 @@ MCity_d.exe — MSVC debug build, Win32, 32-bit. Pentium II instruction set.
 Intel 80386 Programmer's Reference Manual, 1986
 Path: ~/Documents/i386.pdf (421 pages)
 
-## Current state (2026-04-21)
+## Current state (2026-04-22)
 
 Game reaches the rendering loop and cycles through it actively:
 - Login, auth, THRASH/Vulkan, SDL window, timer threads, NPS networking threads — all alive
@@ -20,20 +20,36 @@ ZigCPU is wired in and working. Main loop uses cpu.run(100K) batches.
 
 ## Current blocker
 
-`Dev::BeginScene` is unimplemented (stubs with `cpu.halted = True`). This is the
-expected next blocker now that threading is correct. Requires a real Vulkan device.
+Scheduler refactor in progress (Steps 2/12 complete). `cpu.halted` was being used
+for thread suspension as well as real CPU halts — refactoring to separate these
+cleanly. Scheduler class (`tew/kernel/scheduler.py`) is fully implemented and
+tested; wired into `CRTState` but not yet used for actual thread switching.
 
-Design `D3D8DeviceState` before touching BeginScene/EndScene/Present.
+Next step: Step 3 — migrate `PendingThreadInfo` → `ThreadState`, add property
+delegation on `CRTState` so existing handler code keeps working.
+
+After refactor: `Dev::BeginScene` remains the next real blocker (requires Vulkan
+device). Design `D3D8DeviceState` before touching BeginScene/EndScene/Present.
 
 ## Queued issues (priority order)
+- **Scheduler refactor** — Steps 3–12 remaining. See plan in session notes.
+  - **Step 9 note (heartbeat round-robin):** The heartbeat must call
+    `scheduler.maybe_switch(cpu, memory)` after each quantum so threads that
+    never voluntarily yield (no Sleep/Wait/CS calls) still get preempted at
+    batch boundaries. The old design used a hard 10K-step slice per background
+    thread; the new design achieves the same via heartbeat-driven switching.
+    Without this, a non-yielding thread monopolizes the CPU indefinitely.
+    Clock advancement is NOT the issue (tick() handles that unconditionally);
+    this is purely about CPU time fairness between threads.
 - **`D3D8DeviceState` class** — design before implementing CreateDevice/BeginScene/Present.
 - `BeginScene` / `EndScene` / `Clear` / `Present` — require real Vulkan device; NOT stubs.
 - `[alive]` heartbeat still silent during `GetMessageA` host-sleep — heartbeat
   only fires between batches, not inside the host sleep loop. Low priority.
 - SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768 —
   game has additional sizing logic. Not critical.
-- `diagnose_fault` in run_exe.py crashes with `assert error is not None` when
-  `cpu.last_error` is None (happens when BeginScene halt has no error message set).
+- `diagnose_fault` assert fixed (BeginScene halt now propagates correctly).
+- BeginScene fires 4x instead of 1x — caused by scheduler clearing cpu.halted
+  when resuming threads. Will be fully resolved by the scheduler refactor.
 
 ## Run command
 ```bash

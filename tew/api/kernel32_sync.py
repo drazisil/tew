@@ -50,44 +50,38 @@ def register_kernel32_sync_handlers(
     def _enter_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         tid = state.tls_current_thread_id()
-        owner = memory.read32(ptr + 0x0C)
+        owner = memory.read32((ptr + 0x0C) & 0xFFFFFFFF)
         if owner == tid:
             # Recursive entry — same thread, deepen RecursionCount only.
-            memory.write32(ptr + 0x08, (memory.read32(ptr + 0x08) + 1) & 0xFFFFFFFF)
+            memory.write32((ptr + 0x08) & 0xFFFFFFFF,
+                           (memory.read32((ptr + 0x08) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF)
         else:
-            lock_count = (memory.read32(ptr + 0x04) + 1) & 0xFFFFFFFF
-            memory.write32(ptr + 0x04, lock_count)
+            lock_count = (memory.read32((ptr + 0x04) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+            memory.write32((ptr + 0x04) & 0xFFFFFFFF, lock_count)
             if lock_count == 0:
                 # Acquired (LockCount was -1 → 0): first entry.
-                memory.write32(ptr + 0x08, 1)
-                memory.write32(ptr + 0x0C, tid)
-                if state.is_running_thread:
-                    state.pending_threads[state.current_thread_idx].waiting_on_cs = None
+                memory.write32((ptr + 0x08) & 0xFFFFFFFF, 1)
+                memory.write32((ptr + 0x0C) & 0xFFFFFFFF, tid)
             else:
-                # CS is held by another thread.
-                memory.write32(ptr + 0x04, (lock_count - 1) & 0xFFFFFFFF)  # undo increment
-                if state.is_running_thread:
-                    t = state.pending_threads[state.current_thread_idx]
-                    t.waiting_on_cs = ptr
-                    state.thread_yield_requested = True
-                    cpu.halted = True
-                    logger.debug("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested: owner=0x{owner:08x} tid=0x{tid:08x} — suspending slice")
-                    return  # no cleanup_stdcall: EIP stays at stub for retry
-                else:
-                    logger.error("kernel32", f"[EnterCriticalSection] 0x{ptr:08x} contested on main thread: owner=0x{owner:08x} — halting")
-                    cpu.halted = True
-                    return
+                # CS is held by another thread — undo increment and block.
+                memory.write32((ptr + 0x04) & 0xFFFFFFFF, (lock_count - 1) & 0xFFFFFFFF)
+                retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+                logger.debug("kernel32",
+                    f"[EnterCriticalSection] 0x{ptr:08x} contested: "
+                    f"owner=0x{owner:08x} tid=0x{tid:08x} — blocking")
+                state.scheduler.block_current_on_cs(cpu, memory, ptr, retry_eip)
+                return  # no cleanup_stdcall: EIP set to retry_eip by scheduler
         cleanup_stdcall(cpu, memory, 4)
 
     def _leave_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        rec = (memory.read32(ptr + 0x08) - 1) & 0xFFFFFFFF
-        memory.write32(ptr + 0x08, rec)
+        rec = (memory.read32((ptr + 0x08) & 0xFFFFFFFF) - 1) & 0xFFFFFFFF
+        memory.write32((ptr + 0x08) & 0xFFFFFFFF, rec)
         if rec == 0:
-            # Full release: reset to free state. Threads with waiting_on_cs == ptr
-            # will detect OwningThread == 0 on the next scheduler pass and retry.
-            memory.write32(ptr + 0x0C, 0x00000000)  # OwningThread = 0
-            memory.write32(ptr + 0x04, 0xFFFFFFFF)  # LockCount = -1 (free)
+            # Full release: reset to free state and wake any blocked threads.
+            memory.write32((ptr + 0x0C) & 0xFFFFFFFF, 0x00000000)  # OwningThread = 0
+            memory.write32((ptr + 0x04) & 0xFFFFFFFF, 0xFFFFFFFF)  # LockCount = -1 (free)
+            state.scheduler.unblock_cs(ptr)
         cleanup_stdcall(cpu, memory, 4)
 
     def _delete_cs(cpu: "CPU") -> None:

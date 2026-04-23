@@ -12,8 +12,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from tew.hardware.cpu import SavedCPUState
 from tew.api.window_manager import WindowManager
+from tew.kernel.scheduler import Scheduler, ThreadState
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -63,30 +63,8 @@ class DynamicModule:
 
 # ── Cooperative thread state ─────────────────────────────────────────────────
 
-@dataclass
-class PendingThreadInfo:
-    start_address: int
-    parameter: int
-    handle: int
-    thread_id: int
-    suspended: bool
-    completed: bool
-    calls_seen: Optional[set[str]] = None     # dedup set for call logging
-    saved_state: Optional[SavedCPUState] = None
-    # When non-empty the thread is blocked waiting for one of these handles.
-    # The scheduler will skip it until an event in this set is signaled OR
-    # the virtual clock reaches wait_deadline_ms.
-    waiting_on_handles: Optional[frozenset[int]] = None
-    # virtual_ticks_ms value at which a finite-timeout wait expires.
-    # None means the wait has no deadline (INFINITE or thread is not waiting).
-    wait_deadline_ms: Optional[int] = None
-    # Set to True by the scheduler when a finite-timeout wait expires before
-    # the handle was signaled.  The retried WaitForSingle/Multiple handler
-    # reads this, clears it, and returns WAIT_TIMEOUT (0x102).
-    wait_timed_out: bool = False
-    # CS address this thread is blocking on (set by _enter_cs, cleared by scheduler).
-    # EIP is saved at the EnterCriticalSection stub so the handler retries on resume.
-    waiting_on_cs: Optional[int] = None
+# ThreadState is the canonical thread descriptor; PendingThreadInfo is a legacy alias.
+PendingThreadInfo = ThreadState
 
 
 # ── Registry types ────────────────────────────────────────────────────────────
@@ -113,19 +91,25 @@ class EmulatorConfig:
 def find_file_ci(linux_path: str) -> Optional[str]:
     """Case-insensitive file lookup for Linux (Windows paths are case-insensitive).
     Returns the real on-disk path if found (any case), or None if not found.
+    Resolves every path component case-insensitively, not just the final one.
     """
     if os.path.exists(linux_path):
         return linux_path
-    dir_path = os.path.dirname(linux_path)
-    name_lower = os.path.basename(linux_path).lower()
+    head, tail = os.path.split(linux_path)
+    if not tail:
+        # Root or bare separator — exists check above already failed.
+        return None
+    resolved_dir = find_file_ci(head)
+    if resolved_dir is None:
+        return None
+    tail_lower = tail.lower()
     try:
-        entries = os.listdir(dir_path)
-        for entry in entries:
-            if entry.lower() == name_lower:
-                return os.path.join(dir_path, entry)
+        for entry in os.listdir(resolved_dir):
+            if entry.lower() == tail_lower:
+                return os.path.join(resolved_dir, entry)
     except OSError as e:
         from tew.logger import logger
-        logger.debug("fileio", f"find_file_ci: cannot list {dir_path!r}: {e}")
+        logger.debug("fileio", f"find_file_ci: cannot list {resolved_dir!r}: {e}")
     return None
 
 
@@ -269,18 +253,6 @@ class CRTState:
         self.pending_threads: list[PendingThreadInfo] = []
         self.next_thread_id: int = 1001
         self.next_thread_handle: int = 0x0000BEEF
-        self.thread_stack_next: int = THREAD_STACK_BASE
-        self.sleep_count: int = 0
-        self.virtual_ticks_ms: int = 0   # virtual clock: advanced by dwMilliseconds per Sleep/SleepEx
-        self.is_running_thread: bool = False
-        self.current_thread_idx: int = -1
-        self.last_scheduled_idx: int = -1
-
-        # ── Thread yield-without-death flag ──────────────────────────────
-        # Set by wait handlers (WaitForSingle/Multiple) when a background
-        # thread must block: _run_thread_slice saves state instead of
-        # marking the thread dead, then clears this flag.
-        self.thread_yield_requested: bool = False
 
         # ── TLS ───────────────────────────────────────────────────────────
         self.tls_slots: set[int] = set()
@@ -288,6 +260,12 @@ class CRTState:
         self.tls_store: dict[int, dict[int, int]] = {}   # tid → (slot → value)
         TLS_MAX_SLOTS = 64
         self.tls_max_slots: int = TLS_MAX_SLOTS
+
+        # ── Kernel scheduler ──────────────────────────────────────────────
+        # tls_slots is passed by reference so TlsAlloc additions are visible.
+        # Main thread TID 1000 matches the tls_current_thread_id() fallback.
+        self.scheduler: Scheduler = Scheduler(tls_slots=self.tls_slots)
+        self.scheduler.create_main_thread(thread_id=1000, handle=0xFFFFFFFF)
 
         # ── Registry ──────────────────────────────────────────────────────
         self.registry_values: RegistryMap = load_registry_json()
@@ -302,6 +280,16 @@ class CRTState:
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded
         self.pe_resources: Optional["PEResources"] = None
+
+    # ── Virtual clock ─────────────────────────────────────────────────────────
+
+    @property
+    def virtual_ticks_ms(self) -> int:
+        return self.scheduler.virtual_ticks_ms
+
+    @virtual_ticks_ms.setter
+    def virtual_ticks_ms(self, val: int) -> None:
+        self.scheduler.virtual_ticks_ms = val
 
     # ── Heap allocation ───────────────────────────────────────────────────────
 
@@ -400,9 +388,7 @@ class CRTState:
     # ── TLS helpers ───────────────────────────────────────────────────────────
 
     def tls_current_thread_id(self) -> int:
-        if self.current_thread_idx >= 0 and self.current_thread_idx < len(self.pending_threads):
-            return self.pending_threads[self.current_thread_idx].thread_id
-        return 1000  # main thread
+        return self.scheduler.current_thread().thread_id
 
     def tls_thread_store(self, tid: int) -> dict[int, int]:
         if tid not in self.tls_store:

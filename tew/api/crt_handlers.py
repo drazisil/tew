@@ -68,7 +68,7 @@ def register_crt_handlers(
     stubs.patch_address(
         THREAD_SENTINEL,
         "_threadReturn",
-        _make_thread_return_handler(state),
+        _make_thread_return_handler(state, memory),
     )
 
     # ── Per-DLL handler registration ──────────────────────────────────────────
@@ -120,16 +120,11 @@ def patch_crt_internals(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _make_thread_return_handler(state: CRTState):
+def _make_thread_return_handler(state: CRTState, memory: "Memory"):
     """Build the handler called when a spawned thread returns to THREAD_SENTINEL."""
     def _handler(cpu: "CPU") -> None:
-        if 0 <= state.current_thread_idx < len(state.pending_threads):
-            thread = state.pending_threads[state.current_thread_idx]
-            logger.debug(
-                "thread",
-                f"Thread {thread.thread_id} returned normally",
-            )
-            thread.completed = True
-        cpu.halted = True
+        thread = state.scheduler.current_thread()
+        logger.debug("thread", f"Thread {thread.thread_id} returned normally")
+        state.scheduler.mark_current_dead(cpu, memory)
 
     return _handler

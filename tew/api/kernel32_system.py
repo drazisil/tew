@@ -12,199 +12,30 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import cleanup_stdcall
-from tew.api._state import (
-    CRTState, FileHandleEntry, PendingThreadInfo,
-    EventHandle, MutexHandle,
-    THREAD_STACK_SIZE, THREAD_SENTINEL, TEB_BASE,
-)
+from tew.api._state import CRTState, FileHandleEntry, TEB_BASE
 from tew.logger import logger
 
 # QPC reports 1 MHz so counter values stay in easy integer range.
 _QPC_FREQ: int = 1_000_000
 
 
-def _run_thread_slice(cpu: "CPU", memory: "Memory",
-                      thread: PendingThreadInfo, state: CRTState) -> None:
-    """Run thread for up to 1M steps; save/restore state around it."""
-    step_limit = 1_000_000
-    cpu.halted = False
-    steps = 0
-    thread_error = None
-    if thread.calls_seen is None:
-        thread.calls_seen = set()
-    log_first = thread.saved_state is None
-
-    if log_first:
-        logger.trace("thread", f"Starting thread at EIP=0x{cpu.eip:x}, ESP=0x{cpu.regs[ESP]:x}")
-        param = thread.parameter
-        logger.trace("thread", f"Parameter at 0x{param:x}:")
-        for off in range(0, 0x54, 4):
-            v = memory.read32(param + off)
-            if v:
-                logger.trace("thread", f"  [+0x{off:x}] = 0x{v:x}")
-
-    try:
-        last_valid = cpu.eip
-        while not cpu.halted and steps < step_limit:
-            eip = cpu.eip & 0xFFFFFFFF
-            in_stubs    = 0x00200000 <= eip < 0x00220000
-            in_exe      = 0x00400000 <= eip < 0x02000000
-            in_dlls     = 0x10000000 <= eip < 0x40000000
-            in_sentinel = 0x001FE000 <= eip < 0x001FE004
-            if not (in_stubs or in_exe or in_dlls or in_sentinel) and steps > 10:
-                logger.warn("thread", f"RUNAWAY step={steps}: EIP=0x{eip:x} last=0x{last_valid:x}")
-                thread.completed = True
-                break
-            if in_stubs or in_exe or in_dlls:
-                last_valid = eip
-            if steps % 250_000 == 0 and steps:
-                logger.warn("thread",
-                    f"[tid={thread.thread_id} step={steps}] "
-                    f"EIP=0x{eip:x} ESP=0x{cpu.regs[ESP]:x}")
-            cpu.step()
-            steps += 1
-    except Exception as exc:
-        thread_error = exc
-        logger.warn("thread", f"Thread {thread.thread_id} error after {steps} steps: {exc}")
-
-    if thread.completed:
-        logger.debug("scheduler", f"Thread {thread.thread_id} completed ({steps} steps)")
-    elif thread_error:
-        thread.completed = True
-    elif cpu.halted:
-        if state.thread_yield_requested:
-            state.thread_yield_requested = False
-            thread.saved_state = cpu.save_state()
-            logger.debug("scheduler",
-                f"Thread {thread.thread_id} blocked (waiting on handles) after {steps} steps "
-                f"(EIP=0x{cpu.eip & 0xFFFFFFFF:08x})")
+def _fire_due_timers(cpu: "CPU", memory: "Memory", state: CRTState) -> None:
+    """Invoke any timer callbacks whose due_at <= virtual_ticks_ms."""
+    from tew.api.win32_handlers import pending_timers
+    if not pending_timers:
+        return
+    due = [t for t in list(pending_timers.values()) if t.due_at <= state.virtual_ticks_ms]
+    if not due:
+        return
+    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+    sentinel = _get_dialog_sentinel(state, memory)
+    for timer in due:
+        _invoke_emulated_proc(cpu, memory, timer.cb_addr, [timer.id, 0, timer.dw_user, 0, 0], sentinel)
+        if timer.period_ms > 0:
+            timer.due_at += timer.period_ms
         else:
-            detail = f": {cpu.last_error}" if cpu.last_error else ""
-            logger.error(
-                "thread",
-                f"Thread {thread.thread_id} crashed: unexpected halt at "
-                f"EIP=0x{cpu.eip & 0xFFFFFFFF:08x} after {steps} steps{detail} — marking dead",
-            )
-            thread.completed = True
-    else:
-        thread.saved_state = cpu.save_state()
-        logger.debug("scheduler",
-            f"Thread {thread.thread_id} yielded after {steps} steps "
-            f"(EIP=0x{cpu.eip:x})")
+            pending_timers.pop(timer.id, None)
 
-
-def _cooperative_sleep(
-    cpu: "CPU", memory: "Memory", state: CRTState, arg_bytes: int
-) -> bool:
-    """Try to run a pending thread for one time slice.
-    Returns True if a thread ran (caller should cleanup and return),
-    False if no thread was available.
-
-    Guards against reentrance: if a background thread calls Sleep() during
-    its own slice, we do not recurse into another slice (that would blow
-    Python's call stack).  Just return False so the Sleep stub returns 0.
-    """
-    if state.is_running_thread:
-        return False
-    num = len(state.pending_threads)
-    runnable: Optional[PendingThreadInfo] = None
-    tidx = -1
-    for i in range(1, num + 1):
-        idx = (state.last_scheduled_idx + i) % num
-        t = state.pending_threads[idx]
-        if t.suspended or t.completed:
-            continue
-        if t.waiting_on_handles:
-            unblocked = False
-            for wh in t.waiting_on_handles:
-                obj = state.kernel_handle_map.get(wh)
-                if obj is None or (isinstance(obj, EventHandle) and obj.signaled):
-                    unblocked = True
-                    break
-                if isinstance(obj, MutexHandle) and obj.owner_tid is None:
-                    unblocked = True
-                    break
-            if not unblocked and t.wait_deadline_ms is not None:
-                if state.virtual_ticks_ms >= t.wait_deadline_ms:
-                    t.wait_timed_out = True
-                    t.wait_deadline_ms = None
-                    unblocked = True
-            if not unblocked:
-                continue
-            t.waiting_on_handles = None
-        if t.waiting_on_cs is not None:
-            owner = memory.read32(t.waiting_on_cs + 0x0C)
-            if owner != 0:
-                continue
-            t.waiting_on_cs = None  # CS is free; thread will retry _enter_cs via EIP at stub
-        runnable = t
-        tidx = idx
-        break
-    if runnable is None or tidx < 0:
-        return False
-
-    state.last_scheduled_idx = tidx
-    logger.debug("scheduler",
-        f"Main thread Sleep #{state.sleep_count} - thread {runnable.thread_id} "
-        f"(startAddr=0x{runnable.start_address:x})")
-
-    main_state = cpu.save_state()
-    main_tid = state.tls_current_thread_id()   # capture before context switch
-    state.is_running_thread = True
-    state.current_thread_idx = tidx
-
-    # Save main thread TLS from TEB to store; load background thread TLS into TEB.
-    _tls_teb = TEB_BASE + 0xE0
-    if state.tls_slots:
-        main_tls = state.tls_thread_store(main_tid)
-        for slot in state.tls_slots:
-            main_tls[slot] = memory.read32(_tls_teb + slot * 4)
-        bg_tls = state.tls_thread_store(runnable.thread_id)
-        for slot in state.tls_slots:
-            memory.write32(_tls_teb + slot * 4, bg_tls.get(slot, 0))
-
-    if runnable.saved_state:
-        cpu.restore_state(runnable.saved_state)
-    else:
-        stack_top = state.thread_stack_next + THREAD_STACK_SIZE - 16
-        state.thread_stack_next += THREAD_STACK_SIZE
-        esp = stack_top - 4
-        memory.write32(esp, runnable.parameter)
-        esp -= 4
-        memory.write32(esp, THREAD_SENTINEL)
-        cpu.regs[ESP] = esp & 0xFFFFFFFF
-        cpu.regs[EBP] = 0
-        cpu.regs[EAX] = 0
-        cpu.regs[ECX] = 0
-        cpu.regs[EDX] = 0
-        cpu.regs[EBX] = 0
-        cpu.regs[ESI] = 0
-        cpu.regs[EDI] = 0
-        cpu.eip = runnable.start_address
-        cpu.eflags = 0x202
-
-    _run_thread_slice(cpu, memory, runnable, state)
-
-    # Advance the virtual clock by 1ms per background slice so finite-timeout
-    # waits can expire even when the main thread spins on Sleep(0).
-    state.virtual_ticks_ms = (state.virtual_ticks_ms + 1) & 0xFFFFFFFF
-
-    # Save background thread TLS from TEB to store; restore main thread TLS into TEB.
-    if state.tls_slots:
-        bg_tls = state.tls_thread_store(runnable.thread_id)
-        for slot in state.tls_slots:
-            bg_tls[slot] = memory.read32(_tls_teb + slot * 4)
-        main_tls = state.tls_thread_store(main_tid)
-        for slot in state.tls_slots:
-            memory.write32(_tls_teb + slot * 4, main_tls.get(slot, 0))
-
-    cpu.restore_state(main_state)
-    cpu.halted = False
-    state.is_running_thread = False
-    state.current_thread_idx = -1
-
-    cleanup_stdcall(cpu, memory, arg_bytes)
-    return True
 
 
 def register_kernel32_system_handlers(
@@ -476,45 +307,14 @@ def register_kernel32_system_handlers(
 
     stubs.register_handler("kernel32.dll", "InterlockedCompareExchange", _interlocked_cmpxchg)
 
-    # ── Cooperative Sleep scheduler ───────────────────────────────────────────
+    # ── Sleep ─────────────────────────────────────────────────────────────────
 
     def _sleep(cpu: "CPU") -> None:
-        if state.is_running_thread:
-            # Background thread: can't yield to another thread from within a
-            # thread slice.  Treat sleep as instant so the thread keeps running.
-            cleanup_stdcall(cpu, memory, 4)
-            return
-        # Advance virtual clock by the requested sleep duration before yielding.
-        # GetTickCount/timeGetTime return this virtual counter so that the
-        # emulated binary sees time advance in proportion to emulated execution,
-        # not Python wall time.
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        state.virtual_ticks_ms = (state.virtual_ticks_ms + dw_ms) & 0xFFFFFFFF
-        # Fire timer callbacks whose due_at has elapsed.
-        from tew.api.win32_handlers import pending_timers
-        due = [t for t in pending_timers.values() if t.due_at <= state.virtual_ticks_ms]
-        if due:
-            from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
-            sentinel = _get_dialog_sentinel(state, memory)
-            for timer in due:
-                _invoke_emulated_proc(
-                    cpu, memory, timer.cb_addr,
-                    [timer.id, 0, timer.dw_user, 0, 0],
-                    sentinel,
-                )
-                if timer.period_ms > 0:
-                    timer.due_at += timer.period_ms
-                else:
-                    pending_timers.pop(timer.id, None)
-        state.sleep_count += 1
-        if _cooperative_sleep(cpu, memory, state, 4):
-            state.sleep_count = 0
-            return
-        # Main thread, no runnable threads.  Warn periodically but do not halt —
-        # the game may legitimately be waiting on a network response.
-        if state.sleep_count % 50 == 0:
-            logger.warn("handlers",
-                f"[Win32] Sleep() called {state.sleep_count} times with no runnable threads")
-        cleanup_stdcall(cpu, memory, 4)
+        return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        cpu.regs[ESP] = (cpu.regs[ESP] + 8) & 0xFFFFFFFF  # stdcall: pop ret addr + 4-byte arg
+        state.scheduler.tick(dw_ms, memory)
+        _fire_due_timers(cpu, memory, state)
+        state.scheduler.sleep_current(cpu, memory, return_eip, 0, dw_ms)
 
     stubs.register_handler("kernel32.dll", "Sleep", _sleep)

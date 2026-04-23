@@ -86,6 +86,8 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_is_halted.restype    = _b
     lib.cpu_is_faulted.argtypes  = [_vp]
     lib.cpu_is_faulted.restype   = _b
+    lib.cpu_set_halted.argtypes  = [_vp]
+    lib.cpu_set_halted.restype   = None
     lib.cpu_clear_halted.argtypes= [_vp]
     lib.cpu_clear_halted.restype = None
 
@@ -323,6 +325,7 @@ class ZigCPU:
             _lib.cpu_clear_halted(self._state)
         else:
             self._py_halted = True
+            _lib.cpu_set_halted(self._state)
 
     @property
     def faulted(self) -> bool:
