@@ -1,0 +1,14 @@
+inputSet:
+  name: Build_drazisil_tew_1777043281219-push-trigger-input-set
+  identifier: Build_drazisil_tew_1777043281219pushtriggerinputset
+  orgIdentifier: default
+  projectIdentifier: rusty
+  pipeline:
+    identifier: Build_drazisil_tew_1777043281219
+    properties:
+      ci:
+        codebase:
+          build:
+            type: branch
+            spec:
+              branch: <+trigger.branch>
