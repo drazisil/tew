@@ -7,56 +7,25 @@ MCity_d.exe — MSVC debug build, Win32, 32-bit. Pentium II instruction set.
 Intel 80386 Programmer's Reference Manual, 1986
 Path: ~/Documents/i386.pdf (421 pages)
 
-## Current state (2026-04-24)
+---
+*This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
+---
 
-### What's fixed this session
+### Current blocker: BeginPaint unimplemented
 
-**Round-robin preemption (`scheduler.py`, `run_exe.py`):**
-- Added `Scheduler.preempt_slice(cpu, memory)`: after each `cpu.run(batch)`, if the
-  current thread is READY and another READY thread exists, rotate to it.
-- Called in the main run loop immediately after `cpu.run(batch)`.
-- Root cause: `mmtimer_callback` (0x00a30a40) signals its own wait event (0x7012) via
-  `_SIGNAL_set` inside the `_tmrsub[]` dispatch loop, so `WaitForMultipleObjectsEx`
-  always found the event signaled and never yielded. The timer thread consumed 100% of
-  emulated CPU, starving all other threads.
-- Fix confirmed: at 132M steps the main game window (`Motor City Online` HWND 0x1034)
-  is created and the game progresses further than before.
+At step ~132M, immediately after `CreateWindowExA` creates the `Motor City Online`
+window, the game calls `BeginPaint` — the entry point to the full GDI/Direct3D
+rendering system. This is the next major subsystem to build.
 
-### What was fixed in previous session (2026-04-23)
-
-**`proc=0` / 122-second stall** — `CreateDialogParamA(#106)` fixed with null-guard.
-
-**`PendingTimer.fu_event`** — `timeSetEvent` dispatch modes separated:
-- `TIME_CALLBACK_FUNCTION` (0x00): invoke emulated proc
-- `TIME_CALLBACK_EVENT_SET` (0x10): SetEvent on handle directly
-
-**advapi32 `timeSetEvent` time source** — fixed to use `state.virtual_ticks_ms + u_delay`.
-
-### Current blocker: __chkesp stack mismatch at 0x0077f8e5
-
-At step ~132M (real ~12s), `__chkesp` fires at return to `0x0077f8e5`.
-ESP=0x081bfe68, EBP=0x081bff08, delta=-160 (40 dwords under-popped).
-Triggered after `CreateWindowExA` creates the main `Motor City Online` window.
-
-**Stack at crash:**
-- `[ESP+00] = 0x0077f8e5` — return address
-- `[ESP+04] = 0x00000008` — 1 arg?
-- `[ESP+08/0c] = 0x011a9ed4` — ptr (repeated)
-- `[ESP+10] = 0x92000000` — main stack sentinel
-- `[ESP+1c/20] = 0x00000400 / 0x00000300` — likely width/height (1024/768)
-
-**What to investigate:**
-- Decompile `0x0077f8e5` (the caller) — what Win32 call precedes the return?
-- The 160-byte delta suggests ~10 args that weren't cleaned up, or a cdecl function
-  that was wrapped as stdcall (caller didn't clean up).
-- `CreateWindowExA` takes 12 args (48 bytes). Check our stub's `cleanup_stdcall` byte count.
-  Alternatively, some other call in the game init path has the wrong convention.
+`BeginPaint(HWND hwnd, LPPAINTSTRUCT lpPaint)` — fills a 64-byte PAINTSTRUCT and
+returns an HDC. Blocked on the broader GDI + D3D8 design.
 
 ## Uncommitted changes
-All changes committed as of 2026-04-24 (450/450 tests pass).
+- `window_manager.py`: add `WM_PAINT = 0x000F` constant
+- `user32_handlers.py`: fix `_GetMessageA` background-thread check (`is_running_thread` → `scheduler.current_idx != 0`)
 
 ## Queued issues (priority order)
-- **`__chkesp` at 0x0077f8e5** — stack mismatch at main window creation
+- **`BeginPaint` / GDI + D3D8 system** — full rendering pipeline; design before implementing
 - **`D3D8DeviceState` class** — design before implementing CreateDevice/BeginScene/Present
 - `BeginScene` / `EndScene` / `Clear` / `Present` — require real Vulkan device; NOT stubs
 - SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768

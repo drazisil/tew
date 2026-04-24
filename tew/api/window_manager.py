@@ -93,6 +93,7 @@ def _sdl_sym_to_vk(sym: int) -> int:
 
 WM_CREATE       = 0x0001
 WM_DESTROY      = 0x0002
+WM_PAINT        = 0x000F
 WM_SETTEXT      = 0x000C
 WM_GETTEXT      = 0x000D
 WM_CLOSE        = 0x0010

@@ -698,7 +698,7 @@ def register_user32_gdi32_handlers(
                 memory.write32(lp_msg + 20, 0)
                 memory.write32(lp_msg + 24, 0)
 
-        if state.is_running_thread:
+        if state.scheduler.current_idx != 0:
             # Cooperative path: one pump-and-check, then yield.
             if not wm.pump_sdl_events():
                 _write_quit()

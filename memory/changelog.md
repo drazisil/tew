@@ -4,6 +4,37 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-24 — Round-robin preemption
+
+**Round-robin preemption (`scheduler.py`, `run_exe.py`):**
+- Added `Scheduler.preempt_slice(cpu, memory)`: after each `cpu.run(batch)`, if the
+  current thread is READY and another READY thread exists, rotate to it.
+- Called in the main run loop immediately after `cpu.run(batch)`.
+- Root cause: `mmtimer_callback` (0x00a30a40) signals its own wait event (0x7012) via
+  `_SIGNAL_set` inside the `_tmrsub[]` dispatch loop, so `WaitForMultipleObjectsEx`
+  always found the event signaled and never yielded. The timer thread consumed 100% of
+  emulated CPU, starving all other threads.
+- Result: at 132M steps the main game window (`Motor City Online` HWND 0x1034) is
+  created and the game progresses further than before.
+
+**Tests:** 450 (up from 388).
+
+---
+
+## 2026-04-23 — CreateDialogParamA fix, timer dispatch, advapi32 time source
+
+**`proc=0` / 122-second stall (`user32_handlers.py`):**
+- `CreateDialogParamA(#106)` fixed with null-guard.
+
+**`PendingTimer.fu_event` — `timeSetEvent` dispatch modes (`kernel32_io.py`):**
+- `TIME_CALLBACK_FUNCTION` (0x00): invoke emulated proc
+- `TIME_CALLBACK_EVENT_SET` (0x10): SetEvent on handle directly
+
+**advapi32 `timeSetEvent` time source (`advapi32_handlers.py`):**
+- Fixed to use `state.virtual_ticks_ms + u_delay`.
+
+---
+
 ## 2026-04-21 — Cooperative CS blocking, mutex owner tracking
 
 **Cooperative CriticalSection blocking (`kernel32_sync.py`, `kernel32_system.py`, `kernel32_io.py`, `_state.py`):**
