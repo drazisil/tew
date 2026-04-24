@@ -5,7 +5,6 @@ Ported from Win32Handlers.ts lines 5709–6634.
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -595,19 +594,19 @@ def register_advapi32_handlers(
         fu_event      = memory.read32(base + 20)
         timer_id      = _next_timer_id
         _next_timer_id += 1
-        now_ms        = time.monotonic() * 1000
         period_ms     = u_delay if (fu_event & TIME_PERIODIC) != 0 else 0
         pending_timers[timer_id] = PendingTimer(
             id=timer_id,
-            due_at=now_ms + u_delay,
+            due_at=state.virtual_ticks_ms + u_delay,
             period_ms=period_ms,
             cb_addr=lp_time_proc,
             dw_user=dw_user,
+            fu_event=fu_event,
         )
         logger.info(
             "handlers",
             f"[winmm] timeSetEvent(delay={u_delay}, res={u_resolution},"
-            f" cb=0x{lp_time_proc:x}, periodic={period_ms > 0}) -> id={timer_id}",
+            f" cb=0x{lp_time_proc:x}, fuEvent=0x{fu_event:x}, periodic={period_ms > 0}) -> id={timer_id}",
         )
         cpu.regs[EAX] = timer_id
         cleanup_stdcall(cpu, memory, 20)

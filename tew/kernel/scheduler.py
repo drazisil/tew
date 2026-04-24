@@ -85,6 +85,7 @@ class Scheduler:
         self._tls_slots = tls_slots           # shared reference — sees TlsAlloc additions
         self._thread_stack_next = thread_stack_next
         self._last_scheduled_idx: int = 0
+        self._kernel: Optional[object] = None  # set to Kernel by CRTState after construction
 
     # ── Thread registration ───────────────────────────────────────────────────
 
@@ -250,6 +251,20 @@ class Scheduler:
         if blocked_fallback_idx is not None:
             self.threads[blocked_fallback_idx].status = ThreadStatus.READY
             return blocked_fallback_idx
+
+        # Kernel tick: poll pending I/O completions.  If any socket is ready,
+        # kernel.tick() signals event handles and calls unblock_handle(), which
+        # sets BLOCKED_HANDLES threads to READY.  Re-scan to pick one up.
+        if self._kernel is not None:
+            self._kernel.tick()
+            for i in range(n):
+                idx = (start + i) % n
+                if idx == self.current_idx:
+                    continue
+                t = self.threads[idx]
+                if not t.suspended and t.status == ThreadStatus.READY:
+                    return idx
+
         return None
 
     # ── Public: context switch ────────────────────────────────────────────────
@@ -260,6 +275,27 @@ class Scheduler:
             if self.threads[self.current_idx].status != ThreadStatus.DEAD:
                 self._save_current(cpu, memory)
         self._load_next(idx, cpu, memory)
+
+    def preempt_slice(self, cpu: "CPU", memory: "Memory") -> bool:
+        """Round-robin preemption: yield the current slice to the next READY thread.
+
+        Called after each cpu.run(batch) so that a thread which never calls a
+        blocking Win32 stub (e.g. a timer dispatch loop that re-signals its own
+        wait event) cannot starve other threads indefinitely.
+
+        Returns True if a context switch occurred.
+        """
+        current = self.threads[self.current_idx]
+        if current.status != ThreadStatus.READY:
+            return False  # Thread blocked mid-batch; switch already happened.
+        n = len(self.threads)
+        for i in range(1, n):
+            idx = (self.current_idx + i) % n
+            t = self.threads[idx]
+            if not t.suspended and t.status == ThreadStatus.READY:
+                self.switch_to(cpu, memory, idx)
+                return True
+        return False
 
     # ── Public: blocking operations ───────────────────────────────────────────
 

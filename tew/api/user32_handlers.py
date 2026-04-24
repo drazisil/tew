@@ -985,11 +985,12 @@ def register_user32_gdi32_handlers(
             if hwnd_msg == dlg_hwnd and msg_id == WM_INITDIALOG:
                 for saved in requeue:
                     wm.post_message(*saved)
-                _invoke_emulated_proc(
-                    cpu, memory, lp_dialog_func,
-                    [dlg_hwnd, msg_id, wparam, lparam],
-                    sentinel,
-                )
+                if lp_dialog_func != 0:
+                    _invoke_emulated_proc(
+                        cpu, memory, lp_dialog_func,
+                        [dlg_hwnd, msg_id, wparam, lparam],
+                        sentinel,
+                    )
                 break
             elif wm.is_window(hwnd_msg):
                 requeue.append(pending)

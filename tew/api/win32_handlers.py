@@ -54,13 +54,18 @@ class HandlerEntry:
 
 # ── Timer type ───────────────────────────────────────────────────────────────
 
+_TIME_CALLBACK_EVENT_SET   = 0x10
+_TIME_CALLBACK_EVENT_PULSE = 0x20
+
+
 @dataclass
 class PendingTimer:
     id: int
-    due_at: float    # absolute ms timestamp when callback fires
+    due_at: float    # absolute virtual-ms timestamp when callback fires
     period_ms: int   # 0 = one-shot, >0 = periodic interval
-    cb_addr: int     # game code address of TIMECALLBACK
+    cb_addr: int     # TIMECALLBACK address OR Win32 event handle (see fu_event)
     dw_user: int     # passed through as arg 3
+    fu_event: int = 0  # fuEvent flags from timeSetEvent
 
 
 # Module-level timer table: id → PendingTimer

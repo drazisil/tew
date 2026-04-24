@@ -357,6 +357,9 @@ class WindowManager:
             f"title='{title}' parent=0x{parent_hwnd:x}"
         )
         self._message_queue.append((hwnd, WM_CREATE, 0, 0))
+        # Post WM_PAINT immediately so the game's message loop can render;
+        # without this the game blocks waiting for a paint that SDL never generates.
+        self._message_queue.append((hwnd, WM_PAINT, 0, 0))
         return hwnd
 
     def register_child(self, parent_hwnd: int, ctrl_id: int, child_hwnd: int) -> None:

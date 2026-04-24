@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from tew.api.window_manager import WindowManager
+from tew.kernel.kernel import Kernel
 from tew.kernel.scheduler import Scheduler, ThreadState
 
 if TYPE_CHECKING:
@@ -266,6 +267,10 @@ class CRTState:
         # Main thread TID 1000 matches the tls_current_thread_id() fallback.
         self.scheduler: Scheduler = Scheduler(tls_slots=self.tls_slots)
         self.scheduler.create_main_thread(thread_id=1000, handle=0xFFFFFFFF)
+        # Kernel owns async I/O completions; wired into the scheduler so
+        # tick() fires from _pick_next_ready() when no thread is READY.
+        self.kernel: Kernel = Kernel(self)
+        self.scheduler._kernel = self.kernel
 
         # ── Registry ──────────────────────────────────────────────────────
         self.registry_values: RegistryMap = load_registry_json()

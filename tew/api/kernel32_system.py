@@ -21,16 +21,23 @@ _QPC_FREQ: int = 1_000_000
 
 def _fire_due_timers(cpu: "CPU", memory: "Memory", state: CRTState) -> None:
     """Invoke any timer callbacks whose due_at <= virtual_ticks_ms."""
-    from tew.api.win32_handlers import pending_timers
+    from tew.api.win32_handlers import pending_timers, _TIME_CALLBACK_EVENT_SET
     if not pending_timers:
         return
     due = [t for t in list(pending_timers.values()) if t.due_at <= state.virtual_ticks_ms]
     if not due:
         return
     from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+    from tew.api._state import EventHandle
     sentinel = _get_dialog_sentinel(state, memory)
     for timer in due:
-        _invoke_emulated_proc(cpu, memory, timer.cb_addr, [timer.id, 0, timer.dw_user, 0, 0], sentinel)
+        if timer.fu_event & _TIME_CALLBACK_EVENT_SET:
+            obj = state.kernel_handle_map.get(timer.cb_addr)
+            if isinstance(obj, EventHandle):
+                obj.signaled = True
+                state.scheduler.unblock_handle(timer.cb_addr)
+        elif timer.cb_addr != 0:
+            _invoke_emulated_proc(cpu, memory, timer.cb_addr, [timer.id, 0, timer.dw_user, 0, 0], sentinel)
         if timer.period_ms > 0:
             timer.due_at += timer.period_ms
         else:

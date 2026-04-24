@@ -252,9 +252,23 @@ def register_wsock32_handlers(
         cleanup_stdcall(cpu, memory, 0)
 
     def _wsa_async_select(cpu: "CPU") -> None:
-        """WSAAsyncSelect(s, hWnd, wMsg, lEvent) -> int.  Not needed."""
+        """WSAAsyncSelect(s, hWnd, wMsg, lEvent) -> int."""
+        s       = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        h_wnd   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        w_msg   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        l_event = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        state.kernel.register_async_select(s, h_wnd, w_msg, l_event)
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 16)
+
+    def _wsa_event_select(cpu: "CPU") -> None:
+        """WSAEventSelect(s, hEventObject, lNetworkEvents) -> int."""
+        s            = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        h_event_obj  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        l_network    = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        state.kernel.register_event_select(s, h_event_obj, l_network)
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 12)
 
     def _wsa_async_get_host_by_addr(cpu: "CPU") -> None:
         """WSAAsyncGetHostByAddr(...) -> HANDLE.  Not supported."""
@@ -294,6 +308,7 @@ def register_wsock32_handlers(
     def _closesocket(cpu: "CPU") -> None:
         """closesocket(s) -> int."""
         s = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.kernel.unregister_socket(s)
         entry = _socket_map.pop(s, None)
         if entry and entry.py_sock:
             try:
@@ -818,6 +833,7 @@ def register_wsock32_handlers(
         "WSACancelBlockingCall":    _wsa_cancel_blocking_call,
         "WSAIsBlocking":            _wsa_is_blocking,
         "WSAAsyncSelect":           _wsa_async_select,
+        "WSAEventSelect":           _wsa_event_select,
         "WSAAsyncGetHostByAddr":    _wsa_async_get_host_by_addr,
         "WSAAsyncGetHostByName":    _wsa_async_get_host_by_name,
         "WSACancelAsyncRequest":    _wsa_cancel_async_request,

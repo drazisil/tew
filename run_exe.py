@@ -214,19 +214,25 @@ detected_runaway = False
 _pending_timers = None
 _invoke_emulated_proc_fn = None
 _get_dialog_sentinel_fn = None
+_time_callback_event_set = None
+_event_handle_cls = None
 _heartbeat_count = 0
 
 
 def _run_timer_heartbeat() -> None:
     global _heartbeat_count
     global _pending_timers, _invoke_emulated_proc_fn, _get_dialog_sentinel_fn
+    global _time_callback_event_set, _event_handle_cls
     _heartbeat_count += 1
     if _pending_timers is None:
-        from tew.api.win32_handlers import pending_timers as _pt
+        from tew.api.win32_handlers import pending_timers as _pt, _TIME_CALLBACK_EVENT_SET as _tces
         from tew.api.user32_handlers import _invoke_emulated_proc as _iep, _get_dialog_sentinel as _gds
+        from tew.api._state import EventHandle as _eh
         _pending_timers = _pt
         _invoke_emulated_proc_fn = _iep
         _get_dialog_sentinel_fn = _gds
+        _time_callback_event_set = _tces
+        _event_handle_cls = _eh
     crt_state.scheduler.tick(1, mem)
     if not _pending_timers:
         return
@@ -235,7 +241,13 @@ def _run_timer_heartbeat() -> None:
         return
     sentinel = _get_dialog_sentinel_fn(crt_state, mem)
     for timer in due:
-        _invoke_emulated_proc_fn(cpu, mem, timer.cb_addr, [timer.id, 0, timer.dw_user, 0, 0], sentinel)
+        if timer.fu_event & _time_callback_event_set:
+            obj = crt_state.kernel_handle_map.get(timer.cb_addr)
+            if isinstance(obj, _event_handle_cls):
+                obj.signaled = True
+                crt_state.scheduler.unblock_handle(timer.cb_addr)
+        elif timer.cb_addr != 0:
+            _invoke_emulated_proc_fn(cpu, mem, timer.cb_addr, [timer.id, 0, timer.dw_user, 0, 0], sentinel)
         if timer.period_ms > 0:
             timer.due_at += timer.period_ms
         else:
@@ -251,6 +263,7 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
     cpu.run(batch)
     step_count += batch
+    crt_state.scheduler.preempt_slice(cpu, mem)
 
     _heartbeat_countdown -= batch
     if _heartbeat_countdown <= 0:

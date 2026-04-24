@@ -11,7 +11,10 @@ Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
 
 import os
 import sys
+import time
 from typing import Callable, Literal
+
+_start_time: float = time.monotonic()
 
 LogCategory = Literal[
     "cpu", "dll", "loader", "handlers", "thread", "wininet",
@@ -77,7 +80,9 @@ def _emit(level: int, category: str, msg: str) -> None:
     if _active_categories is not None and category not in _active_categories and category != "exception":
         return
 
-    line = f"{_LEVEL_PREFIX[level]} [{category}] {msg}"
+    elapsed = time.monotonic() - _start_time
+    ts = f"{elapsed:8.3f}s"
+    line = f"{ts} {_LEVEL_PREFIX[level]} [{category}] {msg}"
     if level == ERROR:
         print(line, file=sys.stderr, flush=True)
     elif level == WARN:

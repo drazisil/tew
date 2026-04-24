@@ -1541,10 +1541,10 @@ def register_winmm_handlers(
         _next_timer_id[0] += 1
         pending_timers[tid] = PendingTimer(
             id=tid, due_at=due_at, period_ms=period_ms,
-            cb_addr=lp_time_proc, dw_user=dw_user,
+            cb_addr=lp_time_proc, dw_user=dw_user, fu_event=fu_event,
         )
         logger.debug("handlers",
-            f"timeSetEvent(delay={u_delay}ms, proc=0x{lp_time_proc:08x}) -> id={tid}")
+            f"timeSetEvent(delay={u_delay}ms, proc=0x{lp_time_proc:08x}, fuEvent=0x{fu_event:x}) -> id={tid}")
         cpu.regs[EAX] = tid
         cleanup_stdcall(cpu, memory, 20)
 
