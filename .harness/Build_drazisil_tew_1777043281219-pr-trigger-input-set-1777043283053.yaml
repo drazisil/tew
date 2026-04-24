@@ -1,0 +1,14 @@
+inputSet:
+  name: Build_drazisil_tew_1777043281219-pr-trigger-input-set
+  identifier: Build_drazisil_tew_1777043281219prtriggerinputset
+  orgIdentifier: default
+  projectIdentifier: rusty
+  pipeline:
+    identifier: Build_drazisil_tew_1777043281219
+    properties:
+      ci:
+        codebase:
+          build:
+            type: PR
+            spec:
+              number: <+trigger.prNumber>
