@@ -713,11 +713,11 @@ def register_user32_gdi32_handlers(
                 cpu.regs[EAX] = 1
                 cleanup_stdcall(cpu, memory, 16)
                 return
-            # No message yet — rewind to INT 0xFE and yield to scheduler.
-            # The thread will re-enter GetMessageA on its next slice.
-            cpu.eip = (cpu.eip - 2) & 0xFFFFFFFF
-            cpu.halted = True
-            state.thread_yield_requested = True
+            # No message yet — sleep 1ms and retry from the stub entry.
+            # scheduler.sleep_current saves state at the stub address so
+            # GetMessageA is retried when this thread wakes.
+            retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+            state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 1)
             return
 
         # Main-thread blocking path: sleep until a message or SDL_QUIT.
@@ -1567,6 +1567,52 @@ def register_user32_gdi32_handlers(
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "RedrawWindow", _RedrawWindow)
+
+    # BeginPaint(HWND hwnd, LPPAINTSTRUCT lpPaint) -> HDC
+    # PAINTSTRUCT layout (64 bytes):
+    #   [0]  hdc      (4 bytes)
+    #   [4]  fErase   (BOOL, 4 bytes)
+    #   [8]  rcPaint  (RECT: left, top, right, bottom — 4×4 = 16 bytes)
+    #   [24] fRestore (BOOL)
+    #   [28] fIncUpdate (BOOL)
+    #   [32] rgbReserved[32]
+    def _BeginPaint(cpu: "CPU") -> None:
+        hwnd  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_ps = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        hdc   = _alloc_hdc(hwnd)
+        if lp_ps:
+            entry = wm.get_window(hwnd)
+            right  = entry.cx if entry is not None and entry.cx > 0 else 800
+            bottom = entry.cy if entry is not None and entry.cy > 0 else 600
+            memory.write32(lp_ps,       hdc)     # hdc
+            memory.write32(lp_ps + 4,   0)       # fErase = FALSE
+            memory.write32(lp_ps + 8,   0)       # rcPaint.left
+            memory.write32(lp_ps + 12,  0)       # rcPaint.top
+            memory.write32(lp_ps + 16,  right)   # rcPaint.right
+            memory.write32(lp_ps + 20,  bottom)  # rcPaint.bottom
+            for off in range(24, 64, 4):
+                memory.write32(lp_ps + off, 0)
+        logger.info("handlers",
+            f"[Win32] BeginPaint(hwnd=0x{hwnd:x}) -> hdc=0x{hdc:x}")
+        cpu.regs[EAX] = hdc
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "BeginPaint", _BeginPaint)
+
+    # EndPaint(HWND hwnd, LPPAINTSTRUCT lpPaint) -> BOOL
+    def _EndPaint(cpu: "CPU") -> None:
+        hwnd  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_ps = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        hdc   = memory.read32(lp_ps & 0xFFFFFFFF) if lp_ps else 0
+        if hdc:
+            _live_hdcs.pop(hdc, None)
+            _dc_selected.pop(hdc, None)
+        logger.debug("handlers",
+            f"[Win32] EndPaint(hwnd=0x{hwnd:x}, hdc=0x{hdc:x})")
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "EndPaint", _EndPaint)
 
     # ── gdi32.dll ─────────────────────────────────────────────────────────────
 

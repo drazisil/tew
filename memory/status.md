@@ -11,33 +11,37 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current blocker: BeginPaint unimplemented
+### Current blocker: Wayland deadlock inside IDirect3D8::CreateDevice
 
-At step ~132M, immediately after `CreateWindowExA` creates the `Motor City Online`
-window, the game calls `BeginPaint` — the entry point to the full GDI/Direct3D
-rendering system. This is the next major subsystem to build.
+`CreateDevice` is called successfully (log: `IDirect3D8::CreateDevice hwnd=0x1034 back=800x600`),
+but then hangs before "VkSurfaceKHR created" is logged. The hang is somewhere in the
+VkSurface creation block (lines 152–198 of `idirect3d8.py`): either `vkCreateWaylandSurfaceKHR`,
+`wl_display_roundtrip`, or possibly `vkGetPhysicalDeviceSurfaceSupportKHR`.
 
-`BeginPaint(HWND hwnd, LPPAINTSTRUCT lpPaint)` — fills a 64-byte PAINTSTRUCT and
-returns an HDC. Blocked on the broader GDI + D3D8 design.
+A `wl_display_roundtrip` was added after `vkCreateWaylandSurfaceKHR` to flush Wayland events
+before surface queries — but the hang appears before that log line, so either:
+1. `vkCreateWaylandSurfaceKHR` itself is hanging (unlikely — it's a local wrap), or
+2. `wl_display_roundtrip` is deadlocking because SDL2 holds the Wayland display lock
+   and the call can't dispatch without SDL2 pumping events.
 
-## Uncommitted changes
-- `window_manager.py`: add `WM_PAINT = 0x000F` constant
-- `user32_handlers.py`: fix `_GetMessageA` background-thread check (`is_running_thread` → `scheduler.current_idx != 0`)
-
-## Queued issues (priority order)
-- **`BeginPaint` / GDI + D3D8 system** — full rendering pipeline; design before implementing
-- **`D3D8DeviceState` class** — design before implementing CreateDevice/BeginScene/Present
-- `BeginScene` / `EndScene` / `Clear` / `Present` — require real Vulkan device; NOT stubs
-- SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768
-- `[alive]` heartbeat silent during `GetMessageA` host-sleep — low priority
+Next step: add fine-grained logging inside the surface creation block to pinpoint
+which call hangs, then fix (likely: call SDL_PumpEvents before Vulkan surface queries,
+or use wl_display_dispatch_pending instead of roundtrip).
 
 ## Run command
 ```bash
 cd /data/Code/tew
-timeout 120 env LOG_LEVEL=info /data/Code/tew/.venv/bin/python /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -5
+timeout 30 env LOG_LEVEL=info /data/Code/tew/.venv/bin/python -u /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -20
 ```
 Note: uutils timeout (installed on this system) does not support inline env vars —
-use `env KEY=VAL` prefix and absolute paths.
+use `env KEY=VAL` prefix and absolute paths. Add `-u` to python for unbuffered output.
+
+## Queued issues (priority order)
+- **Pinpoint Wayland deadlock** — add step logging inside surface creation block
+- **Fix Wayland deadlock** — likely SDL_PumpEvents or wl_display_dispatch_pending
+- SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768
+- DrawPrimitive / DrawIndexedPrimitive — currently `_halt`; needed for actual geometry
+- `[alive]` heartbeat silent during `GetMessageA` host-sleep — low priority
 
 ## Architecture
 - Game does NOT call D3D8 directly.

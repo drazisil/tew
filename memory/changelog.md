@@ -4,6 +4,75 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-24 — GetMessageA cooperative yield + Wayland roundtrip attempt
+
+**`GetMessageA` cooperative yield (`user32_handlers.py`):**
+- Fixed broken cooperative-yield path. Old code set `cpu.halted = True` +
+  `state.thread_yield_requested = True`; `thread_yield_requested` was never read
+  anywhere, so it terminated the run loop instead of yielding.
+- New code: `state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 1)` — saves
+  thread state at stub entry EIP, marks thread SLEEPING, switches to next READY thread.
+
+**`IDirect3D8::CreateDevice` — Wayland roundtrip (`d3d8/idirect3d8.py`):**
+- Added `wl_display_roundtrip(wl_display)` via ctypes after `vkCreateWaylandSurfaceKHR`,
+  before any surface-property queries (`vkGetPhysicalDeviceSurfaceSupportKHR` etc.).
+- Rationale: Wayland compositor needs to process events before it can respond to
+  surface capability queries; without this, those calls deadlock.
+- Status: hang persists — exact call still unknown. Next: fine-grained step logging
+  inside the surface creation block to isolate which call deadlocks.
+
+**Tests:** 450 (all passing).
+
+---
+
+## 2026-04-24 — BeginPaint/EndPaint + full Vulkan swapchain
+
+**`BeginPaint` / `EndPaint` (`user32_handlers.py`):**
+- Implemented `BeginPaint(HWND, LPPAINTSTRUCT) → HDC` using the existing
+  `_alloc_hdc` infrastructure. Fills the 64-byte PAINTSTRUCT: hdc, fErase=0,
+  rcPaint from window entry cx/cy, all reserved bytes zero.
+- Implemented `EndPaint(HWND, LPPAINTSTRUCT)`: reads hdc from PAINTSTRUCT,
+  removes it from `_live_hdcs` / `_dc_selected`, returns TRUE.
+- Both registered as user32.dll stubs with stdcall 8-byte cleanup (2 args).
+
+**`IDirect3D8::CreateDevice` (`d3d8/idirect3d8.py`):**
+- Now builds the complete Vulkan rendering backend:
+  - Creates `VkSurfaceKHR` from the SDL window's SDL_GetWindowWMInfo X11/Wayland
+    display and window handles via `vkCreateXlibSurfaceKHR` /
+    `vkCreateWaylandSurfaceKHR` (selected by WAYLAND_DISPLAY).
+  - Destroys the SDL renderer on the game window (Vulkan takes over).
+  - Finds a queue family with graphics + present support.
+  - Creates `VkDevice` with `VK_KHR_swapchain`.
+  - Creates `VkSwapchainKHR` (format B8G8R8A8_UNORM preferred, FIFO present mode,
+    extent from D3DPRESENT_PARAMETERS or surface capabilities).
+  - Allocates command pool + single `VkCommandBuffer`.
+  - Creates 2 semaphores (`image_available`, `render_done`) + 1 fence
+    (`in_flight`, pre-signalled).
+  - All failures halt with explicit error log.
+- `make_vtable` now accepts `window_manager` parameter; threaded through from
+  `register_d3d8_handlers(stubs, memory, state)` in crt_handlers.py.
+
+**`BeginScene` / `EndScene` / `Clear` / `Present` (`d3d8/idirect3d8device.py`):**
+- `BeginScene`: waits for in-flight fence, acquires swapchain image, records
+  UNDEFINED → TRANSFER_DST_OPTIMAL barrier, begins command buffer.
+- `Clear`: records `vkCmdClearColorImage` (D3DCOLOR ARGB → float RGBA; only when
+  D3DCLEAR_TARGET flag set).
+- `EndScene`: records TRANSFER_DST_OPTIMAL → PRESENT_SRC_KHR barrier, ends
+  command buffer.
+- `Present`: `vkQueueSubmit` with image_available wait + render_done signal +
+  in_flight fence; `vkQueuePresentKHR`.
+- All four were previously `_halt`; now real Vulkan.
+
+**State (`d3d8/_state.py`):**
+- Added: `_vk_device`, `_vk_*_queue_family`, `_vk_*_queue`, `_vk_surface`,
+  `_vk_swapchain`, `_vk_swapchain_*`, `_vk_command_pool`, `_vk_cmd_buf`,
+  `_vk_image_available`, `_vk_render_done`, `_vk_in_flight`,
+  `_vk_current_image_idx`, `_vk_fn_*` extension function slots.
+
+**Tests:** 450 (all passing).
+
+---
+
 ## 2026-04-24 — Round-robin preemption
 
 **Round-robin preemption (`scheduler.py`, `run_exe.py`):**

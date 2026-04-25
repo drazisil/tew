@@ -91,7 +91,7 @@ def register_crt_handlers(
     register_user32_gdi32_handlers(stubs, memory, state)
     register_oleaut32_ole32_handlers(stubs, memory, state)
     register_advapi32_handlers(stubs, memory, state)
-    register_d3d8_handlers(stubs, memory)
+    register_d3d8_handlers(stubs, memory, state)
     register_version_handlers(stubs, memory, state)
     register_wininet_handlers(stubs, memory, state)
     register_wsock32_handlers(stubs, memory, state)

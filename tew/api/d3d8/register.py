@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+    from tew.api._state import CRTState
 
 from tew.logger import logger
 from tew.api.d3d8._layout import (
@@ -26,7 +27,7 @@ from tew.api.d3d8.idirect3d8 import make_vtable as _make_d3d8_vtable, make_creat
 from tew.api.d3d8.idirect3d8device import make_vtable as _make_dev_vtable
 
 
-def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory") -> None:
+def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRTState") -> None:
     """Register all D3D8 COM stubs and write vtable pointers into memory."""
 
     # ── Generic resource vtable ───────────────────────────────────────────────
@@ -35,7 +36,7 @@ def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory") -> None:
         memory.write32(D3DRES_VTABLE + i * 4, addr)
 
     # ── IDirect3D8 vtable + object ────────────────────────────────────────────
-    d3d8_vtable = _make_d3d8_vtable(stubs, memory)
+    d3d8_vtable = _make_d3d8_vtable(stubs, memory, state.window_manager)
     for i, addr in enumerate(d3d8_vtable):
         memory.write32(D3D8_VTABLE + i * 4, addr)
         logger.trace("d3d8", f"  IDirect3D8 vtable[{i}] @ 0x{D3D8_VTABLE + i * 4:08x} = 0x{addr:08x}")

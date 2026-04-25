@@ -114,6 +114,7 @@ from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
 from tew.api.d3d8._helpers import _alloc_resource_obj, _com_stub, _set_eax
 from tew.api.d3d8._caps import _fill_d3d_caps8
+import tew.api.d3d8._state as _state
 
 
 def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
@@ -264,6 +265,209 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(pp_surf, _alloc_resource_obj(800 * 600 * 4, mem))
         cpu.regs[EAX] = S_OK
 
+    # [34] BeginScene()
+    # Waits for the previous frame fence, acquires the next swapchain image, and
+    # opens the command buffer.  Transitions the image to TRANSFER_DST_OPTIMAL so
+    # Clear can vkCmdClearColorImage without an additional barrier.
+    def _begin_scene(cpu: "CPU", mem: "Memory") -> None:
+        import vulkan as vk
+
+        if _state._vk_device is None:
+            logger.error("d3d8", "BeginScene: device not initialised — halting")
+            cpu.halted = True
+            return
+
+        try:
+            vk.vkWaitForFences(
+                _state._vk_device, 1, [_state._vk_in_flight],
+                vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+            vk.vkResetFences(_state._vk_device, 1, [_state._vk_in_flight])
+
+            idx = _state._vk_fn_acquire_next_image(
+                _state._vk_device, _state._vk_swapchain,
+                0xFFFFFFFFFFFFFFFF, _state._vk_image_available, None)
+            _state._vk_current_image_idx = int(idx)
+
+            vk.vkResetCommandBuffer(_state._vk_cmd_buf, 0)
+            begin_info = vk.VkCommandBufferBeginInfo(
+                sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            )
+            vk.vkBeginCommandBuffer(_state._vk_cmd_buf, begin_info)
+
+            # Transition swapchain image UNDEFINED → TRANSFER_DST_OPTIMAL
+            image = _state._vk_swapchain_images[_state._vk_current_image_idx]
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0, levelCount=1,
+                baseArrayLayer=0, layerCount=1,
+            )
+            barrier = vk.VkImageMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                srcAccessMask=0,
+                dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                image=image,
+                subresourceRange=subresource,
+            )
+            vk.vkCmdPipelineBarrier(
+                _state._vk_cmd_buf,
+                vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, None, 0, None, 1, [barrier],
+            )
+        except Exception as exc:
+            logger.error("d3d8", f"BeginScene failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("d3d8",
+            f"BeginScene: image_idx={_state._vk_current_image_idx}")
+        cpu.regs[EAX] = S_OK
+
+    # [35] EndScene()
+    # Transitions the swapchain image to PRESENT_SRC_KHR and ends the command buffer.
+    def _end_scene(cpu: "CPU", mem: "Memory") -> None:
+        import vulkan as vk
+
+        if _state._vk_device is None:
+            logger.error("d3d8", "EndScene: device not initialised — halting")
+            cpu.halted = True
+            return
+
+        try:
+            image = _state._vk_swapchain_images[_state._vk_current_image_idx]
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0, levelCount=1,
+                baseArrayLayer=0, layerCount=1,
+            )
+            barrier = vk.VkImageMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask=0,
+                oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                image=image,
+                subresourceRange=subresource,
+            )
+            vk.vkCmdPipelineBarrier(
+                _state._vk_cmd_buf,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, None, 0, None, 1, [barrier],
+            )
+            vk.vkEndCommandBuffer(_state._vk_cmd_buf)
+        except Exception as exc:
+            logger.error("d3d8", f"EndScene failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("d3d8", "EndScene: command buffer closed")
+        cpu.regs[EAX] = S_OK
+
+    # [36] Clear(Count, pRects, Flags, Color, Z, Stencil)
+    # Stack (this at ESP+4):
+    #   ESP+8:  Count
+    #   ESP+12: pRects
+    #   ESP+16: Flags
+    #   ESP+20: Color (D3DCOLOR = 0xAARRGGBB)
+    #   ESP+24: Z
+    #   ESP+28: Stencil
+    def _clear(cpu: "CPU", mem: "Memory") -> None:
+        import vulkan as vk
+
+        if _state._vk_device is None:
+            logger.error("d3d8", "Clear: device not initialised — halting")
+            cpu.halted = True
+            return
+
+        flags = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        D3DCLEAR_TARGET = 0x00000001
+        if not (flags & D3DCLEAR_TARGET):
+            cpu.regs[EAX] = S_OK
+            return
+
+        argb  = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        a = ((argb >> 24) & 0xFF) / 255.0
+        r = ((argb >> 16) & 0xFF) / 255.0
+        g = ((argb >>  8) & 0xFF) / 255.0
+        b = ( argb        & 0xFF) / 255.0
+
+        try:
+            image = _state._vk_swapchain_images[_state._vk_current_image_idx]
+            clear_color = vk.VkClearColorValue(float32=[r, g, b, a])
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0, levelCount=1,
+                baseArrayLayer=0, layerCount=1,
+            )
+            vk.vkCmdClearColorImage(
+                _state._vk_cmd_buf,
+                image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                clear_color,
+                1, [subresource],
+            )
+        except Exception as exc:
+            logger.error("d3d8", f"Clear failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("d3d8",
+            f"Clear: ARGB=0x{argb:08x} rgba=({r:.2f},{g:.2f},{b:.2f},{a:.2f})")
+        cpu.regs[EAX] = S_OK
+
+    # [15] Present(pSrc, pDest, hWnd, pRegion)
+    # Submits the command buffer and presents the current swapchain image.
+    def _present(cpu: "CPU", mem: "Memory") -> None:
+        import vulkan as vk
+
+        if _state._vk_device is None:
+            logger.error("d3d8", "Present: device not initialised — halting")
+            cpu.halted = True
+            return
+
+        try:
+            submit_info = vk.VkSubmitInfo(
+                sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                waitSemaphoreCount=1,
+                pWaitSemaphores=[_state._vk_image_available],
+                pWaitDstStageMask=[
+                    vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
+                commandBufferCount=1,
+                pCommandBuffers=[_state._vk_cmd_buf],
+                signalSemaphoreCount=1,
+                pSignalSemaphores=[_state._vk_render_done],
+            )
+            vk.vkQueueSubmit(
+                _state._vk_graphics_queue, 1, [submit_info],
+                _state._vk_in_flight)
+
+            present_info = vk.VkPresentInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                waitSemaphoreCount=1,
+                pWaitSemaphores=[_state._vk_render_done],
+                swapchainCount=1,
+                pSwapchains=[_state._vk_swapchain],
+                pImageIndices=[_state._vk_current_image_idx],
+            )
+            _state._vk_fn_queue_present(
+                _state._vk_present_queue, present_info)
+        except Exception as exc:
+            logger.error("d3d8", f"Present failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.debug("d3d8",
+            f"Present: image_idx={_state._vk_current_image_idx}")
+        cpu.regs[EAX] = S_OK
+
 
     # [51] GetRenderState(State, DWORD* pValue)
     def _get_render_state(cpu: "CPU", mem: "Memory") -> None:
@@ -365,7 +569,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev[12] = _uint("Dev::ShowCursor",                 4, 0)
     dev[13] = _ok  ("Dev::CreateAdditionalSwapChain",  8)
     dev[14] = _com_stub(stubs, "d3d8dev", "Dev::Reset",   _reset,   4, memory, D3DDEV_OBJ)
-    dev[15] = _halt("Dev::Present", 16)
+    dev[15] = _com_stub(stubs, "d3d8dev", "Dev::Present",
+                _present, 16, memory, D3DDEV_OBJ)
     dev[16] = _com_stub(stubs, "d3d8dev", "Dev::GetBackBuffer",
                 _get_back_buffer, 12, memory, D3DDEV_OBJ)
     dev[17] = _ok  ("Dev::GetRasterStatus",   4)
@@ -396,9 +601,12 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 _get_render_target, 4, memory, D3DDEV_OBJ)
     dev[33] = _com_stub(stubs, "d3d8dev", "Dev::GetDepthStencilSurface",
                 _get_depth_stencil, 4, memory, D3DDEV_OBJ)
-    dev[34] = _halt("Dev::BeginScene", 0)
-    dev[35] = _halt("Dev::EndScene",   0)
-    dev[36] = _halt("Dev::Clear",     24)
+    dev[34] = _com_stub(stubs, "d3d8dev", "Dev::BeginScene",
+                _begin_scene, 0, memory, D3DDEV_OBJ)
+    dev[35] = _com_stub(stubs, "d3d8dev", "Dev::EndScene",
+                _end_scene,   0, memory, D3DDEV_OBJ)
+    dev[36] = _com_stub(stubs, "d3d8dev", "Dev::Clear",
+                _clear,      24, memory, D3DDEV_OBJ)
     dev[37] = _ok  ("Dev::SetTransform",      8)
     dev[38] = _ok  ("Dev::GetTransform",      8)
     dev[39] = _ok  ("Dev::MultiplyTransform",  8)

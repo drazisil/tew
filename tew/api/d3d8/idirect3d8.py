@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+    from tew.api.window_manager import WindowManager
 
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
@@ -46,7 +47,7 @@ _DX8Z_PREFERRED_BASE   = 0x60000000
 _DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
     """Return the 16 trampoline addresses for the IDirect3D8 vtable."""
 
     # [5] GetAdapterIdentifier(Adapter, Flags, D3DADAPTER_IDENTIFIER8*)
@@ -86,11 +87,304 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
     # [15] CreateDevice(Adapter, DevType, hFocusWindow, BehaviorFlags,
     #                   D3DPRESENT_PARAMETERS*, IDirect3DDevice8**)
+    # Stack (this at ESP+4, args at ESP+8..):
+    #   ESP+4:  this
+    #   ESP+8:  Adapter
+    #   ESP+12: DevType
+    #   ESP+16: hFocusWindow
+    #   ESP+20: BehaviorFlags
+    #   ESP+24: pPresentationParameters
+    #   ESP+28: ppReturnedDeviceInterface
     def _create_device(cpu: "CPU", mem: "Memory") -> None:
-        pp_device = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        import os
+        import ctypes
+        import vulkan as vk
+        from vulkan import ffi
+        from sdl2 import SDL_DestroyRenderer
+        from sdl2.syswm import SDL_SysWMinfo, SDL_GetWindowWMInfo
+
+        pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        hwnd       = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        pp_params  = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        back_w = mem.read32(pp_params & 0xFFFFFFFF)       if pp_params else 0
+        back_h = mem.read32((pp_params + 4) & 0xFFFFFFFF) if pp_params else 0
+
+        logger.info("d3d8",
+            f"IDirect3D8::CreateDevice hwnd=0x{hwnd:x} "
+            f"back={back_w}x{back_h} ppdev=0x{pp_device:08x}")
+
+        # ── Locate SDL window ──────────────────────────────────────────────
+        entry = window_manager.get_window(hwnd)
+        if entry is None or entry.sdl_window is None:
+            # Fall back to first top-level window that has an SDL window
+            for e in window_manager._windows.values():
+                if e.sdl_window is not None:
+                    entry = e
+                    break
+        if entry is None or entry.sdl_window is None:
+            logger.error("d3d8", "CreateDevice: no SDL window found — halting")
+            cpu.halted = True
+            return
+
+        sdl_window = entry.sdl_window
+
+        # Destroy the SDL renderer — Vulkan presentation takes over this window
+        if entry.sdl_renderer is not None:
+            SDL_DestroyRenderer(entry.sdl_renderer)
+            entry.sdl_renderer = None
+
+        # ── Load instance-level KHR extension functions ────────────────────
+        try:
+            vkGetSurfaceSupport = vk.vkGetInstanceProcAddr(
+                _state._vk_instance, 'vkGetPhysicalDeviceSurfaceSupportKHR')
+            vkGetSurfaceCaps = vk.vkGetInstanceProcAddr(
+                _state._vk_instance, 'vkGetPhysicalDeviceSurfaceCapabilitiesKHR')
+            vkGetSurfaceFormats = vk.vkGetInstanceProcAddr(
+                _state._vk_instance, 'vkGetPhysicalDeviceSurfaceFormatsKHR')
+            vkGetPresentModes = vk.vkGetInstanceProcAddr(
+                _state._vk_instance, 'vkGetPhysicalDeviceSurfacePresentModesKHR')
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: failed to load surface extension functions: {exc} — halting")
+            cpu.halted = True
+            return
+
+        # ── Create VkSurfaceKHR ────────────────────────────────────────────
+        try:
+            wm_info = SDL_SysWMinfo()
+            wm_info.version.major = 2
+            wm_info.version.minor = 0
+            wm_info.version.patch = 0
+            SDL_GetWindowWMInfo(sdl_window, ctypes.byref(wm_info))
+
+            if os.environ.get("WAYLAND_DISPLAY"):
+                vkCreateSurface = vk.vkGetInstanceProcAddr(
+                    _state._vk_instance, 'vkCreateWaylandSurfaceKHR')
+                wl_display_ptr = wm_info.info.wl.display or 0
+                disp = ffi.cast('struct wl_display *', wl_display_ptr)
+                surf = ffi.cast('struct wl_surface *',
+                                wm_info.info.wl.surface or 0)
+                surface_ci = vk.VkWaylandSurfaceCreateInfoKHR(
+                    sType=vk.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
+                    display=disp,
+                    surface=surf,
+                )
+            else:
+                wl_display_ptr = 0
+                vkCreateSurface = vk.vkGetInstanceProcAddr(
+                    _state._vk_instance, 'vkCreateXlibSurfaceKHR')
+                disp = ffi.cast('Display *', wm_info.info.x11.display or 0)
+                surface_ci = vk.VkXlibSurfaceCreateInfoKHR(
+                    sType=vk.VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+                    dpy=disp,
+                    window=int(wm_info.info.x11.window),
+                )
+            _state._vk_surface = vkCreateSurface(
+                _state._vk_instance, surface_ci, None)
+
+            # On Wayland the compositor hasn't acknowledged the surface yet,
+            # so surface-property queries (support, caps, formats) deadlock
+            # unless we flush all pending Wayland events first.
+            if wl_display_ptr:
+                import ctypes as _ct
+                _libwl = _ct.CDLL('libwayland-client.so.0')
+                _libwl.wl_display_roundtrip.restype  = _ct.c_int
+                _libwl.wl_display_roundtrip.argtypes = [_ct.c_void_p]
+                _libwl.wl_display_roundtrip(_ct.c_void_p(wl_display_ptr))
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: VkSurface creation failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.info("d3d8", "CreateDevice: VkSurfaceKHR created")
+
+        # ── Find queue family with graphics + present support ──────────────
+        phys_dev = _state._vk_physical_devices[0]
+        queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys_dev)
+        gfx_family = -1
+        for i, qf in enumerate(queue_families):
+            if qf.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
+                try:
+                    supported = vkGetSurfaceSupport(
+                        phys_dev, i, _state._vk_surface)
+                    if supported:
+                        gfx_family = i
+                        break
+                except Exception:
+                    continue
+        if gfx_family < 0:
+            logger.error("d3d8",
+                "CreateDevice: no GRAPHICS queue family found — halting")
+            cpu.halted = True
+            return
+        _state._vk_graphics_queue_family = gfx_family
+        _state._vk_present_queue_family  = gfx_family
+
+        # ── Create logical VkDevice ────────────────────────────────────────
+        try:
+            q_priority = ffi.new('float[1]', [1.0])
+            queue_ci = vk.VkDeviceQueueCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                queueFamilyIndex=gfx_family,
+                queueCount=1,
+                pQueuePriorities=q_priority,
+            )
+            device_ci = vk.VkDeviceCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                queueCreateInfoCount=1,
+                pQueueCreateInfos=[queue_ci],
+                enabledExtensionCount=1,
+                ppEnabledExtensionNames=["VK_KHR_swapchain"],
+                enabledLayerCount=0,
+                ppEnabledLayerNames=[],
+            )
+            _state._vk_device = vk.vkCreateDevice(phys_dev, device_ci, None)
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: vkCreateDevice failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        _state._vk_graphics_queue = vk.vkGetDeviceQueue(
+            _state._vk_device, gfx_family, 0)
+        _state._vk_present_queue = _state._vk_graphics_queue
+        logger.info("d3d8",
+            f"CreateDevice: VkDevice ready, graphics queue family={gfx_family}")
+
+        # ── Load device-level KHR extension functions ──────────────────────
+        try:
+            _state._vk_fn_create_swapchain = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkCreateSwapchainKHR')
+            _state._vk_fn_get_swapchain_images = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkGetSwapchainImagesKHR')
+            _state._vk_fn_acquire_next_image = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkAcquireNextImageKHR')
+            _state._vk_fn_queue_present = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkQueuePresentKHR')
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: failed to load swapchain extension functions: {exc} — halting")
+            cpu.halted = True
+            return
+
+        # ── Create swapchain ───────────────────────────────────────────────
+        try:
+            caps = vkGetSurfaceCaps(phys_dev, _state._vk_surface)
+
+            # Choose format: prefer VK_FORMAT_B8G8R8A8_UNORM (44)
+            formats = vkGetSurfaceFormats(phys_dev, _state._vk_surface)
+            chosen_fmt   = int(formats[0].format)
+            chosen_space = int(formats[0].colorSpace)
+            for f in formats:
+                if int(f.format) == vk.VK_FORMAT_B8G8R8A8_UNORM:
+                    chosen_fmt   = int(f.format)
+                    chosen_space = int(f.colorSpace)
+                    break
+            _state._vk_swapchain_format = chosen_fmt
+
+            # Extent: use D3DPRESENT_PARAMETERS values when provided
+            if back_w > 0 and back_h > 0:
+                w, h = back_w, back_h
+            elif caps.currentExtent.width != 0xFFFFFFFF:
+                w = int(caps.currentExtent.width)
+                h = int(caps.currentExtent.height)
+            else:
+                w = max(int(caps.minImageExtent.width),
+                        min(int(caps.maxImageExtent.width),  800))
+                h = max(int(caps.minImageExtent.height),
+                        min(int(caps.maxImageExtent.height), 600))
+            _state._vk_swapchain_width  = w
+            _state._vk_swapchain_height = h
+
+            img_count = int(caps.minImageCount) + 1
+            if int(caps.maxImageCount) > 0:
+                img_count = min(img_count, int(caps.maxImageCount))
+
+            swapchain_ci = vk.VkSwapchainCreateInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+                surface=_state._vk_surface,
+                minImageCount=img_count,
+                imageFormat=chosen_fmt,
+                imageColorSpace=chosen_space,
+                imageExtent=vk.VkExtent2D(width=w, height=h),
+                imageArrayLayers=1,
+                imageUsage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+                queueFamilyIndexCount=0,
+                pQueueFamilyIndices=None,
+                preTransform=caps.currentTransform,
+                compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
+                clipped=vk.VK_TRUE,
+                oldSwapchain=None,
+            )
+            _state._vk_swapchain = _state._vk_fn_create_swapchain(
+                _state._vk_device, swapchain_ci, None)
+
+            raw_imgs = _state._vk_fn_get_swapchain_images(
+                _state._vk_device, _state._vk_swapchain)
+            _state._vk_swapchain_images = list(raw_imgs)
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: swapchain creation failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        logger.info("d3d8",
+            f"CreateDevice: swapchain {w}x{h} fmt={chosen_fmt} "
+            f"images={len(_state._vk_swapchain_images)}")
+
+        # ── Command pool + command buffer ──────────────────────────────────
+        try:
+            pool_ci = vk.VkCommandPoolCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                flags=vk.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                queueFamilyIndex=gfx_family,
+            )
+            _state._vk_command_pool = vk.vkCreateCommandPool(
+                _state._vk_device, pool_ci, None)
+
+            alloc_info = vk.VkCommandBufferAllocateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                commandPool=_state._vk_command_pool,
+                level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                commandBufferCount=1,
+            )
+            cmd_bufs = vk.vkAllocateCommandBuffers(
+                _state._vk_device, alloc_info)
+            _state._vk_cmd_buf = cmd_bufs[0]
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: command pool/buffer creation failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        # ── Sync primitives ────────────────────────────────────────────────
+        try:
+            sem_ci = vk.VkSemaphoreCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+            # Fence starts signalled so the first BeginScene doesn't block
+            fence_ci = vk.VkFenceCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                flags=vk.VK_FENCE_CREATE_SIGNALED_BIT)
+            _state._vk_image_available = vk.vkCreateSemaphore(
+                _state._vk_device, sem_ci, None)
+            _state._vk_render_done = vk.vkCreateSemaphore(
+                _state._vk_device, sem_ci, None)
+            _state._vk_in_flight = vk.vkCreateFence(
+                _state._vk_device, fence_ci, None)
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: sync primitive creation failed: {exc} — halting")
+            cpu.halted = True
+            return
+
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
-        logger.info("d3d8", f"IDirect3D8::CreateDevice -> 0x{D3DDEV_OBJ:08x}")
+        logger.info("d3d8",
+            f"IDirect3D8::CreateDevice complete -> D3DDEV_OBJ=0x{D3DDEV_OBJ:08x}")
         cpu.regs[EAX] = S_OK
 
     return [
