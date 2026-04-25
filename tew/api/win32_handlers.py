@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 from tew.hardware.cpu import ESP
+from tew.logger import logger
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -305,6 +306,7 @@ class Win32Handlers:
 
         # Log the stub call; deduplicate consecutive identical calls with a counter
         log_entry = f"{entry.name} @ 0x{handler_addr:x}"
+        logger.trace("calls", log_entry)
         if self._call_log and self._call_log[-1].startswith(log_entry):
             last = self._call_log[-1]
             count_match = re.search(r" x(\d+)$", last)
