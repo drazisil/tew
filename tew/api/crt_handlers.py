@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
+    from tew.api._state import EmulatorConfig
 
 from tew.api.win32_handlers import Win32Handlers
 from tew.api._state import CRTState, THREAD_SENTINEL
@@ -23,6 +24,8 @@ def register_crt_handlers(
     stubs: Win32Handlers,
     memory: "Memory",
     dll_loader: Optional["DLLLoader"] = None,
+    config: Optional["EmulatorConfig"] = None,
+    registry_dir: Optional[str] = None,
 ) -> CRTState:
     """Register all default Win32 API stubs needed for MSVC CRT startup.
 
@@ -32,7 +35,7 @@ def register_crt_handlers(
 
     Returns the CRTState so callers can pass it to patch_crt_internals.
     """
-    state = CRTState()
+    state = CRTState(config=config, registry_dir=registry_dir)
 
     # ── Fixed data region writes ──────────────────────────────────────────────
 

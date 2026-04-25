@@ -2,6 +2,7 @@
 
 Usage:
     python run_exe.py [path/to/game.exe]
+    python run_exe.py --install-dir /path/to/game [--exe MCity_d.exe]
 
 If no path is given, reads 'exePath' from emulator.json in the current directory.
 
@@ -12,6 +13,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -26,22 +28,100 @@ from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.pe_resources import PEResources
+from tew.api._state import EmulatorConfig
 from tew.logger import logger
 
 
-# ── Resolve exe path ──────────────────────────────────────────────────────────
+# ── Parse arguments ───────────────────────────────────────────────────────────
 
-exe_path: str = sys.argv[1] if len(sys.argv) > 1 else ""
-if not exe_path:
-    try:
-        cfg = json.loads(open(os.path.join(os.getcwd(), "emulator.json")).read())
-        exe_path = cfg.get("exePath", "")
-    except Exception:
-        pass
+_parser = argparse.ArgumentParser(
+    description="Run a Win32 PE executable in the x86-32 emulator",
+    add_help=True,
+)
+_parser.add_argument(
+    "positional_exe", nargs="?", metavar="exe",
+    help="Path to the .exe to run (overrides emulator.json exePath)",
+)
+_parser.add_argument(
+    "--install-dir", metavar="DIR",
+    help="Game install directory. Sets C:\\ path mapping and working directory. "
+         "Replaces the need for pathMappings in emulator.json.",
+)
+_parser.add_argument(
+    "--exe", metavar="EXE", dest="exe_flag",
+    help="Exe filename or relative path within --install-dir (e.g. MCity_d.exe or "
+         "3dSetup/3DSetup.exe). Ignored if --install-dir is not given.",
+)
+_args = _parser.parse_args()
+
+# ── Resolve install dir, config, and exe path — all before any chdir ─────────
+
+_repo_dir = os.getcwd()
+
+# Load emulator.json from the repo dir for baseline config + fallback exe path.
+_cfg: dict = {}
+try:
+    with open(os.path.join(_repo_dir, "emulator.json"), "r", encoding="utf-8") as _f:
+        _cfg = json.load(_f)
+except Exception:
+    pass
+
+install_dir: str | None = None
+if _args.install_dir:
+    install_dir = os.path.abspath(_args.install_dir)
+    if not os.path.isdir(install_dir):
+        raise SystemExit(f"--install-dir does not exist: {install_dir}")
+
+# Build EmulatorConfig: --install-dir overrides C:\\ mapping; otherwise use emulator.json.
+if install_dir:
+    _path_mappings: dict[str, str] = {"c:/": install_dir.rstrip("/") + "/"}
+else:
+    _raw = _cfg.get("pathMappings", {})
+    _path_mappings = {
+        k.replace("\\", "/").lower(): v
+        for k, v in _raw.items()
+        if not k.startswith("_")
+    }
+_emulator_config = EmulatorConfig(
+    path_mappings=_path_mappings,
+    interactive_on_missing_file=_cfg.get("interactiveOnMissingFile") is True,
+)
+
+# Resolve exe_path.
+exe_path: str = ""
+if _args.positional_exe:
+    exe_path = _args.positional_exe
+elif install_dir:
+    if _args.exe_flag:
+        exe_path = os.path.join(install_dir, _args.exe_flag)
+    else:
+        # Fall back to the basename from emulator.json exePath, looked up in install_dir.
+        _json_exe = _cfg.get("exePath", "")
+        if _json_exe:
+            exe_path = os.path.join(install_dir, os.path.basename(_json_exe))
+        else:
+            _exes = [f for f in os.listdir(install_dir) if f.lower().endswith(".exe")]
+            if len(_exes) == 1:
+                exe_path = os.path.join(install_dir, _exes[0])
+            elif _exes:
+                raise SystemExit(
+                    f"Multiple .exe files in {install_dir}: {_exes}\n"
+                    f"Use --exe to specify one."
+                )
+            else:
+                raise SystemExit(f"No .exe found in {install_dir}")
+else:
+    exe_path = _cfg.get("exePath", "")
+
 if not exe_path:
     raise SystemExit(
-        "No exe path specified. Pass as CLI argument or set 'exePath' in emulator.json"
+        "No exe path specified. Pass as a positional argument, use --install-dir/--exe, "
+        "or set 'exePath' in emulator.json."
     )
+
+# chdir to install_dir so relative game file writes land there, not in the repo.
+if install_dir:
+    os.chdir(install_dir)
 
 # ── Load PE ───────────────────────────────────────────────────────────────────
 
@@ -84,7 +164,10 @@ exe.import_resolver.build_iat_map(exe.import_table, exe.optional_header.image_ba
 register_all_opcodes(cpu)
 
 win32_handlers = Win32Handlers(mem)
-crt_state = register_crt_handlers(win32_handlers, mem, exe.import_resolver.get_dll_loader())
+crt_state = register_crt_handlers(
+    win32_handlers, mem, exe.import_resolver.get_dll_loader(),
+    config=_emulator_config, registry_dir=_repo_dir,
+)
 crt_state.exe_path = exe_path   # used by GetModuleFileNameA
 
 # Attach PE resources so dialog templates and bitmap controls can be loaded

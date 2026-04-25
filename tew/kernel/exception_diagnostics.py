@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from tew.hardware.cpu import REG_NAMES, ESP, EBP
+from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
 from tew.logger import logger
 
 if TYPE_CHECKING:
@@ -18,8 +18,10 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
     Produces a diagnostic report with memory access info, CPU state, and DLL ranges.
     """
     error = cpu.last_error
-    assert error is not None
-    logger.error("exception", str(error))
+    if error is not None:
+        logger.error("exception", str(error))
+    else:
+        logger.error("exception", f"CPU faulted (no Python error — likely unhandled opcode or bad memory access at EIP=0x{cpu.eip:08x} opcode=0x{cpu.memory.read8(cpu.eip):02x})")
 
     # Extract address from error message
     match = re.search(r"0x([0-9a-fA-F]+)", str(error))

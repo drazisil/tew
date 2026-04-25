@@ -114,13 +114,13 @@ def find_file_ci(linux_path: str) -> Optional[str]:
     return None
 
 
-def load_registry_json() -> RegistryMap:
+def load_registry_json(base_dir: str | None = None) -> RegistryMap:
     """Load fake registry values from registry.json in the project root.
     Keys and value names are normalized to lowercase. Returns empty map on error.
     """
     from tew.logger import logger
     try:
-        file_path = os.path.join(os.getcwd(), "registry.json")
+        file_path = os.path.join(base_dir or os.getcwd(), "registry.json")
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         result: RegistryMap = {}
@@ -214,9 +214,13 @@ THREAD_SENTINEL   = 0x001FE000
 class CRTState:
     """All shared mutable state for CRT/Win32 handler callbacks."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        config: EmulatorConfig | None = None,
+        registry_dir: str | None = None,
+    ) -> None:
         # ── Emulator config ───────────────────────────────────────────────
-        self.config: EmulatorConfig = load_emulator_config()
+        self.config: EmulatorConfig = config if config is not None else load_emulator_config()
 
         # ── Exe path (set by run_exe.py after construction) ───────────────
         # Linux path to the executable being emulated.  Used by the
@@ -273,7 +277,7 @@ class CRTState:
         self.scheduler._kernel = self.kernel
 
         # ── Registry ──────────────────────────────────────────────────────
-        self.registry_values: RegistryMap = load_registry_json()
+        self.registry_values: RegistryMap = load_registry_json(registry_dir)
 
         # ── Timers ────────────────────────────────────────────────────────
         self.next_timer_id: int = 1
