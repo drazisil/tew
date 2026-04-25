@@ -55,4 +55,4 @@ use `env KEY=VAL` prefix and absolute paths. Add `-u` to python for unbuffered o
   Event handle at runtime is 0x7012 (may vary).
 
 ## Test suite
-450 tests (all passing as of 2026-04-24).
+543 tests (all passing as of 2026-04-25).

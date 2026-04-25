@@ -4,6 +4,39 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-25 — TDD sweep: fix silent failures, implement missing handlers, port tests to ZigCPU
+
+**Silent failure fixes:**
+- `msvcrt._realloc`: was returning a new pointer but discarding old data; now copies
+  `min(old_size, new_size)` bytes using `heap_alloc_sizes` to find old allocation size.
+- `msvcrt._write`: was ignoring the fd entirely; now routes to host fd via `os.write`,
+  with fallback for raw stdout/stderr (fd 1/2) when no file handle entry exists.
+
+**Missing handler implementations:**
+- `advapi32.RegEnumKeyExA` / `RegEnumValueA`: fully implemented direct-child enumeration
+  from the flat `registry_values` dict using backslash-prefix filtering.
+- `kernel32.TryEnterCriticalSection`: three-case implementation — recursive by owner
+  (TRUE), free CS (acquire + TRUE), contested by other thread (FALSE, no blocking).
+- `user32.CallNextHookEx`: full LIFO chain propagation via `_winhook_chains`; each
+  handle knows its position in the chain and invokes the next via `_invoke_emulated_proc`.
+- `user32._dispatch_winhooks`: fixed to call only the chain head (not all hooks).
+- `oleaut32`: added `logger.warn` to previously silent stubs (VarCyFromStr, LoadTypeLibEx,
+  RegisterTypeLib, CoCreateInstance).
+
+**Test suite (543 passing):**
+- New API unit tests: msvcrt realloc + write, registry enum happy + invalid paths,
+  CS (Init/Enter/Leave/TryEnter) and mutex (Create/Wait/Release/Close) paths,
+  hook chain happy + sad paths.
+- Hypothesis chaos tests: `@given` invariants for CS/mutex, garbage-memory fuzzing,
+  `RuleBasedStateMachine` for arbitrary Enter/TryEnter/Leave sequences.
+- Opcode tests ported from Python CPU to ZigCPU black-box execution (all 5 files).
+- Deleted `test_cpu.py` — tested Python CPU internals, not the production ZigCPU path.
+
+**Run result:** With server running, game logs in, initializes D3D8, and hangs at
+`IDirect3D8::CreateDevice` (Wayland deadlock — unchanged blocker).
+
+---
+
 ## 2026-04-24 — GetMessageA cooperative yield + Wayland roundtrip attempt
 
 **`GetMessageA` cooperative yield (`user32_handlers.py`):**
