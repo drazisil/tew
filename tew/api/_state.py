@@ -114,15 +114,38 @@ def find_file_ci(linux_path: str) -> Optional[str]:
     return None
 
 
-def load_registry_json(base_dir: str | None = None) -> RegistryMap:
+def load_registry_json(
+    base_dir: str | None = None,
+    config: "EmulatorConfig | None" = None,
+) -> RegistryMap:
     """Load fake registry values from registry.json in the project root.
     Keys and value names are normalized to lowercase. Returns empty map on error.
+
+    If config is provided and its path_mappings map c:/ to a directory that
+    differs from registry.json's _install_dir, all registry string values have
+    the template install dir substituted with the actual Windows install root.
     """
     from tew.logger import logger
     try:
         file_path = os.path.join(base_dir or os.getcwd(), "registry.json")
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        # Compute install-dir substitution when config overrides the default.
+        # _install_dir is the Windows path the registry was authored for (e.g. C:\MCity\).
+        # When --install-dir maps c:/ to a different root the game files live at C:\ directly,
+        # so every registry path that starts with _install_dir needs updating.
+        template_dir: str = data.get("_install_dir", "")
+        actual_dir: str = ""
+        if config and template_dir and "c:/" in config.path_mappings:
+            candidate = "C:\\"
+            if candidate.lower() != template_dir.lower().rstrip("\\") + "\\":
+                actual_dir = candidate
+                logger.info(
+                    "registry",
+                    f"Substituting install dir: {template_dir!r} → {actual_dir!r}",
+                )
+
         result: RegistryMap = {}
         for key, values in data.items():
             if key.startswith("_"):
@@ -133,8 +156,15 @@ def load_registry_json(base_dir: str | None = None) -> RegistryMap:
             result[normalized_key] = {}
             for vname, entry in values.items():
                 if isinstance(entry, dict) and "type" in entry and "value" in entry:
+                    value = entry["value"]
+                    if actual_dir and template_dir and isinstance(value, str):
+                        lower = value.lower()
+                        tmpl = template_dir.lower()
+                        if tmpl in lower:
+                            idx = lower.find(tmpl)
+                            value = value[:idx] + actual_dir + value[idx + len(template_dir):]
                     result[normalized_key][vname.lower()] = RegistryEntry(
-                        type=entry["type"], value=entry["value"]
+                        type=entry["type"], value=value
                     )
         logger.info("registry", f"Loaded {len(result)} keys from registry.json")
         return result
@@ -277,7 +307,7 @@ class CRTState:
         self.scheduler._kernel = self.kernel
 
         # ── Registry ──────────────────────────────────────────────────────
-        self.registry_values: RegistryMap = load_registry_json(registry_dir)
+        self.registry_values: RegistryMap = load_registry_json(registry_dir, config=self.config)
 
         # ── Timers ────────────────────────────────────────────────────────
         self.next_timer_id: int = 1
