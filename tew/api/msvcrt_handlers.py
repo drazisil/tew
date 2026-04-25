@@ -8,6 +8,7 @@ noted otherwise — msvcrt.dll exports are exclusively cdecl.
 from __future__ import annotations
 
 import math
+import os
 import struct
 from typing import TYPE_CHECKING, Callable
 
@@ -461,10 +462,21 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "calloc", _calloc)
 
     # realloc(void* ptr, size_t size) -> void* [cdecl]
-    # Old data is not copied (bump allocator; good enough for game init paths).
     def _realloc(cpu: "CPU") -> None:
+        ptr  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+        if ptr == 0:
+            cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+            return
+        if size == 0:
+            cpu.regs[EAX] = 0
+            return
+        new_ptr  = state.simple_alloc(size)
+        old_size = state.heap_alloc_sizes.get(ptr, 0)
+        copy_len = min(old_size, size)
+        for i in range(copy_len):
+            memory.write8((new_ptr + i) & 0xFFFFFFFF, memory.read8((ptr + i) & 0xFFFFFFFF))
+        cpu.regs[EAX] = new_ptr
 
     stubs.register_handler("msvcrt.dll", "realloc", _realloc)
 
@@ -1671,10 +1683,22 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_read", _read)
 
     # _write(int fd, const void* buf, unsigned int count) -> int [cdecl]
-    # Claims all bytes written; discards data.
     def _write(cpu: "CPU") -> None:
+        fd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        buf   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        cpu.regs[EAX] = count  # claim all bytes written
+        data  = bytes(memory.read8((buf + i) & 0xFFFFFFFF) for i in range(count))
+        entry = state.file_handle_map.get(fd)
+        if entry is not None and entry.writable and entry.fd is not None:
+            n = os.write(entry.fd, data)
+            entry.position += n
+            cpu.regs[EAX] = n
+            return
+        if fd in (1, 2) and entry is None:
+            n = os.write(fd, data)
+            cpu.regs[EAX] = n
+            return
+        cpu.regs[EAX] = 0xFFFFFFFF  # -1 = error (unknown/unwritable fd)
 
     stubs.register_handler("msvcrt.dll", "_write", _write)
 

@@ -139,6 +139,8 @@ def register_user32_gdi32_handlers(
 
     # Active hooks: hhook handle → (idHook, lpfn)
     _winhooks: dict[int, tuple[int, int]] = {}
+    # Per-type chain: idHook → [hhook, ...] in call order (most recently installed first)
+    _winhook_chains: dict[int, list[int]] = {}
     _next_hhook = [0xA000]
 
     def _halt(name: str):
@@ -319,6 +321,7 @@ def register_user32_gdi32_handlers(
         handle  = _next_hhook[0]
         _next_hhook[0] += 1
         _winhooks[handle] = (id_hook, lp_fn)
+        _winhook_chains.setdefault(id_hook, []).insert(0, handle)  # most recently installed = first
         logger.debug("handlers", f"SetWindowsHookExA(idHook={id_hook}, lpfn=0x{lp_fn:x}) -> 0x{handle:x}")
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 16)
@@ -328,16 +331,45 @@ def register_user32_gdi32_handlers(
     # UnhookWindowsHookEx(HHOOK hhk) -> BOOL
     def _UnhookWindowsHookEx(cpu: "CPU") -> None:
         hhk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        _winhooks.pop(hhk, None)
+        entry = _winhooks.pop(hhk, None)
+        if entry is not None:
+            id_hook, _ = entry
+            chain = _winhook_chains.get(id_hook, [])
+            if hhk in chain:
+                chain.remove(hhk)
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "UnhookWindowsHookEx", _UnhookWindowsHookEx)
 
     # CallNextHookEx(HHOOK hhk, int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT
-    # We maintain a flat hook list (no chain), so there is no next hook.
     def _CallNextHookEx(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        hhk    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        ncode  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        wparam = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lparam = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        entry  = _winhooks.get(hhk)
+        if entry is None:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        id_hook, _ = entry
+        chain = _winhook_chains.get(id_hook, [])
+        try:
+            idx = chain.index(hhk)
+        except ValueError:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        if idx + 1 >= len(chain):
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        next_handle = chain[idx + 1]
+        _, next_fn  = _winhooks[next_handle]
+        sentinel    = _get_dialog_sentinel(state, memory)
+        result      = _invoke_emulated_proc(cpu, memory, next_fn, [ncode, wparam, lparam], sentinel)
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "CallNextHookEx", _CallNextHookEx)
@@ -618,21 +650,19 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "ShowCursor", _ShowCursor)
 
     def _dispatch_winhooks(cpu: "CPU", msg_id: int, wparam: int, lp_msg: int) -> None:
-        """Call any registered hooks appropriate for this message."""
-        if not _winhooks:
+        """Call the first hook in each relevant chain; the chain propagates via CallNextHookEx."""
+        if not _winhook_chains:
             return
         sentinel = _get_dialog_sentinel(state, memory)
-        for id_hook, lp_fn in list(_winhooks.values()):
-            if id_hook == _WH_GETMESSAGE:
-                _invoke_emulated_proc(
-                    cpu, memory, lp_fn,
-                    [_HC_ACTION, _PM_REMOVE, lp_msg], sentinel,
-                )
-            elif id_hook == _WH_KEYBOARD and msg_id in (0x0100, 0x0101):  # WM_KEYDOWN/WM_KEYUP
-                _invoke_emulated_proc(
-                    cpu, memory, lp_fn,
-                    [_HC_ACTION, wparam, 0], sentinel,
-                )
+        gm_chain = _winhook_chains.get(_WH_GETMESSAGE, [])
+        if gm_chain:
+            _, lp_fn = _winhooks[gm_chain[0]]
+            _invoke_emulated_proc(cpu, memory, lp_fn, [_HC_ACTION, _PM_REMOVE, lp_msg], sentinel)
+        if msg_id in (0x0100, 0x0101):  # WM_KEYDOWN / WM_KEYUP
+            kb_chain = _winhook_chains.get(_WH_KEYBOARD, [])
+            if kb_chain:
+                _, lp_fn = _winhooks[kb_chain[0]]
+                _invoke_emulated_proc(cpu, memory, lp_fn, [_HC_ACTION, wparam, 0], sentinel)
 
     # PeekMessageA(LPMSG lpMsg, HWND, UINT, UINT, UINT) -> BOOL
     # Pump SDL events and check our message queue; return FALSE if nothing there.

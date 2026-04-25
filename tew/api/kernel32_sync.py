@@ -87,11 +87,35 @@ def register_kernel32_sync_handlers(
     def _delete_cs(cpu: "CPU") -> None:
         cleanup_stdcall(cpu, memory, 4)
 
+    # TryEnterCriticalSection(LPCRITICAL_SECTION) -> BOOL
+    # Acquires if free or already owned by this thread; returns FALSE without
+    # blocking if held by another thread.
+    def _try_enter_cs(cpu: "CPU") -> None:
+        ptr   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        tid   = state.tls_current_thread_id()
+        owner = memory.read32((ptr + 0x0C) & 0xFFFFFFFF)
+        if owner == tid:
+            # Recursive entry — owning thread deepens RecursionCount.
+            rec = (memory.read32((ptr + 0x08) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+            memory.write32((ptr + 0x08) & 0xFFFFFFFF, rec)
+            cpu.regs[EAX] = 1  # TRUE
+        elif memory.read32((ptr + 0x04) & 0xFFFFFFFF) == 0xFFFFFFFF:
+            # CS is free (LockCount == -1): acquire it.
+            memory.write32((ptr + 0x04) & 0xFFFFFFFF, 0)    # LockCount = 0
+            memory.write32((ptr + 0x08) & 0xFFFFFFFF, 1)    # RecursionCount = 1
+            memory.write32((ptr + 0x0C) & 0xFFFFFFFF, tid)  # OwningThread = tid
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            # Held by another thread — return FALSE without blocking.
+            cpu.regs[EAX] = 0  # FALSE
+        cleanup_stdcall(cpu, memory, 4)
+
     stubs.register_handler("kernel32.dll", "InitializeCriticalSection",             _init_cs)
     stubs.register_handler("kernel32.dll", "InitializeCriticalSectionAndSpinCount", _init_cs_spin)
     stubs.register_handler("kernel32.dll", "EnterCriticalSection",                  _enter_cs)
     stubs.register_handler("kernel32.dll", "LeaveCriticalSection",                  _leave_cs)
     stubs.register_handler("kernel32.dll", "DeleteCriticalSection",                 _delete_cs)
+    stubs.register_handler("kernel32.dll", "TryEnterCriticalSection",               _try_enter_cs)
 
     # ── TLS ───────────────────────────────────────────────────────────────────
 

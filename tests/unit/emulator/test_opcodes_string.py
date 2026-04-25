@@ -1,16 +1,13 @@
-"""Tests for string operation opcodes: MOVS, STOS, LODS, SCAS, CMPS."""
-
+"""Black-box string operation opcode tests against ZigCPU."""
 import pytest
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import CPU, EAX, ECX, EDX, ESI, EDI, ESP, ZF_BIT, CF_BIT
-from tew.emulator.opcodes import register_all_opcodes
+from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, ESI, EDI, ESP, ZF_BIT
 
 
 @pytest.fixture
 def cpu():
-    m = Memory(0x20000)
-    c = CPU(m)
-    register_all_opcodes(c)
+    mem = Memory(0x20000)
+    c = ZigCPU(mem)
     c.regs[ESP] = 0x18000
     return c
 
@@ -33,9 +30,7 @@ class TestStosb:
         cpu.regs[EAX] = 0xAB
         cpu.regs[EDI] = 0x3000
         cpu.regs[ECX] = 4
-        cpu.memory.load(0x1000, bytes([0xF3, 0xAA]))  # REP STOSB
-        cpu.eip = 0x1000
-        cpu.step()
+        step(cpu, 0xF3, 0xAA)  # REP STOSB
         for i in range(4):
             assert cpu.memory.read8(0x3000 + i) == 0xAB
         assert cpu.regs[ECX] == 0
@@ -54,9 +49,7 @@ class TestStosd:
         cpu.regs[EAX] = 0xCAFEBABE
         cpu.regs[EDI] = 0x5000
         cpu.regs[ECX] = 3
-        cpu.memory.load(0x1000, bytes([0xF3, 0xAB]))  # REP STOSD
-        cpu.eip = 0x1000
-        cpu.step()
+        step(cpu, 0xF3, 0xAB)  # REP STOSD
         for i in range(3):
             assert cpu.memory.read32(0x5000 + i * 4) == 0xCAFEBABE
         assert cpu.regs[ECX] == 0
@@ -78,26 +71,20 @@ class TestMovsb:
         cpu.regs[ESI] = 0x8000
         cpu.regs[EDI] = 0x9000
         cpu.regs[ECX] = 5
-        cpu.memory.load(0x1000, bytes([0xF3, 0xA4]))  # REP MOVSB
-        cpu.eip = 0x1000
-        cpu.step()
+        step(cpu, 0xF3, 0xA4)  # REP MOVSB
         for i in range(5):
             assert cpu.memory.read8(0x9000 + i) == i + 1
 
 
 class TestScasb:
     def test_repne_finds_null(self, cpu):
-        # Write "ABC\0" at 0xA000, scan for '\0'
         cpu.memory.load(0xA000, b"ABC\x00")
-        cpu.regs[EAX] = 0x00   # scanning for 0
+        cpu.regs[EAX] = 0x00
         cpu.regs[EDI] = 0xA000
         cpu.regs[ECX] = 10
-        cpu.memory.load(0x1000, bytes([0xF2, 0xAE]))  # REPNE SCASB
-        cpu.eip = 0x1000
-        cpu.step()
-        # Stops when ZF=1 (found the match)
+        step(cpu, 0xF2, 0xAE)  # REPNE SCASB
         assert cpu.get_flag(ZF_BIT) is True
-        assert cpu.regs[EDI] == 0xA004   # advanced past the '\0'
+        assert cpu.regs[EDI] == 0xA004
 
 
 class TestCmpsb:
@@ -107,9 +94,7 @@ class TestCmpsb:
         cpu.regs[ESI] = 0xB000
         cpu.regs[EDI] = 0xC000
         cpu.regs[ECX] = 5
-        cpu.memory.load(0x1000, bytes([0xF3, 0xA6]))  # REPE CMPSB
-        cpu.eip = 0x1000
-        cpu.step()
+        step(cpu, 0xF3, 0xA6)  # REPE CMPSB
         assert cpu.get_flag(ZF_BIT) is True
         assert cpu.regs[ECX] == 0
 
@@ -119,8 +104,6 @@ class TestCmpsb:
         cpu.regs[ESI] = 0xD000
         cpu.regs[EDI] = 0xE000
         cpu.regs[ECX] = 5
-        cpu.memory.load(0x1000, bytes([0xF3, 0xA6]))  # REPE CMPSB
-        cpu.eip = 0x1000
-        cpu.step()
+        step(cpu, 0xF3, 0xA6)  # REPE CMPSB
         assert cpu.get_flag(ZF_BIT) is False
-        assert cpu.regs[ECX] < 5   # stopped before exhausting count
+        assert cpu.regs[ECX] < 5

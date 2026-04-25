@@ -381,6 +381,7 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 104 — VarCyFromStr(strIn, lcid, dwFlags, pcyOut) -> HRESULT
     def _ord104(cpu: "CPU") -> None:
+        logger.warn("com", "VarCyFromStr (Ordinal 104) called — returning E_NOTIMPL (currency conversion not implemented)")
         cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
         cleanup_stdcall(cpu, memory, 20)
 
@@ -419,6 +420,7 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 154 — LoadTypeLibEx(...) -> HRESULT
     def _ord154(cpu: "CPU") -> None:
+        logger.warn("com", "LoadTypeLibEx (Ordinal 154) called — returning E_NOTIMPL (type library loading not implemented)")
         cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
         cleanup_stdcall(cpu, memory, 12)
 
@@ -426,6 +428,7 @@ def register_oleaut32_ole32_handlers(
 
     # Ordinal 155 — RegisterTypeLib(...) -> HRESULT
     def _ord155(cpu: "CPU") -> None:
+        logger.warn("com", "RegisterTypeLib (Ordinal 155) called — returning E_NOTIMPL (type library registration not implemented)")
         cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
         cleanup_stdcall(cpu, memory, 12)
 
@@ -455,6 +458,9 @@ def register_oleaut32_ole32_handlers(
 
     # CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv) -> HRESULT
     def _CoCreateInstance(cpu: "CPU") -> None:
+        rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        riid   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        logger.warn("com", f"CoCreateInstance(clsid@0x{rclsid:08x}, riid@0x{riid:08x}) — returning REGDB_E_CLASSNOTREG (COM not implemented)")
         cpu.regs[EAX] = 0x80040154  # REGDB_E_CLASSNOTREG
         cleanup_stdcall(cpu, memory, 20)
 

@@ -1,16 +1,13 @@
-"""Tests for data-movement opcodes: MOV, LEA, XCHG, PUSH/POP segment regs."""
-
+"""Black-box data-movement opcode tests against ZigCPU."""
 import pytest
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import CPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
-from tew.emulator.opcodes import register_all_opcodes
+from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
 
 
 @pytest.fixture
 def cpu():
-    m = Memory(0x10000)
-    c = CPU(m)
-    register_all_opcodes(c)
+    mem = Memory(0x10000)
+    c = ZigCPU(mem)
     c.regs[ESP] = 0x8000
     return c
 
@@ -22,13 +19,13 @@ def load(cpu, addr, data):
 
 class TestMovR32Imm32:
     def test_eax(self, cpu):
-        load(cpu, 0, [0xB8, 0x78, 0x56, 0x34, 0x12])
+        load(cpu, 0, [0xB8, 0x78, 0x56, 0x34, 0x12])  # MOV EAX, 0x12345678
         cpu.step()
         assert cpu.regs[EAX] == 0x12345678
         assert cpu.eip == 5
 
     def test_ecx(self, cpu):
-        load(cpu, 0, [0xB9, 0xEF, 0xBE, 0xAD, 0xDE])
+        load(cpu, 0, [0xB9, 0xEF, 0xBE, 0xAD, 0xDE])  # MOV ECX, 0xDEADBEEF
         cpu.step()
         assert cpu.regs[ECX] == 0xDEADBEEF
 
@@ -49,15 +46,13 @@ class TestMovR32Imm32:
 class TestMovRm32R32:
     def test_reg_to_reg(self, cpu):
         cpu.regs[EAX] = 0x12345678
-        # MOV ECX, EAX  (89 C1)
-        load(cpu, 0, [0x89, 0xC1])
+        load(cpu, 0, [0x89, 0xC1])  # MOV ECX, EAX
         cpu.step()
         assert cpu.regs[ECX] == 0x12345678
 
     def test_reg_to_mem(self, cpu):
         cpu.regs[EAX] = 0xCAFEBABE
-        # MOV [0x1000], EAX  (89 05 00 10 00 00)
-        load(cpu, 0, [0x89, 0x05, 0x00, 0x10, 0x00, 0x00])
+        load(cpu, 0, [0x89, 0x05, 0x00, 0x10, 0x00, 0x00])  # MOV [0x1000], EAX
         cpu.step()
         assert cpu.memory.read32(0x1000) == 0xCAFEBABE
 
@@ -65,28 +60,24 @@ class TestMovRm32R32:
 class TestMovR32Rm32:
     def test_reg_to_reg(self, cpu):
         cpu.regs[EBX] = 0x87654321
-        # MOV EAX, EBX  (8B C3)
-        load(cpu, 0, [0x8B, 0xC3])
+        load(cpu, 0, [0x8B, 0xC3])  # MOV EAX, EBX
         cpu.step()
         assert cpu.regs[EAX] == 0x87654321
 
     def test_mem_to_reg(self, cpu):
         cpu.memory.write32(0x2000, 0x11223344)
-        # MOV EAX, [0x2000]  (8B 05 00 20 00 00)
-        load(cpu, 0, [0x8B, 0x05, 0x00, 0x20, 0x00, 0x00])
+        load(cpu, 0, [0x8B, 0x05, 0x00, 0x20, 0x00, 0x00])  # MOV EAX, [0x2000]
         cpu.step()
         assert cpu.regs[EAX] == 0x11223344
 
 
 class TestMovRm32Imm32:
     def test_reg_imm(self, cpu):
-        # MOV EAX, 0xAABBCCDD  (C7 C0 DD CC BB AA)
-        load(cpu, 0, [0xC7, 0xC0, 0xDD, 0xCC, 0xBB, 0xAA])
+        load(cpu, 0, [0xC7, 0xC0, 0xDD, 0xCC, 0xBB, 0xAA])  # MOV EAX, 0xAABBCCDD
         cpu.step()
         assert cpu.regs[EAX] == 0xAABBCCDD
 
     def test_mem_imm(self, cpu):
-        # MOV [0x3000], 0xDEAD  (C7 05 00 30 00 00 AD DE 00 00)
         load(cpu, 0, [0xC7, 0x05, 0x00, 0x30, 0x00, 0x00, 0xAD, 0xDE, 0x00, 0x00])
         cpu.step()
         assert cpu.memory.read32(0x3000) == 0xDEAD
@@ -95,15 +86,13 @@ class TestMovRm32Imm32:
 class TestMovALMem:
     def test_mov_al_from_mem(self, cpu):
         cpu.memory.write8(0x4000, 0xAB)
-        # MOV AL, [0x4000]  (A0 00 40 00 00)
-        load(cpu, 0, [0xA0, 0x00, 0x40, 0x00, 0x00])
+        load(cpu, 0, [0xA0, 0x00, 0x40, 0x00, 0x00])  # MOV AL, [0x4000]
         cpu.step()
         assert cpu.regs[EAX] & 0xFF == 0xAB
 
     def test_mov_eax_from_mem(self, cpu):
         cpu.memory.write32(0x5000, 0x12345678)
-        # MOV EAX, [0x5000]  (A1 00 50 00 00)
-        load(cpu, 0, [0xA1, 0x00, 0x50, 0x00, 0x00])
+        load(cpu, 0, [0xA1, 0x00, 0x50, 0x00, 0x00])  # MOV EAX, [0x5000]
         cpu.step()
         assert cpu.regs[EAX] == 0x12345678
 
@@ -111,8 +100,7 @@ class TestMovALMem:
 class TestLea:
     def test_lea_reg_plus_disp8(self, cpu):
         cpu.regs[EBX] = 0x1000
-        # LEA EAX, [EBX+0x10]  (8D 43 10)
-        load(cpu, 0, [0x8D, 0x43, 0x10])
+        load(cpu, 0, [0x8D, 0x43, 0x10])  # LEA EAX, [EBX+0x10]
         cpu.step()
         assert cpu.regs[EAX] == 0x1010
 
@@ -121,8 +109,7 @@ class TestXchg:
     def test_xchg_r32_rm32(self, cpu):
         cpu.regs[EAX] = 0x111
         cpu.regs[EBX] = 0x222
-        # XCHG EAX, EBX  (87 C3)
-        load(cpu, 0, [0x87, 0xC3])
+        load(cpu, 0, [0x87, 0xC3])  # XCHG EAX, EBX
         cpu.step()
         assert cpu.regs[EAX] == 0x222
         assert cpu.regs[EBX] == 0x111
@@ -130,8 +117,7 @@ class TestXchg:
     def test_xchg_eax_r32_short(self, cpu):
         cpu.regs[EAX] = 0xAAA
         cpu.regs[ECX] = 0xBBB
-        # XCHG EAX, ECX  (91)
-        load(cpu, 0, [0x91])
+        load(cpu, 0, [0x91])  # XCHG EAX, ECX
         cpu.step()
         assert cpu.regs[EAX] == 0xBBB
         assert cpu.regs[ECX] == 0xAAA
@@ -140,14 +126,12 @@ class TestXchg:
 class TestMovR8Imm8:
     def test_mov_al(self, cpu):
         cpu.regs[EAX] = 0xFFFFFFFF
-        # MOV AL, 0x42  (B0 42)
-        load(cpu, 0, [0xB0, 0x42])
+        load(cpu, 0, [0xB0, 0x42])  # MOV AL, 0x42
         cpu.step()
         assert cpu.regs[EAX] == 0xFFFFFF42
 
     def test_mov_ah(self, cpu):
         cpu.regs[EAX] = 0xFFFFFFFF
-        # MOV AH, 0x42  (B4 42)
-        load(cpu, 0, [0xB4, 0x42])
+        load(cpu, 0, [0xB4, 0x42])  # MOV AH, 0x42
         cpu.step()
         assert cpu.regs[EAX] == 0xFFFF42FF

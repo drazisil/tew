@@ -435,7 +435,43 @@ def register_advapi32_handlers(
     # RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
     #               lpftLastWriteTime) - 8 args (32 bytes)
     def _reg_enum_key_ex_a(cpu: "CPU") -> None:
-        cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+        h_key     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        dw_index  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_name   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lpch_name = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        parent_path = (_reg_key_names.get(h_key) or "").lower()
+        if parent_path:
+            prefix  = parent_path + "\\"
+            subkeys = sorted([
+                k[len(prefix):]
+                for k in state.registry_values
+                if k.startswith(prefix) and "\\" not in k[len(prefix):]
+            ])
+        else:
+            subkeys = sorted([k for k in state.registry_values if "\\" not in k])
+
+        if dw_index >= len(subkeys):
+            cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+            cleanup_stdcall(cpu, memory, 32)
+            return
+
+        name     = subkeys[dw_index]
+        required = len(name) + 1
+        if not lpch_name:
+            cpu.regs[EAX] = ERROR_MORE_DATA
+            cleanup_stdcall(cpu, memory, 32)
+            return
+        buf_size = memory.read32(lpch_name & 0xFFFFFFFF)
+        memory.write32(lpch_name & 0xFFFFFFFF, len(name))
+        if buf_size < required:
+            cpu.regs[EAX] = ERROR_MORE_DATA
+            cleanup_stdcall(cpu, memory, 32)
+            return
+        if lp_name:
+            _write_ansi_str(lp_name, name, memory)
+        logger.debug("registry", f'RegEnumKeyExA(0x{h_key:x}, {dw_index}) -> "{name}"')
+        cpu.regs[EAX] = ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 32)
 
     stubs.register_handler("advapi32.dll", "RegEnumKeyExA", _reg_enum_key_ex_a)
@@ -443,7 +479,59 @@ def register_advapi32_handlers(
     # RegEnumValueA(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
     #               lpData, lpcbData) - 8 args (32 bytes)
     def _reg_enum_value_a(cpu: "CPU") -> None:
-        cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+        h_key           = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        dw_index        = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_value_name   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lpch_value_name = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_type         = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        lp_data         = memory.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        lpcb_data       = memory.read32((cpu.regs[ESP] + 32) & 0xFFFFFFFF)
+
+        key_path    = (_reg_key_names.get(h_key) or "").lower()
+        values_dict = state.registry_values.get(key_path, {})
+        value_names = sorted(values_dict.keys())
+
+        if dw_index >= len(value_names):
+            cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+            cleanup_stdcall(cpu, memory, 32)
+            return
+
+        name  = value_names[dw_index]
+        entry = values_dict[name]
+
+        if not lpch_value_name:
+            cpu.regs[EAX] = ERROR_MORE_DATA
+            cleanup_stdcall(cpu, memory, 32)
+            return
+        buf_size = memory.read32(lpch_value_name & 0xFFFFFFFF)
+        memory.write32(lpch_value_name & 0xFFFFFFFF, len(name))
+        if buf_size < len(name) + 1:
+            cpu.regs[EAX] = ERROR_MORE_DATA
+            cleanup_stdcall(cpu, memory, 32)
+            return
+        if lp_value_name:
+            _write_ansi_str(lp_value_name, name, memory)
+
+        if lp_type:
+            memory.write32(lp_type & 0xFFFFFFFF, entry.type)
+
+        if lpcb_data:
+            if entry.type == 4:  # REG_DWORD
+                val = entry.value if isinstance(entry.value, int) else 0
+                if lp_data and memory.read32(lpcb_data & 0xFFFFFFFF) >= 4:
+                    memory.write32(lp_data & 0xFFFFFFFF, val & 0xFFFFFFFF)
+                memory.write32(lpcb_data & 0xFFFFFFFF, 4)
+            elif entry.type == 1:  # REG_SZ
+                s           = str(entry.value) if entry.value is not None else ""
+                data_needed = len(s) + 1
+                if lp_data and memory.read32(lpcb_data & 0xFFFFFFFF) >= data_needed:
+                    _write_ansi_str(lp_data, s, memory)
+                memory.write32(lpcb_data & 0xFFFFFFFF, data_needed)
+            else:
+                memory.write32(lpcb_data & 0xFFFFFFFF, 0)
+
+        logger.debug("registry", f'RegEnumValueA(0x{h_key:x}, {dw_index}) -> "{name}" type={entry.type}')
+        cpu.regs[EAX] = ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 32)
 
     stubs.register_handler("advapi32.dll", "RegEnumValueA", _reg_enum_value_a)
