@@ -1,0 +1,119 @@
+pipeline:
+  identifier: Build_drazisil_tew_1777043281219
+  name: Build tew
+  orgIdentifier: default
+  projectIdentifier: rusty
+  properties:
+    ci:
+      codebase:
+        build: <+input>
+        connectorRef: account.Github_OAuth_1777025660192
+        repoName: drazisil/tew
+  stages:
+    - stage:
+        identifier: build
+        name: build
+        spec:
+          caching:
+            enabled: true
+          cloneCodebase: true
+          execution:
+            steps:
+              - step:
+                  identifier: runlinter
+                  name: run linter
+                  spec:
+                    command: |-
+                      pip install flake8
+                      flake8 .
+                  timeout: ""
+                  type: Run
+              - step:
+                  identifier: setupvirtualenvironment
+                  name: Setup Virtual Environment
+                  spec:
+                    shell: Bash
+                    command: |-
+                      set -euo pipefail
+
+                      echo "=== Setting up Python environment with uv ==="
+
+                      # Install uv if not present
+                      if ! command -v uv &> /dev/null; then
+                        echo "Installing uv..."
+                        curl -LsSf https://astral.sh/uv/install.sh | sh
+                        
+                        # Add uv to PATH for this session
+                        export PATH="$HOME/.local/bin:$PATH"
+                        
+                        # Verify installation
+                        if ! command -v uv &> /dev/null; then
+                          echo "ERROR: uv installation failed"
+                          exit 1
+                        fi
+                        echo "uv installed successfully: $(uv --version)"
+                      else
+                        echo "uv already installed: $(uv --version)"
+                      fi
+
+                      # Set virtual environment path
+                      VENV_DIR="${UV_VENV_PATH:-.venv}"
+                      echo "Virtual environment directory: $VENV_DIR"
+
+                      # Create virtual environment using uv
+                      echo "Creating virtual environment..."
+                      uv venv "$VENV_DIR" --seed
+
+                      # Activate virtual environment
+                      source "$VENV_DIR/bin/activate"
+
+                      # Verify activation
+                      echo "Python location: $(which python)"
+                      echo "Python version: $(python --version)"
+
+                      # Install dependencies if requirements file exists
+                      if [ -f "requirements.txt" ]; then
+                        echo "Installing dependencies from requirements.txt..."
+                        uv pip install -r requirements.txt
+                      elif [ -f "pyproject.toml" ]; then
+                        echo "Installing dependencies from pyproject.toml..."
+                        uv pip install -r pyproject.toml
+                      else
+                        echo "No requirements.txt or pyproject.toml found, skipping dependency installation"
+                      fi
+
+                      # Install package in editable mode if setup.py or pyproject.toml exists
+                      if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+                        echo "Installing package in editable mode..."
+                        uv pip install -e .
+                      else
+                        echo "No setup.py or pyproject.toml found, skipping editable install"
+                      fi
+
+                      # Export virtual environment path for subsequent steps
+                      export VIRTUAL_ENV_PATH="$(pwd)/$VENV_DIR"
+
+                      echo "=== Virtual environment setup complete ==="
+                      echo "To activate in subsequent steps, run: source $VENV_DIR/bin/activate"
+                  timeout: 10m
+                  type: Run
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Retry
+                          spec:
+                            retryCount: 2
+                            retryIntervals:
+                              - 5s
+                            onRetryFailure:
+                              action:
+                                type: MarkAsFailure
+          platform:
+            arch: Amd64
+            os: Linux
+          runtime:
+            spec: {}
+            type: Cloud
+        type: CI
