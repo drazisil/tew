@@ -279,15 +279,18 @@ class ZigCPU:
     # ── C callback (called by Zig on INT instruction) ─────────────────────────
 
     def _c_int_dispatch(self, _state_ptr: int, int_num: int) -> None:
-        if self._int_handler:
-            self._int_handler(int_num, self)
+        try:
+            if self._int_handler:
+                self._int_handler(int_num, self)
+        except Exception as e:
+            self.handle_exception(e)
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def step(self) -> None:
         self._sync_fs_gs()
         result = _lib.cpu_run(self._state, 1)
-        if result == _RUN_FAULTED:
+        if result == _RUN_FAULTED and self.last_error is None:
             self.last_error = RuntimeError(
                 f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
             )
@@ -454,13 +457,9 @@ class ZigCPU:
 
     def handle_exception(self, error: Exception) -> None:
         self.last_error = error
-        # Signal Zig that the CPU has faulted by setting EIP to a known-bad
-        # address and letting the main loop see halted=True from Zig's own fault
-        # flag — but since this is called from Python (not from inside Zig), we
-        # have no Zig-side setter for halted.  Work around: store a Python-side
-        # override and check it in step().
         self._py_faulted = True
         self._py_halted  = True
+        _lib.cpu_set_halted(self._state)
 
     # ── Save / restore ────────────────────────────────────────────────────────
 

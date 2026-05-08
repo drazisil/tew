@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import ESP
 from tew.logger import logger
+from tew.api.nt_syscall import NtSyscallDispatcher
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,11 @@ class Win32Handlers:
         self._installed: bool = False
         self._call_log: list[str] = []
         self._call_log_size: int = 2000
+        self._nt_dispatcher: NtSyscallDispatcher = NtSyscallDispatcher(memory)
+
+    @property
+    def nt_dispatcher(self) -> NtSyscallDispatcher:
+        return self._nt_dispatcher
 
     # ── Registration ─────────────────────────────────────────────────────────
 
@@ -263,9 +269,14 @@ class Win32Handlers:
 
         stubs = self
 
+        nt_dispatcher = self._nt_dispatcher
+
         def _dispatch(int_num: int, c: "CPU") -> None:
             if int_num == STUB_INT:
                 stubs._handle_api_int(c)
+                return
+            if int_num == 0x2E:
+                nt_dispatcher.dispatch(c)
                 return
             if int_num == 3:
                 # INT3 debug breakpoint — halt so the run loop dumps state
