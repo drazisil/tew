@@ -6,6 +6,7 @@ Covers handlers from CloseHandle through GetWindowsDirectoryA.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import stat
 import datetime
@@ -657,9 +658,91 @@ def register_kernel32_io_handlers(
 
     # ── Find file / attributes ────────────────────────────────────────────────
 
+    # WIN32_FIND_DATAA field offsets
+    _FIND_OFF_ATTRS    = 0    # DWORD dwFileAttributes
+    _FIND_OFF_FNAME    = 44   # CHAR  cFileName[260]
+    _FIND_OFF_ALTNAME  = 304  # CHAR  cAlternateFileName[14]
+    FILE_ATTRIBUTE_DIRECTORY = 0x10
+    FILE_ATTRIBUTE_ARCHIVE   = 0x20
+
+    def _write_find_data(addr: int, name: str, attrs: int) -> None:
+        memory.write32(addr + _FIND_OFF_ATTRS, attrs)
+        for i in range(4, 44):          # timestamps + sizes: zero
+            memory.write8(addr + i, 0)
+        name_b = name.encode("ascii", errors="replace")[:259]
+        for i, b in enumerate(name_b):
+            memory.write8(addr + _FIND_OFF_FNAME + i, b)
+        memory.write8(addr + _FIND_OFF_FNAME + len(name_b), 0)
+        for i in range(14):             # cAlternateFileName: empty
+            memory.write8(addr + _FIND_OFF_ALTNAME + i, 0)
+
+    def _find_first_file_a(cpu: "CPU") -> None:
+        INVALID = 0xFFFFFFFF
+        lp_name     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_find_data = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        pattern_win = read_cstring(lp_name, memory, 260)
+        linux_pat   = state.translate_windows_path(pattern_win)
+        dir_path    = os.path.dirname(linux_pat)
+        pat         = os.path.basename(linux_pat)
+        if pat in ("*.*", ""):          # Windows *.*  matches everything
+            pat = "*"
+        logger.debug("handlers", f'FindFirstFileA({pattern_win!r})')
+        real_dir = find_file_ci(dir_path) if dir_path else None
+        if not real_dir or not os.path.isdir(real_dir):
+            cpu.regs[EAX] = INVALID
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        try:
+            entries: list[tuple[str, int]] = []
+            for name in sorted(os.listdir(real_dir), key=str.lower):
+                if fnmatch.fnmatch(name.lower(), pat.lower()):
+                    full = os.path.join(real_dir, name)
+                    attrs = FILE_ATTRIBUTE_DIRECTORY if os.path.isdir(full) else FILE_ATTRIBUTE_ARCHIVE
+                    entries.append((name, attrs))
+        except OSError:
+            cpu.regs[EAX] = INVALID
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        if not entries:
+            cpu.regs[EAX] = INVALID
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        handle = state.next_find_handle
+        state.next_find_handle += 1
+        state.find_handle_map[handle] = entries
+        state.find_handle_idx[handle] = 0
+        _write_find_data(lp_find_data, entries[0][0], entries[0][1])
+        logger.debug("handlers", f'  -> handle=0x{handle:x} first={entries[0][0]!r} ({len(entries)} total)')
+        cpu.regs[EAX] = handle
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _find_next_file_a(cpu: "CPU") -> None:
+        h            = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_find_data = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entries = state.find_handle_map.get(h)
+        if entries is None:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        idx = state.find_handle_idx[h] + 1
+        state.find_handle_idx[h] = idx
+        if idx >= len(entries):
+            logger.debug("handlers", f'FindNextFileA(0x{h:x}) -> no more files')
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        _write_find_data(lp_find_data, entries[idx][0], entries[idx][1])
+        logger.debug("handlers", f'FindNextFileA(0x{h:x}) -> {entries[idx][0]!r}')
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
     def _find_close(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] FindClose — find handle tracking not implemented, halting")
-        cpu.halted = True
+        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.find_handle_map.pop(h, None)
+        state.find_handle_idx.pop(h, None)
+        logger.debug("handlers", f'FindClose(0x{h:x})')
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 4)
 
     def _get_file_attributes_a(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -682,9 +765,9 @@ def register_kernel32_io_handlers(
             cpu.regs[EAX] = 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 4)
 
-    stubs.register_handler("kernel32.dll", "FindFirstFileA", _halt("FindFirstFileA"))
+    stubs.register_handler("kernel32.dll", "FindFirstFileA", _find_first_file_a)
     stubs.register_handler("kernel32.dll", "FindFirstFileW", _halt("FindFirstFileW"))
-    stubs.register_handler("kernel32.dll", "FindNextFileA",  _halt("FindNextFileA"))
+    stubs.register_handler("kernel32.dll", "FindNextFileA",  _find_next_file_a)
     stubs.register_handler("kernel32.dll", "FindNextFileW",  _halt("FindNextFileW"))
     stubs.register_handler("kernel32.dll", "FindClose",      _find_close)
     stubs.register_handler("kernel32.dll", "CompareFileTime", _halt("CompareFileTime"))
@@ -821,16 +904,19 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 20)
 
+    _drive_type_traced = [False]
+
     def _get_drive_type_a(cpu: "CPU") -> None:
         # GetDriveTypeA(lpRootPathName) -> UINT
         # DRIVE_UNKNOWN=0, DRIVE_NO_ROOT_DIR=1, DRIVE_REMOVABLE=2,
         # DRIVE_FIXED=3, DRIVE_REMOTE=4, DRIVE_CDROM=5, DRIVE_RAMDISK=6
         DRIVE_NO_ROOT_DIR = 1
         DRIVE_FIXED       = 3
+        _NAMES = {0: "UNKNOWN", 1: "NO_ROOT_DIR", 2: "REMOVABLE", 3: "FIXED", 4: "REMOTE", 5: "CDROM", 6: "RAMDISK"}
         lp_root = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if lp_root == 0:
-            # NULL → drive type of current directory; we report fixed
             cpu.regs[EAX] = DRIVE_FIXED
+            logger.debug("handlers", f"GetDriveTypeA(NULL) -> FIXED")
         else:
             root_path = read_cstring(lp_root, memory, 16)
             linux_path = state.translate_windows_path(root_path)
@@ -838,6 +924,11 @@ def register_kernel32_io_handlers(
                 cpu.regs[EAX] = DRIVE_FIXED
             else:
                 cpu.regs[EAX] = DRIVE_NO_ROOT_DIR
+            logger.debug("handlers", f"GetDriveTypeA({root_path!r}) -> {_NAMES.get(cpu.regs[EAX], cpu.regs[EAX])}")
+        if not _drive_type_traced[0]:
+            _drive_type_traced[0] = True
+            ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+            logger.info("handlers", f"GetDriveTypeA first call from 0x{ret_addr:08x}")
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "GetCurrentDirectoryA", _get_current_dir_a)

@@ -277,6 +277,12 @@ class CRTState:
         self.file_handle_map: dict[int, FileHandleEntry] = {}
         self.next_file_handle: int = 0x5000
 
+        # ── Find handles (FindFirstFileA / FindNextFileA) ──────────────
+        # Each entry: list of (filename: str, attrs: int) tuples, current index
+        self.find_handle_map: dict[int, list[tuple[str, int]]] = {}
+        self.find_handle_idx: dict[int, int] = {}
+        self.next_find_handle: int = 0x6000
+
         # ── Kernel objects ────────────────────────────────────────────────
         self.kernel_handle_map: dict[int, KernelHandle] = {}
         self.next_kernel_handle: int = 0x7000

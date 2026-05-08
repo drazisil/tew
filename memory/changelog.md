@@ -4,6 +4,33 @@ Entries are newest-first.
 
 ---
 
+## 2026-04-25 — Beta binary CD check investigation
+
+Investigated why mcity_beta_1.exe shows "Game CD not found" despite instLev=2 in registry.
+
+**Root cause:** The beta binary's CD check function (~0x4d27c0) reads instLev and sets
+bMaxInstall at 0x975f78, but has no conditional skip of the CD loop — it unconditionally
+calls SetErrorMode(0x8001), loops GetDriveTypeA over A:–Z:, then returns 2 (failure) if no
+game CDROM found. The debug binary has Platform_IsMaxInstall (0x52dc30) which reads from
+a different global (0xa10f50) and skips the loop; the beta binary lacks this path entirely.
+
+**Key addresses (beta binary):**
+- CD check function entry: ~0x4d27c0 (complex SEH prologue, thiscall)
+- instLev check + bMaxInstall set: 0x4d2a11–0x4d2a31
+- SetErrorMode call (start of CD loop): 0x4d2a7b, return to 0x4d2a81
+- Inner drive check (calls GetDriveTypeA): 0x4d56b0
+- Loop back: 0x4d2ae0 (JL 0x4d2a86, 26 drives)
+- SetErrorMode restore + CD-found check: 0x4d2ae6, CMP ESI,EDI at 0x4d2aec
+- Failure path (return 2): 0x4d2afc; success path (return 0): 0x4d2bb8
+
+**Planned fix (deferred):** return DRIVE_CDROM for the install drive in GetDriveTypeA
+handler — binary-agnostic, no address-specific patches needed.
+
+**Diagnostics removed:** SetErrorMode return-address logging, Platform_IsMaxInstall patch.
+GetDriveTypeA first-call trace kept.
+
+---
+
 ## 2026-04-25 — TDD sweep: fix silent failures, implement missing handlers, port tests to ZigCPU
 
 **Silent failure fixes:**

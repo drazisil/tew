@@ -11,7 +11,7 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current blocker: Wayland deadlock inside IDirect3D8::CreateDevice
+### Current blocker (MCity_d.exe): Wayland deadlock inside IDirect3D8::CreateDevice
 
 `CreateDevice` is called successfully (log: `IDirect3D8::CreateDevice hwnd=0x1034 back=800x600`),
 but then hangs before "VkSurfaceKHR created" is logged. The hang is somewhere in the
@@ -27,6 +27,17 @@ before surface queries — but the hang appears before that log line, so either:
 Next step: add fine-grained logging inside the surface creation block to pinpoint
 which call hangs, then fix (likely: call SDL_PumpEvents before Vulkan surface queries,
 or use wl_display_dispatch_pending instead of roundtrip).
+
+### Deferred: beta binary (mcity_beta_1.exe) — "Game CD not found"
+
+The beta binary always runs the CD check regardless of instLev. The check function
+(~0x4d27c0) reads instLev and sets bMaxInstall, but then unconditionally calls
+SetErrorMode + loops GetDriveTypeA over all 26 drives. No CD found → MessageBoxA +
+return 2 → ExitProcess.
+
+**Planned fix (not yet implemented):** make `GetDriveTypeA` return `DRIVE_CDROM` for
+the drive containing the install directory. Binary-agnostic Win32-layer fix that works
+for any game using the standard GetDriveTypeA CD detection pattern.
 
 ## Run command
 ```bash

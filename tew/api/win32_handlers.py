@@ -33,6 +33,9 @@ MAX_HANDLERS: int = 4096
 # INT number used for stubs that need Python logic
 STUB_INT: int = 0xFE
 
+# Stub names suppressed from trace-level call logging (too noisy to be useful)
+_TRACE_SUPPRESS: frozenset[str] = frozenset({"EnterCriticalSection", "LeaveCriticalSection"})
+
 # Trampolines used by dialog / DllMain bootstrap sequences
 DIALOG_TRAMPOLINE: int = 0x00210000
 DLLMAIN_TRAMPOLINE: int = 0x00210010
@@ -306,7 +309,8 @@ class Win32Handlers:
 
         # Log the stub call; deduplicate consecutive identical calls with a counter
         log_entry = f"{entry.name} @ 0x{handler_addr:x}"
-        logger.trace("calls", log_entry)
+        if not any(s in entry.name for s in _TRACE_SUPPRESS):
+            logger.trace("calls", log_entry)
         if self._call_log and self._call_log[-1].startswith(log_entry):
             last = self._call_log[-1]
             count_match = re.search(r" x(\d+)$", last)
