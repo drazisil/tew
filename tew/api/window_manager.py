@@ -203,6 +203,13 @@ class WindowManager:
         creating any windows.  Safe to call multiple times."""
         if self._initialized:
             return True
+        # XInitThreads() must be called before any Xlib call so that Mesa's
+        # Vulkan WSI can safely use the same Display* from a background thread.
+        try:
+            _xlib = ctypes.CDLL("libX11.so.6")
+            _xlib.XInitThreads()
+        except Exception:
+            pass  # non-X11 environment; safe to skip
         SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, b"0")
         rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)
         if rc != 0:

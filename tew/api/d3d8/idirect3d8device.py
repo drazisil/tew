@@ -112,7 +112,7 @@ if TYPE_CHECKING:
 from tew.hardware.cpu import EAX, ECX, ESP
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _alloc_resource_obj, _com_stub, _set_eax
+from tew.api.d3d8._helpers import _alloc_resource_obj, _com_stub, _set_eax, vk_pump
 from tew.api.d3d8._caps import _fill_d3d_caps8
 import tew.api.d3d8._state as _state
 
@@ -265,6 +265,56 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(pp_surf, _alloc_resource_obj(800 * 600 * 4, mem))
         cpu.regs[EAX] = S_OK
 
+    def _rebuild_swapchain() -> None:
+        """Recreate the swapchain using the current surface extent."""
+        import vulkan as vk
+
+        phys_dev = _state._vk_physical_devices[0]
+        caps = vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            phys_dev, _state._vk_surface)
+
+        w = caps.currentExtent.width
+        h = caps.currentExtent.height
+        # 0xFFFFFFFF means driver wants us to pick; fall back to last known size
+        if w == 0xFFFFFFFF:
+            w = _state._vk_swapchain_width
+            h = _state._vk_swapchain_height
+
+        old_swapchain = _state._vk_swapchain
+        swapchain_ci = vk.VkSwapchainCreateInfoKHR(
+            sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            surface=_state._vk_surface,
+            minImageCount=2,
+            imageFormat=_state._vk_swapchain_format,
+            imageColorSpace=0,   # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+            imageExtent=vk.VkExtent2D(width=w, height=h),
+            imageArrayLayers=1,
+            imageUsage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+            imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+            queueFamilyIndexCount=0,
+            pQueueFamilyIndices=None,
+            preTransform=0x00000001,  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+            compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
+            clipped=vk.VK_TRUE,
+            oldSwapchain=old_swapchain,
+        )
+        new_swapchain = vk_pump(
+            lambda: _state._vk_fn_create_swapchain(
+                _state._vk_device, swapchain_ci, None))
+
+        vk.vkDestroySwapchainKHR(_state._vk_device, old_swapchain, None)
+
+        raw_imgs = _state._vk_fn_get_swapchain_images(
+            _state._vk_device, new_swapchain)
+        _state._vk_swapchain        = new_swapchain
+        _state._vk_swapchain_images = list(raw_imgs)
+        _state._vk_swapchain_width  = w
+        _state._vk_swapchain_height = h
+        logger.info("d3d8",
+            f"_rebuild_swapchain: {w}x{h} images={len(_state._vk_swapchain_images)}")
+
     # [34] BeginScene()
     # Waits for the previous frame fence, acquires the next swapchain image, and
     # opens the command buffer.  Transitions the image to TRANSFER_DST_OPTIMAL so
@@ -283,9 +333,19 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
             vk.vkResetFences(_state._vk_device, 1, [_state._vk_in_flight])
 
-            idx = _state._vk_fn_acquire_next_image(
-                _state._vk_device, _state._vk_swapchain,
-                0xFFFFFFFFFFFFFFFF, _state._vk_image_available, None)
+            try:
+                idx = vk_pump(lambda: _state._vk_fn_acquire_next_image(
+                    _state._vk_device, _state._vk_swapchain,
+                    0xFFFFFFFFFFFFFFFF, _state._vk_image_available, None))
+            except Exception as acq_exc:
+                if "OutOfDate" in type(acq_exc).__name__:
+                    logger.info("d3d8", "BeginScene: swapchain out-of-date, rebuilding")
+                    _rebuild_swapchain()
+                    idx = vk_pump(lambda: _state._vk_fn_acquire_next_image(
+                        _state._vk_device, _state._vk_swapchain,
+                        0xFFFFFFFFFFFFFFFF, _state._vk_image_available, None))
+                else:
+                    raise
             _state._vk_current_image_idx = int(idx)
 
             vk.vkResetCommandBuffer(_state._vk_cmd_buf, 0)
@@ -320,7 +380,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 0, 0, None, 0, None, 1, [barrier],
             )
         except Exception as exc:
-            logger.error("d3d8", f"BeginScene failed: {exc} — halting")
+            logger.error("d3d8",
+                f"BeginScene failed: {type(exc).__name__}: {exc!r} — halting")
             cpu.halted = True
             return
 
@@ -457,8 +518,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 pSwapchains=[_state._vk_swapchain],
                 pImageIndices=[_state._vk_current_image_idx],
             )
-            _state._vk_fn_queue_present(
-                _state._vk_present_queue, present_info)
+            vk_pump(lambda: _state._vk_fn_queue_present(
+                _state._vk_present_queue, present_info))
         except Exception as exc:
             logger.error("d3d8", f"Present failed: {exc} — halting")
             cpu.halted = True

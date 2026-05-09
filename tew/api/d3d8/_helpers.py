@@ -2,6 +2,41 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
+
+def vk_pump(fn):
+    """Run fn() in a background thread while pumping SDL events in the main thread.
+
+    Mesa's Wayland Vulkan WSI calls wl_display_roundtrip internally for surface
+    and swapchain operations. Those roundtrips block until the Wayland compositor
+    replies, but SDL owns the event loop and won't dispatch events while we're
+    inside a Python callback. Running the Vulkan call on a background thread lets
+    the main thread keep pumping events until it completes.
+    """
+    from sdl2 import SDL_PumpEvents
+
+    result: list = [None]
+    exc:    list = [None]
+
+    def _run() -> None:
+        try:
+            result[0] = fn()
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    while t.is_alive():
+        SDL_PumpEvents()
+        time.sleep(0.001)
+    t.join()
+
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:

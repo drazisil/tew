@@ -36,7 +36,7 @@ from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax
+from tew.api.d3d8._helpers import _com_stub, _set_eax, vk_pump
 from tew.api.d3d8._caps import _fill_adapter_identifier, _fill_d3d_caps8
 import tew.api.d3d8._state as _state
 
@@ -197,20 +197,17 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         logger.info("d3d8", "CreateDevice: VkSurfaceKHR created")
 
-        # ── Find queue family with graphics + present support ──────────────
+        # ── Find queue family with graphics support ────────────────────────
+        # vkGetPhysicalDeviceSurfaceSupportKHR blocks on Wayland (compositor
+        # roundtrip in the Vulkan WSI layer). On desktop Linux the graphics
+        # queue always supports present, so skip the query.
         phys_dev = _state._vk_physical_devices[0]
         queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys_dev)
         gfx_family = -1
         for i, qf in enumerate(queue_families):
             if qf.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
-                try:
-                    supported = vkGetSurfaceSupport(
-                        phys_dev, i, _state._vk_surface)
-                    if supported:
-                        gfx_family = i
-                        break
-                except Exception:
-                    continue
+                gfx_family = i
+                break
         if gfx_family < 0:
             logger.error("d3d8",
                 "CreateDevice: no GRAPHICS queue family found — halting")
@@ -267,38 +264,19 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create swapchain ───────────────────────────────────────────────
+        # Use the requested back-buffer size; any mismatch with the actual
+        # surface extent will be caught as VK_ERROR_OUT_OF_DATE_KHR in
+        # BeginScene, which recreates the swapchain with the correct size.
+        w = back_w if back_w > 0 else 800
+        h = back_h if back_h > 0 else 600
+        chosen_fmt   = 44  # VK_FORMAT_B8G8R8A8_UNORM
+        chosen_space = 0   # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+        img_count    = 2
+        pre_transform = 0x00000001  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+        _state._vk_swapchain_format = chosen_fmt
+        _state._vk_swapchain_width  = w
+        _state._vk_swapchain_height = h
         try:
-            caps = vkGetSurfaceCaps(phys_dev, _state._vk_surface)
-
-            # Choose format: prefer VK_FORMAT_B8G8R8A8_UNORM (44)
-            formats = vkGetSurfaceFormats(phys_dev, _state._vk_surface)
-            chosen_fmt   = int(formats[0].format)
-            chosen_space = int(formats[0].colorSpace)
-            for f in formats:
-                if int(f.format) == vk.VK_FORMAT_B8G8R8A8_UNORM:
-                    chosen_fmt   = int(f.format)
-                    chosen_space = int(f.colorSpace)
-                    break
-            _state._vk_swapchain_format = chosen_fmt
-
-            # Extent: use D3DPRESENT_PARAMETERS values when provided
-            if back_w > 0 and back_h > 0:
-                w, h = back_w, back_h
-            elif caps.currentExtent.width != 0xFFFFFFFF:
-                w = int(caps.currentExtent.width)
-                h = int(caps.currentExtent.height)
-            else:
-                w = max(int(caps.minImageExtent.width),
-                        min(int(caps.maxImageExtent.width),  800))
-                h = max(int(caps.minImageExtent.height),
-                        min(int(caps.maxImageExtent.height), 600))
-            _state._vk_swapchain_width  = w
-            _state._vk_swapchain_height = h
-
-            img_count = int(caps.minImageCount) + 1
-            if int(caps.maxImageCount) > 0:
-                img_count = min(img_count, int(caps.maxImageCount))
-
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(
                 sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
                 surface=_state._vk_surface,
@@ -312,14 +290,15 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
                 queueFamilyIndexCount=0,
                 pQueueFamilyIndices=None,
-                preTransform=caps.currentTransform,
+                preTransform=pre_transform,
                 compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
                 presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
                 clipped=vk.VK_TRUE,
                 oldSwapchain=None,
             )
-            _state._vk_swapchain = _state._vk_fn_create_swapchain(
-                _state._vk_device, swapchain_ci, None)
+            _state._vk_swapchain = vk_pump(
+                lambda: _state._vk_fn_create_swapchain(
+                    _state._vk_device, swapchain_ci, None))
 
             raw_imgs = _state._vk_fn_get_swapchain_images(
                 _state._vk_device, _state._vk_swapchain)
@@ -332,7 +311,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         logger.info("d3d8",
             f"CreateDevice: swapchain {w}x{h} fmt={chosen_fmt} "
-            f"images={len(_state._vk_swapchain_images)}")
+            f"images={len(_state._vk_swapchain_images)} "
+            f"(hardcoded params, skipped surface queries)")
 
         # ── Command pool + command buffer ──────────────────────────────────
         try:

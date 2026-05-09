@@ -83,13 +83,7 @@ def _emit(level: int, category: str, msg: str) -> None:
     elapsed = time.monotonic() - _start_time
     ts = f"{elapsed:8.3f}s"
     line = f"{ts} {_LEVEL_PREFIX[level]} [{category}] {msg}"
-    if level == ERROR:
-        print(line, file=sys.stderr, flush=True)
-    elif level == WARN:
-        print(line, file=sys.stderr, flush=True)
-    else:
-        print(line, flush=True)
-
+    print(line, flush=True)
     if _emit_hook is not None:
         _emit_hook(level, line)
 
