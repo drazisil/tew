@@ -8,15 +8,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -24,11 +24,11 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "srcdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "shardurl": {
       "type": 1,
@@ -98,15 +98,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -114,7 +114,7 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     }
   },
   "hklm\\software\\eacom\\authauth": {
@@ -180,15 +180,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -196,7 +196,7 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "shardurl": {
       "type": 1,
@@ -226,21 +226,21 @@
   "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity.exe": {
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "": {
       "type": 1,
-      "value": "C:\\MCity\\MCity_d.exe"
+      "value": "C:\\MCity_d.exe"
     }
   },
   "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity_d.exe": {
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "": {
       "type": 1,
-      "value": "C:\\MCity\\MCity_d.exe"
+      "value": "C:\\MCity_d.exe"
     }
   }
 }
