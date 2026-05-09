@@ -29,6 +29,7 @@ from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
+from tew.api.nt_handlers import register_nt_handlers
 from tew.logger import logger
 
 
@@ -177,6 +178,7 @@ crt_state.pe_resources = _pe_resources
 crt_state.window_manager.set_pe_resources(_pe_resources)
 
 win32_handlers.install(cpu)
+register_nt_handlers(win32_handlers.nt_dispatcher)
 
 # ── Load sections ─────────────────────────────────────────────────────────────
 
