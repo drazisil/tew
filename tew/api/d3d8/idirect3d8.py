@@ -182,15 +182,13 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             _state._vk_surface = vkCreateSurface(
                 _state._vk_instance, surface_ci, None)
 
-            # On Wayland the compositor hasn't acknowledged the surface yet,
-            # so surface-property queries (support, caps, formats) deadlock
-            # unless we flush all pending Wayland events first.
+            # On Wayland the compositor hasn't acknowledged the surface yet.
+            # wl_display_roundtrip deadlocks here because SDL2 holds the Wayland
+            # display lock — SDL_PumpEvents lets SDL flush its pending events
+            # through its own lock-safe path instead.
             if wl_display_ptr:
-                import ctypes as _ct
-                _libwl = _ct.CDLL('libwayland-client.so.0')
-                _libwl.wl_display_roundtrip.restype  = _ct.c_int
-                _libwl.wl_display_roundtrip.argtypes = [_ct.c_void_p]
-                _libwl.wl_display_roundtrip(_ct.c_void_p(wl_display_ptr))
+                from sdl2 import SDL_PumpEvents
+                SDL_PumpEvents()
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: VkSurface creation failed: {exc} — halting")
