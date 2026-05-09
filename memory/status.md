@@ -11,22 +11,14 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current blocker (MCity_d.exe): Wayland deadlock inside IDirect3D8::CreateDevice
+### Current blocker (MCity_d.exe): unknown — post-D3D8 init
 
-`CreateDevice` is called successfully (log: `IDirect3D8::CreateDevice hwnd=0x1034 back=800x600`),
-but then hangs before "VkSurfaceKHR created" is logged. The hang is somewhere in the
-VkSurface creation block (lines 152–198 of `idirect3d8.py`): either `vkCreateWaylandSurfaceKHR`,
-`wl_display_roundtrip`, or possibly `vkGetPhysicalDeviceSurfaceSupportKHR`.
+Wayland deadlock in `CreateDevice` is fixed (2026-05-08): replaced
+`wl_display_roundtrip` with `SDL_PumpEvents()`. Game now runs past
+"VkSurfaceKHR created" and continues running (seen alive at step 130M+).
 
-A `wl_display_roundtrip` was added after `vkCreateWaylandSurfaceKHR` to flush Wayland events
-before surface queries — but the hang appears before that log line, so either:
-1. `vkCreateWaylandSurfaceKHR` itself is hanging (unlikely — it's a local wrap), or
-2. `wl_display_roundtrip` is deadlocking because SDL2 holds the Wayland display lock
-   and the call can't dispatch without SDL2 pumping events.
-
-Next step: add fine-grained logging inside the surface creation block to pinpoint
-which call hangs, then fix (likely: call SDL_PumpEvents before Vulkan surface queries,
-or use wl_display_dispatch_pending instead of roundtrip).
+Next step: run without timeout with server running to observe what the
+game does after D3D8 init — login dialog, network traffic, etc.
 
 ### Deferred: beta binary (mcity_beta_1.exe) — "Game CD not found"
 
@@ -48,8 +40,7 @@ Note: uutils timeout (installed on this system) does not support inline env vars
 use `env KEY=VAL` prefix and absolute paths. Add `-u` to python for unbuffered output.
 
 ## Queued issues (priority order)
-- **Pinpoint Wayland deadlock** — add step logging inside surface creation block
-- **Fix Wayland deadlock** — likely SDL_PumpEvents or wl_display_dispatch_pending
+- **Identify post-D3D8 blocker** — run without timeout with server up, observe behaviour
 - SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768
 - DrawPrimitive / DrawIndexedPrimitive — currently `_halt`; needed for actual geometry
 - `[alive]` heartbeat silent during `GetMessageA` host-sleep — low priority
@@ -66,4 +57,4 @@ use `env KEY=VAL` prefix and absolute paths. Add `-u` to python for unbuffered o
   Event handle at runtime is 0x7012 (may vary).
 
 ## Test suite
-543 tests (all passing as of 2026-04-25).
+543 tests (all passing as of 2026-05-08).
