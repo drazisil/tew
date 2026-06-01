@@ -772,7 +772,52 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "FindClose",      _find_close)
     stubs.register_handler("kernel32.dll", "CompareFileTime", _halt("CompareFileTime"))
     stubs.register_handler("kernel32.dll", "GetFileAttributesA", _get_file_attributes_a)
-    stubs.register_handler("kernel32.dll", "GetFullPathNameA",   _halt("GetFullPathNameA"))
+
+    def _get_full_path_name_a(cpu: "CPU") -> None:
+        lp_file = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        n_buf   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        lp_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_part = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        raw = read_cstring(lp_file, memory, 260) if lp_file else ""
+
+        CWD = "C:\\MCity"
+        if raw and len(raw) >= 2 and raw[1] == ':':
+            full_win = raw
+        elif raw.startswith("\\\\"):
+            full_win = raw
+        else:
+            full_win = CWD + "\\" + raw.lstrip("\\")
+
+        parts: list = []
+        for seg in full_win.replace("/", "\\").split("\\"):
+            if seg == "..":
+                if len(parts) > 1:
+                    parts.pop()
+            elif seg == "." or seg == "":
+                pass
+            else:
+                parts.append(seg)
+        result = "\\".join(parts) or "C:\\"
+
+        needed = len(result) + 1
+        if lp_buf and n_buf >= needed:
+            for i, ch in enumerate(result):
+                memory.write8((lp_buf + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
+            memory.write8((lp_buf + len(result)) & 0xFFFFFFFF, 0)
+            if lp_part:
+                last_sep = result.rfind("\\")
+                if 0 <= last_sep < len(result) - 1:
+                    memory.write32(lp_part, (lp_buf + last_sep + 1) & 0xFFFFFFFF)
+                else:
+                    memory.write32(lp_part, 0)
+            cpu.regs[EAX] = len(result)
+            logger.debug("handlers", f'GetFullPathNameA({raw!r}) -> {result!r}')
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("kernel32.dll", "GetFullPathNameA", _get_full_path_name_a)
 
     # ── SetFilePointer / GetFileSize ──────────────────────────────────────────
 

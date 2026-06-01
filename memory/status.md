@@ -11,14 +11,22 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current blocker (MCity_d.exe): unknown — post-D3D8 init
+### Current blocker (MCity_d.exe): ifc22.dll!??0CImmMouse@@QAE@XZ UNIMPLEMENTED halt
 
-Wayland deadlock in `CreateDevice` is fixed (2026-05-08): replaced
-`wl_display_roundtrip` with `SDL_PumpEvents()`. Game now runs past
-"VkSurfaceKHR created" and continues running (seen alive at step 130M+).
+As of 2026-05-31, game runs through render loop and file-path work, then hits a C++
+constructor from ifc22.dll. Steps executed: 133,018,631.
 
-Next step: run without timeout with server running to observe what the
-game does after D3D8 init — login dialog, network traffic, etc.
+`??0CImmMouse@@QAE@XZ` demangles to `CImmMouse::CImmMouse()` — default constructor
+for CImmMouse, some kind of input/mouse manager from the ImmVersion middleware layer
+used by EA circa 2004.
+
+Likely stubbed out: constructor probably just zeroes fields and sets up a vtable.
+Need Ghidra to check what ifc22.dll exports and what the constructor actually does.
+
+Also: `CoCreateInstance` fails (REGDB_E_CLASSNOTREG) — still happening, probably DirectSound.
+
+Note: game also opens `CreateFile("")` (empty path) around this area — this returns
+INVALID_HANDLE_VALUE and the game continues normally, so it's not blocking.
 
 ### Deferred: beta binary (mcity_beta_1.exe) — "Game CD not found"
 
@@ -40,7 +48,7 @@ Note: uutils timeout (installed on this system) does not support inline env vars
 use `env KEY=VAL` prefix and absolute paths. Add `-u` to python for unbuffered output.
 
 ## Queued issues (priority order)
-- **Identify post-D3D8 blocker** — run without timeout with server up, observe behaviour
+- **RUNAWAY at 0x2196** — diagnose bad call from 0x9f8d11 (current blocker)
 - SDL window is 1536×1248 despite SM_CXSCREEN/SM_CYSCREEN capped at 1024×768
 - DrawPrimitive / DrawIndexedPrimitive — currently `_halt`; needed for actual geometry
 - `[alive]` heartbeat silent during `GetMessageA` host-sleep — low priority

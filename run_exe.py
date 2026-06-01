@@ -367,9 +367,14 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     _progress_countdown -= batch
     if _progress_countdown <= 0:
         _progress_countdown = 5_000_000
+        eip_now = cpu.eip & 0xFFFFFFFF
+        stub_note = ""
+        if 0x00200000 <= eip_now < 0x00220000:
+            recent = win32_handlers._call_log[-8:]
+            stub_note = f" calls={recent}"
         logger.info(
             "startup",
-            f"[alive] step={step_count:,} EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
+            f"[alive] step={step_count:,} EIP=0x{eip_now:08x}{stub_note}"
             f" vtime={crt_state.virtual_ticks_ms}ms",
         )
 

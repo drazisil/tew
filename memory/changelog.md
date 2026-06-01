@@ -4,6 +4,134 @@ Entries are newest-first.
 
 ---
 
+## 2026-05-31 — Implement CharUpperA
+
+**`tew/api/user32_handlers.py`** — added `_CharUpperA` handler.
+Both spec branches: HIWORD==0 → single-char uppercase return; HIWORD!=0 → string
+pointer, uppercase ASCII ('a'-'z') in-place, return pointer. Non-ASCII unchanged.
+
+**Result:** Game proceeds past step 133,014,085 (4,546 steps past CharUpperA).
+New blocker: `ifc22.dll!??0CImmMouse@@QAE@XZ` (CImmMouse constructor).
+
+---
+
+## 2026-05-31 — Implement GetFullPathNameA
+
+**`tew/api/kernel32_io.py`** — replaced `_halt("GetFullPathNameA")` with real handler.
+Resolves relative paths against `C:\MCity`; normalises `..` and `.` segments; writes
+to lpBuffer and sets *lpFilePart. Returns char count on success, required size if buffer
+too small.
+
+**Result:** Game proceeds past step 133,014,079. New blocker: `user32.dll!CharUpperA`.
+
+---
+
+## 2026-05-31 — Implement Dev::DrawPrimitive (Vulkan geometry rendering)
+
+**New file:** `tew/api/d3d8/_pipeline.py`
+- SPIR-V passthrough vertex/fragment shaders encoded as Python word lists (no external compiler)
+- `create_image_views`: VkImageView per swapchain image
+- `create_render_pass`: single color attachment, loadOp=LOAD (preserves cleared background)
+- `create_framebuffers`: one VkFramebuffer per swapchain image
+- `create_pipeline`: graphics pipeline — XYZRHW+DIFFUSE vertex layout (stride=32), dynamic viewport/scissor, no culling
+- `create_vertex_buffer`: 4MB host-visible/host-coherent Vulkan buffer, permanently mapped
+- `init_pipeline`: orchestrates all of the above
+
+**`tew/api/d3d8/_state.py`** additions:
+- `_vk_image_views`, `_vk_render_pass`, `_vk_framebuffers`, `_vk_pipeline`, `_vk_pipeline_layout`, `_vk_vertex_buffer`, `_vk_vertex_memory`, `_vk_vertex_mapped_ptr`
+- `_vk_in_render_pass` flag
+- `_draw_stream_ptr`, `_draw_stream_stride`, `_draw_vertex_fvf`
+
+**`tew/api/d3d8/idirect3d8.py`** — CreateDevice calls `init_pipeline` after swapchain + sync primitives are ready.
+
+**`tew/api/d3d8/idirect3d8device.py`** changes:
+- `SetStreamSource`: now stores vertex buffer data pointer and stride in `_state`
+- `SetVertexShader`: stores FVF handle in `_state._draw_vertex_fvf`
+- `BeginScene`: adds `TRANSFER_DST → COLOR_ATTACHMENT` barrier + `vkCmdBeginRenderPass`
+- `EndScene`: calls `vkCmdEndRenderPass` (render pass finalLayout handles `PRESENT_SRC_KHR` transition)
+- `Clear`: uses `vkCmdClearAttachments` when inside render pass, `vkCmdClearColorImage` otherwise
+- `DrawPrimitive(slot 70)`: transforms XYZRHW→NDC in Python, uploads to Vulkan buffer, issues `vkCmdDraw`
+
+**Result:** Game now renders geometry. DrawPrimitive fires (prim_count=1 triangles).
+New blocker: `GetFullPathNameA` (kernel32, file I/O) — game has advanced past rendering.
+
+---
+
+## 2026-05-31 — Fix D3DRES_VTABLE buffer slot ordering
+
+**Root cause diagnosed:** `D3DRES_VTABLE` (used by vertex/index buffer objects) had Surface methods
+at slots 11–14. dx8z calls Lock (slot 11) and Unlock (slot 12) on vertex buffers per the D3D8 spec,
+but our vtable had Surface::GetContainer (arg_bytes=8) and Surface::GetDesc (arg_bytes=4) there.
+Each Lock call (which pushes 4 args = 16 bytes) hit GetContainer's 8-byte cleanup, leaving 8 bytes
+uncleaned. After 100K steps this corrupted EBP → 0x020d9228 (.data) and the LEAVE+RET sequence
+popped a .data value (0x2196) as the return address → RUNAWAY.
+
+**Files changed:**
+- `tew/api/d3d8/idirect3d8resource.py`: Reduced from 18 to 14 slots. Removed dead Surface
+  methods (slots 11–14 — surfaces use D3DSURF_VTABLE, not D3DRES_VTABLE). Buffer methods now at
+  correct spec positions: Lock(11, arg_bytes=16), Unlock(12, arg_bytes=0), GetDesc(13, arg_bytes=4).
+  Also fixed `_get_device` which read ESP+4 (= `this`) instead of ESP+8 (`ppDevice`).
+  Implemented `_buffer_get_desc` to fill D3DVERTEXBUFFER_DESC with size from object field.
+- `tew/api/d3d8/_layout.py`: Updated D3DRES_VTABLE comment (14 × 4 = 56 bytes).
+
+**Result:** RUNAWAY at 132.7M eliminated. Game now halts loudly at `Dev::DrawPrimitive`.
+
+---
+
+## 2026-05-31 — DirectInput stub + cursor/keyboard handlers
+
+**New file:** `tew/api/dinput_handlers.py`
+- `DirectInputCreateA` (dinput.dll + dinput8.dll) — returns DI_OK, writes singleton IDirectInput2 COM object to `*lplpDirectInput`
+- IDirectInput2A vtable (9 slots @ DI_VTABLE=0x00220290, singleton @ DI_OBJ=0x002202C0): QI, AddRef, Release, CreateDevice (heap-allocates device obj), EnumDevices (S_OK, no callbacks), GetDeviceStatus (DI_NOTATTACHED), RunControlPanel (E_NOTIMPL), Initialize (S_OK), FindDevice (DIERR_DEVICENOTREG)
+- IDirectInputDevice2A vtable (18 slots @ DI_DEV_VTABLE=0x002202D0): full set including GetDeviceState (zeroes output buffer), GetDeviceData (pdwInOut=0), SetDataFormat/SetCooperativeLevel/Acquire/Unacquire (all S_OK)
+
+**user32_handlers.py additions:**
+- `GetCursorPos` → writes (0,0), returns TRUE
+- `ScreenToClient`, `ClientToScreen` → no-op, returns TRUE (window at screen origin)
+- `SetCursorPos` → no-op, TRUE
+- `SetCapture` → 0, `ReleaseCapture` → TRUE, `GetCapture` → 0
+- `ClipCursor` → TRUE, `MapWindowPoints` → 0
+- `GetAsyncKeyState` → 0 (key up)
+- `GetKeyboardState` → zero-fills 256-byte table, TRUE
+- `GetKeyboardType` → 4/0/12 for type/subtype/fkeys (Enhanced 101-key)
+- `MapVirtualKeyA` → 0
+
+**Result:** Game now reaches the render loop. RUNAWAY at step 132.7M (new blocker).
+
+---
+
+## 2026-05-31 — IDirect3DSurface8 vtable fix + BeginScene deadlock fix
+
+**Root cause 1:** D3DRES_VTABLE had IDirect3DResource8 slot ordering (slot 9 = PreLoad),
+but dx8z expected IDirect3DSurface8 ordering (slot 9 = LockRect). `_THRASH_lockwindow`
+crashed on INT 0xcd because it called LockRect through the wrong vtable.
+
+**Fix:** New `D3DSURF_VTABLE` @ 0x00220260 with correct 11-slot IDirect3DSurface8 layout.
+`_alloc_surface_obj(w, h, fmt, memory)` allocates 24-byte COM objects with vtable,
+data ptr, size, width, height, and D3DFORMAT. GetDesc reads these fields; LockRect
+fills D3DLOCKED_RECT with correct pitch (w×4) and data pointer.
+All surface-returning device methods (`GetBackBuffer`, `CreateTexture`,
+`CreateRenderTarget`, `CreateDepthStencilSurface`, `CreateImageSurface`,
+`GetRenderTarget`, `GetDepthStencilSurface`, `CreateVolumeTexture`, `CreateCubeTexture`)
+switched to `_alloc_surface_obj`.
+
+**Root cause 2:** BeginScene deadlock on frame 2+. `vkWaitForFences` was called directly
+on the main thread; Mesa/Wayland WSI can call `wl_display_roundtrip` internally, which
+needs the main thread to pump events — deadlock.
+
+Also: dx8z calls BeginScene/EndScene twice during THRASH init without any Present
+between them. The second BeginScene called `vkWaitForFences` on an unsignaled fence
+(reset in frame 1, never re-signaled because QueueSubmit was never called).
+
+**Fix:** Moved `vkWaitForFences` + `vkResetFences` into `vk_pump` background thread.
+Added `_vk_frame_submitted` flag (set by Present after QueueSubmit, cleared by
+BeginScene) to gate the wait. Added `_vk_image_acquired` flag to skip re-acquiring
+when BeginScene is called multiple times without Present.
+
+**Result:** Game now reaches `dinput.dll!DirectInputCreateA` (new blocker).
+
+---
+
 ## 2026-04-25 — Beta binary CD check investigation
 
 Investigated why mcity_beta_1.exe shows "Game CD not found" despite instLev=2 in registry.

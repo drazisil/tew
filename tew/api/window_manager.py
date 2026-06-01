@@ -23,7 +23,7 @@ from sdl2 import (
     SDL_SetHint,
     SDL_CreateWindow, SDL_DestroyWindow,
     SDL_CreateRenderer, SDL_DestroyRenderer,
-    SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE,
+    SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
     SDL_RENDERER_ACCELERATED, SDL_RENDERER_PRESENTVSYNC,
     SDL_PollEvent, SDL_Event,
     SDL_QUIT,
@@ -325,22 +325,13 @@ class WindowManager:
                 y if y >= 0 else 100,
                 px_w,
                 px_h,
-                SDL_WINDOW_SHOWN,
+                SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN,
             )
             if not sdl_win:
                 logger.error("window", f"[WindowManager] SDL_CreateWindow failed for '{title}'")
                 return 0
-            sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
-            if not sdl_rend:
-                # Fall back to software renderer
-                from sdl2 import SDL_RENDERER_SOFTWARE
-                sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE)
-                if not sdl_rend:
-                    logger.error("window", "[WindowManager] SDL_CreateRenderer failed")
-                    SDL_DestroyWindow(sdl_win)
-                    return 0
             entry.sdl_window = sdl_win
-            entry.sdl_renderer = sdl_rend
+            entry.sdl_renderer = None
             win_id = SDL_GetWindowID(sdl_win)
             self._sdl_window_id_to_hwnd[win_id] = hwnd
             SDL_RaiseWindow(sdl_win)

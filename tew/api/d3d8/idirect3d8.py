@@ -96,12 +96,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     #   ESP+24: pPresentationParameters
     #   ESP+28: ppReturnedDeviceInterface
     def _create_device(cpu: "CPU", mem: "Memory") -> None:
-        import os
         import ctypes
         import vulkan as vk
         from vulkan import ffi
-        from sdl2 import SDL_DestroyRenderer
-        from sdl2.syswm import SDL_SysWMinfo, SDL_GetWindowWMInfo
+        from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         hwnd       = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -128,10 +126,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         sdl_window = entry.sdl_window
 
-        # Destroy the SDL renderer — Vulkan presentation takes over this window
-        if entry.sdl_renderer is not None:
-            SDL_DestroyRenderer(entry.sdl_renderer)
-            entry.sdl_renderer = None
+        # Top-level windows are created with SDL_WINDOW_VULKAN so no EGL
+        # surface is attached to the wl_surface; no renderer to destroy here.
 
         # ── Load instance-level KHR extension functions ────────────────────
         try:
@@ -143,6 +139,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 _state._vk_instance, 'vkGetPhysicalDeviceSurfaceFormatsKHR')
             vkGetPresentModes = vk.vkGetInstanceProcAddr(
                 _state._vk_instance, 'vkGetPhysicalDeviceSurfacePresentModesKHR')
+            _state._vk_fn_get_surface_caps = vkGetSurfaceCaps
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: failed to load surface extension functions: {exc} — halting")
@@ -150,45 +147,16 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create VkSurfaceKHR ────────────────────────────────────────────
+        # SDL_Vulkan_CreateSurface handles the X11/Wayland/XWayland selection
+        # automatically — avoids forcing vkCreateWaylandSurfaceKHR on systems
+        # where SDL is actually running through XWayland (NVIDIA + Wayland).
         try:
-            wm_info = SDL_SysWMinfo()
-            wm_info.version.major = 2
-            wm_info.version.minor = 0
-            wm_info.version.patch = 0
-            SDL_GetWindowWMInfo(sdl_window, ctypes.byref(wm_info))
-
-            if os.environ.get("WAYLAND_DISPLAY"):
-                vkCreateSurface = vk.vkGetInstanceProcAddr(
-                    _state._vk_instance, 'vkCreateWaylandSurfaceKHR')
-                wl_display_ptr = wm_info.info.wl.display or 0
-                disp = ffi.cast('struct wl_display *', wl_display_ptr)
-                surf = ffi.cast('struct wl_surface *',
-                                wm_info.info.wl.surface or 0)
-                surface_ci = vk.VkWaylandSurfaceCreateInfoKHR(
-                    sType=vk.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
-                    display=disp,
-                    surface=surf,
-                )
-            else:
-                wl_display_ptr = 0
-                vkCreateSurface = vk.vkGetInstanceProcAddr(
-                    _state._vk_instance, 'vkCreateXlibSurfaceKHR')
-                disp = ffi.cast('Display *', wm_info.info.x11.display or 0)
-                surface_ci = vk.VkXlibSurfaceCreateInfoKHR(
-                    sType=vk.VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
-                    dpy=disp,
-                    window=int(wm_info.info.x11.window),
-                )
-            _state._vk_surface = vkCreateSurface(
-                _state._vk_instance, surface_ci, None)
-
-            # On Wayland the compositor hasn't acknowledged the surface yet.
-            # wl_display_roundtrip deadlocks here because SDL2 holds the Wayland
-            # display lock — SDL_PumpEvents lets SDL flush its pending events
-            # through its own lock-safe path instead.
-            if wl_display_ptr:
-                from sdl2 import SDL_PumpEvents
-                SDL_PumpEvents()
+            inst_int = int(ffi.cast('uintptr_t', _state._vk_instance))
+            surf_handle = ctypes.c_uint64(0)
+            if not SDL_Vulkan_CreateSurface(sdl_window, inst_int,
+                                            ctypes.byref(surf_handle)):
+                raise RuntimeError("SDL_Vulkan_CreateSurface returned false")
+            _state._vk_surface = ffi.cast('VkSurfaceKHR', surf_handle.value)
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: VkSurface creation failed: {exc} — halting")
@@ -198,9 +166,6 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         logger.info("d3d8", "CreateDevice: VkSurfaceKHR created")
 
         # ── Find queue family with graphics support ────────────────────────
-        # vkGetPhysicalDeviceSurfaceSupportKHR blocks on Wayland (compositor
-        # roundtrip in the Vulkan WSI layer). On desktop Linux the graphics
-        # queue always supports present, so skip the query.
         phys_dev = _state._vk_physical_devices[0]
         queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys_dev)
         gfx_family = -1
@@ -251,6 +216,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         try:
             _state._vk_fn_create_swapchain = vk.vkGetDeviceProcAddr(
                 _state._vk_device, 'vkCreateSwapchainKHR')
+            _state._vk_fn_destroy_swapchain = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkDestroySwapchainKHR')
             _state._vk_fn_get_swapchain_images = vk.vkGetDeviceProcAddr(
                 _state._vk_device, 'vkGetSwapchainImagesKHR')
             _state._vk_fn_acquire_next_image = vk.vkGetDeviceProcAddr(
@@ -264,19 +231,27 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create swapchain ───────────────────────────────────────────────
-        # Use the requested back-buffer size; any mismatch with the actual
-        # surface extent will be caught as VK_ERROR_OUT_OF_DATE_KHR in
-        # BeginScene, which recreates the swapchain with the correct size.
-        w = back_w if back_w > 0 else 800
-        h = back_h if back_h > 0 else 600
+        # Query the actual surface extent — the Vulkan spec requires imageExtent
+        # to equal currentExtent exactly (when it is not 0xFFFFFFFF). Passing a
+        # mismatched extent is undefined behavior; Mesa crashes instead of
+        # returning VK_ERROR_OUT_OF_DATE_KHR.
         chosen_fmt   = 44  # VK_FORMAT_B8G8R8A8_UNORM
         chosen_space = 0   # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
         img_count    = 2
         pre_transform = 0x00000001  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
         _state._vk_swapchain_format = chosen_fmt
-        _state._vk_swapchain_width  = w
-        _state._vk_swapchain_height = h
         try:
+            phys_dev = _state._vk_physical_devices[0]
+            caps = vk_pump(
+                lambda: _state._vk_fn_get_surface_caps(
+                    phys_dev, _state._vk_surface))
+            w = caps.currentExtent.width
+            h = caps.currentExtent.height
+            if w == 0xFFFFFFFF:
+                w = back_w if back_w > 0 else 800
+                h = back_h if back_h > 0 else 600
+            _state._vk_swapchain_width  = w
+            _state._vk_swapchain_height = h
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(
                 sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
                 surface=_state._vk_surface,
@@ -296,9 +271,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 clipped=vk.VK_TRUE,
                 oldSwapchain=None,
             )
-            _state._vk_swapchain = vk_pump(
-                lambda: _state._vk_fn_create_swapchain(
-                    _state._vk_device, swapchain_ci, None))
+            _state._vk_swapchain = _state._vk_fn_create_swapchain(
+                _state._vk_device, swapchain_ci, None)
 
             raw_imgs = _state._vk_fn_get_swapchain_images(
                 _state._vk_device, _state._vk_swapchain)
@@ -311,8 +285,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         logger.info("d3d8",
             f"CreateDevice: swapchain {w}x{h} fmt={chosen_fmt} "
-            f"images={len(_state._vk_swapchain_images)} "
-            f"(hardcoded params, skipped surface queries)")
+            f"images={len(_state._vk_swapchain_images)}")
 
         # ── Command pool + command buffer ──────────────────────────────────
         try:
@@ -356,6 +329,31 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: sync primitive creation failed: {exc} — halting")
+            cpu.halted = True
+            return
+
+        # ── Render pipeline (render pass, framebuffers, graphics pipeline) ───
+        try:
+            from tew.api.d3d8._pipeline import init_pipeline
+            pipe = init_pipeline(
+                _state._vk_device,
+                _state._vk_physical_devices[0],
+                _state._vk_swapchain_images,
+                _state._vk_swapchain_format,
+                _state._vk_swapchain_width,
+                _state._vk_swapchain_height,
+            )
+            _state._vk_image_views      = pipe["image_views"]
+            _state._vk_render_pass      = pipe["render_pass"]
+            _state._vk_framebuffers     = pipe["framebuffers"]
+            _state._vk_pipeline         = pipe["pipeline"]
+            _state._vk_pipeline_layout  = pipe["pipeline_layout"]
+            _state._vk_vertex_buffer    = pipe["vertex_buffer"]
+            _state._vk_vertex_memory    = pipe["vertex_memory"]
+            _state._vk_vertex_mapped_ptr = pipe["vertex_mapped"]
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: pipeline init failed: {exc} — halting")
             cpu.halted = True
             return
 
@@ -420,32 +418,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 def _platform_vulkan_extensions() -> list[str]:
     """Return the Vulkan instance extensions required for surface creation on this host.
 
-    VK_KHR_surface is always required. The platform-specific surface extension
-    is selected by platform and, on Linux, by display server environment variables.
-    This mirrors what a real D3D runtime does: it knows its platform at build time
-    and doesn't ask SDL which extensions to request.
+    On Linux, include both xlib and wayland extensions so the instance is usable
+    regardless of which backend SDL selected. SDL_Vulkan_CreateSurface (called in
+    CreateDevice) picks the correct one at runtime.
     """
     import os
     from sdl2.platform import SDL_GetPlatform
 
-    extensions = ["VK_KHR_surface"]
     platform = SDL_GetPlatform().decode()
-
     if platform == "Linux":
+        extensions = ["VK_KHR_surface", "VK_KHR_xlib_surface"]
         if os.environ.get("WAYLAND_DISPLAY"):
             extensions.append("VK_KHR_wayland_surface")
-        else:
-            # DISPLAY set or unset — default to xlib, most widely supported
-            extensions.append("VK_KHR_xlib_surface")
+        return extensions
     elif platform == "Windows":
-        extensions.append("VK_KHR_win32_surface")
+        return ["VK_KHR_surface", "VK_KHR_win32_surface"]
     elif platform == "Mac OS X":
-        extensions.append("VK_EXT_metal_surface")
+        return ["VK_KHR_surface", "VK_EXT_metal_surface"]
     else:
         logger.warn("d3d8", f"[Direct3DCreate8] Unknown platform '{platform}' — defaulting to VK_KHR_xlib_surface")
-        extensions.append("VK_KHR_xlib_surface")
-
-    return extensions
+        return ["VK_KHR_surface", "VK_KHR_xlib_surface"]
 
 
 def make_create8(memory: "Memory") -> Callable:
@@ -459,6 +451,12 @@ def make_create8(memory: "Memory") -> Callable:
     """
     def _direct3d_create8(cpu: "CPU") -> None:
         import vulkan as vk
+
+        if _state._vk_instance is not None:
+            logger.info("d3d8", "[Direct3DCreate8] reusing existing VkInstance")
+            cpu.regs[EAX] = D3D8_OBJ
+            cleanup_stdcall(cpu, memory, 4)
+            return
 
         extensions = _platform_vulkan_extensions()
         logger.info("d3d8", f"[Direct3DCreate8] Vulkan surface extensions: {extensions}")

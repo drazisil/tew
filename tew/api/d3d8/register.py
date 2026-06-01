@@ -18,11 +18,12 @@ from tew.logger import logger
 from tew.api.d3d8._layout import (
     D3D8_OBJ, D3D8_VTABLE,
     D3DDEV_OBJ, D3DDEV_VTABLE,
-    D3DRES_VTABLE,
+    D3DRES_VTABLE, D3DSURF_VTABLE,
     S_OK,
 )
 from tew.api.d3d8._helpers import _cleanup_com, _set_eax
 from tew.api.d3d8.idirect3d8resource import make_vtable as _make_res_vtable
+from tew.api.d3d8.idirect3d8surface import make_vtable as _make_surf_vtable
 from tew.api.d3d8.idirect3d8 import make_vtable as _make_d3d8_vtable, make_create8
 from tew.api.d3d8.idirect3d8device import make_vtable as _make_dev_vtable
 
@@ -30,10 +31,15 @@ from tew.api.d3d8.idirect3d8device import make_vtable as _make_dev_vtable
 def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRTState") -> None:
     """Register all D3D8 COM stubs and write vtable pointers into memory."""
 
-    # ── Generic resource vtable ───────────────────────────────────────────────
+    # ── IDirect3DResource8/Buffer vtable ─────────────────────────────────────
     res_vtable = _make_res_vtable(stubs, memory)
     for i, addr in enumerate(res_vtable):
         memory.write32(D3DRES_VTABLE + i * 4, addr)
+
+    # ── IDirect3DSurface8 vtable ──────────────────────────────────────────────
+    surf_vtable = _make_surf_vtable(stubs, memory)
+    for i, addr in enumerate(surf_vtable):
+        memory.write32(D3DSURF_VTABLE + i * 4, addr)
 
     # ── IDirect3D8 vtable + object ────────────────────────────────────────────
     d3d8_vtable = _make_d3d8_vtable(stubs, memory, state.window_manager)

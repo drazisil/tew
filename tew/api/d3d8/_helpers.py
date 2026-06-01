@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from tew.api.win32_handlers import Win32Handlers
 
 from tew.hardware.cpu import EAX, ESP
-from tew.api.d3d8._layout import D3DRES_VTABLE
+from tew.api.d3d8._layout import D3DRES_VTABLE, D3DSURF_VTABLE
 
 # ── D3D8 private bump-heap (separate from CRT heap at 0x04000000) ─────────────
 _next_heap_addr: int = 0x04800000
@@ -96,7 +96,7 @@ def _com_stub(
 
 
 def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
-    """Allocate and initialise a generic D3D resource COM object.
+    """Allocate a generic D3D resource COM object (for vertex/index buffers).
 
     Layout (12 bytes): [0] vtable ptr, [4] data ptr, [8] size.
     """
@@ -105,6 +105,23 @@ def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
     memory.write32(obj,     D3DRES_VTABLE)
     memory.write32(obj + 4, data_ptr)
     memory.write32(obj + 8, data_size)
+    return obj
+
+
+def _alloc_surface_obj(w: int, h: int, fmt: int, memory: "Memory") -> int:
+    """Allocate an IDirect3DSurface8 COM object with stored dimensions and format.
+
+    Layout (24 bytes): [0] vtable ptr, [4] data ptr, [8] size,
+                       [12] width, [16] height, [20] D3DFORMAT.
+    """
+    data_ptr = _heap_alloc((w * h * 4) or 4)
+    obj = _heap_alloc(24)
+    memory.write32(obj,      D3DSURF_VTABLE)
+    memory.write32(obj + 4,  data_ptr)
+    memory.write32(obj + 8,  w * h * 4)
+    memory.write32(obj + 12, w)
+    memory.write32(obj + 16, h)
+    memory.write32(obj + 20, fmt)
     return obj
 
 
