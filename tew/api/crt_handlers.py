@@ -88,6 +88,8 @@ def register_crt_handlers(
     from tew.api.wininet_handlers import register_wininet_handlers
     from tew.api.wsock32_handlers import register_wsock32_handlers
     from tew.api.dinput_handlers import register_dinput_handlers
+    from tew.api.ifc22_handlers import register_ifc22_handlers
+    from tew.api.dsound_handlers import register_dsound_handlers
 
     register_kernel32_handlers(stubs, memory, state, dll_loader)
     register_winmm_handlers(stubs, memory, state)
@@ -100,6 +102,8 @@ def register_crt_handlers(
     register_wininet_handlers(stubs, memory, state)
     register_wsock32_handlers(stubs, memory, state)
     register_dinput_handlers(stubs, memory)
+    register_ifc22_handlers(stubs, memory)
+    register_dsound_handlers(stubs, memory, state)
 
     logger.info("handlers", f"Registered {stubs.count} Win32 stubs")
 

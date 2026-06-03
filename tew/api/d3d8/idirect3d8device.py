@@ -632,7 +632,13 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 _state._vk_present_queue, present_info))
             _state._vk_image_acquired = False
         except Exception as exc:
-            logger.error("d3d8", f"Present failed: {exc} — halting")
+            if "OutOfDate" in type(exc).__name__ or "Suboptimal" in type(exc).__name__:
+                logger.info("d3d8", "Present: swapchain out-of-date, rebuilding")
+                _rebuild_swapchain()
+                _state._vk_image_acquired = False
+                cpu.regs[EAX] = S_OK
+                return
+            logger.error("d3d8", f"Present failed: {type(exc).__name__} — halting")
             cpu.halted = True
             return
 

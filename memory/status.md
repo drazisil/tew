@@ -11,17 +11,19 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current blocker (MCity_d.exe): ifc22.dll!??0CImmMouse@@QAE@XZ UNIMPLEMENTED halt
+### Current status: ifc22.dll RESOLVED — login dialog requires interaction
 
-As of 2026-05-31, game runs through render loop and file-path work, then hits a C++
-constructor from ifc22.dll. Steps executed: 133,018,631.
+As of 2026-05-31, all known programmatic blockers are fixed. The login dialog
+(`DialogBoxParamA`) requires a user click on OK to proceed. Automated test runs
+get stuck there. Interactive runs proceed past login.
 
-`??0CImmMouse@@QAE@XZ` demangles to `CImmMouse::CImmMouse()` — default constructor
-for CImmMouse, some kind of input/mouse manager from the ImmVersion middleware layer
-used by EA circa 2004.
+ifc22.dll (ImmVersion FFB middleware): all 11 imports stubbed.
+- CImmMouse::Initialize returns 0 → no FFB hardware → entire FFB path skipped.
+- Constructors/destructors are no-ops.
+- FFB device methods (UsesWin32MouseServices, OpenFile, etc.) are loud halts
+  if ever reached (should not be with Initialize=0).
 
-Likely stubbed out: constructor probably just zeroes fields and sets up a vtable.
-Need Ghidra to check what ifc22.dll exports and what the constructor actually does.
+Next blocker after login: unknown — will be discovered in next interactive run.
 
 Also: `CoCreateInstance` fails (REGDB_E_CLASSNOTREG) — still happening, probably DirectSound.
 

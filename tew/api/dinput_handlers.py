@@ -102,10 +102,13 @@ def register_dinput_handlers(
     # ── IDirectInputDevice2A vtable ───────────────────────────────────────────
 
     def _dev_query_interface(cpu: "CPU", mem: "Memory") -> None:
+        # Game QIs for IDirectInputDevice2A from the device it just created —
+        # return the same object (AddRef implicit, device is our singleton stub).
+        this_ptr = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ppv = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if ppv:
-            mem.write32(ppv, 0)
-        cpu.regs[EAX] = E_NOINTERFACE
+            mem.write32(ppv, this_ptr)
+        cpu.regs[EAX] = DI_OK
 
     def _dev_get_caps(cpu: "CPU", mem: "Memory") -> None:
         # GetCapabilities(LPDIDEVCAPS lpDIDevCaps) — zero-fill struct
@@ -226,5 +229,17 @@ def register_dinput_handlers(
 
     stubs.register_handler("dinput.dll",  "DirectInputCreateA", _direct_input_create_a)
     stubs.register_handler("dinput8.dll", "DirectInputCreateA", _direct_input_create_a)
+
+    def _direct_input8_create(cpu: "CPU") -> None:
+        # DirectInput8Create(hInst, dwVersion, riidltf, ppvOut, punkOuter) — 5 args, 20 bytes
+        # ppvOut at ESP+16 (arg 4)
+        pp_di = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        if pp_di:
+            memory.write32(pp_di, DI_OBJ)
+        logger.info("handlers", f"DirectInput8Create -> DI_OBJ=0x{DI_OBJ:08x}")
+        cpu.regs[EAX] = DI_OK
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("dinput8.dll", "DirectInput8Create", _direct_input8_create)
 
     logger.info("handlers", "DirectInput handlers registered — IDirectInput2A + IDirectInputDevice2A stubs wired")

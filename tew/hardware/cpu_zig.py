@@ -297,7 +297,11 @@ class ZigCPU:
 
     def run(self, max_steps: int = 1_000_000) -> None:
         self._sync_fs_gs()
-        _lib.cpu_run(self._state, max_steps)
+        result = _lib.cpu_run(self._state, max_steps)
+        if result == _RUN_FAULTED and self.last_error is None:
+            self.last_error = RuntimeError(
+                f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
+            )
 
     # ── Register/state properties ─────────────────────────────────────────────
 

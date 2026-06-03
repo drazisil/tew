@@ -189,3 +189,4 @@ def patch_crt_internals(
     stubs.patch_address(0x009F6E20, "__free_dbg", _free_dbg_noop)
 
 
+

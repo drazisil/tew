@@ -319,19 +319,30 @@ class WindowManager:
         if is_top_level and is_visible:
             px_w = du_to_px_x(cx) if cx > 0 else 640
             px_h = du_to_px_y(cy) if cy > 0 else 480
+            # Dialog windows (class #32770) use SDL renderer for drawing and hit-testing.
+            # Non-dialog windows (the game's main rendering surface) need SDL_WINDOW_VULKAN
+            # so that SDL_Vulkan_CreateSurface succeeds when D3D8 sets up its swapchain.
+            is_dialog_class = (class_name == "#32770")
+            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN)
             sdl_win = SDL_CreateWindow(
                 title.encode("utf-8"),
                 x if x >= 0 else 100,
                 y if y >= 0 else 100,
                 px_w,
                 px_h,
-                SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN,
+                sdl_flags,
             )
             if not sdl_win:
                 logger.error("window", f"[WindowManager] SDL_CreateWindow failed for '{title}'")
                 return 0
+            sdl_rend = None
+            if is_dialog_class:
+                sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
+                if not sdl_rend:
+                    from sdl2 import SDL_RENDERER_SOFTWARE
+                    sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE)
             entry.sdl_window = sdl_win
-            entry.sdl_renderer = None
+            entry.sdl_renderer = sdl_rend
             win_id = SDL_GetWindowID(sdl_win)
             self._sdl_window_id_to_hwnd[win_id] = hwnd
             SDL_RaiseWindow(sdl_win)

@@ -4,6 +4,34 @@ Entries are newest-first.
 
 ---
 
+## 2026-05-31 — ifc22.dll (ImmVersion FFB) stubs + dialog window fix
+
+**New file: `tew/api/ifc22_handlers.py`** — stubs for all 11 ifc22.dll imports:
+- Default constructors (CImmMouse, CImmProject, CImmPeriodic): thiscall no-ops
+- `CImmMouse::Initialize` → returns 0 (no FFB hardware); the game's entire FFB
+  code path is conditional on this return value, so it is fully skipped
+- Destructors: no-op (nothing was allocated)
+- FFB device methods (UsesWin32MouseServices, OpenFile, Start, ChangeParameters):
+  registered as loud halts — should never be called when Initialize returns 0
+- All names confirmed via `pefile` on MCity_d.exe; call graph verified in Ghidra
+
+**`tew/api/crt_handlers.py`** — added `register_ifc22_handlers` call.
+
+**`tew/api/window_manager.py`** — fixed regression from 54189a1: dialog windows
+had `SDL_WINDOW_VULKAN` flag which prevents SDL renderer creation. Restored
+`SDL_WINDOW_SHOWN` + SDL renderer (with soft fallback) for all dialog windows.
+The Vulkan surface belongs to the D3D8 game window, not dialog windows.
+
+**Note:** The login dialog (`DialogBoxParamA`) requires a user click on OK to
+proceed — there is no auto-submit. Interactive runs proceed past login; automated
+test runs remain at the dialog. This is expected behavior.
+
+**Result:** No new step count measurable in automated runs (login requires
+interaction). When the user clicks OK, the game will proceed past ifc22 and
+continue. Next automated blocker will be visible in the next interactive run.
+
+---
+
 ## 2026-05-31 — Implement CharUpperA
 
 **`tew/api/user32_handlers.py`** — added `_CharUpperA` handler.

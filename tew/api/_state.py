@@ -321,6 +321,9 @@ class CRTState:
         # ── Local/GlobalAlloc tracking ────────────────────────────────────
         self.local_alloc_map: dict[int, int] = {}   # addr → size
 
+        # ── Current working directory ─────────────────────────────────────
+        self.current_directory: str = "C:\\MCity"
+
         # ── Window / dialog system ────────────────────────────────────────
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded
@@ -380,7 +383,7 @@ class CRTState:
         # No mapping matched — return as-is with backslashes.
         return linux_path.replace("/", "\\")
 
-    def open_file_handle(self, win_name: str, writable: bool) -> int:
+    def open_file_handle(self, win_name: str, writable: bool, no_create_prompt: bool = False) -> int:
         """Open a file and register it in file_handle_map. Returns the handle."""
         from tew.logger import logger
         # Device namespace paths (\\.\xxx) are kernel driver handles — never a
@@ -389,11 +392,15 @@ class CRTState:
         if normalized.startswith("/./") or normalized.startswith("//./"):
             logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (device path, not emulated)')
             return 0xFFFFFFFF
+        if not win_name:
+            logger.debug("fileio", 'CreateFile("") -> INVALID_HANDLE_VALUE (empty path)')
+            return 0xFFFFFFFF
         handle = self.next_file_handle
         self.next_file_handle += 1
         if writable:
             real_path = self.translate_windows_path(win_name)
             try:
+                os.makedirs(os.path.dirname(real_path), exist_ok=True)
                 fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
@@ -418,7 +425,7 @@ class CRTState:
                 except OSError:
                     logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (read error)')
                     return 0xFFFFFFFF
-            if not self.config.interactive_on_missing_file:
+            if not self.config.interactive_on_missing_file or no_create_prompt:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (not found: {linux_path})')
                 return 0xFFFFFFFF
             print(f"\n[FileIO] File not found: {linux_path}")
