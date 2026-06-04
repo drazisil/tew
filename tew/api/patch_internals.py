@@ -137,12 +137,29 @@ def patch_crt_internals(
             except Exception as e:
                 logger.debug("exception", f"_CrtDbgReport: read_cstring(fmt) failed: {e}")
 
-        logger.error(
-            "exception",
-            f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}",
-        )
-        cpu.halted = True
-        cpu.regs[EAX] = 1  # retry = __debugbreak (moot since we halted)
+        # Substitute first variadic arg if format contains %s or %d
+        if '%' in fmt:
+            arg_ptr = memory.read32((sp + 24) & 0xFFFFFFFF)
+            if '%s' in fmt:
+                val = "(null)"
+                if arg_ptr > 0x1000:
+                    try:
+                        val = read_cstring(arg_ptr, memory)
+                    except Exception:
+                        val = f"<bad ptr {arg_ptr:#010x}>"
+                fmt = fmt.replace('%s', val, 1)
+            elif '%d' in fmt:
+                fmt = fmt.replace('%d', str(arg_ptr), 1)
+
+        # _CRT_WARN (0) is informational — log and continue.
+        # _CRT_ERROR (1) and _CRT_ASSERT (2) are fatal — halt.
+        if report_type == 0:
+            logger.warn("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
+            cpu.regs[EAX] = 0  # 0 = don't trigger debugbreak
+        else:
+            logger.error("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
+            cpu.halted = True
+            cpu.regs[EAX] = 1  # retry = __debugbreak (moot since we halted)
         # cdecl variadic — no stack cleanup by callee
 
     stubs.patch_address(0x009F9300, "_CrtDbgReport", _crt_dbg_report)
