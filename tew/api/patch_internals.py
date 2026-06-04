@@ -226,10 +226,10 @@ def patch_crt_internals(
         memory.write32(param_1 + 16,      (param_2 - 3) & 0xFFFFFFFF)     # [4] min
         memory.write32(param_1 + 20,      0)                   # [5] entry count = 0
         blist = (param_1 + param_2 - 0x18) & 0xFFFFFFFF
-        watch = blist + 4  # size field of entry 0 — 4 bytes at this address
+        watch = blist + 7  # MSB of size field — any write here is corrupt (pool < 0x64000)
         logger.info("handlers",
             f"[SNDMEMI_init] pool={param_1:#010x} size={param_2:#x} "
-            f"base={pool_base:#010x} blist={blist:#010x} watching {watch:#010x}")
+            f"base={pool_base:#010x} blist={blist:#010x} watching {watch:#010x} (size MSB)")
 
         # Install a Zig-level watchpoint: halt the CPU and log when anything
         # writes the first byte of the size field of block-entry 0.

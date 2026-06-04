@@ -151,17 +151,16 @@ def _open_sdl_audio(mem_buf: bytearray,
         cb = SDL_AudioCallback(_callback)
         _callback_ref[0] = cb   # prevent GC
 
-        spec = SDL_AudioSpec()
-        spec.freq     = sample_rate
-        spec.format   = fmt
-        spec.channels = channels
-        spec.samples  = 2048
+        spec = SDL_AudioSpec(freq=sample_rate, aformat=fmt,
+                             channels=channels, samples=2048)
         spec.callback = cb
         spec.userdata = None
 
         dev_id = int(SDL_OpenAudioDevice(None, 0, spec, None, 0))
         if dev_id == 0:
-            logger.warn("handlers", "DirectSound: SDL_OpenAudioDevice failed")
+            from sdl2 import SDL_GetError
+            err = SDL_GetError()
+            logger.warn("handlers", f"DirectSound: SDL_OpenAudioDevice failed: {err}")
             return 0
         SDL_PauseAudioDevice(dev_id, 0)
         logger.info("handlers",

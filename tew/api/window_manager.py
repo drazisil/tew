@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from tew.api.pe_resources import PEResources
 
 from sdl2 import (
-    SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS,
+    SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS, SDL_INIT_AUDIO,
     SDL_SetHint,
     SDL_CreateWindow, SDL_DestroyWindow,
     SDL_CreateRenderer, SDL_DestroyRenderer,
@@ -211,7 +211,7 @@ class WindowManager:
         except Exception:
             pass  # non-X11 environment; safe to skip
         SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, b"0")
-        rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)
+        rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO)
         if rc != 0:
             logger.error("window", f"[WindowManager] SDL_Init failed: {rc}")
             return False

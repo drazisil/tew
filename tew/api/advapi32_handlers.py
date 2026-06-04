@@ -644,11 +644,17 @@ def register_advapi32_handlers(
             #  +0  WORD  wMid             manufacturer ID (Microsoft = 1)
             #  +2  WORD  wPid             product ID
             #  +4  DWORD vDriverVersion   1.0
-            #  +8  CHAR  szPname[32]      device name
+            #  +8  CHAR  szPname[32]      device name (null-padded to 32 bytes)
             # +40  DWORD dwFormats        supported PCM format flags
             # +44  WORD  wChannels        2 = stereo
-            # +46  WORD  wReserved1
+            # +46  WORD  wReserved1       0
             # +48  DWORD dwSupport        WAVECAPS_VOLUME | WAVECAPS_LRVOLUME
+            WAVEOUTCAPSA_SIZE = 52
+            # Zero-fill the entire struct before writing fields
+            to_fill = min(cbwoc, WAVEOUTCAPSA_SIZE)
+            for i in range(to_fill):
+                memory.write8(pwoc + i, 0)
+
             def _w16(off: int, val: int) -> None:
                 if off + 2 <= cbwoc:
                     memory.write16(pwoc + off, val)
@@ -657,13 +663,14 @@ def register_advapi32_handlers(
                 if off + 4 <= cbwoc:
                     memory.write32(pwoc + off, val)
 
-            _w16(0,  0x0001)        # wMid
-            _w16(2,  0x0001)        # wPid
-            _w32(4,  0x0100)        # vDriverVersion 1.0
+            _w16(0,  0x0001)        # wMid: Microsoft
+            _w16(2,  0x0001)        # wPid: generic
+            _w32(4,  0x0100)        # vDriverVersion: 1.0
             name = b'Wave Audio\x00'
             for i, byte in enumerate(name):
                 if 8 + i < cbwoc:
                     memory.write8(pwoc + 8 + i, byte)
+            # szPname bytes [18..39] already zeroed by the fill above
             _w32(40, 0x00000FFF)    # dwFormats: all standard PCM (8/16-bit, mono/stereo, 11/22/44 kHz)
             _w16(44, 2)             # wChannels: stereo
             _w16(46, 0)             # wReserved1
