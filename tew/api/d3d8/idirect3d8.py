@@ -363,28 +363,76 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             f"IDirect3D8::CreateDevice complete -> D3DDEV_OBJ=0x{D3DDEV_OBJ:08x}")
         cpu.regs[EAX] = S_OK
 
+    # [9]  CheckDeviceType(this, Adapter, CheckType, DisplayFmt, BackFmt, Windowed)
+    def _check_device_type(cpu: "CPU", mem: "Memory") -> None:
+        adapter   = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        disp_fmt  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        back_fmt  = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        windowed  = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDeviceType adapter={adapter} devType={dev_type} "
+            f"dispFmt={disp_fmt} backFmt={back_fmt} windowed={windowed} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
+    # [10] CheckDeviceFormat(this, Adapter, DevType, AdapterFmt, Usage, RType, CheckFmt)
+    def _check_device_format(cpu: "CPU", mem: "Memory") -> None:
+        adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        usage      = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        rtype      = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        check_fmt  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDeviceFormat adapter={adapter} devType={dev_type} "
+            f"adapterFmt={adapter_fmt} usage=0x{usage:x} rtype={rtype} checkFmt={check_fmt} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
+    # [11] CheckDeviceMultiSampleType(this, Adapter, DevType, SurfaceFmt, Windowed, MultiSampleType)
+    def _check_multisample(cpu: "CPU", mem: "Memory") -> None:
+        logger.info("d3d8", "CheckDeviceMultiSampleType -> D3DERR_NOTAVAIL (no MSAA)")
+        cpu.regs[EAX] = D3DERR_NOTAVAIL
+
+    # [12] CheckDepthStencilMatch(this, Adapter, DevType, AdapterFmt, RTFmt, DSFmt)
+    def _check_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+        adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        rt_fmt     = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        ds_fmt     = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDepthStencilMatch adapter={adapter} devType={dev_type} "
+            f"adapterFmt={adapter_fmt} rtFmt={rt_fmt} dsFmt={ds_fmt} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
     return [
-        # [0]  QueryInterface
+        # [0]  QueryInterface — E_NOINTERFACE: we don't support QI on this object
         _com_stub(stubs, "d3d8", "IDirect3D8::QueryInterface",
-            lambda cpu, mem: _set_eax(cpu, 0x80004002), 8, memory),
-        # [1]  AddRef
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::QueryInterface -> E_NOINTERFACE"),
+                              _set_eax(cpu, 0x80004002))[-1], 8, memory),
+        # [1]  AddRef — refcount stub, always 1
         _com_stub(stubs, "d3d8", "IDirect3D8::AddRef",
-            lambda cpu, mem: _set_eax(cpu, 1), 0, memory),
-        # [2]  Release
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::AddRef -> 1"),
+                              _set_eax(cpu, 1))[-1], 0, memory),
+        # [2]  Release — refcount stub, always 0
         _com_stub(stubs, "d3d8", "IDirect3D8::Release",
-            lambda cpu, mem: _set_eax(cpu, 0), 0, memory),
-        # [3]  RegisterSoftwareDevice
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::Release -> 0"),
+                              _set_eax(cpu, 0))[-1], 0, memory),
+        # [3]  RegisterSoftwareDevice — not supported
         _com_stub(stubs, "d3d8", "IDirect3D8::RegisterSoftwareDevice",
-            lambda cpu, mem: _set_eax(cpu, D3DERR_NOTAVAIL), 4, memory),
-        # [4]  GetAdapterCount
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::RegisterSoftwareDevice -> D3DERR_NOTAVAIL"),
+                              _set_eax(cpu, D3DERR_NOTAVAIL))[-1], 4, memory),
+        # [4]  GetAdapterCount — we expose one adapter
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterCount",
-            lambda cpu, mem: _set_eax(cpu, 1), 0, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterCount -> 1"),
+                              _set_eax(cpu, 1))[-1], 0, memory),
         # [5]  GetAdapterIdentifier
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterIdentifier",
             _get_adapter_identifier, 12, memory),
-        # [6]  GetAdapterModeCount
+        # [6]  GetAdapterModeCount — we expose one mode (800x600@60)
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterModeCount",
-            lambda cpu, mem: _set_eax(cpu, 1), 4, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterModeCount -> 1"),
+                              _set_eax(cpu, 1))[-1], 4, memory),
         # [7]  EnumAdapterModes
         _com_stub(stubs, "d3d8", "IDirect3D8::EnumAdapterModes",
             _enum_adapter_modes, 12, memory),
@@ -393,22 +441,23 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             _get_adapter_display_mode, 8, memory),
         # [9]  CheckDeviceType
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceType",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 20, memory),
+            _check_device_type, 20, memory),
         # [10] CheckDeviceFormat
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceFormat",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 24, memory),
+            _check_device_format, 24, memory),
         # [11] CheckDeviceMultiSampleType
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceMultiSampleType",
-            lambda cpu, mem: _set_eax(cpu, D3DERR_NOTAVAIL), 20, memory),
+            _check_multisample, 20, memory),
         # [12] CheckDepthStencilMatch
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDepthStencilMatch",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 20, memory),
+            _check_depth_stencil, 20, memory),
         # [13] GetDeviceCaps
         _com_stub(stubs, "d3d8", "IDirect3D8::GetDeviceCaps",
             _get_device_caps, 12, memory),
-        # [14] GetAdapterMonitor
+        # [14] GetAdapterMonitor — fake HMONITOR, no real monitor object
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterMonitor",
-            lambda cpu, mem: _set_eax(cpu, 0x0D3D0001), 4, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterMonitor -> 0x0D3D0001"),
+                              _set_eax(cpu, 0x0D3D0001))[-1], 4, memory),
         # [15] CreateDevice
         _com_stub(stubs, "d3d8", "IDirect3D8::CreateDevice",
             _create_device, 24, memory),

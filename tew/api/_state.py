@@ -351,15 +351,23 @@ class CRTState:
     # ── Path translation ──────────────────────────────────────────────────────
 
     def translate_windows_path(self, win_path: str) -> str:
-        """Map a Windows path to a host Linux path using config path_mappings."""
+        """Map a Windows path to a host Linux path, resolving case-insensitively.
+
+        Windows paths are case-insensitive; Linux is not.  After applying the
+        drive/prefix mapping we run find_file_ci to resolve every path component
+        to the actual on-disk case.  If no match exists we return the naively-
+        translated path so callers can report ENOENT normally.
+        """
         p = win_path.replace("\\", "/")
-        # Sort by key length descending so longer prefixes match first
         mappings = sorted(self.config.path_mappings.items(), key=lambda kv: -len(kv[0]))
         for win_prefix, linux_prefix in mappings:
             if p.lower().startswith(win_prefix):
-                result = linux_prefix + p[len(win_prefix):]
-                return result.replace("//", "/")
-        return p.replace("//", "/")
+                naive = (linux_prefix + p[len(win_prefix):]).replace("//", "/")
+                resolved = find_file_ci(naive)
+                return resolved if resolved is not None else naive
+        naive = p.replace("//", "/")
+        resolved = find_file_ci(naive)
+        return resolved if resolved is not None else naive
 
     def reverse_translate_path(self, linux_path: str) -> str:
         """

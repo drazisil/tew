@@ -79,6 +79,30 @@
     "loginpw": {
       "type": 1,
       "value": "admin"
+    },
+    "3d card": {
+      "type": 1,
+      "value": "Unknown D3D"
+    },
+    "3d device description": {
+      "type": 1,
+      "value": "NVIDIA GeForce GTX 470 [D3D]"
+    },
+    "d3d device": {
+      "type": 4,
+      "value": 1
+    },
+    "group": {
+      "type": 1,
+      "value": "D3D"
+    },
+    "hardware acceleration": {
+      "type": 4,
+      "value": 1
+    },
+    "thrash driver": {
+      "type": 1,
+      "value": "dx8z.dll"
     }
   },
   "hklm\\software\\electronic arts\\motor city\\authauth": {

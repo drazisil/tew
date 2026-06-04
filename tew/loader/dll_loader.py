@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tew.logger import logger
+from tew.api._state import find_file_ci
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -120,19 +121,9 @@ class DLLLoader:
     def _find_dll_file(self, dll_name: str) -> str | None:
         for path in self._search_paths:
             full_path = os.path.join(path, dll_name)
-            if os.path.exists(full_path):
-                return full_path
-
-        lower_name = dll_name.lower()
-        for dir_path in self._search_paths:
-            try:
-                entries = os.listdir(dir_path)
-                match = next((e for e in entries if e.lower() == lower_name), None)
-                if match:
-                    return os.path.join(dir_path, match)
-            except OSError as e:
-                logger.debug("dll", f"Search path {dir_path} unreadable: {e}")
-
+            resolved = find_file_ci(full_path)
+            if resolved is not None:
+                return resolved
         return None
 
     def _get_forwarding_candidates(self, dll_name: str) -> list[str]:

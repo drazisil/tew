@@ -172,6 +172,27 @@ def patch_crt_internals(
             except Exception as e:
                 logger.debug("exception", f"abortmessage: read_cstring(filename) failed: {e}")
 
+        # Format variadic args: handle %s (pointer) and %d/%i (int) substitutions
+        if '%' in fmt:
+            args_base = (sp + 8) & 0xFFFFFFFF  # first variadic arg after fmt_ptr
+            parts = fmt.split('%')
+            out = parts[0]
+            for i, part in enumerate(parts[1:]):
+                arg_ptr = memory.read32((args_base + i * 4) & 0xFFFFFFFF)
+                if part.startswith('s'):
+                    val = "(null)"
+                    if arg_ptr > 0x1000:
+                        try:
+                            val = read_cstring(arg_ptr, memory)
+                        except Exception:
+                            val = f"<bad ptr {arg_ptr:#010x}>"
+                    out += val + part[1:]
+                elif part.startswith(('d', 'i')):
+                    out += str(arg_ptr) + part[1:]  # arg_ptr holds the int value
+                else:
+                    out += '%' + part  # unknown spec, pass through
+            fmt = out
+
         logger.error("exception", f"abortmessage: {filename}:{line_num} — {fmt}")
         cpu.halted = True
         # cdecl variadic — no stack cleanup by callee
