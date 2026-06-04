@@ -127,6 +127,17 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_fpu_set_tag.argtypes     = [_vp, _u16]
     lib.cpu_fpu_set_tag.restype      = None
 
+    lib.cpu_set_watchpoint.argtypes  = [_vp, _u32]
+    lib.cpu_set_watchpoint.restype   = None
+    lib.cpu_clear_watchpoint.argtypes= [_vp]
+    lib.cpu_clear_watchpoint.restype = None
+    lib.cpu_watchpoint_hit.argtypes  = [_vp]
+    lib.cpu_watchpoint_hit.restype   = _b
+    lib.cpu_watchpoint_eip.argtypes  = [_vp]
+    lib.cpu_watchpoint_eip.restype   = _u32
+    lib.cpu_watchpoint_val.argtypes  = [_vp]
+    lib.cpu_watchpoint_val.restype   = _u32
+
     return lib
 
 _lib = _load_lib()
@@ -452,6 +463,26 @@ class ZigCPU:
 
     def on_step(self, handler: Callable) -> None:
         self._step_handler = handler
+
+    # ── Watchpoint ────────────────────────────────────────────────────────────
+
+    def set_watchpoint(self, addr: int) -> None:
+        _lib.cpu_set_watchpoint(self._state, addr & 0xFFFFFFFF)
+
+    def clear_watchpoint(self) -> None:
+        _lib.cpu_clear_watchpoint(self._state)
+
+    @property
+    def watchpoint_hit(self) -> bool:
+        return bool(_lib.cpu_watchpoint_hit(self._state))
+
+    @property
+    def watchpoint_eip(self) -> int:
+        return _lib.cpu_watchpoint_eip(self._state)
+
+    @property
+    def watchpoint_val(self) -> int:
+        return _lib.cpu_watchpoint_val(self._state)
 
     def trigger_interrupt(self, int_num: int) -> None:
         if self._int_handler:

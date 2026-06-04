@@ -431,7 +431,13 @@ logger.debug("handlers", "--- Win32 Stub Call Log (last 50) ---")
 for call in win32_handlers.get_call_log()[-50:]:
     logger.debug("handlers", f"  {call}")
 
-if cpu.faulted:
+if cpu.watchpoint_hit:
+    logger.error("exception",
+        f"WATCHPOINT HIT at EIP=0x{cpu.watchpoint_eip:08x}"
+        f"  written=0x{cpu.watchpoint_val:02x}"
+        f"  (first byte of write to watchpoint address)")
+    diagnose_halt(cpu, exe.import_resolver)
+elif cpu.faulted:
     diagnose_fault(cpu, exe.import_resolver)
 elif cpu.halted:
     diagnose_halt(cpu, exe.import_resolver)

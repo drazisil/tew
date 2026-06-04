@@ -188,5 +188,123 @@ def patch_crt_internals(
 
     stubs.patch_address(0x009F6E20, "__free_dbg", _free_dbg_noop)
 
+    # SNDMEMI_init (FUN_00a5422a) — zero-fill pool + log
+    #
+    # The game's pool allocator (FUN_00a70610) does not guarantee the returned
+    # block is zero-filled.  SNDMEMI_init never writes struct[5] (entry count),
+    # and the sentinel-validator FUN_00a54107 dereferences struct[1][0] (the
+    # first block-entry's start offset) as an offset into pool_base.  If that
+    # offset is garbage (uninitialised pool memory), the read faults.
+    #
+    # Fix: intercept SNDMEMI_init, zero-fill the pool buffer, then replay the
+    # six field writes that the original asm does.  __cdecl, caller cleans args.
+    #
+    # Original (FUN_00a5422a at 0xa5422a):
+    #   DAT_020def78    = param_1
+    #   param_1[2]      = param_2
+    #   param_1[1]      = param_1 + param_2 - 0x18   (block-list ptr)
+    #   param_1[0]      = (param_1 + 40) aligned-4   (pool base)
+    #   param_1[3]      = param_2 - 0x43             (available size)
+    #   param_1[4]      = param_2 - 3                (min alloc size)
+    #   param_1[5]      = NOT SET  ← we now set it to 0 explicitly
+    SNDMEMI_STRUCT_PTR = 0x020def78  # DAT_020def78
+    SNDMEMI_INIT_ADDR  = 0x00a5422a
+
+    def _sndmemi_init(cpu: "CPU") -> None:
+        param_1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        param_2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        # Zero-fill the entire pool struct so all fields (including [5]) start clean
+        for off in range(0, param_2, 4):
+            memory.write32((param_1 + off) & 0xFFFFFFFF, 0)
+        # Replay the six field assignments from the original asm
+        memory.write32(SNDMEMI_STRUCT_PTR, param_1)            # DAT_020def78 = param_1
+        pool_base = ((param_1 + 40) + 3) & ~3                  # align to 4
+        memory.write32(param_1,           pool_base)           # param_1[0] = pool_base
+        memory.write32(param_1 + 4,       (param_1 + param_2 - 0x18) & 0xFFFFFFFF)  # [1]
+        memory.write32(param_1 + 8,       param_2)             # param_1[2] = size
+        memory.write32(param_1 + 12,      (param_2 - 0x43) & 0xFFFFFFFF)  # [3] available
+        memory.write32(param_1 + 16,      (param_2 - 3) & 0xFFFFFFFF)     # [4] min
+        memory.write32(param_1 + 20,      0)                   # [5] entry count = 0
+        blist = (param_1 + param_2 - 0x18) & 0xFFFFFFFF
+        watch = blist + 4  # size field of entry 0 — 4 bytes at this address
+        logger.info("handlers",
+            f"[SNDMEMI_init] pool={param_1:#010x} size={param_2:#x} "
+            f"base={pool_base:#010x} blist={blist:#010x} watching {watch:#010x}")
+
+        # Install a Zig-level watchpoint: halt the CPU and log when anything
+        # writes the first byte of the size field of block-entry 0.
+        cpu.set_watchpoint(watch)
+
+        # cdecl: caller cleans args; just return (RET pops saved ret addr)
+
+    stubs.patch_address(SNDMEMI_INIT_ADDR, "SNDMEMI_init", _sndmemi_init)
+
+    # SNDMEMI_validator intercept — log sentinel check state
+    #
+    # FUN_00a54107 (0xa54107): iterates existing allocs and checks sentinel
+    # values (0xDEADDEAD) at each end.  If it reads from a bad address, a
+    # prior alloc recorded a garbage block size in the block table.
+    # We replace the entire function with a Python version that logs each
+    # check so we can find which block entry is corrupt.
+    #
+    # Original: __cdecl, no args, no return value.
+    from tew.hardware.cpu_zig import EBP as _EBP
+
+    def _sndmemi_validate(cpu: "CPU") -> None:
+        pool_ptr = memory.read32(SNDMEMI_STRUCT_PTR & 0xFFFFFFFF)
+        if not pool_ptr:
+            return
+        pool_base   = memory.read32(pool_ptr & 0xFFFFFFFF)
+        blist_ptr   = memory.read32((pool_ptr + 4) & 0xFFFFFFFF)
+        entry_count = memory.read32((pool_ptr + 20) & 0xFFFFFFFF)  # [5], negative
+        n = (-entry_count) & 0x7FFFFFFF
+        if n > 1024:
+            logger.warn("handlers", f"[SNDMEMI_validate] insane count={entry_count:#x}")
+            return
+        # Log count=0 allocs too — these are the "first alloc" path and may be
+        # the corrupt writer (count=0 writes entry 0 at blist_ptr with whatever uVar2).
+        if n == 0:
+            caller_ebp = cpu.regs[_EBP] & 0xFFFFFFFF
+            try:
+                param1 = memory.read32((caller_ebp + 8) & 0xFFFFFFFF) & 0xFFFFFFFF
+            except Exception:
+                param1 = 0
+            logger.info("handlers",
+                f"[SNDMEMI_validate] [count=0] first alloc, param1={param1:#010x}")
+        any_bad = False
+        for idx in range(n):
+            entry = blist_ptr - idx * 0x18
+            start  = memory.read32(entry & 0xFFFFFFFF)
+            size   = memory.read32((entry + 4) & 0xFFFFFFFF)
+            lo_addr = (pool_base + start) & 0xFFFFFFFF
+            hi_addr = (pool_base + start + size - 4) & 0xFFFFFFFF
+            lo_val = memory.read32(lo_addr) if lo_addr < 0x7FFFFFFF else 0
+            hi_val = memory.read32(hi_addr) if hi_addr < 0x7FFFFFFF else 0
+            ok = "✓" if (lo_val == 0xDEADDEAD and hi_val == 0xDEADDEAD) else "✗"
+            logger.info("handlers",
+                f"[SNDMEMI_validate] [{ok}] idx={idx} entry={entry:#010x} "
+                f"start={start:#x} size={size:#x} "
+                f"lo={lo_addr:#010x}={lo_val:#010x} hi={hi_addr:#010x}={hi_val:#010x}")
+            if ok == "✗":
+                any_bad = True
+        # When corruption is detected, the validator is called BY the SNDMEMI_alloc
+        # that made the bad write.  Walk the EBP chain to find who passed the giant size.
+        if any_bad:
+            logger.warn("handlers", "[SNDMEMI_validate] CORRUPTION detected — call stack:")
+            ebp = cpu.regs[_EBP] & 0xFFFFFFFF
+            for depth in range(16):
+                if not (0x07000000 <= ebp <= 0x7FFFFFFF):
+                    break
+                try:
+                    saved_ebp = memory.read32(ebp) & 0xFFFFFFFF
+                    ret_addr  = memory.read32(ebp + 4) & 0xFFFFFFFF
+                    param1    = memory.read32(ebp + 8) & 0xFFFFFFFF  # first arg
+                except Exception:
+                    break
+                logger.warn("handlers",
+                    f"  [{depth}] EBP={ebp:#010x}  ret={ret_addr:#010x}  arg0={param1:#010x}")
+                ebp = saved_ebp
+
+    stubs.patch_address(0x00a54107, "SNDMEMI_validate", _sndmemi_validate)
 
 
