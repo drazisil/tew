@@ -403,6 +403,28 @@ class CRTState:
         if not win_name:
             logger.debug("fileio", 'CreateFile("") -> INVALID_HANDLE_VALUE (empty path)')
             return 0xFFFFFFFF
+        # Win32 reserved device names — case-insensitive, ignore any path prefix.
+        _dev_name = normalized.rsplit("/", 1)[-1].upper().split(".")[0]
+        if _dev_name == "NUL":
+            handle = self.next_file_handle
+            self.next_file_handle += 1
+            if writable:
+                fd = os.open("/dev/null", os.O_WRONLY)
+                self.file_handle_map[handle] = FileHandleEntry(
+                    path="/dev/null", data=b"", position=0, writable=True, fd=fd
+                )
+            else:
+                self.file_handle_map[handle] = FileHandleEntry(
+                    path="/dev/null", data=b"", position=0, writable=False, fd=None
+                )
+            logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [NUL device]')
+            return handle
+        if _dev_name in ("CON", "AUX", "PRN", "COM1", "COM2", "COM3", "COM4",
+                         "COM5", "COM6", "COM7", "COM8", "COM9",
+                         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+                         "LPT6", "LPT7", "LPT8", "LPT9"):
+            logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (unsupported device {_dev_name})')
+            return 0xFFFFFFFF
         handle = self.next_file_handle
         self.next_file_handle += 1
         if writable:

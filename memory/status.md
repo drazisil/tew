@@ -11,19 +11,37 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status: ifc22.dll RESOLVED — login dialog requires interaction
+### Current status: _THRASH_setvideomode always returns false → hardware acceleration MessageBoxA
 
-As of 2026-05-31, all known programmatic blockers are fixed. The login dialog
-(`DialogBoxParamA`) requires a user click on OK to proceed. Automated test runs
-get stuck there. Interactive runs proceed past login.
+Post-login, the game calls `_THRASHDRIVER_init` which:
+1. Calls `_THRASH_setstate(0x13, &_librarythrashinterface)` — sets 8 callback ptrs
+   in dx8z.dll globals `DAT_600200e0..fc`. `DAT_600200e8 = 0x0040439f` (`setwinhandler`).
+2. Calls `_THRASH_init()` → creates D3D8 object → enumerates adapters → registers
+   window message handlers 0x464→`FUN_60003500` and 0x465→`FUN_60003430` via callback.
+3. Calls `_THRASH_setvideomode(display, mode, bpp)`.
 
-ifc22.dll (ImmVersion FFB middleware): all 11 imports stubbed.
-- CImmMouse::Initialize returns 0 → no FFB hardware → entire FFB path skipped.
-- Constructors/destructors are no-ops.
-- FFB device methods (UsesWin32MouseServices, OpenFile, etc.) are loud halts
-  if ever reached (should not be with Initialize=0).
+**Root cause of failure**: `_THRASH_setvideomode` (dx8z.dll:0x60003230) only sets
+`bVar4=true` in the cross-thread path. It defaults false and the same-thread path
+never changes it — so the return value is always false → game shows error MessageBoxA.
 
-Next blocker after login: unknown — will be discovered in next interactive run.
+**Cross-thread path** (requires `DAT_600200e8 != 0`):
+- Creates unsignaled event via `CreateEventA`
+- `PostMessageA(hwnd, 0x464, display_idx, mode)` — queues to window message queue
+- `WaitForSingleObject(event, 10000)` — blocks thrash thread
+- Window thread (`FUN_0077ef80`) runs `GetMessageA`/`DispatchMessageA` loop
+- DispatchMessageA → window proc → dispatches 0x464 → calls `FUN_60003500`
+- `FUN_60003500` does the actual `IDirect3D8::CreateDevice` call
+- `FUN_60003500` calls `SetEvent(DAT_6001de50)` → wakes thrash thread → bVar4=true
+
+**Key question**: Does the game's window thread (`FUN_0077ef80`) run as a cooperative
+thread in our scheduler? It's created by `_THREAD_create(FUN_0077ef80, ...)` inside
+`openmainwindow`. If that thread isn't running, no one processes the PostMessageA
+message, the event is never signaled, and WaitForSingleObject times out → WAIT_TIMEOUT
+→ bVar4=false.
+
+**Next investigative step**: Check whether `_THREAD_create`/`_THREAD_yield`/`_SYNCTASK_run`
+are hooked, and whether the window thread exists in the cooperative scheduler at the
+point `_THRASH_setvideomode` runs.
 
 Also: `CoCreateInstance` fails (REGDB_E_CLASSNOTREG) — still happening, probably DirectSound.
 
