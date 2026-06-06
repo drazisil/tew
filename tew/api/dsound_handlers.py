@@ -3,10 +3,10 @@
 Real PCM audio via SDL2 audio callback.  IDirectSound + IDirectSoundBuffer COM
 stubs sufficient for DirectSound-based game audio.
 
-Fixed-data region addresses (immediately after DInput vtables at 0x00220318):
-    DS_VTABLE     = 0x00220320  IDirectSound      11 slots × 4 =  44 bytes
-    DS_OBJ        = 0x00220350  IDirectSound singleton (4 bytes)
-    DS_BUF_VTABLE = 0x00220360  IDirectSoundBuffer 21 slots × 4 =  84 bytes
+Fixed-data region addresses (immediately after DInput vtables at 0x00220368):
+    DS_VTABLE     = 0x00220370  IDirectSound      11 slots × 4 =  44 bytes → 0x0022039C
+    DS_OBJ        = 0x002203A0  IDirectSound singleton (4 bytes)
+    DS_BUF_VTABLE = 0x002203B0  IDirectSoundBuffer 21 slots × 4 =  84 bytes → 0x00220404
 
 Buffer COM object layout (16 bytes, bump-allocated from D3D8 heap):
     [0]  vtable ptr   DS_BUF_VTABLE
@@ -37,9 +37,9 @@ from tew.api._state import CRTState
 from tew.logger import logger
 
 # ── Fixed COM addresses ────────────────────────────────────────────────────────
-DS_VTABLE     = 0x00220320   # IDirectSound vtable       (11 × 4 = 44 bytes)
-DS_OBJ        = 0x00220350   # IDirectSound singleton    (4 bytes)
-DS_BUF_VTABLE = 0x00220360   # IDirectSoundBuffer vtable (21 × 4 = 84 bytes)
+DS_VTABLE     = 0x00220370   # IDirectSound vtable       (11 × 4 = 44 bytes → 0x0022039C)
+DS_OBJ        = 0x002203A0   # IDirectSound singleton    (4 bytes)
+DS_BUF_VTABLE = 0x002203B0   # IDirectSoundBuffer vtable (21 × 4 = 84 bytes → 0x00220404)
 
 # ── Status codes ──────────────────────────────────────────────────────────────
 DS_OK                    = 0x00000000

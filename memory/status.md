@@ -11,25 +11,54 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status: WATCHPOINT HIT at 0x00a544f3 (SNDMEMI pool corruption)
+### Current status: SNDMEMI pool corruption — watchpoint hit at EIP=0x00a544f3
 
 **Previous blockers resolved**:
 
-1. **Font file `C:\Data\Fonts\Macaro14.ffn` failing to open** — root cause was
-   `_MEM_copyfpi` using `FILD m64` / `FISTP m64` (FPU integer 64-bit load/store) to
-   copy the filename buffer. The Zig CPU's FPU stack was `[8]f64` (53-bit mantissa),
-   which loses precision for i64 values > 2^53, zeroing the destination buffer.
-   Fix: changed `fpu_stack` to `[8]f80` (64-bit mantissa — exact round-trip for all
-   i64 values). Also added CPUID MMX bit (EDX bit 23) + implemented MOVQ, MOVD,
-   PUNPCKLDQ, EMMS so the game uses the integer MMX copy path instead.
+1. **Font file `C:\Data\Fonts\Macaro14.ffn` failing to open** — `_MEM_copyfpi` used
+   `FILD m64`/`FISTP m64` with f64 FPU stack (53-bit mantissa, lossy for i64 > 2^53).
+   Fix: `fpu_stack: [8]f80`. Also added CPUID MMX bit + MOVQ/MOVD/PUNPCKLDQ/EMMS.
 
-2. **cpu.zig split**: 1904-line monolith split into `core.zig` (CpuState + shared
-   helpers), `fpu.zig` (FPU ops with f80 fix), `mmx.zig` (MMX instructions),
-   `two_byte.zig` (0x0F dispatch with MMX CPUID), `cpu.zig` (one-byte ops + C API).
+2. **cpu.zig split**: 1904-line monolith → `core.zig`, `fpu.zig`, `mmx.zig`,
+   `two_byte.zig`, `cpu.zig`.
 
-**Current blocker**: WATCHPOINT HIT at EIP=0x00a544f3 — SNDMEMI pool size field
-corruption. Plan file exists: change watchpoint to `blist+7` (MSB of size field)
-to catch the actual corruption write, not the innocent `0x00` write that follows it.
+3. **VirtualAlloc(NULL, size, MEM_COMMIT, prot)**: was halting. Fixed: NULL + MEM_COMMIT
+   alone is spec-valid (implicit reserve+commit); allocate from `next_virtual_alloc`.
+   Unblocked `_DTEX_settextureramsize`.
+
+4. **mixerGetNumDevs**: was returning 0 with wrong log level. Fixed to return 1
+   (we have a wave device). Verified safe: game calls `mixerGetLineInfoA` once,
+   gets `MMSYSERR_NODRIVER`, skips CD volume set cleanly.
+
+5. **IDirect3DTexture8 COM interface**: `CreateTexture`/`CreateVolumeTexture`/
+   `CreateCubeTexture` were returning `IDirect3DSurface8` objects (11-slot vtable).
+   Implemented `idirect3d8texture.py` — full 18-slot vtable at `D3DTEX_VTABLE=0x00220290`.
+   Texture objects store per-mip `IDirect3DSurface8*` at `obj+28+i*4`.
+   Also relocated `DI_VTABLE` → `0x002202E0`, `DS_VTABLE` → `0x00220370` to avoid collision.
+
+**Current blocker**: CPU fault at `EIP=0x00a6bfcb`, `ECX=0xfe000088` during `showmad`.
+`showmad` (`005b6bb0`) plays `C:\Data\Movies\ealogo.mad` (1,619,700 bytes) via a 1MB
+circular stream buffer. The crash happens in `_MAD_decodemacroblock` (called from
+`showmad`) when `_maddataptr` points to garbage data — ECX goes out of bounds in the
+zigzag table lookup.
+
+**Root cause analysis** (2026-06-06): Stream uses EA's async FILESYS layer (not direct
+Win32 ReadFile). Buffer fills via `_FILESYS_read` → `FUN_00a64850` → per-device queue +
+`_SIGNAL_set` (→ `SetEvent`) to wake I/O thread (`LAB_00a64c00`, spawned in
+`FUN_00a64a60`). Refill chain: `_STREAM_release` → `FUN_00a661d0` → `_FILESYS_read`
+only when stream state==2 (WAITING_FOR_SPACE, set when buffer has <8192 bytes free).
+
+Log shows exactly 127 ReadFile calls (127×8192=1,040,384 bytes of 1,619,700), then no
+more reads. After the initial fill, state becomes 2. Each `_STREAM_release` call should
+trigger one more 8192-byte read via the I/O thread. Decode loop in `showmad` runs
+without `_SYNCTASK_run` — relies on `preempt_slice` every 100K steps for I/O thread
+scheduling. Crash happens before buffer exhaustion; likely the refill IS triggering but
+decoded data is hitting bad VLC input for a different reason.
+
+**Next step**: Determine whether `_STREAM_release` is triggering `_FILESYS_read` (and
+thus more ReadFile calls) at all. Add ReadFile logging for ALL reads (not just ealogo.mad)
+to see if the I/O thread is waking and doing work. Alternatively, check what's at
+EIP=0x00a6bfcb and whether EBP=0x00000014 (smashed frame pointer) explains the fault.
 
 ### Deferred: beta binary (mcity_beta_1.exe) — "Game CD not found"
 

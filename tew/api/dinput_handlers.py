@@ -3,10 +3,10 @@
 Implements DirectInputCreateA and minimal IDirectInput2A + IDirectInputDevice2A stubs
 sufficient for the game to complete DI initialisation and proceed to the render loop.
 
-COM vtable addresses (fixed-data region, after D3DSURF_VTABLE ends at 0x0022028C):
-    DI_VTABLE     = 0x00220290  (IDirectInput2A,       9 slots × 4 =  36 bytes)
-    DI_OBJ        = 0x002202C0  (IDirectInput2A object, 4 bytes)
-    DI_DEV_VTABLE = 0x002202D0  (IDirectInputDevice2A, 18 slots × 4 = 72 bytes)
+COM vtable addresses (fixed-data region, after D3DTEX_VTABLE ends at 0x002202D8):
+    DI_VTABLE     = 0x002202E0  (IDirectInput2A,       9 slots × 4 =  36 bytes → 0x00220304)
+    DI_OBJ        = 0x00220310  (IDirectInput2A object, 4 bytes)
+    DI_DEV_VTABLE = 0x00220320  (IDirectInputDevice2A, 18 slots × 4 = 72 bytes → 0x00220368)
     Device objects are bump-allocated from the D3D8 heap (8 bytes each).
 
 All handlers read `this` from ESP+4 (dx8z / game push `this` on stack, not ECX).
@@ -26,9 +26,9 @@ from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
 from tew.logger import logger
 
 # ── Fixed COM object addresses ────────────────────────────────────────────────
-DI_VTABLE     = 0x00220290   # IDirectInput2A vtable     (9  × 4 = 36 bytes)
-DI_OBJ        = 0x002202C0   # IDirectInput2A singleton  (4 bytes)
-DI_DEV_VTABLE = 0x002202D0   # IDirectInputDevice2A vtable (18 × 4 = 72 bytes)
+DI_VTABLE     = 0x002202E0   # IDirectInput2A vtable     (9  × 4 = 36 bytes → 0x00220304)
+DI_OBJ        = 0x00220310   # IDirectInput2A singleton  (4 bytes)
+DI_DEV_VTABLE = 0x00220320   # IDirectInputDevice2A vtable (18 × 4 = 72 bytes → 0x00220368)
 
 # ── DirectInput error / status codes ─────────────────────────────────────────
 DI_OK                  = 0x00000000

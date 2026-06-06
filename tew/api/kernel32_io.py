@@ -628,6 +628,7 @@ def register_kernel32_io_handlers(
                 memory.write32(lp_read, 0)
             cpu.regs[EAX] = 0
         else:
+            pos_before = entry.position
             available = len(entry.data) - entry.position
             to_read = min(n_to_read, available)
             for i in range(to_read):
@@ -636,6 +637,11 @@ def register_kernel32_io_handlers(
             if lp_read:
                 memory.write32(lp_read, to_read)
             cpu.regs[EAX] = 1
+            if "ealogo.mad" in entry.path.lower():
+                logger.debug("fileio",
+                    f'ReadFile(ealogo.mad h=0x{h_file:x}) '
+                    f'offset={pos_before} req={n_to_read} got={to_read} '
+                    f'pos_after={entry.position} eof={len(entry.data)}')
         cleanup_stdcall(cpu, memory, 20)
 
     def _delete_file_a(cpu: "CPU") -> None:

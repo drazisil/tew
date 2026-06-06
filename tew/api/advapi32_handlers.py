@@ -581,10 +581,10 @@ def register_advapi32_handlers(
 
     MMSYSERR_NODRIVER = 10
 
-    # mixerGetNumDevs() -> UINT [stdcall, no args] — 0 = no mixer hardware
+    # mixerGetNumDevs() -> UINT [stdcall, no args] — 1 = our SDL2 wave device
     def _mixer_get_num_devs(cpu: "CPU") -> None:
-        logger.warn("handlers", "[winmm] mixerGetNumDevs -> 0 (no audio hardware)")
-        cpu.regs[EAX] = 0
+        logger.debug("handlers", "[winmm] mixerGetNumDevs -> 1")
+        cpu.regs[EAX] = 1
 
     stubs.register_handler("winmm.dll", "mixerGetNumDevs", _mixer_get_num_devs)
 

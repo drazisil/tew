@@ -4,6 +4,44 @@ Entries are newest-first.
 
 ---
 
+## 2026-06-06 — IDirect3DTexture8 COM interface + vtable layout fix
+
+**New file: `tew/api/d3d8/idirect3d8texture.py`** — full 18-slot `IDirect3DTexture8`
+vtable at `D3DTEX_VTABLE = 0x00220290`.
+
+- IUnknown [0-2], IDirect3DResource8 [3-10], IDirect3DBaseTexture8 [11-13],
+  IDirect3DTexture8 [14-17] (GetLevelDesc / GetSurfaceLevel / LockRect / UnlockRect).
+- `GetSurfaceLevel(Level, ppSurface)` returns the pre-allocated `IDirect3DSurface8*`
+  stored at `texture_obj + 28 + Level*4`.
+
+**`tew/api/d3d8/_layout.py`** — added `D3DTEX_VTABLE = 0x00220290`.
+
+**`tew/api/d3d8/_helpers.py`** — added `_alloc_texture_obj(w, h, fmt, levels, mem)`;
+texture object holds `levels` surface ptrs starting at `obj+28`.
+
+**`tew/api/d3d8/idirect3d8device.py`** — `CreateTexture`/`CreateVolumeTexture`/
+`CreateCubeTexture` now call `_alloc_texture_obj` instead of `_alloc_surface_obj`;
+`levels` argument is now read and forwarded.
+
+**`tew/api/dinput_handlers.py`** — relocated `DI_VTABLE → 0x002202E0`,
+`DI_OBJ → 0x00220310`, `DI_DEV_VTABLE → 0x00220320` (D3DTEX_VTABLE now occupies
+the old DI range `0x00220290`–`0x002202D7`).
+
+**`tew/api/dsound_handlers.py`** — relocated `DS_VTABLE → 0x00220370`,
+`DS_OBJ → 0x002203A0`, `DS_BUF_VTABLE → 0x002203B0` (old DS addresses were inside
+the shifted DI range).
+
+**`tew/api/patch_internals.py`** — removed SNDMEMI pool watchpoint (was on `blist+7`,
+MSB of pool block-entry size field); game now runs past ~189M steps.
+
+**`tew/api/kernel32_io.py`** — added per-file ReadFile logging for `ealogo.mad`.
+
+**Result:** game runs ~189M steps through many BeginScene/EndScene/Present cycles,
+then crashes in `_MAD_decodemacroblock` (showmad playing ealogo.mad). SNDMEMI
+watchpoint removed (new blocker: MAD decoder crash, see status.md).
+
+---
+
 ## 2026-05-31 — ifc22.dll (ImmVersion FFB) stubs + dialog window fix
 
 **New file: `tew/api/ifc22_handlers.py`** — stubs for all 11 ifc22.dll imports:

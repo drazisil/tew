@@ -114,7 +114,7 @@ import struct as _struct
 from tew.hardware.cpu import EAX, ECX, ESP
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _alloc_resource_obj, _alloc_surface_obj, _com_stub, _set_eax, vk_pump
+from tew.api.d3d8._helpers import _alloc_resource_obj, _alloc_surface_obj, _alloc_texture_obj, _com_stub, _set_eax, vk_pump
 from tew.api.d3d8._caps import _fill_d3d_caps8
 import tew.api.d3d8._state as _state
 
@@ -193,9 +193,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     def _create_texture(cpu: "CPU", mem: "Memory") -> None:
         w          = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h          = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        levels     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         fmt        = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         pp_texture = mem.read32((cpu.regs[ESP] + 32) & 0xFFFFFFFF)
-        tex = _alloc_surface_obj(w or 1, h or 1, fmt, mem)
+        tex = _alloc_texture_obj(w or 1, h or 1, fmt, levels, mem)
         if pp_texture:
             mem.write32(pp_texture, tex)
         cpu.regs[EAX] = S_OK
@@ -204,19 +205,21 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     def _create_volume_texture(cpu: "CPU", mem: "Memory") -> None:
         w          = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h          = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        levels     = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         fmt        = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         pp_texture = mem.read32((cpu.regs[ESP] + 36) & 0xFFFFFFFF)
         if pp_texture:
-            mem.write32(pp_texture, _alloc_surface_obj(w or 1, h or 1, fmt, mem))
+            mem.write32(pp_texture, _alloc_texture_obj(w or 1, h or 1, fmt, levels, mem))
         cpu.regs[EAX] = S_OK
 
     # [22] CreateCubeTexture(EdgeLength, Levels, Usage, Fmt, Pool, IDirect3DCubeTexture8**)
     def _create_cube_texture(cpu: "CPU", mem: "Memory") -> None:
         edge       = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        levels     = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         fmt        = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         pp_texture = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         if pp_texture:
-            mem.write32(pp_texture, _alloc_surface_obj(edge or 1, edge or 1, fmt, mem))
+            mem.write32(pp_texture, _alloc_texture_obj(edge or 1, edge or 1, fmt, levels, mem))
         cpu.regs[EAX] = S_OK
 
     # [23] CreateVertexBuffer(Length, Usage, FVF, Pool, IDirect3DVertexBuffer8**)
