@@ -11,32 +11,25 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status: WATCHPOINT HIT at 0x00a544f3 + missing font file
+### Current status: WATCHPOINT HIT at 0x00a544f3 (SNDMEMI pool corruption)
 
-**Previous blocker resolved**: "Hardware acceleration unable to initialize" MessageBoxA.
-- Root cause: registry.json "d3d device" was 1 (adapter index 1), but we only expose
-  adapter 0. `FUN_006b3890` in main exe checks the requested adapter index against
-  `IDirect3D8::GetAdapterCount`. With index 1 and count 1, it fails before even calling
-  dx8z. Fix: set "d3d device" to 0.
-- `IDirect3D8::CreateDevice` now succeeds (Vulkan swapchain created).
+**Previous blockers resolved**:
 
-**New blockers** (from most recent run):
+1. **Font file `C:\Data\Fonts\Macaro14.ffn` failing to open** — root cause was
+   `_MEM_copyfpi` using `FILD m64` / `FISTP m64` (FPU integer 64-bit load/store) to
+   copy the filename buffer. The Zig CPU's FPU stack was `[8]f64` (53-bit mantissa),
+   which loses precision for i64 values > 2^53, zeroing the destination buffer.
+   Fix: changed `fpu_stack` to `[8]f80` (64-bit mantissa — exact round-trip for all
+   i64 values). Also added CPUID MMX bit (EDX bit 23) + implemented MOVQ, MOVD,
+   PUNPCKLDQ, EMMS so the game uses the integer MMX copy path instead.
 
-1. **Font file missing**: `FILE_load - unable to open file C:\Data\Fonts\Macaro14.ffn`
-   — game calls `abortmessage` (OutputDebugString). This may or may not halt execution;
-   the watchpoint fires at roughly the same time.
+2. **cpu.zig split**: 1904-line monolith split into `core.zig` (CpuState + shared
+   helpers), `fpu.zig` (FPU ops with f80 fix), `mmx.zig` (MMX instructions),
+   `two_byte.zig` (0x0F dispatch with MMX CPUID), `cpu.zig` (one-byte ops + C API).
 
-2. **WATCHPOINT HIT at EIP=0x00a544f3** — pre-existing watchpoint on SNDMEMI pool
-   size field MSB (from plan: `blist+7`). The write is `0x00` (one byte). The plan
-   says to change watch address to `blist+7` (MSB of size field) to catch corruption.
-   Final EIP after halt: `0x00a30142`.
-
-**Next investigative step**: Determine if the font file failure is the real abort
-path or if it's cosmetic and the watchpoint is the actual halt. Then address whichever
-is the true blocker.
-
-Note: game also opens `CreateFile("")` (empty path) around this area — this returns
-INVALID_HANDLE_VALUE and the game continues normally, so it's not blocking.
+**Current blocker**: WATCHPOINT HIT at EIP=0x00a544f3 — SNDMEMI pool size field
+corruption. Plan file exists: change watchpoint to `blist+7` (MSB of size field)
+to catch the actual corruption write, not the innocent `0x00` write that follows it.
 
 ### Deferred: beta binary (mcity_beta_1.exe) — "Game CD not found"
 

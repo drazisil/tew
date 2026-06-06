@@ -598,6 +598,8 @@ def register_kernel32_io_handlers(
         access      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory)
+        if not name:
+            logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
         cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
