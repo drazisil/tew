@@ -1,0 +1,161 @@
+"""
+Tests for tew.kernel.seh -- the 32-bit SEH (Structured Exception Handling)
+dispatcher: FS:[0] chain walking, handler invocation via the return-sentinel
+mechanism, disposition handling, and the real RtlUnwind implementation.
+
+Exercised against hand-built SEH frames and hand-assembled tiny handler
+routines rather than MCity_d.exe's real CRT internals -- reimplementing
+_except_handler3's scope-table walking is explicitly NOT this module's job
+(see tew/kernel/seh.py's docstring): real handlers are either genuine
+compiled code (executed natively, like any other code this emulator runs)
+or, where actually intercepted (RtlUnwind), given a real implementation.
+These tests verify the DISPATCHER is correct on inputs we fully control.
+"""
+
+import pytest
+from tew.hardware.memory import Memory
+from tew.hardware.cpu_zig import ZigCPU, ESP, EAX
+from tew.kernel.kernel_structures import KernelStructures
+from tew.api.win32_handlers import Win32Handlers
+from tew.kernel.seh import (
+    install as seh_install,
+    register_seh_handlers,
+    dispatch_exception,
+)
+
+MEM_SIZE = 0x00400000
+STACK_TOP = 0x00040000
+CODE_BASE = 0x00050000
+FRAME_A = 0x00041000
+FRAME_B = 0x00041020
+
+
+def write_bytes(mem: Memory, addr: int, data: bytes) -> None:
+    for i, b in enumerate(data):
+        mem.write8(addr + i, b)
+
+
+def push_seh_frame(mem: Memory, fs_base: int, frame_addr: int, handler_addr: int, next_frame: int) -> None:
+    mem.write32(frame_addr + 0x00, next_frame)
+    mem.write32(frame_addr + 0x04, handler_addr)
+    mem.write32(fs_base + 0x00, frame_addr)
+
+
+@pytest.fixture
+def cpu_env():
+    """A CPU with kernel structures + SEH installed, ready to dispatch."""
+    mem = Memory(size_bytes=MEM_SIZE)
+    cpu = ZigCPU(mem)
+    ks = KernelStructures(mem)
+    ks.initialize_kernel_structures(stack_base=STACK_TOP, stack_limit=STACK_TOP - 0x10000)
+    cpu.kernel_structures = ks
+    cpu.regs[ESP] = STACK_TOP - 0x100
+    stubs = Win32Handlers(mem)
+    seh_install(stubs, mem)
+    register_seh_handlers(stubs, mem)
+    stubs.install(cpu)
+    return cpu, mem, ks, stubs
+
+
+def test_single_continue_search_handler_is_unhandled(cpu_env):
+    cpu, mem, ks, stubs = cpu_env
+    handler = CODE_BASE
+    write_bytes(mem, handler, bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]))  # mov eax,1 (ContinueSearch); ret
+    push_seh_frame(mem, ks.get_fs_base(), FRAME_A, handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is False
+    assert not cpu.halted
+    assert not cpu.faulted
+
+
+def test_single_continue_execution_handler_is_handled(cpu_env):
+    cpu, mem, ks, stubs = cpu_env
+    handler = CODE_BASE
+    write_bytes(mem, handler, bytes([0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]))  # mov eax,0 (ContinueExecution); ret
+    push_seh_frame(mem, ks.get_fs_base(), FRAME_A, handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+
+
+def test_chain_walks_past_continue_search_to_continue_execution(cpu_env):
+    cpu, mem, ks, stubs = cpu_env
+    search_handler = CODE_BASE
+    write_bytes(mem, search_handler, bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]))
+    exec_handler = CODE_BASE + 0x10
+    write_bytes(mem, exec_handler, bytes([0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]))
+
+    fs_base = ks.get_fs_base()
+    push_seh_frame(mem, fs_base, FRAME_B, exec_handler, 0xFFFFFFFF)  # outer, installed first
+    push_seh_frame(mem, fs_base, FRAME_A, search_handler, FRAME_B)   # inner, chains to outer
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+
+
+def test_handler_escaping_via_jmp_is_detected_as_handled(cpu_env):
+    """A handler that redirects execution (jmp) instead of returning via
+    ret -- the shape any handler takes when it internally calls RtlUnwind
+    and RtlUnwind takes over. dispatch_exception must recognize this as
+    resolved and must NOT silently clear a real halt the redirected code
+    produces (regression test for the bug where escape detection
+    unconditionally cleared cpu.halted, erasing genuine hlt results)."""
+    cpu, mem, ks, stubs = cpu_env
+    escape_target = CODE_BASE + 0x100
+    escape_handler = CODE_BASE
+    write_bytes(mem, escape_handler, bytes([0xB9]) + escape_target.to_bytes(4, "little") + bytes([0xFF, 0xE1]))
+    write_bytes(mem, escape_target, bytes([0xB8, 0x2A, 0x00, 0x00, 0x00, 0xF4]))  # mov eax,0x2a; hlt
+    push_seh_frame(mem, ks.get_fs_base(), FRAME_A, escape_handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+    # The escape target's own code already ran to completion as part of the
+    # escape itself -- dispatch_exception doesn't artificially stop at the
+    # jump target.
+    assert cpu.regs[EAX] == 0x2A
+    assert cpu.halted
+
+
+def test_rtlunwind_pops_current_frame_without_reinvoking_it(cpu_env):
+    """Regression test for the infinite-recursion bug: RtlUnwind's
+    intervening-handler walk must not re-invoke the frame whose handler is
+    currently calling RtlUnwind (the standard shape) -- doing so recurses
+    into that same handler forever."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+
+    outer_handler = CODE_BASE + 0x10
+    write_bytes(mem, outer_handler, bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]))
+    push_seh_frame(mem, fs_base, FRAME_B, outer_handler, 0xFFFFFFFF)
+
+    rtlunwind_addr = stubs.get_handler_address("kernel32.dll", "RtlUnwind")
+    recovered_label = CODE_BASE + 0x200
+    write_bytes(mem, recovered_label, bytes([0xB8, 0x77, 0x00, 0x00, 0x00, 0xF4]))  # mov eax,0x77; hlt
+
+    inner_handler = CODE_BASE
+    code = b""
+    code += bytes([0x68]) + (0x99).to_bytes(4, "little")           # push 0x99 (ReturnValue)
+    code += bytes([0x6A, 0x00])                                     # push 0 (ExceptionRecord=NULL)
+    code += bytes([0x68]) + recovered_label.to_bytes(4, "little")   # push recovered_label (TargetIp)
+    code += bytes([0x68]) + FRAME_B.to_bytes(4, "little")           # push FRAME_B (TargetFrame)
+    code += bytes([0xB9]) + rtlunwind_addr.to_bytes(4, "little")    # mov ecx, rtlunwind_addr
+    code += bytes([0xFF, 0xD1])                                     # call ecx
+    code += bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3])             # (unreached)
+    write_bytes(mem, inner_handler, code)
+    push_seh_frame(mem, fs_base, FRAME_A, inner_handler, FRAME_B)
+
+    assert mem.read32(fs_base) == FRAME_A
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+    assert mem.read32(fs_base) == FRAME_B  # chain correctly popped past FRAME_A
+    assert (cpu.regs[ESP] & 0xFFFFFFFF) == FRAME_B
+    # recovered_label's own code ran to completion as part of the redirect.
+    assert cpu.regs[EAX] == 0x77
+    assert cpu.halted

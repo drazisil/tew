@@ -253,8 +253,11 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "TerminateProcess", _terminate_process)
     stubs.register_handler("kernel32.dll", "FatalAppExitA",    _fatal_app_exit)
-    stubs.register_handler("kernel32.dll", "RtlUnwind",        _halt("RtlUnwind"))
-    stubs.register_handler("kernel32.dll", "RaiseException",   _halt("RaiseException"))
+    # RtlUnwind/RaiseException: real implementations, not _halt placeholders
+    # -- see tew/kernel/seh.py. register_handler dedupes by key, so this
+    # must run before anything else tries to register the same names.
+    from tew.kernel.seh import register_seh_handlers
+    register_seh_handlers(stubs, memory)
 
     # ── Thread creation and management ────────────────────────────────────────
 

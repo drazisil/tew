@@ -74,6 +74,12 @@ def register_crt_handlers(
         _make_thread_return_handler(state, memory),
     )
 
+    # ── SEH return sentinel ────────────────────────────────────────────────────
+    # Lets tew.kernel.seh's dispatcher know precisely when an invoked
+    # exception handler returns normally -- see that module's docstring.
+    from tew.kernel.seh import install as _install_seh
+    _install_seh(stubs, memory)
+
     # ── Per-DLL handler registration ──────────────────────────────────────────
     # Import here to keep top-level imports free of circular dependencies and
     # to allow individual modules to be loaded/tested in isolation.

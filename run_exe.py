@@ -30,6 +30,7 @@ from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
 from tew.api.nt_handlers import register_nt_handlers
+from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
 from tew.logger import logger
 
 
@@ -348,6 +349,22 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
     cpu.run(batch)
     step_count += batch
+
+    if cpu.faulted:
+        # Give the game's own SEH chain a chance to handle this before
+        # giving up -- see tew/kernel/seh.py. Real Windows would report
+        # this as an access violation; that's the only fault shape this
+        # CPU core currently produces (see core.zig's memRead8/memWrite8),
+        # so it's the honest default rather than a guess.
+        fault_eip = cpu.eip & 0xFFFFFFFF
+        logger.warn("seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
+        handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
+        if handled:
+            logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
+            cpu.faulted = False
+        else:
+            logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
+
     crt_state.scheduler.preempt_slice(cpu, mem)
 
     _heartbeat_countdown -= batch
