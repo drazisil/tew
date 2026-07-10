@@ -93,6 +93,8 @@ def _load_lib() -> ctypes.CDLL:
 
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
+    lib.cpu_get_run_id.argtypes      = [_vp]
+    lib.cpu_get_run_id.restype       = _u64
     lib.cpu_get_last_opcode.argtypes = [_vp]
     lib.cpu_get_last_opcode.restype  = _u8
 
