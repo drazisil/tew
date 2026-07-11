@@ -196,6 +196,12 @@ def register_user32_gdi32_handlers(
     }
 
     def _show_messagebox(caption: str, text: str, u_type: int) -> int:
+        if wm._messagebox_hook is not None:
+            answer = wm._messagebox_hook(caption, text, u_type)
+            if answer is not None:
+                logger.info("dialog", f"[MessageBox] auto-answered ({caption!r}) -> {answer}")
+                return answer
+
         btn_type  = u_type & 0x0F
         icon_key  = u_type & 0x70
         sdl_flags = _MSGBOX_ICON_FLAGS.get(icon_key, SDL_MESSAGEBOX_INFORMATION)
@@ -1017,6 +1023,12 @@ def register_user32_gdi32_handlers(
 
             # Render the current dialog state
             render_dialog(wm, dlg_hwnd)
+
+            # Programmatic dialog interaction hook (tests / scripted
+            # headless runs) -- see WindowManager.set_dialog_step_hook.
+            hook, wm._dialog_step_hook = wm._dialog_step_hook, None
+            if hook is not None:
+                hook(wm, dlg_hwnd)
 
             # Dispatch one pending message (if any)
             msg = wm.peek_message()
