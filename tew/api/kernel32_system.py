@@ -93,7 +93,7 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = 0x00210024
 
     def _get_cmd_w(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x00210030
+        cpu.regs[EAX] = 0x00210070
 
     def _get_startup_a(cpu: "CPU") -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -236,14 +236,14 @@ def register_kernel32_system_handlers(
     # ── Environment strings ───────────────────────────────────────────────────
 
     def _get_env_strings_w(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x00210048
+        cpu.regs[EAX] = 0x002100F0
 
     def _free_env_strings_w(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
     def _get_env_strings(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x0021004C
+        cpu.regs[EAX] = 0x002100F8
 
     def _free_env_strings_a(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1

@@ -38,27 +38,40 @@ def register_crt_handlers(
     state = CRTState(config=config, registry_dir=registry_dir)
 
     # ── Fixed data region writes ──────────────────────────────────────────────
+    # Generously-sized slots (not exact-length packed -- the previous
+    # zero-slack layout couldn't grow the command line without overflowing
+    # into the next field) starting at 0x00210024, matching
+    # tew/api/kernel32_system.py's GetCommandLineA/W and
+    # tew/api/msvcrt_handlers.py's __getmainargs address constants, which
+    # must stay in sync with these.
 
-    # ANSI command line string at 0x00210024
+    # ANSI command line string at 0x00210024 (64 bytes reserved).
+    # -nomovie: MCity_d.exe's own command-line switch to skip the opening
+    # movie -- confirmed in the binary (the string "nomovie" sits right
+    # after "Skip the opening movie" in a switch-description table, also
+    # shown by the in-game "Motor City Command Line Switches" dialog,
+    # resource 104). Passed by default since the MAD movie/audio decoder
+    # is the source of the known EIP=0x00a6bfcb fault documented in
+    # tew/kernel/seh.py, and isn't needed for anything else.
     cmd_line_addr = 0x00210024
-    cmd_line_str  = b"MCity_d.exe\x00"
+    cmd_line_str  = b"MCity_d.exe -nomovie\x00"
     for i, b in enumerate(cmd_line_str):
         memory.write8(cmd_line_addr + i, b)
 
-    # Wide (UTF-16LE) command line string at 0x00210030
-    cmd_line_w_addr = 0x00210030
-    cmd_line_w      = "MCity_d.exe"
+    # Wide (UTF-16LE) command line string at 0x00210070 (128 bytes reserved)
+    cmd_line_w_addr = 0x00210070
+    cmd_line_w      = "MCity_d.exe -nomovie"
     for i, ch in enumerate(cmd_line_w):
         memory.write16(cmd_line_w_addr + i * 2, ord(ch))
     memory.write16(cmd_line_w_addr + len(cmd_line_w) * 2, 0)  # null terminator
 
-    # Wide empty environment string at 0x00210048 (double-null = empty env block)
-    env_str_addr = 0x00210048
+    # Wide empty environment string at 0x002100F0 (double-null = empty env block)
+    env_str_addr = 0x002100F0
     memory.write16(env_str_addr,     0)
     memory.write16(env_str_addr + 2, 0)
 
-    # ANSI empty environment string at 0x0021004C
-    env_str_a_addr = 0x0021004C
+    # ANSI empty environment string at 0x002100F8
+    env_str_a_addr = 0x002100F8
     memory.write8(env_str_a_addr,     0)
     memory.write8(env_str_a_addr + 1, 0)
 
