@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from os.path import dirname
 
 from tew.hardware.memory import Memory
@@ -357,6 +358,13 @@ MAX_STEPS = 500_000_000
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
 # from the normal SleepEx path.  Advancing the clock here lets due callbacks fire.
 _TIMER_HEARTBEAT_INTERVAL = 100_000
+# Upper bound on wall-clock ms creditable to the virtual clock in a single
+# heartbeat. Measured real throughput is ~220k-250k instr/sec, i.e. ~400-450ms
+# per 100k-instruction batch, so this is >10x normal headroom. Anything beyond
+# it (debugger pause, OS suspend/resume, a slow future breakpoint handler) is
+# capped rather than credited in full, so one heartbeat can't inject a huge
+# virtual-time jump that fires a backlog of periodic timers/timeouts at once.
+_TIMER_HEARTBEAT_MAX_MS = 5_000
 
 step_count = 0
 last_valid_step = 0
@@ -377,6 +385,7 @@ def _run_timer_heartbeat() -> None:
     global _heartbeat_count
     global _pending_timers, _invoke_emulated_proc_fn, _get_dialog_sentinel_fn
     global _time_callback_event_set, _event_handle_cls
+    global _last_heartbeat_wall_time
     _heartbeat_count += 1
     if _pending_timers is None:
         from tew.api.win32_handlers import pending_timers as _pt, _TIME_CALLBACK_EVENT_SET as _tces
@@ -387,7 +396,11 @@ def _run_timer_heartbeat() -> None:
         _get_dialog_sentinel_fn = _gds
         _time_callback_event_set = _tces
         _event_handle_cls = _eh
-    crt_state.scheduler.tick(1, mem)
+    now = time.monotonic()
+    elapsed_ms = int((now - _last_heartbeat_wall_time) * 1000)
+    elapsed_ms = max(1, min(elapsed_ms, _TIMER_HEARTBEAT_MAX_MS))
+    _last_heartbeat_wall_time = now
+    crt_state.scheduler.tick(elapsed_ms, mem)
     if not _pending_timers:
         return
     due = [t for t in list(_pending_timers.values()) if t.due_at <= crt_state.virtual_ticks_ms]
@@ -409,6 +422,9 @@ def _run_timer_heartbeat() -> None:
 
 
 _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
+# Captured here (not earlier) so DLL loading / breakpoint setup above isn't
+# credited as elapsed emulation time for the first heartbeat.
+_last_heartbeat_wall_time = time.monotonic()
 _sample_countdown = 1_000_000
 _progress_countdown = 5_000_000
 

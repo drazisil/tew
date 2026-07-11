@@ -571,6 +571,13 @@ class ZigCPU:
     def watchpoint_val(self) -> int:
         return _lib.cpu_watchpoint_val(self._state)
 
+    @property
+    def run_id(self) -> int:
+        """Opaque per-run identifier used to correlate this CPU's execution-
+        history events (see enable_history_capture_* below) with rows in an
+        external sink like ClickHouse."""
+        return _lib.cpu_get_run_id(self._state)
+
     # ── Breakpoints (halt before instruction) ─────────────────────────────────
 
     def add_breakpoint(self, eip: int) -> None:
