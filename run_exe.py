@@ -177,6 +177,35 @@ with open(exe_path, "rb") as _f:
 crt_state.pe_resources = _pe_resources
 crt_state.window_manager.set_pe_resources(_pe_resources)
 
+# ── Unattended boot: auto-answer the two interactive prompts MCity_d.exe's
+# ── startup flow shows before real gameplay begins, so a run doesn't sit
+# ── blocked on real mouse/keyboard input. (A third window appears in this
+# ── same stretch of boot -- dialog resource 106, an untitled splash bitmap
+# ── with no buttons -- but it dismisses itself and needs no hook.)
+
+_LOGIN_CONTINUE_ID = 0x0001
+_IDNO = 7
+
+def _auto_click_login_continue(wm, dlg_hwnd):
+    """Dialog 114 ("Motor City Online Login"): username/password are
+    already sourced from registry.json by the game itself, so only the
+    Continue click is needed."""
+    entry = wm.get_window(dlg_hwnd)
+    if entry is None or entry.title != "Motor City Online Login":
+        wm.set_dialog_step_hook(_auto_click_login_continue)
+        return
+    wm.click_control(dlg_hwnd, _LOGIN_CONTINUE_ID)
+
+def _auto_decline_fullscreen_prompt(caption, text, u_type):
+    """MB_YESNO "Do you want to run Motor City Online full screen?"
+    (FUN_006b13b0) -- default to windowed."""
+    if "full screen" in text:
+        return _IDNO
+    return None
+
+crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
+crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
+
 win32_handlers.install(cpu)
 register_nt_handlers(win32_handlers.nt_dispatcher)
 
