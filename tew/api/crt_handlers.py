@@ -53,6 +53,16 @@ def register_crt_handlers(
     # resource 104). Passed by default since the MAD movie/audio decoder
     # is the source of the known EIP=0x00a6bfcb fault documented in
     # tew/kernel/seh.py, and isn't needed for anything else.
+    #
+    # VERIFIED 2026-07-11 (merged temporarily with the dialog-click branch's
+    # unattended-boot hooks for this live check, not otherwise related):
+    # with -nomovie, that fault no longer occurs at all. The run gets much
+    # further -- 192.7M steps, through DirectSound audio setup and real
+    # thread/d3d8 activity in the main GetMessageA loop -- before halting
+    # at a different, later, unrelated point: `abortmessage: mono.c:260`,
+    # right after a failed `CreateFile("trace000.txt")` (looks like a
+    # missing trace-log directory in this sandbox, not a MAD/movie issue,
+    # and not investigated further here -- out of scope for this change).
     cmd_line_addr = 0x00210024
     cmd_line_str  = b"MCity_d.exe -nomovie\x00"
     for i, b in enumerate(cmd_line_str):
