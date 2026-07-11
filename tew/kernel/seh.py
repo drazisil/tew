@@ -36,6 +36,22 @@ Known, documented simplifications (see individual functions):
     detected (see above), "retry" in practice resumes at the *next*
     instruction, not a true retry. This case is rare in real handlers
     (almost everything uses ContinueSearch + unwind instead).
+
+VERIFIED 2026-07-10 against the real MCity_d.exe (needs the mco-server
+auth server running first): two real faults occurred during a run that
+reached actual gameplay rendering (~196M steps). EIP=0xccccccce (MSVC's
+debug-build uninitialized-stack poison pattern -- a genuine jump through a
+garbage function pointer) was caught and handled by the game's own SEH
+chain; execution correctly continued afterward into the game's own real
+_CrtDbgReport/CRT-assertion code path (patch_internals.py, pre-existing,
+not part of this module) -- confirming the full dispatch pipeline against
+real compiled code, not just the synthetic test suite. A second fault at
+EIP=0x00a6bfcb (inside the MAD audio decoder) matched a handler at
+0x00c76920 that ran past _STEP_LIMIT without returning or escaping --
+logged honestly as unhandled rather than pretending success. Not yet
+investigated whether that handler is doing legitimate heavy work (e.g.
+audio resync/error-recovery) or is genuinely stuck -- worth checking in
+Ghidra before assuming either way.
 """
 
 from __future__ import annotations
@@ -82,6 +98,13 @@ SEH_RETURN_SENTINEL = 0x001FE010
 
 _STEP_BATCH = 10_000
 _STEP_LIMIT = 2_000_000  # safety net against a genuinely broken/looping handler
+# Observed live 2026-07-10: a real handler at 0x00c76920 (matched for a
+# fault at 0x00a6bfcb, inside the MAD audio decoder) hit this limit against
+# the real MCity_d.exe. Not yet determined whether it's legitimate heavy
+# work (audio resync/error-recovery is plausible) or genuinely stuck --
+# see seh.py's module docstring "VERIFIED" section. If raising this value
+# is ever considered, check that address in Ghidra first rather than
+# guessing a bigger number.
 
 
 class SehHandlerTimeout(Exception):
