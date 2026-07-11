@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Callable
 
 if TYPE_CHECKING:
     from tew.api.pe_resources import PEResources
@@ -191,6 +191,10 @@ class WindowManager:
         self._message_queue: deque[tuple[int, int, int, int]] = deque()
         # Currently focused edit control hwnd (receives keyboard input)
         self._focused_hwnd: int = 0
+        # One-shot programmatic dialog interaction hook -- see
+        # set_dialog_step_hook/click_control. Cleared before invocation, so
+        # it fires at most once per registration.
+        self._dialog_step_hook: Optional[Callable[["WindowManager", int], None]] = None
         # SDL window ID → top-level hwnd
         self._sdl_window_id_to_hwnd: dict[int, int] = {}
         # PE resources for loading bitmap textures (set by run_exe.py after load)
@@ -758,17 +762,53 @@ class WindowManager:
                     f"[WindowManager]   HIT ctrl 0x{ctrl_id:04x} '{child.class_name}' '{child.title}'"
                 )
                 if class_lower == "button":
-                    # Toggle checkbox; for push buttons post WM_COMMAND
-                    if child.style & 0x0F in (0x02, 0x03):  # BS_CHECKBOX, BS_AUTOCHECKBOX
-                        child.check_state ^= 1
-                    else:
-                        self._message_queue.append((dlg_hwnd, WM_COMMAND, ctrl_id, child_hwnd))
+                    self._activate_button(dlg_hwnd, ctrl_id, child_hwnd, child)
                 elif class_lower == "edit":
                     self._focused_hwnd = child_hwnd
                     logger.debug("dialog", f"[WindowManager] Focus -> edit hwnd=0x{child_hwnd:x}")
                 return
 
         logger.debug("dialog", f"[WindowManager]   no hit for click ({px},{py})")
+
+    def _activate_button(self, dlg_hwnd: int, ctrl_id: int, child_hwnd: int, child: "WindowEntry") -> None:
+        """Shared BUTTON-activation logic for both a real pixel-hit-tested
+        click (_handle_mouse_click) and a synthetic ID-based one
+        (click_control): toggle checkbox styles in place, otherwise post
+        WM_COMMAND same as a real click would."""
+        if child.style & 0x0F in (0x02, 0x03):  # BS_CHECKBOX, BS_AUTOCHECKBOX
+            child.check_state ^= 1
+        else:
+            self._message_queue.append((dlg_hwnd, WM_COMMAND, ctrl_id, child_hwnd))
+
+    # ── Programmatic control injection ──────────────────────────────────────
+    # Synthetic (non-SDL) equivalent of _handle_mouse_click, for scripted/
+    # automated dialog interaction (tests, headless runs) -- see
+    # set_dialog_step_hook for how this gets invoked at the right moment.
+
+    def click_control(self, dlg_hwnd: int, ctrl_id: int) -> bool:
+        """Simulate a left-click on control ctrl_id of dialog dlg_hwnd, by
+        ID rather than pixel coordinates. Returns False if dlg_hwnd/ctrl_id
+        is unknown or the control isn't a BUTTON."""
+        dlg_entry = self._windows.get(dlg_hwnd)
+        if dlg_entry is None:
+            return False
+        child_hwnd = self.get_dlg_item(dlg_hwnd, ctrl_id)
+        if not child_hwnd:
+            return False
+        child = self._windows.get(child_hwnd)
+        if child is None or child.class_name.lower() != "button":
+            return False
+        self._activate_button(dlg_hwnd, ctrl_id, child_hwnd, child)
+        return True
+
+    def set_dialog_step_hook(self, hook: Callable[["WindowManager", int], None]) -> None:
+        """Registers a one-shot callback hook(wm, dlg_hwnd), invoked on the
+        next DialogBoxParamA modal-loop iteration for whichever dialog is
+        active. Cleared immediately before invocation, so it fires once by
+        default -- call set_dialog_step_hook again from inside the callback
+        (e.g. if dlg_hwnd isn't the one you're waiting for) to keep waiting
+        or to chain a further step."""
+        self._dialog_step_hook = hook
 
     def _cycle_focus(self, current_hwnd: int) -> None:
         """Move keyboard focus to the next EDIT control in the parent dialog."""

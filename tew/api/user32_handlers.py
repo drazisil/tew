@@ -1018,6 +1018,12 @@ def register_user32_gdi32_handlers(
             # Render the current dialog state
             render_dialog(wm, dlg_hwnd)
 
+            # Programmatic dialog interaction hook (tests / scripted
+            # headless runs) -- see WindowManager.set_dialog_step_hook.
+            hook, wm._dialog_step_hook = wm._dialog_step_hook, None
+            if hook is not None:
+                hook(wm, dlg_hwnd)
+
             # Dispatch one pending message (if any)
             msg = wm.peek_message()
             if msg is None:
