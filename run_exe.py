@@ -309,6 +309,45 @@ def is_valid_eip(eip: int) -> str | None:
     return None
 
 
+# ── Debugger: breakpoints and logpoints ──────────────────────────────────────
+#
+# Breakpoints halt execution before the target instruction and call a Python
+# handler(cpu, mem).  Resume is automatic.
+#
+# Logpoints fire a C callback inline from the Zig hot loop (no halt, near-zero
+# overhead).  The callback signature is:
+#   fn(eip: u32, regs: ptr[u32 x8], memory: ptr[u8], memory_size: usize)
+# Use mem.read32() / cpu.regs[] from the *Python* handler for readable access;
+# use the raw pointers only when you need speed.
+
+_bp_handlers: dict = {}   # eip -> callable(cpu, mem)
+
+def register_breakpoint(eip: int, handler) -> None:
+    _bp_handlers[eip] = handler
+    cpu.add_breakpoint(eip)
+
+def unregister_breakpoint(eip: int) -> None:
+    _bp_handlers.pop(eip, None)
+    cpu.remove_breakpoint(eip)
+
+def _dispatch_breakpoint() -> None:
+    if not cpu.breakpoint_hit:
+        return
+    hit_eip = cpu.breakpoint_hit_eip
+    cpu.clear_breakpoint_hit()            # unhalt + clear flag
+    h = _bp_handlers.get(hit_eip)
+    keep = True
+    if h:
+        result = h(cpu, mem)
+        if result is False:               # handler returns False → one-shot, remove
+            keep = False
+    # Execute the halted instruction once without re-triggering the breakpoint.
+    cpu.remove_breakpoint(hit_eip)
+    cpu.run(1)
+    if keep and hit_eip in _bp_handlers:
+        cpu.add_breakpoint(hit_eip)
+
+
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 logger.info("startup", "=== Starting Emulation ===")
@@ -394,6 +433,8 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
         else:
             logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
 
+    if _bp_handlers:
+        _dispatch_breakpoint()
     crt_state.scheduler.preempt_slice(cpu, mem)
 
     _heartbeat_countdown -= batch

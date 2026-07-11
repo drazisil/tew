@@ -349,6 +349,8 @@ def register_kernel32_io_handlers(
     def _sleep_ex(cpu: "CPU") -> None:
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        tid = state.tls_current_thread_id()
+        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) tid={tid} ret=0x{return_eip:x}")
         cpu.regs[ESP] = (cpu.regs[ESP] + 12) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
         state.scheduler.tick(dw_ms, memory)
         _fire_due_timers(cpu, memory, state)
@@ -433,6 +435,8 @@ def register_kernel32_io_handlers(
                         obj.owner_tid = tid
                         obj.recursion_count = 1
                         obj.locked = True
+                    logger.debug("scheduler",
+                        f"WaitForMultipleEx: tid={tid} satisfied h=0x{h:x} idx={i}")
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
@@ -556,7 +560,8 @@ def register_kernel32_io_handlers(
         obj = state.kernel_handle_map.get(h)
         if isinstance(obj, EventHandle):
             obj.signaled = True
-            state.scheduler.unblock_handle(h)
+            n = state.scheduler.unblock_handle(h)
+            logger.debug("scheduler", f"SetEvent(0x{h:x}) signaled={obj.signaled} unblocked={n}")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -640,11 +645,11 @@ def register_kernel32_io_handlers(
             if lp_read:
                 memory.write32(lp_read, to_read)
             cpu.regs[EAX] = 1
-            if "ealogo.mad" in entry.path.lower():
-                logger.debug("fileio",
-                    f'ReadFile(ealogo.mad h=0x{h_file:x}) '
-                    f'offset={pos_before} req={n_to_read} got={to_read} '
-                    f'pos_after={entry.position} eof={len(entry.data)}')
+            name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            logger.debug("fileio",
+                f'ReadFile({name_short} h=0x{h_file:x}) '
+                f'offset={pos_before} req={n_to_read} got={to_read} '
+                f'pos_after={entry.position} eof={len(entry.data)}')
         cleanup_stdcall(cpu, memory, 20)
 
     def _delete_file_a(cpu: "CPU") -> None:
