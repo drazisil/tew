@@ -93,6 +93,8 @@ def _load_lib() -> ctypes.CDLL:
 
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
+    lib.cpu_get_run_id.argtypes      = [_vp]
+    lib.cpu_get_run_id.restype       = _u64
     lib.cpu_get_last_opcode.argtypes = [_vp]
     lib.cpu_get_last_opcode.restype  = _u8
 
@@ -137,6 +139,18 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_watchpoint_eip.restype   = _u32
     lib.cpu_watchpoint_val.argtypes  = [_vp]
     lib.cpu_watchpoint_val.restype   = _u32
+
+    # Execution-history capture (ported from pe-walker's history/capture.zig
+    # -- see cpu.zig's "Execution-history capture" section). Returns/takes
+    # an opaque *Capture handle, distinct from the *CpuState handle above.
+    lib.cpu_history_enable_discard.argtypes    = [_vp]
+    lib.cpu_history_enable_discard.restype     = _vp
+    lib.cpu_history_enable_clickhouse.argtypes = [_vp, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    lib.cpu_history_enable_clickhouse.restype  = _vp
+    lib.cpu_history_flush.argtypes             = [_vp]
+    lib.cpu_history_flush.restype              = None
+    lib.cpu_history_disable.argtypes           = [_vp, _vp]
+    lib.cpu_history_disable.restype            = None
 
     return lib
 
@@ -266,6 +280,55 @@ class ZigCPU:
 
         # Compatibility shim — callers that do cpu.segments["FS"] = ...
         self.segments: dict[str, int] = {"ES": 0, "DS": 0, "CS": 0, "SS": 0, "FS": 0, "GS": 0}
+
+        # Execution-history capture: opt-in, not wired unless a caller
+        # explicitly enables it (see enable_history_capture_*/disable_
+        # history_capture below). None of the buffering/hooking/HTTP flush
+        # crosses back into Python once enabled — it's all native code
+        # inside libcpu.so; only these few control calls do.
+        self._history_cap: int = 0
+
+    # ── Execution-history capture ─────────────────────────────────────────────
+
+    def enable_history_capture_discard(self) -> None:
+        """Wires a discard-sink Capture: exercises the real hook/buffer path
+        with zero network I/O. Useful for smoke-testing the wiring itself."""
+        if self._history_cap:
+            raise RuntimeError("history capture already enabled")
+        cap = _lib.cpu_history_enable_discard(self._state)
+        if not cap:
+            raise RuntimeError("cpu_history_enable_discard returned NULL")
+        self._history_cap = cap
+
+    def enable_history_capture_clickhouse(
+        self, base_url: str, user: str = "default", password: str = ""
+    ) -> None:
+        """Wires a Capture that flushes real events to ClickHouse's HTTP
+        interface at base_url (e.g. "http://localhost:8123")."""
+        if self._history_cap:
+            raise RuntimeError("history capture already enabled")
+        cap = _lib.cpu_history_enable_clickhouse(
+            self._state,
+            base_url.encode("utf-8"),
+            user.encode("utf-8"),
+            password.encode("utf-8"),
+        )
+        if not cap:
+            raise RuntimeError("cpu_history_enable_clickhouse returned NULL")
+        self._history_cap = cap
+
+    def flush_history_capture(self) -> None:
+        """Forces a flush now, without waiting for the internal threshold —
+        e.g. at the end of a run, so the tail of a capture isn't lost."""
+        if self._history_cap:
+            _lib.cpu_history_flush(self._history_cap)
+
+    def disable_history_capture(self) -> None:
+        """Unwires the hooks, flushes any remaining buffered events, and
+        frees the Capture. Safe to call even if never enabled."""
+        if self._history_cap:
+            _lib.cpu_history_disable(self._state, self._history_cap)
+            self._history_cap = 0
 
     # ── Kernel structures / FS-GS sync ────────────────────────────────────────
 
@@ -550,6 +613,9 @@ class ZigCPU:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def __del__(self) -> None:
+        # Flush before destroying the CpuState the Capture's hooks point at
+        # -- disable_history_capture is a no-op if never enabled.
+        self.disable_history_capture()
         if self._state:
             _lib.cpu_destroy(self._state)
             self._state = 0
