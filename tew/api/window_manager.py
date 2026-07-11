@@ -195,6 +195,12 @@ class WindowManager:
         # set_dialog_step_hook/click_control. Cleared before invocation, so
         # it fires at most once per registration.
         self._dialog_step_hook: Optional[Callable[["WindowManager", int], None]] = None
+        # Persistent MessageBoxA/W auto-answer hook -- see set_messagebox_hook.
+        # Unlike _dialog_step_hook, NOT one-shot: each MessageBoxA call is
+        # already a single synchronous event (no polling loop to consume a
+        # hook from), so the hook is consulted on every call and decides
+        # per-call whether to answer or let the real message box show.
+        self._messagebox_hook: Optional[Callable[[str, str, int], Optional[int]]] = None
         # SDL window ID → top-level hwnd
         self._sdl_window_id_to_hwnd: dict[int, int] = {}
         # PE resources for loading bitmap textures (set by run_exe.py after load)
@@ -809,6 +815,15 @@ class WindowManager:
         (e.g. if dlg_hwnd isn't the one you're waiting for) to keep waiting
         or to chain a further step."""
         self._dialog_step_hook = hook
+
+    def set_messagebox_hook(self, hook: Optional[Callable[[str, str, int], Optional[int]]]) -> None:
+        """Registers a persistent hook(caption, text, uType) consulted before
+        every MessageBoxA/W call (see user32_handlers.py's _show_messagebox).
+        Returning a Win32 button ID (e.g. 7 = IDNO) auto-answers with it,
+        bypassing the real blocking SDL_ShowMessageBox entirely; returning
+        None lets the real message box show and wait for genuine input.
+        Pass None to clear the hook."""
+        self._messagebox_hook = hook
 
     def _cycle_focus(self, current_hwnd: int) -> None:
         """Move keyboard focus to the next EDIT control in the parent dialog."""
