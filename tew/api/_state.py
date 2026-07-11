@@ -429,8 +429,25 @@ class CRTState:
         self.next_file_handle += 1
         if writable:
             real_path = self.translate_windows_path(win_name)
+            # A bare relative filename (e.g. the game writing "trace000.txt"
+            # with no path prefix at all) has no directory component --
+            # os.path.dirname() returns "", and os.makedirs("",
+            # exist_ok=True) raises FileNotFoundError rather than being a
+            # no-op (real CreateFile needs no directory creation for this
+            # case either: the process's current directory already exists).
+            #
+            # VERIFIED 2026-07-12 (merged temporarily with the dialog-click/
+            # nomovie branches' work for this live check, not otherwise
+            # related): with this fix, the previously-reliable "abortmessage:
+            # mono.c:260" halt no longer occurs at all -- the run progresses
+            # ~5M steps further (197.1M total, past real d3d8 rendering) to
+            # a clean, honest, unrelated stop: "[UNIMPLEMENTED]
+            # user32.dll!IsIconic -- halting". Not a crash, not investigated
+            # further here.
             try:
-                os.makedirs(os.path.dirname(real_path), exist_ok=True)
+                dirname = os.path.dirname(real_path)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
                 fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
