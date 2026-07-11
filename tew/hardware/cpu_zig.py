@@ -138,6 +138,30 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_watchpoint_val.argtypes  = [_vp]
     lib.cpu_watchpoint_val.restype   = _u32
 
+    lib.cpu_add_breakpoint.argtypes      = [_vp, _u32]
+    lib.cpu_add_breakpoint.restype       = None
+    lib.cpu_remove_breakpoint.argtypes   = [_vp, _u32]
+    lib.cpu_remove_breakpoint.restype    = None
+    lib.cpu_clear_breakpoints.argtypes   = [_vp]
+    lib.cpu_clear_breakpoints.restype    = None
+    lib.cpu_breakpoint_hit.argtypes      = [_vp]
+    lib.cpu_breakpoint_hit.restype       = _b
+    lib.cpu_breakpoint_hit_eip.argtypes  = [_vp]
+    lib.cpu_breakpoint_hit_eip.restype   = _u32
+    lib.cpu_clear_breakpoint_hit.argtypes= [_vp]
+    lib.cpu_clear_breakpoint_hit.restype = None
+
+    # LogpointFn: fn(eip: u32, regs: *u32, memory: *u8, memory_size: usize) callconv(.C) void
+    LogpointCType = ctypes.CFUNCTYPE(None, _u32, ctypes.POINTER(_u32), ctypes.POINTER(_u8), ctypes.c_size_t)
+    lib._LogpointCType = LogpointCType   # keep reference so callers can use it
+
+    lib.cpu_add_logpoint.argtypes    = [_vp, _u32, LogpointCType]
+    lib.cpu_add_logpoint.restype     = None
+    lib.cpu_remove_logpoint.argtypes = [_vp, _u32]
+    lib.cpu_remove_logpoint.restype  = None
+    lib.cpu_clear_logpoints.argtypes = [_vp]
+    lib.cpu_clear_logpoints.restype  = None
+
     return lib
 
 _lib = _load_lib()
@@ -483,6 +507,52 @@ class ZigCPU:
     @property
     def watchpoint_val(self) -> int:
         return _lib.cpu_watchpoint_val(self._state)
+
+    # ── Breakpoints (halt before instruction) ─────────────────────────────────
+
+    def add_breakpoint(self, eip: int) -> None:
+        _lib.cpu_add_breakpoint(self._state, eip & 0xFFFFFFFF)
+
+    def remove_breakpoint(self, eip: int) -> None:
+        _lib.cpu_remove_breakpoint(self._state, eip & 0xFFFFFFFF)
+
+    def clear_breakpoints(self) -> None:
+        _lib.cpu_clear_breakpoints(self._state)
+
+    @property
+    def breakpoint_hit(self) -> bool:
+        return bool(_lib.cpu_breakpoint_hit(self._state))
+
+    @property
+    def breakpoint_hit_eip(self) -> int:
+        return _lib.cpu_breakpoint_hit_eip(self._state)
+
+    def clear_breakpoint_hit(self) -> None:
+        _lib.cpu_clear_breakpoint_hit(self._state)
+
+    # ── Logpoints (inline C callback, no halt) ────────────────────────────────
+
+    def add_logpoint(self, eip: int, cb: Callable) -> None:
+        """Register a logpoint.  cb(eip, regs_array, memory_array, memory_size).
+
+        The callback is a plain Python callable — we wrap it in a ctypes
+        CFUNCTYPE automatically and keep it alive on this CPU object.
+        """
+        c_cb = _lib._LogpointCType(cb)
+        if not hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs: dict = {}
+        self._logpoint_refs[eip & 0xFFFFFFFF] = c_cb   # keep alive
+        _lib.cpu_add_logpoint(self._state, eip & 0xFFFFFFFF, c_cb)
+
+    def remove_logpoint(self, eip: int) -> None:
+        _lib.cpu_remove_logpoint(self._state, eip & 0xFFFFFFFF)
+        if hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs.pop(eip & 0xFFFFFFFF, None)
+
+    def clear_logpoints(self) -> None:
+        _lib.cpu_clear_logpoints(self._state)
+        if hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs.clear()
 
     def trigger_interrupt(self, int_num: int) -> None:
         if self._int_handler:
