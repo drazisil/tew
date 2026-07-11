@@ -430,7 +430,16 @@ class CRTState:
         if writable:
             real_path = self.translate_windows_path(win_name)
             try:
-                os.makedirs(os.path.dirname(real_path), exist_ok=True)
+                # A bare relative filename (e.g. the game writing
+                # "trace000.txt" with no path prefix at all) has no
+                # directory component -- os.path.dirname() returns "", and
+                # os.makedirs("", exist_ok=True) raises FileNotFoundError
+                # rather than being a no-op (real CreateFile needs no
+                # directory creation for this case either: the process's
+                # current directory already exists).
+                dirname = os.path.dirname(real_path)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
                 fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
