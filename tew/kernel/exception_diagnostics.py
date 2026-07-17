@@ -12,6 +12,56 @@ if TYPE_CHECKING:
     from tew.loader.import_resolver import ImportResolver
 
 
+def _annotate_address(value: int, import_resolver: "ImportResolver | None") -> str:
+    if import_resolver:
+        dll = import_resolver.find_dll_for_address(value)
+        if dll:
+            return f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
+    if 0x00400000 <= value < 0x02200000:   # full PE image range
+        return "  ← exe"
+    if 0x00200000 <= value < 0x00220000:
+        return "  ← stub"
+    if 0x7FFF0000 <= value:
+        return "  ← main stack"
+    if 0x08000000 <= value < 0x09000000:
+        return "  ← thread stack"
+    if 0x04000000 <= value < 0x08000000:
+        return "  ← heap"
+    if 0x40000000 <= value:
+        return "  ← VirtualAlloc"
+    return ""
+
+
+def _walk_ebp_chain(
+    cpu: "CPU",
+    import_resolver: "ImportResolver | None",
+    ebp_val: int,
+    max_frames: int = 32,
+) -> None:
+    """Reconstructs the call stack from saved frame pointers (fs:[EBP]/[EBP+4] chain)."""
+    logger.error("exception", "EBP chain (call frames):")
+    frame_ebp = ebp_val
+    frame_depth = 0
+    seen = set()
+    while frame_depth < max_frames and frame_ebp and cpu.memory.is_valid_address(frame_ebp):
+        if frame_ebp in seen:
+            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (cycle — stopping)")
+            break
+        seen.add(frame_ebp)
+        try:
+            saved_ebp = cpu.memory.read32(frame_ebp) & 0xFFFFFFFF
+            ret_addr = cpu.memory.read32(frame_ebp + 4) & 0xFFFFFFFF
+        except Exception:
+            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (read error)")
+            break
+        logger.error(
+            "exception",
+            f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x}  ret=0x{ret_addr:08x}{_annotate_address(ret_addr, import_resolver)}",
+        )
+        frame_ebp = saved_ebp
+        frame_depth += 1
+
+
 def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
     """
     Called after the run loop detects cpu.faulted == True.
@@ -86,25 +136,6 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
     stack_status = "valid" if cpu.memory.is_valid_address(esp_val) else "INVALID"
     logger.error("exception", f"Stack: ESP=0x{esp_val:08x} EBP=0x{ebp_val:08x} ({stack_status})")
 
-    def _annotate(value: int) -> str:
-        if import_resolver:
-            dll = import_resolver.find_dll_for_address(value)
-            if dll:
-                return f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
-        if 0x00400000 <= value < 0x02200000:   # full PE image range
-            return "  ← exe"
-        if 0x00200000 <= value < 0x00220000:
-            return "  ← stub"
-        if 0x7FFF0000 <= value:
-            return "  ← main stack"
-        if 0x08000000 <= value < 0x09000000:
-            return "  ← thread stack"
-        if 0x04000000 <= value < 0x08000000:
-            return "  ← heap"
-        if 0x40000000 <= value:
-            return "  ← VirtualAlloc"
-        return ""
-
     logger.error("exception", "Stack dump (64 slots):")
     for i in range(64):
         slot_addr = esp_val + i * 4
@@ -113,28 +144,9 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
         except Exception:
             logger.error("exception", f"  [ESP+{i*4:03x}] (read error)")
             break
-        logger.error("exception", f"  [ESP+{i*4:03x}] 0x{value:08x}{_annotate(value)}")
+        logger.error("exception", f"  [ESP+{i*4:03x}] 0x{value:08x}{_annotate_address(value, import_resolver)}")
 
-    # EBP chain walk — reconstructs the call stack from saved frame pointers
-    logger.error("exception", "EBP chain (call frames):")
-    frame_ebp = ebp_val
-    frame_depth = 0
-    seen = set()
-    while frame_depth < 32 and frame_ebp and cpu.memory.is_valid_address(frame_ebp):
-        if frame_ebp in seen:
-            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (cycle — stopping)")
-            break
-        seen.add(frame_ebp)
-        try:
-            saved_ebp = cpu.memory.read32(frame_ebp) & 0xFFFFFFFF
-            ret_addr  = cpu.memory.read32(frame_ebp + 4) & 0xFFFFFFFF
-        except Exception:
-            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (read error)")
-            break
-        logger.error("exception",
-            f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x}  ret=0x{ret_addr:08x}{_annotate(ret_addr)}")
-        frame_ebp = saved_ebp
-        frame_depth += 1
+    _walk_ebp_chain(cpu, import_resolver, ebp_val)
 
     logger.error("exception", "Execution stopped.")
 
@@ -174,18 +186,6 @@ def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
         except Exception:
             logger.error("exception", f"  [ESP+{i*4:02x}] (read error)")
             break
-        annotation = ""
-        if import_resolver:
-            dll = import_resolver.find_dll_for_address(value)
-            if dll:
-                annotation = f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
-        if not annotation:
-            if 0x00400000 <= value < 0x00700000:
-                annotation = "  ← exe"
-            elif 0x00200000 <= value < 0x00220000:
-                annotation = "  ← stub"
-            elif 0x7FFF0000 <= value:
-                annotation = "  ← main stack"
-            elif 0x08000000 <= value < 0x09000000:
-                annotation = "  ← thread stack"
-        logger.error("exception", f"  [ESP+{i*4:02x}] 0x{value:08x}{annotation}")
+        logger.error("exception", f"  [ESP+{i*4:02x}] 0x{value:08x}{_annotate_address(value, import_resolver)}")
+
+    _walk_ebp_chain(cpu, import_resolver, ebp)

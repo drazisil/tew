@@ -47,6 +47,23 @@ _DX8Z_PREFERRED_BASE   = 0x60000000
 _DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
 
 
+def _query_real_desktop_mode() -> tuple[int, int, int]:
+    """Report a plausible XP-era desktop resolution/refresh rate.
+
+    The emulated identity is a period-correct WinXP + GeForce4 Ti 4200 rig
+    (see _caps.py), so this reports a fixed, mundane 4:3 mode rather than
+    the real host's actual (likely modern, possibly ultrawide) desktop —
+    live-verified that the game's own mode-validation code rejects unusual
+    resolutions/aspect ratios with a "switch your desktop video mode to
+    800x600 ... and restart game" dialog. 1024x768 was a completely
+    ordinary XP-era desktop size and keeps this in sync with gdi32.dll's
+    GetDeviceCaps HORZRES/VERTRES fallback (user32_handlers.py), which the
+    game separately queries at startup — both must agree with each other
+    to look like one consistent, real monitor.
+    """
+    return 1024, 768, 60
+
+
 def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
     """Return the 16 trampoline addresses for the IDirect3D8 vtable."""
 
@@ -62,9 +79,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     def _enum_adapter_modes(cpu: "CPU", mem: "Memory") -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         if p_mode:
-            mem.write32(p_mode,      800)   # Width
-            mem.write32(p_mode + 4,  600)   # Height
-            mem.write32(p_mode + 8,  60)    # RefreshRate
+            width, height, refresh = _query_real_desktop_mode()
+            mem.write32(p_mode,      width)
+            mem.write32(p_mode + 4,  height)
+            mem.write32(p_mode + 8,  refresh)
             mem.write32(p_mode + 12, 0x16)  # Format = D3DFMT_X8R8G8B8
         cpu.regs[EAX] = S_OK
 
@@ -72,9 +90,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     def _get_adapter_display_mode(cpu: "CPU", mem: "Memory") -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_mode:
-            mem.write32(p_mode,      800)
-            mem.write32(p_mode + 4,  600)
-            mem.write32(p_mode + 8,  60)
+            width, height, refresh = _query_real_desktop_mode()
+            mem.write32(p_mode,      width)
+            mem.write32(p_mode + 4,  height)
+            mem.write32(p_mode + 8,  refresh)
             mem.write32(p_mode + 12, 0x16)
         cpu.regs[EAX] = S_OK
 

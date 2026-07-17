@@ -1830,15 +1830,15 @@ def register_user32_gdi32_handlers(
     }
 
     def _GetDeviceCaps(cpu: "CPU") -> None:
-        from sdl2 import SDL_GetDesktopDisplayMode, SDL_DisplayMode
-        import ctypes
         hdc     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_index = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        mode = SDL_DisplayMode()
-        if SDL_GetDesktopDisplayMode(0, ctypes.byref(mode)) == 0:
-            screen_w, screen_h = mode.w, mode.h
-        else:
-            screen_w, screen_h = 1024, 768
+        # Fixed, ordinary XP-era 4:3 resolution rather than the real host's
+        # (possibly modern/ultrawide) desktop — matches IDirect3D8's
+        # EnumAdapterModes/GetAdapterDisplayMode (idirect3d8.py), which the
+        # game separately queries and cross-checks against this. Live-
+        # verified: an unusual real resolution/aspect ratio here trips the
+        # game's own mode-validation code into an early abort dialog.
+        screen_w, screen_h = 1024, 768
         if n_index == 8:
             val = screen_w
         elif n_index == 10:
