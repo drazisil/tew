@@ -2,6 +2,12 @@
 
 <!-- AUTO-COMPACTOR NOTE: When compressing conversation history, discard large code blocks, hex dumps, binary data listings, and raw file contents. Summarize what was found/done instead. Preserve: current blocker, last user directive, any explicit stop-point instructions. -->
 
+**Licensing note**: this repo (the Python emulator) is GPL-3.0. The `cpu/`
+subdirectory (the standalone Zig x86 CPU core) is separately licensed
+LGPL-3.0-or-later as of 2026-07 -- see `cpu/LICENSE`. This was done
+specifically so `cpu/` can be reused in other projects (e.g. pe-walker,
+which vendors it) without GPL-encumbering them.
+
 ## Project Goal
 
 This emulator's goal is to see how far we can get rebuilding a correct Windows XP

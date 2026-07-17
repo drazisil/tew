@@ -82,6 +82,22 @@ class TestMovRm32Imm32:
         cpu.step()
         assert cpu.memory.read32(0x3000) == 0xDEAD
 
+    def test_reg_indirect_disp8(self, cpu):
+        # C7 42 FC AD DE AD DE  =  MOV DWORD PTR [EDX-4], 0xDEADDEAD
+        # This is the exact encoding seen in SNDMEMI_alloc (0xa5453a).
+        cpu.regs[EDX] = 0x4000           # [EDX-4] = 0x3FFC
+        load(cpu, 0, [0xC7, 0x42, 0xFC, 0xAD, 0xDE, 0xAD, 0xDE])
+        cpu.step()
+        assert cpu.memory.read32(0x3FFC) == 0xDEADDEAD
+        assert cpu.eip == 7
+
+    def test_reg_indirect_disp8_zero_offset(self, cpu):
+        # C7 40 00 78 56 34 12  =  MOV DWORD PTR [EAX+0], 0x12345678
+        cpu.regs[EAX] = 0x5000
+        load(cpu, 0, [0xC7, 0x40, 0x00, 0x78, 0x56, 0x34, 0x12])
+        cpu.step()
+        assert cpu.memory.read32(0x5000) == 0x12345678
+
 
 class TestMovALMem:
     def test_mov_al_from_mem(self, cpu):

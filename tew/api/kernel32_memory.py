@@ -208,8 +208,16 @@ def register_kernel32_memory_handlers(
         page_size = ((dw_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)) & 0xFFFFFFFF
         if (fl_type & _MEM_COMMIT) and not (fl_type & _MEM_RESERVE):
             if lp_addr == 0:
-                logger.error("handlers", "[VirtualAlloc] MEM_COMMIT with NULL address — halting")
-                cpu.halted = True
+                # NULL + MEM_COMMIT: spec says system implicitly reserves+commits
+                addr = state.next_virtual_alloc
+                state.next_virtual_alloc = (
+                    (state.next_virtual_alloc + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
+                ) & 0xFFFFFFFF
+                state.virtual_reserved[addr] = page_size
+                state.virtual_committed[addr] = page_size
+                logger.debug("handlers", f"[VirtualAlloc] MEM_COMMIT(NULL) -> 0x{addr:08x} size=0x{page_size:x}")
+                cpu.regs[EAX] = addr
+                cleanup_stdcall(cpu, memory, 16)
                 return
             in_reserved = any(
                 base <= lp_addr < base + sz

@@ -196,6 +196,12 @@ def register_user32_gdi32_handlers(
     }
 
     def _show_messagebox(caption: str, text: str, u_type: int) -> int:
+        if wm._messagebox_hook is not None:
+            answer = wm._messagebox_hook(caption, text, u_type)
+            if answer is not None:
+                logger.info("dialog", f"[MessageBox] auto-answered ({caption!r}) -> {answer}")
+                return answer
+
         btn_type  = u_type & 0x0F
         icon_key  = u_type & 0x70
         sdl_flags = _MSGBOX_ICON_FLAGS.get(icon_key, SDL_MESSAGEBOX_INFORMATION)
@@ -493,6 +499,45 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetKeyState", _GetKeyState)
 
+    # GetAsyncKeyState(int vKey) -> SHORT — same as GetKeyState: all keys up
+    def _GetAsyncKeyState(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "GetAsyncKeyState", _GetAsyncKeyState)
+
+    # GetKeyboardState(PBYTE lpKeyState) — fill 256-byte table with zeros
+    def _GetKeyboardState(cpu: "CPU") -> None:
+        lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if lp:
+            for i in range(256):
+                memory.write8((lp + i) & 0xFFFFFFFF, 0)
+        cpu.regs[EAX] = 1   # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "GetKeyboardState", _GetKeyboardState)
+
+    # GetKeyboardType(nTypeFlag) -> int
+    # 0=type (4=Enhanced 101/102-key), 1=subtype (0), 2=function keys (12)
+    def _GetKeyboardType(cpu: "CPU") -> None:
+        flag = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if flag == 0:
+            cpu.regs[EAX] = 4   # Enhanced 101/102-key keyboard
+        elif flag == 1:
+            cpu.regs[EAX] = 0   # subtype
+        else:
+            cpu.regs[EAX] = 12  # function keys
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "GetKeyboardType", _GetKeyboardType)
+
+    # MapVirtualKeyA(uCode, uMapType) -> UINT — returns 0 (no mapping)
+    def _MapVirtualKeyA(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "MapVirtualKeyA", _MapVirtualKeyA)
+
     # UpdateWindow(HWND hWnd) -> BOOL
     # Triggers WM_PAINT; we re-render via SDL on every DispatchMessageA call,
     # so no additional action is needed here.
@@ -591,6 +636,9 @@ def register_user32_gdi32_handlers(
             return
         if lpdw_process_id:
             memory.write32(lpdw_process_id & 0xFFFFFFFF, 1)  # our fake PID
+        cur = state.tls_current_thread_id()
+        logger.debug("handlers",
+            f"[GetWindowThreadProcessId] hwnd=0x{h_wnd:08x} creator_tid={entry.creator_tid} current_tid={cur}")
         cpu.regs[EAX] = entry.creator_tid
         cleanup_stdcall(cpu, memory, 8)
 
@@ -638,6 +686,74 @@ def register_user32_gdi32_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "SetCursor", _SetCursor)
+
+    # GetCursorPos(LPPOINT lpPoint) -> BOOL
+    def _GetCursorPos(cpu: "CPU") -> None:
+        lp_point = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if lp_point:
+            memory.write32(lp_point,     0)   # x
+            memory.write32(lp_point + 4, 0)   # y
+        cpu.regs[EAX] = 1   # TRUE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "GetCursorPos", _GetCursorPos)
+
+    # ScreenToClient(HWND, LPPOINT) -> BOOL
+    # ClientToScreen(HWND, LPPOINT) -> BOOL
+    # Window origin is (0,0) in our emulated session; coords are unchanged.
+    def _ScreenToClient(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _ClientToScreen(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "ScreenToClient", _ScreenToClient)
+    stubs.register_handler("user32.dll", "ClientToScreen", _ClientToScreen)
+
+    # SetCursorPos(X, Y) -> BOOL — no-op in emulated session
+    def _SetCursorPos(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "SetCursorPos", _SetCursorPos)
+
+    # SetCapture(HWND) -> HWND (returns previous capture window, NULL if none)
+    def _SetCapture(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "SetCapture", _SetCapture)
+
+    # ReleaseCapture() -> BOOL
+    def _ReleaseCapture(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 0)
+
+    stubs.register_handler("user32.dll", "ReleaseCapture", _ReleaseCapture)
+
+    # GetCapture() -> HWND (NULL — no window has capture)
+    def _GetCapture(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 0)
+
+    stubs.register_handler("user32.dll", "GetCapture", _GetCapture)
+
+    # ClipCursor(CONST RECT*) -> BOOL — no-op
+    def _ClipCursor(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "ClipCursor", _ClipCursor)
+
+    # MapWindowPoints(hWndFrom, hWndTo, LPPOINT lpPoints, UINT cPoints) -> int
+    # Returns 0 (no offset between our virtual windows)
+    def _MapWindowPoints(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("user32.dll", "MapWindowPoints", _MapWindowPoints)
 
     # ShowCursor(BOOL bShow) -> int (display counter)
     def _ShowCursor(cpu: "CPU") -> None:
@@ -750,27 +866,24 @@ def register_user32_gdi32_handlers(
             state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 1)
             return
 
-        # Main-thread blocking path: sleep until a message or SDL_QUIT.
-        caller_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-        idle_iters = 0
-        while True:
-            if not wm.pump_sdl_events():
-                _write_quit()
-                cpu.regs[EAX] = 0
-                cleanup_stdcall(cpu, memory, 16)
-                return
-            msg = wm.peek_message()
-            if msg is not None:
-                hwnd_msg, msg_id, wparam, lparam = msg
-                _write_msg(hwnd_msg, msg_id, wparam, lparam)
-                _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
-                cpu.regs[EAX] = 1
-                cleanup_stdcall(cpu, memory, 16)
-                return
-            idle_iters += 1
-            if idle_iters % 500 == 0:
-                logger.debug("handlers", f"[GetMessageA] idle {idle_iters} iters, caller EIP=0x{caller_eip:08x}, ESP=0x{cpu.regs[ESP]:08x}")
-            _time.sleep(0.001)
+        # Main-thread path: one pump-and-check, then yield to the scheduler.
+        # Using the same cooperative pattern as non-main threads so that
+        # other threads (e.g. the render thread) can run while we wait.
+        if not wm.pump_sdl_events():
+            _write_quit()
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        msg = wm.peek_message()
+        if msg is not None:
+            hwnd_msg, msg_id, wparam, lparam = msg
+            _write_msg(hwnd_msg, msg_id, wparam, lparam)
+            _dispatch_winhooks(cpu, msg_id, wparam, lp_msg)
+            cpu.regs[EAX] = 1
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+        state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 1)
 
     stubs.register_handler("user32.dll", "GetMessageA", _GetMessageA)
 
@@ -910,6 +1023,12 @@ def register_user32_gdi32_handlers(
 
             # Render the current dialog state
             render_dialog(wm, dlg_hwnd)
+
+            # Programmatic dialog interaction hook (tests / scripted
+            # headless runs) -- see WindowManager.set_dialog_step_hook.
+            hook, wm._dialog_step_hook = wm._dialog_step_hook, None
+            if hook is not None:
+                hook(wm, dlg_hwnd)
 
             # Dispatch one pending message (if any)
             msg = wm.peek_message()
@@ -1711,15 +1830,15 @@ def register_user32_gdi32_handlers(
     }
 
     def _GetDeviceCaps(cpu: "CPU") -> None:
-        from sdl2 import SDL_GetDesktopDisplayMode, SDL_DisplayMode
-        import ctypes
         hdc     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_index = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        mode = SDL_DisplayMode()
-        if SDL_GetDesktopDisplayMode(0, ctypes.byref(mode)) == 0:
-            screen_w, screen_h = mode.w, mode.h
-        else:
-            screen_w, screen_h = 1024, 768
+        # Fixed, ordinary XP-era 4:3 resolution rather than the real host's
+        # (possibly modern/ultrawide) desktop — matches IDirect3D8's
+        # EnumAdapterModes/GetAdapterDisplayMode (idirect3d8.py), which the
+        # game separately queries and cross-checks against this. Live-
+        # verified: an unusual real resolution/aspect ratio here trips the
+        # game's own mode-validation code into an early abort dialog.
+        screen_w, screen_h = 1024, 768
         if n_index == 8:
             val = screen_w
         elif n_index == 10:
@@ -1794,3 +1913,27 @@ def register_user32_gdi32_handlers(
 
     # SetTextColor(HDC hDC, COLORREF color) -> COLORREF (previous color)
     stubs.register_handler("gdi32.dll", "SetTextColor", _halt("SetTextColor"))
+
+    # CharUpperA(LPTSTR lpsz) -> LPTSTR
+    # HIWORD==0: single char in LOWORD; return uppercased char.
+    # HIWORD!=0: pointer to string; uppercase in-place; return pointer.
+    def _CharUpperA(cpu: "CPU") -> None:
+        lpsz = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        if (lpsz >> 16) == 0:
+            ch = lpsz & 0xFF
+            if 0x61 <= ch <= 0x7A:   # 'a'-'z'
+                ch -= 0x20
+            cpu.regs[EAX] = ch
+        else:
+            addr = lpsz
+            while True:
+                ch = memory.read8(addr & 0xFFFFFFFF)
+                if ch == 0:
+                    break
+                if 0x61 <= ch <= 0x7A:
+                    memory.write8(addr & 0xFFFFFFFF, ch - 0x20)
+                addr += 1
+            cpu.regs[EAX] = lpsz
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "CharUpperA", _CharUpperA)

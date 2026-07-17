@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from os.path import dirname
 
 from tew.hardware.memory import Memory
@@ -29,6 +30,8 @@ from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
+from tew.api.nt_handlers import register_nt_handlers
+from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
 from tew.logger import logger
 
 
@@ -176,7 +179,37 @@ with open(exe_path, "rb") as _f:
 crt_state.pe_resources = _pe_resources
 crt_state.window_manager.set_pe_resources(_pe_resources)
 
+# ── Unattended boot: auto-answer the two interactive prompts MCity_d.exe's
+# ── startup flow shows before real gameplay begins, so a run doesn't sit
+# ── blocked on real mouse/keyboard input. (A third window appears in this
+# ── same stretch of boot -- dialog resource 106, an untitled splash bitmap
+# ── with no buttons -- but it dismisses itself and needs no hook.)
+
+_LOGIN_CONTINUE_ID = 0x0001
+_IDNO = 7
+
+def _auto_click_login_continue(wm, dlg_hwnd):
+    """Dialog 114 ("Motor City Online Login"): username/password are
+    already sourced from registry.json by the game itself, so only the
+    Continue click is needed."""
+    entry = wm.get_window(dlg_hwnd)
+    if entry is None or entry.title != "Motor City Online Login":
+        wm.set_dialog_step_hook(_auto_click_login_continue)
+        return
+    wm.click_control(dlg_hwnd, _LOGIN_CONTINUE_ID)
+
+def _auto_decline_fullscreen_prompt(caption, text, u_type):
+    """MB_YESNO "Do you want to run Motor City Online full screen?"
+    (FUN_006b13b0) -- default to windowed."""
+    if "full screen" in text:
+        return _IDNO
+    return None
+
+crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
+crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
+
 win32_handlers.install(cpu)
+register_nt_handlers(win32_handlers.nt_dispatcher)
 
 # ── Load sections ─────────────────────────────────────────────────────────────
 
@@ -277,6 +310,45 @@ def is_valid_eip(eip: int) -> str | None:
     return None
 
 
+# ── Debugger: breakpoints and logpoints ──────────────────────────────────────
+#
+# Breakpoints halt execution before the target instruction and call a Python
+# handler(cpu, mem).  Resume is automatic.
+#
+# Logpoints fire a C callback inline from the Zig hot loop (no halt, near-zero
+# overhead).  The callback signature is:
+#   fn(eip: u32, regs: ptr[u32 x8], memory: ptr[u8], memory_size: usize)
+# Use mem.read32() / cpu.regs[] from the *Python* handler for readable access;
+# use the raw pointers only when you need speed.
+
+_bp_handlers: dict = {}   # eip -> callable(cpu, mem)
+
+def register_breakpoint(eip: int, handler) -> None:
+    _bp_handlers[eip] = handler
+    cpu.add_breakpoint(eip)
+
+def unregister_breakpoint(eip: int) -> None:
+    _bp_handlers.pop(eip, None)
+    cpu.remove_breakpoint(eip)
+
+def _dispatch_breakpoint() -> None:
+    if not cpu.breakpoint_hit:
+        return
+    hit_eip = cpu.breakpoint_hit_eip
+    cpu.clear_breakpoint_hit()            # unhalt + clear flag
+    h = _bp_handlers.get(hit_eip)
+    keep = True
+    if h:
+        result = h(cpu, mem)
+        if result is False:               # handler returns False → one-shot, remove
+            keep = False
+    # Execute the halted instruction once without re-triggering the breakpoint.
+    cpu.remove_breakpoint(hit_eip)
+    cpu.run(1)
+    if keep and hit_eip in _bp_handlers:
+        cpu.add_breakpoint(hit_eip)
+
+
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 logger.info("startup", "=== Starting Emulation ===")
@@ -286,6 +358,13 @@ MAX_STEPS = 500_000_000
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
 # from the normal SleepEx path.  Advancing the clock here lets due callbacks fire.
 _TIMER_HEARTBEAT_INTERVAL = 100_000
+# Upper bound on wall-clock ms creditable to the virtual clock in a single
+# heartbeat. Measured real throughput is ~220k-250k instr/sec, i.e. ~400-450ms
+# per 100k-instruction batch, so this is >10x normal headroom. Anything beyond
+# it (debugger pause, OS suspend/resume, a slow future breakpoint handler) is
+# capped rather than credited in full, so one heartbeat can't inject a huge
+# virtual-time jump that fires a backlog of periodic timers/timeouts at once.
+_TIMER_HEARTBEAT_MAX_MS = 5_000
 
 step_count = 0
 last_valid_step = 0
@@ -306,6 +385,7 @@ def _run_timer_heartbeat() -> None:
     global _heartbeat_count
     global _pending_timers, _invoke_emulated_proc_fn, _get_dialog_sentinel_fn
     global _time_callback_event_set, _event_handle_cls
+    global _last_heartbeat_wall_time
     _heartbeat_count += 1
     if _pending_timers is None:
         from tew.api.win32_handlers import pending_timers as _pt, _TIME_CALLBACK_EVENT_SET as _tces
@@ -316,7 +396,11 @@ def _run_timer_heartbeat() -> None:
         _get_dialog_sentinel_fn = _gds
         _time_callback_event_set = _tces
         _event_handle_cls = _eh
-    crt_state.scheduler.tick(1, mem)
+    now = time.monotonic()
+    elapsed_ms = int((now - _last_heartbeat_wall_time) * 1000)
+    elapsed_ms = max(1, min(elapsed_ms, _TIMER_HEARTBEAT_MAX_MS))
+    _last_heartbeat_wall_time = now
+    crt_state.scheduler.tick(elapsed_ms, mem)
     if not _pending_timers:
         return
     due = [t for t in list(_pending_timers.values()) if t.due_at <= crt_state.virtual_ticks_ms]
@@ -338,6 +422,9 @@ def _run_timer_heartbeat() -> None:
 
 
 _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
+# Captured here (not earlier) so DLL loading / breakpoint setup above isn't
+# credited as elapsed emulation time for the first heartbeat.
+_last_heartbeat_wall_time = time.monotonic()
 _sample_countdown = 1_000_000
 _progress_countdown = 5_000_000
 
@@ -346,6 +433,24 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
     cpu.run(batch)
     step_count += batch
+
+    if cpu.faulted:
+        # Give the game's own SEH chain a chance to handle this before
+        # giving up -- see tew/kernel/seh.py. Real Windows would report
+        # this as an access violation; that's the only fault shape this
+        # CPU core currently produces (see core.zig's memRead8/memWrite8),
+        # so it's the honest default rather than a guess.
+        fault_eip = cpu.eip & 0xFFFFFFFF
+        logger.warn("seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
+        handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
+        if handled:
+            logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
+            cpu.faulted = False
+        else:
+            logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
+
+    if _bp_handlers:
+        _dispatch_breakpoint()
     crt_state.scheduler.preempt_slice(cpu, mem)
 
     _heartbeat_countdown -= batch
@@ -365,9 +470,14 @@ while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
     _progress_countdown -= batch
     if _progress_countdown <= 0:
         _progress_countdown = 5_000_000
+        eip_now = cpu.eip & 0xFFFFFFFF
+        stub_note = ""
+        if 0x00200000 <= eip_now < 0x00220000:
+            recent = win32_handlers._call_log[-8:]
+            stub_note = f" calls={recent}"
         logger.info(
             "startup",
-            f"[alive] step={step_count:,} EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
+            f"[alive] step={step_count:,} EIP=0x{eip_now:08x}{stub_note}"
             f" vtime={crt_state.virtual_ticks_ms}ms",
         )
 
@@ -424,7 +534,13 @@ logger.debug("handlers", "--- Win32 Stub Call Log (last 50) ---")
 for call in win32_handlers.get_call_log()[-50:]:
     logger.debug("handlers", f"  {call}")
 
-if cpu.faulted:
+if cpu.watchpoint_hit:
+    logger.error("exception",
+        f"WATCHPOINT HIT at EIP=0x{cpu.watchpoint_eip:08x}"
+        f"  written=0x{cpu.watchpoint_val:02x}"
+        f"  (first byte of write to watchpoint address)")
+    diagnose_halt(cpu, exe.import_resolver)
+elif cpu.faulted:
     diagnose_fault(cpu, exe.import_resolver)
 elif cpu.halted:
     diagnose_halt(cpu, exe.import_resolver)

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu import ESP
 from tew.logger import logger
+from tew.api.nt_syscall import NtSyscallDispatcher
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,11 @@ class Win32Handlers:
         self._installed: bool = False
         self._call_log: list[str] = []
         self._call_log_size: int = 2000
+        self._nt_dispatcher: NtSyscallDispatcher = NtSyscallDispatcher(memory)
+
+    @property
+    def nt_dispatcher(self) -> NtSyscallDispatcher:
+        return self._nt_dispatcher
 
     # ── Registration ─────────────────────────────────────────────────────────
 
@@ -263,9 +269,14 @@ class Win32Handlers:
 
         stubs = self
 
+        nt_dispatcher = self._nt_dispatcher
+
         def _dispatch(int_num: int, c: "CPU") -> None:
             if int_num == STUB_INT:
                 stubs._handle_api_int(c)
+                return
+            if int_num == 0x2E:
+                nt_dispatcher.dispatch(c)
                 return
             if int_num == 3:
                 # INT3 debug breakpoint — halt so the run loop dumps state
@@ -280,8 +291,29 @@ class Win32Handlers:
             if existing_handler is not None:
                 existing_handler(int_num, c)
             else:
+                from tew.logger import logger as _lg
+                eip = c.eip & 0xFFFFFFFF
+                ecx = c.regs[1] & 0xFFFFFFFF  # ECX
+                esi = c.regs[6] & 0xFFFFFFFF  # ESI
+                esp = c.regs[4] & 0xFFFFFFFF  # ESP
+                # Dump vtable slots around the bad call
+                try:
+                    vtable_dump = ' '.join(
+                        f'[{i}]=0x{stubs._memory.read32((ecx + i*4) & 0xFFFFFFFF):08x}'
+                        for i in range(12))
+                    _lg.error("exception", f"vtable at ECX=0x{ecx:08x}: {vtable_dump}")
+                except Exception:
+                    pass
+                try:
+                    _lg.error("exception",
+                        f"ESI=0x{esi:08x} → *ESI=0x{stubs._memory.read32(esi):08x}")
+                    _lg.error("exception",
+                        f"[ESP+0]=0x{stubs._memory.read32(esp):08x} "
+                        f"call-site ← 0x{stubs._memory.read32(esp):08x} - 5 = 0x{(stubs._memory.read32(esp) - 5) & 0xFFFFFFFF:08x}")
+                except Exception:
+                    pass
                 raise RuntimeError(
-                    f"Unhandled interrupt INT 0x{int_num:02x} at EIP=0x{(c.eip & 0xFFFFFFFF):08x}"
+                    f"Unhandled interrupt INT 0x{int_num:02x} at EIP=0x{eip:08x}"
                 )
 
         cpu.on_interrupt(_dispatch)
@@ -306,6 +338,7 @@ class Win32Handlers:
 
         if entry is None:
             raise RuntimeError(f"Unknown Win32 stub at 0x{handler_addr:08x}")
+
 
         # Log the stub call; deduplicate consecutive identical calls with a counter
         log_entry = f"{entry.name} @ 0x{handler_addr:x}"

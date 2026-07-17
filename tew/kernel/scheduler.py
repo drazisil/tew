@@ -403,21 +403,24 @@ class Scheduler:
                     f"unblock_cs: tid={t.thread_id} ready "
                     f"(CS 0x{cs_ptr:08x} released)")
 
-    def unblock_handle(self, handle: int) -> None:
+    def unblock_handle(self, handle: int) -> int:
         """Mark threads blocked on handle as READY when the object is signaled.
 
         Does NOT consume the signal — the thread will do that when it retries
-        the Wait stub.
+        the Wait stub.  Returns the number of threads unblocked.
         """
+        n = 0
         for t in self.threads:
             if (t.status == ThreadStatus.BLOCKED_HANDLES
                     and t.waiting_on_handles is not None
                     and handle in t.waiting_on_handles):
                 t.waiting_on_handles = None
                 t.status = ThreadStatus.READY
+                n += 1
                 logger.debug("scheduler",
                     f"unblock_handle: tid={t.thread_id} ready "
                     f"(handle 0x{handle:x} signaled)")
+        return n
 
     # ── Public: clock ─────────────────────────────────────────────────────────
 

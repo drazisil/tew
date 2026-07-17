@@ -131,6 +131,13 @@ def register_two_byte_opcodes(cpu: "CPU") -> None:
                 cpu.write_rm32(d["mod"], d["rm"], (val ^ (1 << bit)) & 0xFFFFFFFF)
             # reg==4 is BT (no write)
 
+        elif op2 == 0x34: # SYSENTER — fast NT syscall gate (EAX=syscall#, EDX=arg stack)
+            cpu.trigger_interrupt(0x2E)
+
+        elif op2 == 0x35: # SYSEXIT — fast return from kernel; EIP←ECX, ESP←EDX
+            cpu.eip      = cpu.regs[1] & 0xFFFFFFFF   # ECX
+            cpu.regs[4]  = cpu.regs[2] & 0xFFFFFFFF   # ESP ← EDX
+
         elif op2 == 0xA2: # CPUID
             # Report only what this emulator actually implements.
             # Leaf 0: max standard leaf = 1, vendor = "GenuineIntel"

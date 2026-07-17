@@ -581,10 +581,10 @@ def register_advapi32_handlers(
 
     MMSYSERR_NODRIVER = 10
 
-    # mixerGetNumDevs() -> UINT [stdcall, no args] — 0 = no mixer hardware
+    # mixerGetNumDevs() -> UINT [stdcall, no args] — 1 = our SDL2 wave device
     def _mixer_get_num_devs(cpu: "CPU") -> None:
-        logger.warn("handlers", "[winmm] mixerGetNumDevs -> 0 (no audio hardware)")
-        cpu.regs[EAX] = 0
+        logger.debug("handlers", "[winmm] mixerGetNumDevs -> 1")
+        cpu.regs[EAX] = 1
 
     stubs.register_handler("winmm.dll", "mixerGetNumDevs", _mixer_get_num_devs)
 
@@ -621,9 +621,63 @@ def register_advapi32_handlers(
     stubs.register_handler("winmm.dll", "mixerSetControlDetails", _mixer_set_control_details)
 
     # waveOutGetDevCapsA(uDeviceID, pwoc, cbwoc) -> MMRESULT [stdcall, 3 args (12 bytes)]
+    # Spec: fill *pwoc with WAVEOUTCAPSA (up to cbwoc bytes); NOERROR on success,
+    #       MMSYSERR_BADDEVICEID if uDeviceID >= waveOutGetNumDevs().
+    # We present one stereo PCM device (backed by SDL2 audio).
     def _wave_out_get_dev_caps_a(cpu: "CPU") -> None:
-        logger.warn("handlers", "[winmm] waveOutGetDevCapsA -> MMSYSERR_NODRIVER")
-        cpu.regs[EAX] = MMSYSERR_NODRIVER
+        u_device_id = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pwoc        = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        cbwoc       = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+
+        WAVE_MAPPER          = 0xFFFFFFFF   # (UINT)-1 — always maps to device 0
+        MMSYSERR_BADDEVICEID = 2
+
+        if u_device_id not in (0, WAVE_MAPPER):
+            logger.warn("handlers",
+                f"[winmm] waveOutGetDevCapsA(id={u_device_id:#x}) -> MMSYSERR_BADDEVICEID")
+            cpu.regs[EAX] = MMSYSERR_BADDEVICEID
+            cleanup_stdcall(cpu, memory, 12)
+            return
+
+        if pwoc and cbwoc:
+            # WAVEOUTCAPSA layout (52 bytes total):
+            #  +0  WORD  wMid             manufacturer ID (Microsoft = 1)
+            #  +2  WORD  wPid             product ID
+            #  +4  DWORD vDriverVersion   1.0
+            #  +8  CHAR  szPname[32]      device name (null-padded to 32 bytes)
+            # +40  DWORD dwFormats        supported PCM format flags
+            # +44  WORD  wChannels        2 = stereo
+            # +46  WORD  wReserved1       0
+            # +48  DWORD dwSupport        WAVECAPS_VOLUME | WAVECAPS_LRVOLUME
+            WAVEOUTCAPSA_SIZE = 52
+            # Zero-fill the entire struct before writing fields
+            to_fill = min(cbwoc, WAVEOUTCAPSA_SIZE)
+            for i in range(to_fill):
+                memory.write8(pwoc + i, 0)
+
+            def _w16(off: int, val: int) -> None:
+                if off + 2 <= cbwoc:
+                    memory.write16(pwoc + off, val)
+
+            def _w32(off: int, val: int) -> None:
+                if off + 4 <= cbwoc:
+                    memory.write32(pwoc + off, val)
+
+            _w16(0,  0x0001)        # wMid: Microsoft
+            _w16(2,  0x0001)        # wPid: generic
+            _w32(4,  0x0100)        # vDriverVersion: 1.0
+            name = b'Wave Audio\x00'
+            for i, byte in enumerate(name):
+                if 8 + i < cbwoc:
+                    memory.write8(pwoc + 8 + i, byte)
+            # szPname bytes [18..39] already zeroed by the fill above
+            _w32(40, 0x00000FFF)    # dwFormats: all standard PCM (8/16-bit, mono/stereo, 11/22/44 kHz)
+            _w16(44, 2)             # wChannels: stereo
+            _w16(46, 0)             # wReserved1
+            _w32(48, 0x0000000C)    # dwSupport: WAVECAPS_VOLUME | WAVECAPS_LRVOLUME
+
+        logger.info("handlers", "[winmm] waveOutGetDevCapsA -> NOERROR (stereo, all PCM formats)")
+        cpu.regs[EAX] = 0   # MMSYSERR_NOERROR
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("winmm.dll", "waveOutGetDevCapsA", _wave_out_get_dev_caps_a)

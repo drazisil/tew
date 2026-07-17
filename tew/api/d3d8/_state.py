@@ -35,8 +35,41 @@ _vk_in_flight = None         # VkFence: CPU/GPU frame boundary
 # Index into _vk_swapchain_images for the current frame (set by BeginScene).
 _vk_current_image_idx: int = 0
 
+# True after QueueSubmit in Present; cleared by BeginScene.
+# Used to skip vkWaitForFences when no frame was submitted (BeginScene called
+# without an intervening Present, which D3D8 allows).
+_vk_frame_submitted: bool = False
+
+# True after AcquireNextImage in BeginScene; cleared by Present.
+# Used to skip re-acquiring when BeginScene is called again without Present.
+_vk_image_acquired: bool = False
+
+# Pipeline resources (created in CreateDevice after swapchain is ready).
+_vk_image_views:      list = []   # VkImageView per swapchain image
+_vk_render_pass:      object = None
+_vk_framebuffers:     list = []   # VkFramebuffer per swapchain image
+_vk_pipeline:         object = None
+_vk_pipeline_layout:  object = None
+_vk_vertex_buffer:    object = None
+_vk_vertex_memory:    object = None
+_vk_vertex_mapped_ptr: object = None  # ctypes void* from vkMapMemory (persistent)
+
+# True while inside a vkCmdBeginRenderPass / vkCmdEndRenderPass pair.
+_vk_in_render_pass: bool = False
+
+# Stream source set by SetStreamSource — used by DrawPrimitive.
+_draw_stream_ptr:    int = 0   # flat-memory address of bound vertex buffer data
+_draw_stream_stride: int = 0   # stride in bytes
+
+# Vertex FVF/handle set by SetVertexShader.
+_draw_vertex_fvf: int = 0
+
+# Instance-level extension functions loaded after vkCreateInstance.
+_vk_fn_get_surface_caps = None   # vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+
 # Device-level extension functions loaded after vkCreateDevice.
 _vk_fn_create_swapchain = None
+_vk_fn_destroy_swapchain = None
 _vk_fn_get_swapchain_images = None
 _vk_fn_acquire_next_image = None
 _vk_fn_queue_present = None

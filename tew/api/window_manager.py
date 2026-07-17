@@ -13,17 +13,17 @@ from __future__ import annotations
 import ctypes
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Callable
 
 if TYPE_CHECKING:
     from tew.api.pe_resources import PEResources
 
 from sdl2 import (
-    SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS,
+    SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS, SDL_INIT_AUDIO,
     SDL_SetHint,
     SDL_CreateWindow, SDL_DestroyWindow,
     SDL_CreateRenderer, SDL_DestroyRenderer,
-    SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE,
+    SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
     SDL_RENDERER_ACCELERATED, SDL_RENDERER_PRESENTVSYNC,
     SDL_PollEvent, SDL_Event,
     SDL_QUIT,
@@ -191,6 +191,16 @@ class WindowManager:
         self._message_queue: deque[tuple[int, int, int, int]] = deque()
         # Currently focused edit control hwnd (receives keyboard input)
         self._focused_hwnd: int = 0
+        # One-shot programmatic dialog interaction hook -- see
+        # set_dialog_step_hook/click_control. Cleared before invocation, so
+        # it fires at most once per registration.
+        self._dialog_step_hook: Optional[Callable[["WindowManager", int], None]] = None
+        # Persistent MessageBoxA/W auto-answer hook -- see set_messagebox_hook.
+        # Unlike _dialog_step_hook, NOT one-shot: each MessageBoxA call is
+        # already a single synchronous event (no polling loop to consume a
+        # hook from), so the hook is consulted on every call and decides
+        # per-call whether to answer or let the real message box show.
+        self._messagebox_hook: Optional[Callable[[str, str, int], Optional[int]]] = None
         # SDL window ID → top-level hwnd
         self._sdl_window_id_to_hwnd: dict[int, int] = {}
         # PE resources for loading bitmap textures (set by run_exe.py after load)
@@ -203,8 +213,15 @@ class WindowManager:
         creating any windows.  Safe to call multiple times."""
         if self._initialized:
             return True
+        # XInitThreads() must be called before any Xlib call so that Mesa's
+        # Vulkan WSI can safely use the same Display* from a background thread.
+        try:
+            _xlib = ctypes.CDLL("libX11.so.6")
+            _xlib.XInitThreads()
+        except Exception:
+            pass  # non-X11 environment; safe to skip
         SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, b"0")
-        rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)
+        rc = SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO)
         if rc != 0:
             logger.error("window", f"[WindowManager] SDL_Init failed: {rc}")
             return False
@@ -312,26 +329,28 @@ class WindowManager:
         if is_top_level and is_visible:
             px_w = du_to_px_x(cx) if cx > 0 else 640
             px_h = du_to_px_y(cy) if cy > 0 else 480
+            # Dialog windows (class #32770) use SDL renderer for drawing and hit-testing.
+            # Non-dialog windows (the game's main rendering surface) need SDL_WINDOW_VULKAN
+            # so that SDL_Vulkan_CreateSurface succeeds when D3D8 sets up its swapchain.
+            is_dialog_class = (class_name == "#32770")
+            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN)
             sdl_win = SDL_CreateWindow(
                 title.encode("utf-8"),
                 x if x >= 0 else 100,
                 y if y >= 0 else 100,
                 px_w,
                 px_h,
-                SDL_WINDOW_SHOWN,
+                sdl_flags,
             )
             if not sdl_win:
                 logger.error("window", f"[WindowManager] SDL_CreateWindow failed for '{title}'")
                 return 0
-            sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
-            if not sdl_rend:
-                # Fall back to software renderer
-                from sdl2 import SDL_RENDERER_SOFTWARE
-                sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE)
+            sdl_rend = None
+            if is_dialog_class:
+                sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
                 if not sdl_rend:
-                    logger.error("window", "[WindowManager] SDL_CreateRenderer failed")
-                    SDL_DestroyWindow(sdl_win)
-                    return 0
+                    from sdl2 import SDL_RENDERER_SOFTWARE
+                    sdl_rend = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE)
             entry.sdl_window = sdl_win
             entry.sdl_renderer = sdl_rend
             win_id = SDL_GetWindowID(sdl_win)
@@ -749,17 +768,62 @@ class WindowManager:
                     f"[WindowManager]   HIT ctrl 0x{ctrl_id:04x} '{child.class_name}' '{child.title}'"
                 )
                 if class_lower == "button":
-                    # Toggle checkbox; for push buttons post WM_COMMAND
-                    if child.style & 0x0F in (0x02, 0x03):  # BS_CHECKBOX, BS_AUTOCHECKBOX
-                        child.check_state ^= 1
-                    else:
-                        self._message_queue.append((dlg_hwnd, WM_COMMAND, ctrl_id, child_hwnd))
+                    self._activate_button(dlg_hwnd, ctrl_id, child_hwnd, child)
                 elif class_lower == "edit":
                     self._focused_hwnd = child_hwnd
                     logger.debug("dialog", f"[WindowManager] Focus -> edit hwnd=0x{child_hwnd:x}")
                 return
 
         logger.debug("dialog", f"[WindowManager]   no hit for click ({px},{py})")
+
+    def _activate_button(self, dlg_hwnd: int, ctrl_id: int, child_hwnd: int, child: "WindowEntry") -> None:
+        """Shared BUTTON-activation logic for both a real pixel-hit-tested
+        click (_handle_mouse_click) and a synthetic ID-based one
+        (click_control): toggle checkbox styles in place, otherwise post
+        WM_COMMAND same as a real click would."""
+        if child.style & 0x0F in (0x02, 0x03):  # BS_CHECKBOX, BS_AUTOCHECKBOX
+            child.check_state ^= 1
+        else:
+            self._message_queue.append((dlg_hwnd, WM_COMMAND, ctrl_id, child_hwnd))
+
+    # ── Programmatic control injection ──────────────────────────────────────
+    # Synthetic (non-SDL) equivalent of _handle_mouse_click, for scripted/
+    # automated dialog interaction (tests, headless runs) -- see
+    # set_dialog_step_hook for how this gets invoked at the right moment.
+
+    def click_control(self, dlg_hwnd: int, ctrl_id: int) -> bool:
+        """Simulate a left-click on control ctrl_id of dialog dlg_hwnd, by
+        ID rather than pixel coordinates. Returns False if dlg_hwnd/ctrl_id
+        is unknown or the control isn't a BUTTON."""
+        dlg_entry = self._windows.get(dlg_hwnd)
+        if dlg_entry is None:
+            return False
+        child_hwnd = self.get_dlg_item(dlg_hwnd, ctrl_id)
+        if not child_hwnd:
+            return False
+        child = self._windows.get(child_hwnd)
+        if child is None or child.class_name.lower() != "button":
+            return False
+        self._activate_button(dlg_hwnd, ctrl_id, child_hwnd, child)
+        return True
+
+    def set_dialog_step_hook(self, hook: Callable[["WindowManager", int], None]) -> None:
+        """Registers a one-shot callback hook(wm, dlg_hwnd), invoked on the
+        next DialogBoxParamA modal-loop iteration for whichever dialog is
+        active. Cleared immediately before invocation, so it fires once by
+        default -- call set_dialog_step_hook again from inside the callback
+        (e.g. if dlg_hwnd isn't the one you're waiting for) to keep waiting
+        or to chain a further step."""
+        self._dialog_step_hook = hook
+
+    def set_messagebox_hook(self, hook: Optional[Callable[[str, str, int], Optional[int]]]) -> None:
+        """Registers a persistent hook(caption, text, uType) consulted before
+        every MessageBoxA/W call (see user32_handlers.py's _show_messagebox).
+        Returning a Win32 button ID (e.g. 7 = IDNO) auto-answers with it,
+        bypassing the real blocking SDL_ShowMessageBox entirely; returning
+        None lets the real message box show and wait for genuine input.
+        Pass None to clear the hook."""
+        self._messagebox_hook = hook
 
     def _cycle_focus(self, current_hwnd: int) -> None:
         """Move keyboard focus to the next EDIT control in the parent dialog."""

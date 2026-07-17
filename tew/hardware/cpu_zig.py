@@ -93,6 +93,8 @@ def _load_lib() -> ctypes.CDLL:
 
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
+    lib.cpu_get_run_id.argtypes      = [_vp]
+    lib.cpu_get_run_id.restype       = _u64
     lib.cpu_get_last_opcode.argtypes = [_vp]
     lib.cpu_get_last_opcode.restype  = _u8
 
@@ -126,6 +128,53 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_fpu_get_tag.restype      = _u16
     lib.cpu_fpu_set_tag.argtypes     = [_vp, _u16]
     lib.cpu_fpu_set_tag.restype      = None
+
+    lib.cpu_set_watchpoint.argtypes  = [_vp, _u32]
+    lib.cpu_set_watchpoint.restype   = None
+    lib.cpu_clear_watchpoint.argtypes= [_vp]
+    lib.cpu_clear_watchpoint.restype = None
+    lib.cpu_watchpoint_hit.argtypes  = [_vp]
+    lib.cpu_watchpoint_hit.restype   = _b
+    lib.cpu_watchpoint_eip.argtypes  = [_vp]
+    lib.cpu_watchpoint_eip.restype   = _u32
+    lib.cpu_watchpoint_val.argtypes  = [_vp]
+    lib.cpu_watchpoint_val.restype   = _u32
+
+    # Execution-history capture (ported from pe-walker's history/capture.zig
+    # -- see cpu.zig's "Execution-history capture" section). Returns/takes
+    # an opaque *Capture handle, distinct from the *CpuState handle above.
+    lib.cpu_history_enable_discard.argtypes    = [_vp]
+    lib.cpu_history_enable_discard.restype     = _vp
+    lib.cpu_history_enable_clickhouse.argtypes = [_vp, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    lib.cpu_history_enable_clickhouse.restype  = _vp
+    lib.cpu_history_flush.argtypes             = [_vp]
+    lib.cpu_history_flush.restype              = None
+    lib.cpu_history_disable.argtypes           = [_vp, _vp]
+    lib.cpu_history_disable.restype            = None
+
+    lib.cpu_add_breakpoint.argtypes      = [_vp, _u32]
+    lib.cpu_add_breakpoint.restype       = None
+    lib.cpu_remove_breakpoint.argtypes   = [_vp, _u32]
+    lib.cpu_remove_breakpoint.restype    = None
+    lib.cpu_clear_breakpoints.argtypes   = [_vp]
+    lib.cpu_clear_breakpoints.restype    = None
+    lib.cpu_breakpoint_hit.argtypes      = [_vp]
+    lib.cpu_breakpoint_hit.restype       = _b
+    lib.cpu_breakpoint_hit_eip.argtypes  = [_vp]
+    lib.cpu_breakpoint_hit_eip.restype   = _u32
+    lib.cpu_clear_breakpoint_hit.argtypes= [_vp]
+    lib.cpu_clear_breakpoint_hit.restype = None
+
+    # LogpointFn: fn(eip: u32, regs: *u32, memory: *u8, memory_size: usize) callconv(.C) void
+    LogpointCType = ctypes.CFUNCTYPE(None, _u32, ctypes.POINTER(_u32), ctypes.POINTER(_u8), ctypes.c_size_t)
+    lib._LogpointCType = LogpointCType   # keep reference so callers can use it
+
+    lib.cpu_add_logpoint.argtypes    = [_vp, _u32, LogpointCType]
+    lib.cpu_add_logpoint.restype     = None
+    lib.cpu_remove_logpoint.argtypes = [_vp, _u32]
+    lib.cpu_remove_logpoint.restype  = None
+    lib.cpu_clear_logpoints.argtypes = [_vp]
+    lib.cpu_clear_logpoints.restype  = None
 
     return lib
 
@@ -256,6 +305,55 @@ class ZigCPU:
         # Compatibility shim — callers that do cpu.segments["FS"] = ...
         self.segments: dict[str, int] = {"ES": 0, "DS": 0, "CS": 0, "SS": 0, "FS": 0, "GS": 0}
 
+        # Execution-history capture: opt-in, not wired unless a caller
+        # explicitly enables it (see enable_history_capture_*/disable_
+        # history_capture below). None of the buffering/hooking/HTTP flush
+        # crosses back into Python once enabled — it's all native code
+        # inside libcpu.so; only these few control calls do.
+        self._history_cap: int = 0
+
+    # ── Execution-history capture ─────────────────────────────────────────────
+
+    def enable_history_capture_discard(self) -> None:
+        """Wires a discard-sink Capture: exercises the real hook/buffer path
+        with zero network I/O. Useful for smoke-testing the wiring itself."""
+        if self._history_cap:
+            raise RuntimeError("history capture already enabled")
+        cap = _lib.cpu_history_enable_discard(self._state)
+        if not cap:
+            raise RuntimeError("cpu_history_enable_discard returned NULL")
+        self._history_cap = cap
+
+    def enable_history_capture_clickhouse(
+        self, base_url: str, user: str = "default", password: str = ""
+    ) -> None:
+        """Wires a Capture that flushes real events to ClickHouse's HTTP
+        interface at base_url (e.g. "http://localhost:8123")."""
+        if self._history_cap:
+            raise RuntimeError("history capture already enabled")
+        cap = _lib.cpu_history_enable_clickhouse(
+            self._state,
+            base_url.encode("utf-8"),
+            user.encode("utf-8"),
+            password.encode("utf-8"),
+        )
+        if not cap:
+            raise RuntimeError("cpu_history_enable_clickhouse returned NULL")
+        self._history_cap = cap
+
+    def flush_history_capture(self) -> None:
+        """Forces a flush now, without waiting for the internal threshold —
+        e.g. at the end of a run, so the tail of a capture isn't lost."""
+        if self._history_cap:
+            _lib.cpu_history_flush(self._history_cap)
+
+    def disable_history_capture(self) -> None:
+        """Unwires the hooks, flushes any remaining buffered events, and
+        frees the Capture. Safe to call even if never enabled."""
+        if self._history_cap:
+            _lib.cpu_history_disable(self._state, self._history_cap)
+            self._history_cap = 0
+
     # ── Kernel structures / FS-GS sync ────────────────────────────────────────
 
     @property
@@ -279,22 +377,29 @@ class ZigCPU:
     # ── C callback (called by Zig on INT instruction) ─────────────────────────
 
     def _c_int_dispatch(self, _state_ptr: int, int_num: int) -> None:
-        if self._int_handler:
-            self._int_handler(int_num, self)
+        try:
+            if self._int_handler:
+                self._int_handler(int_num, self)
+        except Exception as e:
+            self.handle_exception(e)
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def step(self) -> None:
         self._sync_fs_gs()
         result = _lib.cpu_run(self._state, 1)
-        if result == _RUN_FAULTED:
+        if result == _RUN_FAULTED and self.last_error is None:
             self.last_error = RuntimeError(
                 f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
             )
 
     def run(self, max_steps: int = 1_000_000) -> None:
         self._sync_fs_gs()
-        _lib.cpu_run(self._state, max_steps)
+        result = _lib.cpu_run(self._state, max_steps)
+        if result == _RUN_FAULTED and self.last_error is None:
+            self.last_error = RuntimeError(
+                f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
+            )
 
     # ── Register/state properties ─────────────────────────────────────────────
 
@@ -446,6 +551,79 @@ class ZigCPU:
     def on_step(self, handler: Callable) -> None:
         self._step_handler = handler
 
+    # ── Watchpoint ────────────────────────────────────────────────────────────
+
+    def set_watchpoint(self, addr: int) -> None:
+        _lib.cpu_set_watchpoint(self._state, addr & 0xFFFFFFFF)
+
+    def clear_watchpoint(self) -> None:
+        _lib.cpu_clear_watchpoint(self._state)
+
+    @property
+    def watchpoint_hit(self) -> bool:
+        return bool(_lib.cpu_watchpoint_hit(self._state))
+
+    @property
+    def watchpoint_eip(self) -> int:
+        return _lib.cpu_watchpoint_eip(self._state)
+
+    @property
+    def watchpoint_val(self) -> int:
+        return _lib.cpu_watchpoint_val(self._state)
+
+    @property
+    def run_id(self) -> int:
+        """Opaque per-run identifier used to correlate this CPU's execution-
+        history events (see enable_history_capture_* below) with rows in an
+        external sink like ClickHouse."""
+        return _lib.cpu_get_run_id(self._state)
+
+    # ── Breakpoints (halt before instruction) ─────────────────────────────────
+
+    def add_breakpoint(self, eip: int) -> None:
+        _lib.cpu_add_breakpoint(self._state, eip & 0xFFFFFFFF)
+
+    def remove_breakpoint(self, eip: int) -> None:
+        _lib.cpu_remove_breakpoint(self._state, eip & 0xFFFFFFFF)
+
+    def clear_breakpoints(self) -> None:
+        _lib.cpu_clear_breakpoints(self._state)
+
+    @property
+    def breakpoint_hit(self) -> bool:
+        return bool(_lib.cpu_breakpoint_hit(self._state))
+
+    @property
+    def breakpoint_hit_eip(self) -> int:
+        return _lib.cpu_breakpoint_hit_eip(self._state)
+
+    def clear_breakpoint_hit(self) -> None:
+        _lib.cpu_clear_breakpoint_hit(self._state)
+
+    # ── Logpoints (inline C callback, no halt) ────────────────────────────────
+
+    def add_logpoint(self, eip: int, cb: Callable) -> None:
+        """Register a logpoint.  cb(eip, regs_array, memory_array, memory_size).
+
+        The callback is a plain Python callable — we wrap it in a ctypes
+        CFUNCTYPE automatically and keep it alive on this CPU object.
+        """
+        c_cb = _lib._LogpointCType(cb)
+        if not hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs: dict = {}
+        self._logpoint_refs[eip & 0xFFFFFFFF] = c_cb   # keep alive
+        _lib.cpu_add_logpoint(self._state, eip & 0xFFFFFFFF, c_cb)
+
+    def remove_logpoint(self, eip: int) -> None:
+        _lib.cpu_remove_logpoint(self._state, eip & 0xFFFFFFFF)
+        if hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs.pop(eip & 0xFFFFFFFF, None)
+
+    def clear_logpoints(self) -> None:
+        _lib.cpu_clear_logpoints(self._state)
+        if hasattr(self, '_logpoint_refs'):
+            self._logpoint_refs.clear()
+
     def trigger_interrupt(self, int_num: int) -> None:
         if self._int_handler:
             self._int_handler(int_num, self)
@@ -454,13 +632,9 @@ class ZigCPU:
 
     def handle_exception(self, error: Exception) -> None:
         self.last_error = error
-        # Signal Zig that the CPU has faulted by setting EIP to a known-bad
-        # address and letting the main loop see halted=True from Zig's own fault
-        # flag — but since this is called from Python (not from inside Zig), we
-        # have no Zig-side setter for halted.  Work around: store a Python-side
-        # override and check it in step().
         self._py_faulted = True
         self._py_halted  = True
+        _lib.cpu_set_halted(self._state)
 
     # ── Save / restore ────────────────────────────────────────────────────────
 
@@ -516,6 +690,9 @@ class ZigCPU:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def __del__(self) -> None:
+        # Flush before destroying the CpuState the Capture's hooks point at
+        # -- disable_history_capture is a no-op if never enabled.
+        self.disable_history_capture()
         if self._state:
             _lib.cpu_destroy(self._state)
             self._state = 0

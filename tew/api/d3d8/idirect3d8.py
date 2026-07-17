@@ -36,7 +36,7 @@ from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax
+from tew.api.d3d8._helpers import _com_stub, _set_eax, vk_pump
 from tew.api.d3d8._caps import _fill_adapter_identifier, _fill_d3d_caps8
 import tew.api.d3d8._state as _state
 
@@ -45,6 +45,23 @@ import tew.api.d3d8._state as _state
 # BSS default is 0 (Reset), but no device exists on first init — must be 1 for CreateDevice.
 _DX8Z_PREFERRED_BASE   = 0x60000000
 _DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
+
+
+def _query_real_desktop_mode() -> tuple[int, int, int]:
+    """Report a plausible XP-era desktop resolution/refresh rate.
+
+    The emulated identity is a period-correct WinXP + GeForce4 Ti 4200 rig
+    (see _caps.py), so this reports a fixed, mundane 4:3 mode rather than
+    the real host's actual (likely modern, possibly ultrawide) desktop —
+    live-verified that the game's own mode-validation code rejects unusual
+    resolutions/aspect ratios with a "switch your desktop video mode to
+    800x600 ... and restart game" dialog. 1024x768 was a completely
+    ordinary XP-era desktop size and keeps this in sync with gdi32.dll's
+    GetDeviceCaps HORZRES/VERTRES fallback (user32_handlers.py), which the
+    game separately queries at startup — both must agree with each other
+    to look like one consistent, real monitor.
+    """
+    return 1024, 768, 60
 
 
 def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
@@ -62,9 +79,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     def _enum_adapter_modes(cpu: "CPU", mem: "Memory") -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         if p_mode:
-            mem.write32(p_mode,      800)   # Width
-            mem.write32(p_mode + 4,  600)   # Height
-            mem.write32(p_mode + 8,  60)    # RefreshRate
+            width, height, refresh = _query_real_desktop_mode()
+            mem.write32(p_mode,      width)
+            mem.write32(p_mode + 4,  height)
+            mem.write32(p_mode + 8,  refresh)
             mem.write32(p_mode + 12, 0x16)  # Format = D3DFMT_X8R8G8B8
         cpu.regs[EAX] = S_OK
 
@@ -72,9 +90,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     def _get_adapter_display_mode(cpu: "CPU", mem: "Memory") -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_mode:
-            mem.write32(p_mode,      800)
-            mem.write32(p_mode + 4,  600)
-            mem.write32(p_mode + 8,  60)
+            width, height, refresh = _query_real_desktop_mode()
+            mem.write32(p_mode,      width)
+            mem.write32(p_mode + 4,  height)
+            mem.write32(p_mode + 8,  refresh)
             mem.write32(p_mode + 12, 0x16)
         cpu.regs[EAX] = S_OK
 
@@ -96,12 +115,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     #   ESP+24: pPresentationParameters
     #   ESP+28: ppReturnedDeviceInterface
     def _create_device(cpu: "CPU", mem: "Memory") -> None:
-        import os
         import ctypes
         import vulkan as vk
         from vulkan import ffi
-        from sdl2 import SDL_DestroyRenderer
-        from sdl2.syswm import SDL_SysWMinfo, SDL_GetWindowWMInfo
+        from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         hwnd       = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -128,10 +145,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         sdl_window = entry.sdl_window
 
-        # Destroy the SDL renderer — Vulkan presentation takes over this window
-        if entry.sdl_renderer is not None:
-            SDL_DestroyRenderer(entry.sdl_renderer)
-            entry.sdl_renderer = None
+        # Top-level windows are created with SDL_WINDOW_VULKAN so no EGL
+        # surface is attached to the wl_surface; no renderer to destroy here.
 
         # ── Load instance-level KHR extension functions ────────────────────
         try:
@@ -143,6 +158,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 _state._vk_instance, 'vkGetPhysicalDeviceSurfaceFormatsKHR')
             vkGetPresentModes = vk.vkGetInstanceProcAddr(
                 _state._vk_instance, 'vkGetPhysicalDeviceSurfacePresentModesKHR')
+            _state._vk_fn_get_surface_caps = vkGetSurfaceCaps
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: failed to load surface extension functions: {exc} — halting")
@@ -150,6 +166,9 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create VkSurfaceKHR ────────────────────────────────────────────
+        # SDL_Vulkan_CreateSurface handles the X11/Wayland/XWayland selection
+        # automatically — avoids forcing vkCreateWaylandSurfaceKHR on systems
+        # where SDL is actually running through XWayland (NVIDIA + Wayland).
         try:
             wm_info = SDL_SysWMinfo()
             wm_info.version.major = 2
@@ -197,20 +216,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         logger.info("d3d8", "CreateDevice: VkSurfaceKHR created")
 
-        # ── Find queue family with graphics + present support ──────────────
+        # ── Find queue family with graphics support ────────────────────────
         phys_dev = _state._vk_physical_devices[0]
         queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(phys_dev)
         gfx_family = -1
         for i, qf in enumerate(queue_families):
             if qf.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
-                try:
-                    supported = vkGetSurfaceSupport(
-                        phys_dev, i, _state._vk_surface)
-                    if supported:
-                        gfx_family = i
-                        break
-                except Exception:
-                    continue
+                gfx_family = i
+                break
         if gfx_family < 0:
             logger.error("d3d8",
                 "CreateDevice: no GRAPHICS queue family found — halting")
@@ -254,6 +267,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         try:
             _state._vk_fn_create_swapchain = vk.vkGetDeviceProcAddr(
                 _state._vk_device, 'vkCreateSwapchainKHR')
+            _state._vk_fn_destroy_swapchain = vk.vkGetDeviceProcAddr(
+                _state._vk_device, 'vkDestroySwapchainKHR')
             _state._vk_fn_get_swapchain_images = vk.vkGetDeviceProcAddr(
                 _state._vk_device, 'vkGetSwapchainImagesKHR')
             _state._vk_fn_acquire_next_image = vk.vkGetDeviceProcAddr(
@@ -267,38 +282,27 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create swapchain ───────────────────────────────────────────────
+        # Query the actual surface extent — the Vulkan spec requires imageExtent
+        # to equal currentExtent exactly (when it is not 0xFFFFFFFF). Passing a
+        # mismatched extent is undefined behavior; Mesa crashes instead of
+        # returning VK_ERROR_OUT_OF_DATE_KHR.
+        chosen_fmt   = 44  # VK_FORMAT_B8G8R8A8_UNORM
+        chosen_space = 0   # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+        img_count    = 2
+        pre_transform = 0x00000001  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+        _state._vk_swapchain_format = chosen_fmt
         try:
-            caps = vkGetSurfaceCaps(phys_dev, _state._vk_surface)
-
-            # Choose format: prefer VK_FORMAT_B8G8R8A8_UNORM (44)
-            formats = vkGetSurfaceFormats(phys_dev, _state._vk_surface)
-            chosen_fmt   = int(formats[0].format)
-            chosen_space = int(formats[0].colorSpace)
-            for f in formats:
-                if int(f.format) == vk.VK_FORMAT_B8G8R8A8_UNORM:
-                    chosen_fmt   = int(f.format)
-                    chosen_space = int(f.colorSpace)
-                    break
-            _state._vk_swapchain_format = chosen_fmt
-
-            # Extent: use D3DPRESENT_PARAMETERS values when provided
-            if back_w > 0 and back_h > 0:
-                w, h = back_w, back_h
-            elif caps.currentExtent.width != 0xFFFFFFFF:
-                w = int(caps.currentExtent.width)
-                h = int(caps.currentExtent.height)
-            else:
-                w = max(int(caps.minImageExtent.width),
-                        min(int(caps.maxImageExtent.width),  800))
-                h = max(int(caps.minImageExtent.height),
-                        min(int(caps.maxImageExtent.height), 600))
+            phys_dev = _state._vk_physical_devices[0]
+            caps = vk_pump(
+                lambda: _state._vk_fn_get_surface_caps(
+                    phys_dev, _state._vk_surface))
+            w = caps.currentExtent.width
+            h = caps.currentExtent.height
+            if w == 0xFFFFFFFF:
+                w = back_w if back_w > 0 else 800
+                h = back_h if back_h > 0 else 600
             _state._vk_swapchain_width  = w
             _state._vk_swapchain_height = h
-
-            img_count = int(caps.minImageCount) + 1
-            if int(caps.maxImageCount) > 0:
-                img_count = min(img_count, int(caps.maxImageCount))
-
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(
                 sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
                 surface=_state._vk_surface,
@@ -312,7 +316,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
                 queueFamilyIndexCount=0,
                 pQueueFamilyIndices=None,
-                preTransform=caps.currentTransform,
+                preTransform=pre_transform,
                 compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
                 presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
                 clipped=vk.VK_TRUE,
@@ -379,34 +383,107 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             cpu.halted = True
             return
 
+        # ── Render pipeline (render pass, framebuffers, graphics pipeline) ───
+        try:
+            from tew.api.d3d8._pipeline import init_pipeline
+            pipe = init_pipeline(
+                _state._vk_device,
+                _state._vk_physical_devices[0],
+                _state._vk_swapchain_images,
+                _state._vk_swapchain_format,
+                _state._vk_swapchain_width,
+                _state._vk_swapchain_height,
+            )
+            _state._vk_image_views      = pipe["image_views"]
+            _state._vk_render_pass      = pipe["render_pass"]
+            _state._vk_framebuffers     = pipe["framebuffers"]
+            _state._vk_pipeline         = pipe["pipeline"]
+            _state._vk_pipeline_layout  = pipe["pipeline_layout"]
+            _state._vk_vertex_buffer    = pipe["vertex_buffer"]
+            _state._vk_vertex_memory    = pipe["vertex_memory"]
+            _state._vk_vertex_mapped_ptr = pipe["vertex_mapped"]
+        except Exception as exc:
+            logger.error("d3d8",
+                f"CreateDevice: pipeline init failed: {exc} — halting")
+            cpu.halted = True
+            return
+
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
         logger.info("d3d8",
             f"IDirect3D8::CreateDevice complete -> D3DDEV_OBJ=0x{D3DDEV_OBJ:08x}")
         cpu.regs[EAX] = S_OK
 
+    # [9]  CheckDeviceType(this, Adapter, CheckType, DisplayFmt, BackFmt, Windowed)
+    def _check_device_type(cpu: "CPU", mem: "Memory") -> None:
+        adapter   = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        disp_fmt  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        back_fmt  = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        windowed  = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDeviceType adapter={adapter} devType={dev_type} "
+            f"dispFmt={disp_fmt} backFmt={back_fmt} windowed={windowed} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
+    # [10] CheckDeviceFormat(this, Adapter, DevType, AdapterFmt, Usage, RType, CheckFmt)
+    def _check_device_format(cpu: "CPU", mem: "Memory") -> None:
+        adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        usage      = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        rtype      = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        check_fmt  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDeviceFormat adapter={adapter} devType={dev_type} "
+            f"adapterFmt={adapter_fmt} usage=0x{usage:x} rtype={rtype} checkFmt={check_fmt} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
+    # [11] CheckDeviceMultiSampleType(this, Adapter, DevType, SurfaceFmt, Windowed, MultiSampleType)
+    def _check_multisample(cpu: "CPU", mem: "Memory") -> None:
+        logger.info("d3d8", "CheckDeviceMultiSampleType -> D3DERR_NOTAVAIL (no MSAA)")
+        cpu.regs[EAX] = D3DERR_NOTAVAIL
+
+    # [12] CheckDepthStencilMatch(this, Adapter, DevType, AdapterFmt, RTFmt, DSFmt)
+    def _check_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+        adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        rt_fmt     = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        ds_fmt     = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        logger.info("d3d8",
+            f"CheckDepthStencilMatch adapter={adapter} devType={dev_type} "
+            f"adapterFmt={adapter_fmt} rtFmt={rt_fmt} dsFmt={ds_fmt} -> S_OK")
+        cpu.regs[EAX] = S_OK
+
     return [
-        # [0]  QueryInterface
+        # [0]  QueryInterface — E_NOINTERFACE: we don't support QI on this object
         _com_stub(stubs, "d3d8", "IDirect3D8::QueryInterface",
-            lambda cpu, mem: _set_eax(cpu, 0x80004002), 8, memory),
-        # [1]  AddRef
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::QueryInterface -> E_NOINTERFACE"),
+                              _set_eax(cpu, 0x80004002))[-1], 8, memory),
+        # [1]  AddRef — refcount stub, always 1
         _com_stub(stubs, "d3d8", "IDirect3D8::AddRef",
-            lambda cpu, mem: _set_eax(cpu, 1), 0, memory),
-        # [2]  Release
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::AddRef -> 1"),
+                              _set_eax(cpu, 1))[-1], 0, memory),
+        # [2]  Release — refcount stub, always 0
         _com_stub(stubs, "d3d8", "IDirect3D8::Release",
-            lambda cpu, mem: _set_eax(cpu, 0), 0, memory),
-        # [3]  RegisterSoftwareDevice
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::Release -> 0"),
+                              _set_eax(cpu, 0))[-1], 0, memory),
+        # [3]  RegisterSoftwareDevice — not supported
         _com_stub(stubs, "d3d8", "IDirect3D8::RegisterSoftwareDevice",
-            lambda cpu, mem: _set_eax(cpu, D3DERR_NOTAVAIL), 4, memory),
-        # [4]  GetAdapterCount
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::RegisterSoftwareDevice -> D3DERR_NOTAVAIL"),
+                              _set_eax(cpu, D3DERR_NOTAVAIL))[-1], 4, memory),
+        # [4]  GetAdapterCount — we expose one adapter
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterCount",
-            lambda cpu, mem: _set_eax(cpu, 1), 0, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterCount -> 1"),
+                              _set_eax(cpu, 1))[-1], 0, memory),
         # [5]  GetAdapterIdentifier
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterIdentifier",
             _get_adapter_identifier, 12, memory),
-        # [6]  GetAdapterModeCount
+        # [6]  GetAdapterModeCount — we expose one mode (800x600@60)
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterModeCount",
-            lambda cpu, mem: _set_eax(cpu, 1), 4, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterModeCount -> 1"),
+                              _set_eax(cpu, 1))[-1], 4, memory),
         # [7]  EnumAdapterModes
         _com_stub(stubs, "d3d8", "IDirect3D8::EnumAdapterModes",
             _enum_adapter_modes, 12, memory),
@@ -415,22 +492,23 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             _get_adapter_display_mode, 8, memory),
         # [9]  CheckDeviceType
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceType",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 20, memory),
+            _check_device_type, 20, memory),
         # [10] CheckDeviceFormat
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceFormat",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 24, memory),
+            _check_device_format, 24, memory),
         # [11] CheckDeviceMultiSampleType
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDeviceMultiSampleType",
-            lambda cpu, mem: _set_eax(cpu, D3DERR_NOTAVAIL), 20, memory),
+            _check_multisample, 20, memory),
         # [12] CheckDepthStencilMatch
         _com_stub(stubs, "d3d8", "IDirect3D8::CheckDepthStencilMatch",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 20, memory),
+            _check_depth_stencil, 20, memory),
         # [13] GetDeviceCaps
         _com_stub(stubs, "d3d8", "IDirect3D8::GetDeviceCaps",
             _get_device_caps, 12, memory),
-        # [14] GetAdapterMonitor
+        # [14] GetAdapterMonitor — fake HMONITOR, no real monitor object
         _com_stub(stubs, "d3d8", "IDirect3D8::GetAdapterMonitor",
-            lambda cpu, mem: _set_eax(cpu, 0x0D3D0001), 4, memory),
+            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::GetAdapterMonitor -> 0x0D3D0001"),
+                              _set_eax(cpu, 0x0D3D0001))[-1], 4, memory),
         # [15] CreateDevice
         _com_stub(stubs, "d3d8", "IDirect3D8::CreateDevice",
             _create_device, 24, memory),
@@ -440,32 +518,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 def _platform_vulkan_extensions() -> list[str]:
     """Return the Vulkan instance extensions required for surface creation on this host.
 
-    VK_KHR_surface is always required. The platform-specific surface extension
-    is selected by platform and, on Linux, by display server environment variables.
-    This mirrors what a real D3D runtime does: it knows its platform at build time
-    and doesn't ask SDL which extensions to request.
+    On Linux, include both xlib and wayland extensions so the instance is usable
+    regardless of which backend SDL selected. SDL_Vulkan_CreateSurface (called in
+    CreateDevice) picks the correct one at runtime.
     """
     import os
     from sdl2.platform import SDL_GetPlatform
 
-    extensions = ["VK_KHR_surface"]
     platform = SDL_GetPlatform().decode()
-
     if platform == "Linux":
+        extensions = ["VK_KHR_surface", "VK_KHR_xlib_surface"]
         if os.environ.get("WAYLAND_DISPLAY"):
             extensions.append("VK_KHR_wayland_surface")
-        else:
-            # DISPLAY set or unset — default to xlib, most widely supported
-            extensions.append("VK_KHR_xlib_surface")
+        return extensions
     elif platform == "Windows":
-        extensions.append("VK_KHR_win32_surface")
+        return ["VK_KHR_surface", "VK_KHR_win32_surface"]
     elif platform == "Mac OS X":
-        extensions.append("VK_EXT_metal_surface")
+        return ["VK_KHR_surface", "VK_EXT_metal_surface"]
     else:
         logger.warn("d3d8", f"[Direct3DCreate8] Unknown platform '{platform}' — defaulting to VK_KHR_xlib_surface")
-        extensions.append("VK_KHR_xlib_surface")
-
-    return extensions
+        return ["VK_KHR_surface", "VK_KHR_xlib_surface"]
 
 
 def make_create8(memory: "Memory") -> Callable:
@@ -479,6 +551,12 @@ def make_create8(memory: "Memory") -> Callable:
     """
     def _direct3d_create8(cpu: "CPU") -> None:
         import vulkan as vk
+
+        if _state._vk_instance is not None:
+            logger.info("d3d8", "[Direct3DCreate8] reusing existing VkInstance")
+            cpu.regs[EAX] = D3D8_OBJ
+            cleanup_stdcall(cpu, memory, 4)
+            return
 
         extensions = _platform_vulkan_extensions()
         logger.info("d3d8", f"[Direct3DCreate8] Vulkan surface extensions: {extensions}")

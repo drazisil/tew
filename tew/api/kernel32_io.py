@@ -253,8 +253,11 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "TerminateProcess", _terminate_process)
     stubs.register_handler("kernel32.dll", "FatalAppExitA",    _fatal_app_exit)
-    stubs.register_handler("kernel32.dll", "RtlUnwind",        _halt("RtlUnwind"))
-    stubs.register_handler("kernel32.dll", "RaiseException",   _halt("RaiseException"))
+    # RtlUnwind/RaiseException: real implementations, not _halt placeholders
+    # -- see tew/kernel/seh.py. register_handler dedupes by key, so this
+    # must run before anything else tries to register the same names.
+    from tew.kernel.seh import register_seh_handlers
+    register_seh_handlers(stubs, memory)
 
     # ── Thread creation and management ────────────────────────────────────────
 
@@ -346,6 +349,8 @@ def register_kernel32_io_handlers(
     def _sleep_ex(cpu: "CPU") -> None:
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        tid = state.tls_current_thread_id()
+        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) tid={tid} ret=0x{return_eip:x}")
         cpu.regs[ESP] = (cpu.regs[ESP] + 12) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
         state.scheduler.tick(dw_ms, memory)
         _fire_due_timers(cpu, memory, state)
@@ -430,6 +435,8 @@ def register_kernel32_io_handlers(
                         obj.owner_tid = tid
                         obj.recursion_count = 1
                         obj.locked = True
+                    logger.debug("scheduler",
+                        f"WaitForMultipleEx: tid={tid} satisfied h=0x{h:x} idx={i}")
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
@@ -553,7 +560,8 @@ def register_kernel32_io_handlers(
         obj = state.kernel_handle_map.get(h)
         if isinstance(obj, EventHandle):
             obj.signaled = True
-            state.scheduler.unblock_handle(h)
+            n = state.scheduler.unblock_handle(h)
+            logger.debug("scheduler", f"SetEvent(0x{h:x}) signaled={obj.signaled} unblocked={n}")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -587,18 +595,32 @@ def register_kernel32_io_handlers(
 
     GENERIC_WRITE = 0x40000000
 
+    _CF_CREATE_NEW        = 1
+    _CF_CREATE_ALWAYS     = 2
+    _CF_OPEN_EXISTING     = 3
+    _CF_OPEN_ALWAYS       = 4
+    _CF_TRUNCATE_EXISTING = 5
+
     def _create_file_a(cpu: "CPU") -> None:
-        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        access   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        name_ptr    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        access      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory)
-        cpu.regs[EAX] = state.open_file_handle(name, bool(access & GENERIC_WRITE))
+        if not name:
+            logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
+        writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+        no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
+        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
         cleanup_stdcall(cpu, memory, 28)
 
     def _create_file_w(cpu: "CPU") -> None:
-        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        access   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        name_ptr    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        access      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_wide_string(name_ptr, memory)
-        cpu.regs[EAX] = state.open_file_handle(name, bool(access & GENERIC_WRITE))
+        writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+        no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
+        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:
@@ -614,6 +636,7 @@ def register_kernel32_io_handlers(
                 memory.write32(lp_read, 0)
             cpu.regs[EAX] = 0
         else:
+            pos_before = entry.position
             available = len(entry.data) - entry.position
             to_read = min(n_to_read, available)
             for i in range(to_read):
@@ -622,6 +645,11 @@ def register_kernel32_io_handlers(
             if lp_read:
                 memory.write32(lp_read, to_read)
             cpu.regs[EAX] = 1
+            name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            logger.debug("fileio",
+                f'ReadFile({name_short} h=0x{h_file:x}) '
+                f'offset={pos_before} req={n_to_read} got={to_read} '
+                f'pos_after={entry.position} eof={len(entry.data)}')
         cleanup_stdcall(cpu, memory, 20)
 
     def _delete_file_a(cpu: "CPU") -> None:
@@ -772,7 +800,52 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "FindClose",      _find_close)
     stubs.register_handler("kernel32.dll", "CompareFileTime", _halt("CompareFileTime"))
     stubs.register_handler("kernel32.dll", "GetFileAttributesA", _get_file_attributes_a)
-    stubs.register_handler("kernel32.dll", "GetFullPathNameA",   _halt("GetFullPathNameA"))
+
+    def _get_full_path_name_a(cpu: "CPU") -> None:
+        lp_file = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        n_buf   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        lp_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_part = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        raw = read_cstring(lp_file, memory, 260) if lp_file else ""
+
+        CWD = state.current_directory
+        if raw and len(raw) >= 2 and raw[1] == ':':
+            full_win = raw
+        elif raw.startswith("\\\\"):
+            full_win = raw
+        else:
+            full_win = CWD + "\\" + raw.lstrip("\\")
+
+        parts: list = []
+        for seg in full_win.replace("/", "\\").split("\\"):
+            if seg == "..":
+                if len(parts) > 1:
+                    parts.pop()
+            elif seg == "." or seg == "":
+                pass
+            else:
+                parts.append(seg)
+        result = "\\".join(parts) or "C:\\"
+
+        needed = len(result) + 1
+        if lp_buf and n_buf >= needed:
+            for i, ch in enumerate(result):
+                memory.write8((lp_buf + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
+            memory.write8((lp_buf + len(result)) & 0xFFFFFFFF, 0)
+            if lp_part:
+                last_sep = result.rfind("\\")
+                if 0 <= last_sep < len(result) - 1:
+                    memory.write32(lp_part, (lp_buf + last_sep + 1) & 0xFFFFFFFF)
+                else:
+                    memory.write32(lp_part, 0)
+            cpu.regs[EAX] = len(result)
+            logger.debug("handlers", f'GetFullPathNameA({raw!r}) -> {result!r}')
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("kernel32.dll", "GetFullPathNameA", _get_full_path_name_a)
 
     # ── SetFilePointer / GetFileSize ──────────────────────────────────────────
 
@@ -867,7 +940,7 @@ def register_kernel32_io_handlers(
     def _get_current_dir_a(cpu: "CPU") -> None:
         n_buf  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        d = "C:\\MCity"
+        d = state.current_directory
         if lp_buf and n_buf > len(d):
             for i, ch in enumerate(d):
                 memory.write8(lp_buf + i, ord(ch))
@@ -878,8 +951,14 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _set_current_dir_a(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] SetCurrentDirectoryA — halting")
-        cpu.halted = True
+        lp_path = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        path = read_cstring(lp_path, memory, 260) if lp_path else ""
+        if path:
+            # Preserve root "C:\" as-is; strip trailing backslash from subdirs
+            state.current_directory = path if path.endswith(":\\") else path.rstrip("\\")
+            logger.debug("handlers", f"SetCurrentDirectoryA({path!r})")
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 4)
 
     def _get_windows_dir_a(cpu: "CPU") -> None:
         lp_buf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)

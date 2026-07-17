@@ -8,15 +8,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -24,11 +24,11 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "srcdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "shardurl": {
       "type": 1,
@@ -79,6 +79,30 @@
     "loginpw": {
       "type": 1,
       "value": "admin"
+    },
+    "3d card": {
+      "type": 1,
+      "value": "Unknown D3D"
+    },
+    "3d device description": {
+      "type": 1,
+      "value": "NVIDIA GeForce GTX 470 [D3D]"
+    },
+    "d3d device": {
+      "type": 4,
+      "value": 0
+    },
+    "group": {
+      "type": 1,
+      "value": "D3D"
+    },
+    "hardware acceleration": {
+      "type": 4,
+      "value": 1
+    },
+    "thrash driver": {
+      "type": 1,
+      "value": "dx8z.dll"
     }
   },
   "hklm\\software\\electronic arts\\motor city\\authauth": {
@@ -98,15 +122,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -114,7 +138,7 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     }
   },
   "hklm\\software\\eacom\\authauth": {
@@ -180,15 +204,15 @@
     },
     "installdir": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "datapath": {
       "type": 1,
-      "value": "C:\\MCity\\Data\\"
+      "value": "C:\\Data\\"
     },
     "srcdrive": {
       "type": 1,
@@ -196,7 +220,7 @@
     },
     "srcpath": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "shardurl": {
       "type": 1,
@@ -226,21 +250,21 @@
   "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity.exe": {
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "": {
       "type": 1,
-      "value": "C:\\MCity\\MCity_d.exe"
+      "value": "C:\\MCity_d.exe"
     }
   },
   "hklm\\software\\microsoft\\windows\\currentversion\\app paths\\mcity_d.exe": {
     "path": {
       "type": 1,
-      "value": "C:\\MCity\\"
+      "value": "C:\\"
     },
     "": {
       "type": 1,
-      "value": "C:\\MCity\\MCity_d.exe"
+      "value": "C:\\MCity_d.exe"
     }
   }
 }

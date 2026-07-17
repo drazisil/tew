@@ -321,6 +321,9 @@ class CRTState:
         # ── Local/GlobalAlloc tracking ────────────────────────────────────
         self.local_alloc_map: dict[int, int] = {}   # addr → size
 
+        # ── Current working directory ─────────────────────────────────────
+        self.current_directory: str = "C:\\MCity"
+
         # ── Window / dialog system ────────────────────────────────────────
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded
@@ -348,15 +351,23 @@ class CRTState:
     # ── Path translation ──────────────────────────────────────────────────────
 
     def translate_windows_path(self, win_path: str) -> str:
-        """Map a Windows path to a host Linux path using config path_mappings."""
+        """Map a Windows path to a host Linux path, resolving case-insensitively.
+
+        Windows paths are case-insensitive; Linux is not.  After applying the
+        drive/prefix mapping we run find_file_ci to resolve every path component
+        to the actual on-disk case.  If no match exists we return the naively-
+        translated path so callers can report ENOENT normally.
+        """
         p = win_path.replace("\\", "/")
-        # Sort by key length descending so longer prefixes match first
         mappings = sorted(self.config.path_mappings.items(), key=lambda kv: -len(kv[0]))
         for win_prefix, linux_prefix in mappings:
             if p.lower().startswith(win_prefix):
-                result = linux_prefix + p[len(win_prefix):]
-                return result.replace("//", "/")
-        return p.replace("//", "/")
+                naive = (linux_prefix + p[len(win_prefix):]).replace("//", "/")
+                resolved = find_file_ci(naive)
+                return resolved if resolved is not None else naive
+        naive = p.replace("//", "/")
+        resolved = find_file_ci(naive)
+        return resolved if resolved is not None else naive
 
     def reverse_translate_path(self, linux_path: str) -> str:
         """
@@ -380,7 +391,7 @@ class CRTState:
         # No mapping matched — return as-is with backslashes.
         return linux_path.replace("/", "\\")
 
-    def open_file_handle(self, win_name: str, writable: bool) -> int:
+    def open_file_handle(self, win_name: str, writable: bool, no_create_prompt: bool = False) -> int:
         """Open a file and register it in file_handle_map. Returns the handle."""
         from tew.logger import logger
         # Device namespace paths (\\.\xxx) are kernel driver handles — never a
@@ -389,11 +400,54 @@ class CRTState:
         if normalized.startswith("/./") or normalized.startswith("//./"):
             logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (device path, not emulated)')
             return 0xFFFFFFFF
+        if not win_name:
+            logger.debug("fileio", 'CreateFile("") -> INVALID_HANDLE_VALUE (empty path)')
+            return 0xFFFFFFFF
+        # Win32 reserved device names — case-insensitive, ignore any path prefix.
+        _dev_name = normalized.rsplit("/", 1)[-1].upper().split(".")[0]
+        if _dev_name == "NUL":
+            handle = self.next_file_handle
+            self.next_file_handle += 1
+            if writable:
+                fd = os.open("/dev/null", os.O_WRONLY)
+                self.file_handle_map[handle] = FileHandleEntry(
+                    path="/dev/null", data=b"", position=0, writable=True, fd=fd
+                )
+            else:
+                self.file_handle_map[handle] = FileHandleEntry(
+                    path="/dev/null", data=b"", position=0, writable=False, fd=None
+                )
+            logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [NUL device]')
+            return handle
+        if _dev_name in ("CON", "AUX", "PRN", "COM1", "COM2", "COM3", "COM4",
+                         "COM5", "COM6", "COM7", "COM8", "COM9",
+                         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+                         "LPT6", "LPT7", "LPT8", "LPT9"):
+            logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (unsupported device {_dev_name})')
+            return 0xFFFFFFFF
         handle = self.next_file_handle
         self.next_file_handle += 1
         if writable:
             real_path = self.translate_windows_path(win_name)
+            # A bare relative filename (e.g. the game writing "trace000.txt"
+            # with no path prefix at all) has no directory component --
+            # os.path.dirname() returns "", and os.makedirs("",
+            # exist_ok=True) raises FileNotFoundError rather than being a
+            # no-op (real CreateFile needs no directory creation for this
+            # case either: the process's current directory already exists).
+            #
+            # VERIFIED 2026-07-12 (merged temporarily with the dialog-click/
+            # nomovie branches' work for this live check, not otherwise
+            # related): with this fix, the previously-reliable "abortmessage:
+            # mono.c:260" halt no longer occurs at all -- the run progresses
+            # ~5M steps further (197.1M total, past real d3d8 rendering) to
+            # a clean, honest, unrelated stop: "[UNIMPLEMENTED]
+            # user32.dll!IsIconic -- halting". Not a crash, not investigated
+            # further here.
             try:
+                dirname = os.path.dirname(real_path)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
                 fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
@@ -418,7 +472,7 @@ class CRTState:
                 except OSError:
                     logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (read error)')
                     return 0xFFFFFFFF
-            if not self.config.interactive_on_missing_file:
+            if not self.config.interactive_on_missing_file or no_create_prompt:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (not found: {linux_path})')
                 return 0xFFFFFFFF
             print(f"\n[FileIO] File not found: {linux_path}")
