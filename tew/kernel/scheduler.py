@@ -21,6 +21,7 @@ from tew.logger import logger
 # ── Constants (mirror tew/api/_state.py) ─────────────────────────────────────
 TEB_BASE          = 0x00320000
 _TLS_TEB_OFFSET   = 0xE0          # TLS slots start at TEB + 0xE0
+_LAST_ERROR_TEB_OFFSET = 0x34     # NT_TIB.LastErrorValue (mirrors tew/api/kernel32_system.py)
 THREAD_STACK_BASE = 0x08000000
 THREAD_STACK_SIZE = 256 * 1024    # 256 KB per thread
 THREAD_SENTINEL   = 0x001FE000   # return address that marks thread exit
@@ -44,6 +45,7 @@ class ThreadState:
     suspended:    bool = False
     saved_state:  Any  = None        # opaque SavedCPUState from cpu.save_state()
     tls_slots:    dict = field(default_factory=dict)   # slot_index -> value
+    last_error:   int  = 0           # this thread's GetLastError/SetLastError value
     calls_seen:   Optional[set] = None
 
     # Blocking conditions
@@ -136,6 +138,20 @@ class Scheduler:
         for slot in self._tls_slots:
             memory.write32((base + slot * 4) & 0xFFFFFFFF, thread.tls_slots.get(slot, 0))
 
+    # ── Internal: last-error (GetLastError/SetLastError) ─────────────────────
+    # Real Windows keeps this per-thread (each thread has its own TEB), but
+    # this emulator has only one fixed TEB address shared by every thread —
+    # without this save/restore, one thread's SetLastError would silently
+    # clobber every other thread's GetLastError result across a context
+    # switch. Same shape as _save_tls/_load_tls above, one DWORD instead of
+    # a slot table.
+
+    def _save_last_error(self, memory: "Memory", thread: ThreadState) -> None:
+        thread.last_error = memory.read32((TEB_BASE + _LAST_ERROR_TEB_OFFSET) & 0xFFFFFFFF)
+
+    def _load_last_error(self, memory: "Memory", thread: ThreadState) -> None:
+        memory.write32((TEB_BASE + _LAST_ERROR_TEB_OFFSET) & 0xFFFFFFFF, thread.last_error)
+
     # ── Internal: CPU state ───────────────────────────────────────────────────
 
     def _save_current(self, cpu: "CPU", memory: "Memory") -> None:
@@ -143,11 +159,13 @@ class Scheduler:
         thread = self.threads[self.current_idx]
         thread.saved_state = cpu.save_state()
         self._save_tls(memory, thread)
+        self._save_last_error(memory, thread)
 
     def _load_thread(self, idx: int, cpu: "CPU", memory: "Memory") -> None:
         """Restore a thread's saved state into the CPU. Sets current_idx."""
         thread = self.threads[idx]
         self._load_tls(memory, thread)
+        self._load_last_error(memory, thread)
         cpu.restore_state(thread.saved_state)
         # restore_state does not touch halted; clear explicitly -- but never
         # override a fatal_halt (e.g. an unimplemented Win32 API): that means
@@ -165,6 +183,7 @@ class Scheduler:
         memory.write32(esp & 0xFFFFFFFF, thread.parameter)
         esp -= 4
         memory.write32(esp & 0xFFFFFFFF, THREAD_SENTINEL)
+        self._load_last_error(memory, thread)  # fresh thread starts at last_error=0
         cpu.regs[EAX] = 0
         cpu.regs[EBX] = 0
         cpu.regs[ECX] = 0
