@@ -155,7 +155,11 @@ def patch_crt_internals(
         # _CRT_WARN (0) is informational — log and continue.
         # _CRT_ERROR (1) and _CRT_ASSERT (2) are fatal — halt.
         if report_type == 0:
-            logger.warn("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
+            # _CRT_WARN fires dozens of times per run for the routine
+            # end-of-process memory-leak dump (Detected memory leaks! /
+            # Dumping objects -> / one line per block) -- informational
+            # noise, not something worth WARN-level attention.
+            logger.debug("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
             cpu.regs[EAX] = 0  # 0 = don't trigger debugbreak
         else:
             logger.error("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
