@@ -505,7 +505,7 @@ def register_msvcrt_handlers(
     # No-op: bump allocator does not support freeing.
     def _free(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        logger.debug("handlers", f"free(0x{ptr:08x}) — no-op (bump allocator)")
+        logger.trace("handlers", f"free(0x{ptr:08x}) — no-op (bump allocator)")
 
     stubs.register_handler("msvcrt.dll", "free", _free)
 
@@ -520,7 +520,7 @@ def register_msvcrt_handlers(
     # No-op: bump allocator has no free.
     def _operator_delete(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        logger.debug("handlers", f"operator delete(0x{ptr:08x}) — no-op (bump allocator)")
+        logger.trace("handlers", f"operator delete(0x{ptr:08x}) — no-op (bump allocator)")
 
     stubs.register_handler("msvcrt.dll", "??3@YAXPAX@Z", _operator_delete)
 

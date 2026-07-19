@@ -745,7 +745,7 @@ def register_advapi32_handlers(
             dw_user=dw_user,
             fu_event=fu_event,
         )
-        logger.info(
+        logger.trace(
             "handlers",
             f"[winmm] timeSetEvent(delay={u_delay}, res={u_resolution},"
             f" cb=0x{lp_time_proc:x}, fuEvent=0x{fu_event:x}, periodic={period_ms > 0}) -> id={timer_id}",
