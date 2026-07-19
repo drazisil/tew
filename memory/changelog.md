@@ -4,6 +4,41 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-19 — MessageBoxA/W log severity now matches dialog icon; fatal dialogs
+tracked so a voluntary ExitProcess after one can't be logged as a clean exit
+
+**`tew/api/user32_handlers.py`**: `_show_messagebox` now maps the same `u_type &
+0x70` icon bits already used to pick the SDL dialog's appearance to a log level —
+`MB_ICONERROR`/`MB_ICONSTOP`/`MB_ICONHAND` (`0x10`/`0x20`) → `logger.error`,
+`MB_ICONWARNING`/`MB_ICONEXCLAMATION` (`0x30`) → `logger.warn`, else `logger.info`
+(unchanged default). Applies whether the dialog was auto-answered via a hook or
+shown for real. Previously every `MessageBoxA`/`MessageBoxW` call logged at a flat
+`INFO`, so a fatal stop-icon abort and a routine yes/no confirmation were
+indistinguishable in the log — found via a live run where the game's own
+`abortmessage` dialog (`depthconv.c:1137`, "Failed to initialize database...",
+`type=0x11011`) logged identically to the harmless "run full screen?" prompt
+(`type=0x4`).
+
+**`tew/api/_state.py`**: new `CRTState.fatal_dialogs: list[tuple[str, str]]` —
+every error-severity dialog's `(caption, text)` is appended here regardless of how
+it was answered.
+
+**`run_exe.py`**: the final run summary now checks `crt_state.fatal_dialogs` —
+if any fired, logs `=== Emulation Complete (NOT a clean exit) ===` at `ERROR` plus
+a listing of each fatal dialog, instead of the previous unconditional
+`=== Emulation Complete ===`. This directly fixes a real misleading-log risk: a
+game-side fatal abort followed by a voluntary `ExitProcess(0)` (exactly what
+happens today, see status.md) used to produce a summary indistinguishable from an
+actually successful run.
+
+**Live-verified**: full run reproduces the fix end-to-end — the `abortmessage`
+dialog logs at `ERROR`, the full-screen prompt still logs at `INFO` (no
+regression), and the summary correctly reads `NOT a clean exit` with the abort's
+caption/text listed. 582/582 tests pass (no test changes needed — this is a pure
+logging-severity change with no behavior affecting emulation itself).
+
+---
+
 ## 2026-06-06 — IDirect3DTexture8 COM interface + vtable layout fix
 
 **New file: `tew/api/d3d8/idirect3d8texture.py`** — full 18-slot `IDirect3DTexture8`

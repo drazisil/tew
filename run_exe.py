@@ -527,7 +527,18 @@ if step_count >= MAX_STEPS:
 
 # ── Post-run reporting ────────────────────────────────────────────────────────
 
-logger.info("startup", "=== Emulation Complete ===")
+if crt_state.fatal_dialogs:
+    logger.error("startup", "=== Emulation Complete (NOT a clean exit) ===")
+    logger.error(
+        "startup",
+        f"{len(crt_state.fatal_dialogs)} fatal (stop/hand-icon) dialog(s) fired"
+        " during this run -- a voluntary ExitProcess afterward is the game"
+        " aborting, not a successful run:",
+    )
+    for caption, text in crt_state.fatal_dialogs:
+        logger.error("startup", f'  "{caption}": {text.splitlines()[0] if text else ""}')
+else:
+    logger.info("startup", "=== Emulation Complete (clean exit) ===")
 logger.info("startup", f"Steps executed: {cpu._step_count}")
 
 logger.debug("handlers", "--- Win32 Stub Call Log (last 50) ---")

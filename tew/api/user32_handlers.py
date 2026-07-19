@@ -194,23 +194,38 @@ def register_user32_gdi32_handlers(
             (b"Cancel", 2, SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT)],
     }
 
-    # MB_ICON* flags occupy bits 4-7 of uType.
+    # MB_ICON* flags occupy bits 4-7 of uType. The same bits also decide how
+    # loud to log the dialog -- a fatal stop/hand-icon abort shouldn't look
+    # identical in the log to a routine yes/no confirmation.
     _MSGBOX_ICON_FLAGS: dict[int, int] = {
         0x10: SDL_MESSAGEBOX_ERROR,        # MB_ICONERROR / MB_ICONSTOP
         0x20: SDL_MESSAGEBOX_ERROR,        # MB_ICONHAND
         0x30: SDL_MESSAGEBOX_WARNING,      # MB_ICONWARNING / MB_ICONEXCLAMATION
         0x40: SDL_MESSAGEBOX_INFORMATION,  # MB_ICONINFORMATION / MB_ICONASTERISK
     }
+    _MSGBOX_LOG_LEVEL: dict[int, str] = {
+        0x10: "error",  # MB_ICONERROR / MB_ICONSTOP
+        0x20: "error",  # MB_ICONHAND
+        0x30: "warn",   # MB_ICONWARNING / MB_ICONEXCLAMATION
+        0x40: "info",   # MB_ICONINFORMATION / MB_ICONASTERISK
+    }
 
-    def _show_messagebox(caption: str, text: str, u_type: int) -> int:
+    def _show_messagebox(caption: str, text: str, u_type: int) -> tuple[int, str]:
+        icon_key  = u_type & 0x70
+        log_level = _MSGBOX_LOG_LEVEL.get(icon_key, "info")
+        if log_level == "error":
+            # The game itself reporting a fatal condition -- record it
+            # regardless of how it gets answered, so a later voluntary
+            # ExitProcess can't be mistaken for a clean run.
+            state.fatal_dialogs.append((caption, text))
+
         if wm._messagebox_hook is not None:
             answer = wm._messagebox_hook(caption, text, u_type)
             if answer is not None:
                 logger.info("dialog", f"[MessageBox] auto-answered ({caption!r}) -> {answer}")
-                return answer
+                return answer, log_level
 
         btn_type  = u_type & 0x0F
-        icon_key  = u_type & 0x70
         sdl_flags = _MSGBOX_ICON_FLAGS.get(icon_key, SDL_MESSAGEBOX_INFORMATION)
         buttons   = _MSGBOX_BUTTONS.get(btn_type, _MSGBOX_BUTTONS[0])
 
@@ -233,8 +248,8 @@ def register_user32_gdi32_handlers(
         ret = SDL_ShowMessageBox(data, _ctypes.byref(button_id))
         if ret < 0:
             logger.error("handlers", f"[Win32] SDL_ShowMessageBox failed (ret={ret}); defaulting to first button")
-            return buttons[0][1]
-        return button_id.value
+            return buttons[0][1], log_level
+        return button_id.value, log_level
 
     def _read_cstr(addr: int, max_len: int = 1024) -> str:
         out = []
@@ -262,8 +277,8 @@ def register_user32_gdi32_handlers(
         u_type     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         text    = _read_cstr(lp_text)
         caption = _read_cstr(lp_caption)
-        result  = _show_messagebox(caption, text, u_type)
-        logger.info(
+        result, log_level  = _show_messagebox(caption, text, u_type)
+        getattr(logger, log_level)(
             "handlers",
             f'[Win32] MessageBoxA("{caption}", "{text.replace(chr(10), "\\n")}")'
             f" type=0x{u_type:x} -> {result}",
@@ -280,8 +295,8 @@ def register_user32_gdi32_handlers(
         u_type     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         text    = _read_wstr(lp_text)
         caption = _read_wstr(lp_caption)
-        result  = _show_messagebox(caption, text, u_type)
-        logger.info(
+        result, log_level  = _show_messagebox(caption, text, u_type)
+        getattr(logger, log_level)(
             "handlers",
             f'[Win32] MessageBoxW("{caption}", "{text.replace(chr(10), "\\n")}")'
             f" type=0x{u_type:x} -> {result}",

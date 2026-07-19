@@ -329,6 +329,13 @@ class CRTState:
         # pe_resources is set by run_exe.py after the PE is loaded
         self.pe_resources: Optional["PEResources"] = None
 
+        # ── Fatal dialogs ─────────────────────────────────────────────────
+        # Every MessageBoxA/W shown with a stop/hand icon (MB_ICONERROR /
+        # MB_ICONSTOP / MB_ICONHAND) lands here, whether it was auto-answered
+        # or shown for real. A voluntary ExitProcess after one of these is
+        # NOT a clean exit -- see run_exe.py's post-run summary.
+        self.fatal_dialogs: list[tuple[str, str]] = []
+
     # ── Virtual clock ─────────────────────────────────────────────────────────
 
     @property
