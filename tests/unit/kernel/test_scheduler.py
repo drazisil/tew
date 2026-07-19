@@ -499,6 +499,62 @@ class TestMarkCurrentDead:
         assert cpu.halted is True
 
 
+# ── terminate_thread ───────────────────────────────────────────────────────────
+
+class TestTerminateThread:
+    def test_returns_none_for_unknown_handle(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        cpu = make_cpu()
+        mem = make_memory()
+
+        result = s.terminate_thread(cpu, mem, 0xDEADBEEF)
+
+        assert result is None
+
+    def test_terminates_a_different_thread_without_switching(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        mem = make_memory()
+        # current_idx stays 0 (main thread) throughout
+
+        result = s.terminate_thread(cpu, mem, 0xBEF0)
+
+        assert result is True
+        assert s.threads[1].status == ThreadStatus.DEAD
+        assert s.threads[1].saved_state is None
+        assert s.current_idx == 0          # never switched
+        cpu.save_state.assert_not_called() # never tried to save the caller
+
+    def test_terminating_current_thread_behaves_like_mark_current_dead(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        mem = make_memory()
+
+        result = s.terminate_thread(cpu, mem, 0xBEEF)  # main thread's own handle
+
+        assert result is False
+        assert s.threads[0].status == ThreadStatus.DEAD
+        assert s.current_idx == 1          # switched to the other ready thread
+
+    def test_halts_when_terminating_current_thread_and_none_left(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        cpu = make_cpu()
+        mem = make_memory()
+
+        result = s.terminate_thread(cpu, mem, 0xBEEF)
+
+        assert result is False
+        assert cpu.halted is True
+
+
 # ── unblock_cs ────────────────────────────────────────────────────────────────
 
 class TestUnblockCs:

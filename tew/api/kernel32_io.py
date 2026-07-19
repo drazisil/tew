@@ -305,6 +305,20 @@ def register_kernel32_io_handlers(
         logger.debug("thread", f"ExitThread({code})")
         state.scheduler.mark_current_dead(cpu, memory)
 
+    def _terminate_thread(cpu: "CPU") -> None:
+        h         = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        exit_code = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        logger.info("thread", f"TerminateThread(handle=0x{h:x}, exitCode=0x{exit_code:x})")
+        result = state.scheduler.terminate_thread(cpu, memory, h)
+        if result is None:
+            cpu.regs[EAX] = 0  # invalid handle
+            cleanup_stdcall(cpu, memory, 8)
+        elif result is True:
+            cpu.regs[EAX] = 1
+            cleanup_stdcall(cpu, memory, 8)
+        # result is False: current thread terminated itself -- scheduler
+        # already switched the live CPU away, must not touch it here.
+
     def _get_exit_code_thread(cpu: "CPU") -> None:
         h         = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_code   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -336,6 +350,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "CreateThread",        _create_thread)
     stubs.register_handler("kernel32.dll", "ResumeThread",        _resume_thread)
     stubs.register_handler("kernel32.dll", "ExitThread",          _exit_thread)
+    stubs.register_handler("kernel32.dll", "TerminateThread",     _terminate_thread)
     stubs.register_handler("kernel32.dll", "GetExitCodeThread",   _get_exit_code_thread)
     stubs.register_handler("kernel32.dll", "OpenThread",          _halt("OpenThread"))
     stubs.register_handler("kernel32.dll", "CreateProcessA",      _halt("CreateProcessA"))

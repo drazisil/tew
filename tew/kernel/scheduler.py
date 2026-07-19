@@ -397,6 +397,29 @@ class Scheduler:
             return
         self._load_next(next_idx, cpu, memory)
 
+    def terminate_thread(self, cpu: "CPU", memory: "Memory", handle: int) -> Optional[bool]:
+        """Forcibly terminate a thread by handle (TerminateThread).
+
+        Returns None if handle doesn't match any known thread. Returns True
+        if a *different* thread was terminated -- the caller (still running)
+        should do its own normal stdcall cleanup. Returns False if the
+        *current* thread terminated itself -- mark_current_dead already
+        switched the live CPU to a different thread's context (or halted if
+        none remained), so the caller must NOT touch cpu/EAX/ESP afterward,
+        exactly like ExitThread's own handler.
+        """
+        for idx, t in enumerate(self.threads):
+            if t.handle == handle:
+                if idx == self.current_idx:
+                    self.mark_current_dead(cpu, memory)
+                    return False
+                t.status = ThreadStatus.DEAD
+                t.saved_state = None
+                logger.debug("scheduler",
+                    f"TerminateThread: tid={t.thread_id} (handle=0x{handle:x}) terminated")
+                return True
+        return None
+
     # ── Public: unblocking ────────────────────────────────────────────────────
 
     def unblock_cs(self, cs_ptr: int) -> None:
