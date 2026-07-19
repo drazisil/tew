@@ -64,6 +64,7 @@ def register_kernel32_handlers(
         def _h(cpu: "CPU") -> None:
             logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
         return _h
 
     # ── Module handles ────────────────────────────────────────────────────────

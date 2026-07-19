@@ -97,6 +97,7 @@ class ImportResolver:
                                 f"EBP=0x{cpu.regs[5] & 0xFFFFFFFF:08x}",
                             )
                             cpu.halted = True
+                            cpu.fatal_halt = True
                         return _handler
 
                     win32_handlers.register_handler(dll_name, func_name, _make_unimplemented_handler(dll_name, func_name))

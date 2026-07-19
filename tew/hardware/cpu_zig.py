@@ -297,6 +297,14 @@ class ZigCPU:
         # Override flags for handle_exception() called from Python (not from Zig)
         self._py_halted:        bool = False
         self._py_faulted:       bool = False
+        # Set by handlers that mean "the whole emulator must stop" (e.g. an
+        # unimplemented Win32 API), as opposed to a routine per-thread halt.
+        # Not part of SavedCPUState/save_state()/restore_state() — this is
+        # deliberately global, not per-thread: the scheduler's thread-switch
+        # bookkeeping (scheduler.py's _load_thread/_load_next) checks this
+        # before clearing `halted`, so a fatal halt survives a thread switch
+        # instead of being silently erased by unrelated scheduling activity.
+        self.fatal_halt:         bool = False
 
         # Keep C callback alive for the lifetime of this object
         self._c_callback = _IntHandlerCType(self._c_int_dispatch)

@@ -274,7 +274,8 @@ def register_msvcrt_handlers(
         cpu.regs[ESP] = (cpu.regs[ESP] - 4) & 0xFFFFFFFF
         memory.write32(cpu.regs[ESP], THREAD_SENTINEL)
         cpu.eip    = fn_addr
-        cpu.halted = False
+        if not cpu.fatal_halt:
+            cpu.halted = False
 
         for _ in range(_INITTERM_STEP_LIMIT):
             cpu.step()
@@ -298,7 +299,8 @@ def register_msvcrt_handlers(
             )
             return False
 
-        cpu.halted = False
+        if not cpu.fatal_halt:
+            cpu.halted = False
         return True
 
     # _initterm(PVOID* pfbegin, PVOID* pfend) -> void [cdecl]

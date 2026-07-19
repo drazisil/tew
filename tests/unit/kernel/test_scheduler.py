@@ -26,6 +26,7 @@ def make_cpu(eip: int = 0x401000) -> MagicMock:
     cpu.regs = [0] * 8
     cpu.eflags = 0x202
     cpu.halted = False
+    cpu.fatal_halt = False
     saved = MagicMock(name="saved_state")
     cpu.save_state.return_value = saved
     return cpu
@@ -238,6 +239,42 @@ class TestSwitchTo:
 
         assert cpu.halted is False
 
+    def test_does_not_clear_fatal_halt_on_saved_thread_load(self):
+        # Regression: an unimplemented-API handler sets both cpu.halted and
+        # cpu.fatal_halt. A routine thread switch (e.g. preempt_slice, which
+        # fires unconditionally every main-loop iteration) used to clear
+        # cpu.halted unconditionally in _load_thread, silently erasing a
+        # genuinely fatal halt and letting the game keep running on garbage
+        # state instead of stopping.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        cpu.halted = True
+        cpu.fatal_halt = True
+        mem = make_memory()
+
+        s.switch_to(cpu, mem, 1)
+
+        assert cpu.halted is True
+
+    def test_does_not_clear_fatal_halt_on_fresh_thread_start(self):
+        # Same regression, but for the "thread has never run before"
+        # branch of _load_next (_init_thread_stack path), which had its
+        # own separate unconditional cpu.halted = False.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        cpu.halted = True
+        cpu.fatal_halt = True
+        mem = make_memory()
+
+        s.switch_to(cpu, mem, 1)
+
+        assert cpu.halted is True
+
     def test_does_not_save_dead_thread(self):
         s = make_scheduler()
         s.create_main_thread(1000, 0xBEEF)
@@ -389,6 +426,20 @@ class TestSleepCurrent:
         assert s.threads[0].status == ThreadStatus.READY
         cpu.restore_state.assert_called_once_with(saved_main)
         assert cpu.halted is False
+
+    def test_does_not_clear_fatal_halt_if_no_others(self):
+        # Same regression as TestSwitchTo's fatal_halt tests, for the
+        # "no other thread ready, wake immediately" branch.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        cpu = make_cpu()
+        cpu.halted = True
+        cpu.fatal_halt = True
+        mem = make_memory()
+
+        s.sleep_current(cpu, mem, return_eip=0x401010, eax_val=0, sleep_ms=50)
+
+        assert cpu.halted is True
 
     def test_switches_to_next_thread(self):
         s = make_scheduler()

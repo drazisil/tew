@@ -138,6 +138,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         def _handler(cpu: "CPU", mem: "Memory") -> None:
             logger.error("d3d8", f"UNIMPLEMENTED: {name} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
         return _com_stub(stubs, "d3d8dev", name, _handler, arg_bytes, memory, D3DDEV_OBJ)
 
     # [6] GetDirect3D(IDirect3D8**)

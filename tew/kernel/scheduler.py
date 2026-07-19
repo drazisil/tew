@@ -149,7 +149,11 @@ class Scheduler:
         thread = self.threads[idx]
         self._load_tls(memory, thread)
         cpu.restore_state(thread.saved_state)
-        cpu.halted = False   # restore_state does not touch halted; clear explicitly
+        # restore_state does not touch halted; clear explicitly -- but never
+        # override a fatal_halt (e.g. an unimplemented Win32 API): that means
+        # the whole emulator must stop, not just this one thread's slice.
+        if not cpu.fatal_halt:
+            cpu.halted = False
         self.current_idx = idx
 
     def _init_thread_stack(self, cpu: "CPU", memory: "Memory",
@@ -179,7 +183,8 @@ class Scheduler:
         if target.saved_state is None:
             self._init_thread_stack(cpu, memory, target)
             self.current_idx = idx
-            cpu.halted = False
+            if not cpu.fatal_halt:
+                cpu.halted = False
         else:
             self._load_thread(idx, cpu, memory)
 
@@ -369,7 +374,8 @@ class Scheduler:
             # No other thread ready — wake immediately and stay on this thread.
             thread.status = ThreadStatus.READY
             cpu.restore_state(thread.saved_state)
-            cpu.halted = False
+            if not cpu.fatal_halt:
+                cpu.halted = False
             return
         self._load_next(next_idx, cpu, memory)
 

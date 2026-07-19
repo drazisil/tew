@@ -28,6 +28,7 @@ def register_kernel32_locale_handlers(
         def _h(cpu: "CPU") -> None:
             logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
         return _h
 
     # ── Code pages ────────────────────────────────────────────────────────────

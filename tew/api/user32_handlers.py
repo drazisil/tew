@@ -100,7 +100,12 @@ def _invoke_emulated_proc(
 
     cpu.regs[ESP] = esp
     cpu.eip = proc_addr & 0xFFFFFFFF
-    cpu.halted = False
+    # Never clear a fatal_halt (e.g. an unimplemented Win32 API): that means
+    # the whole emulator must stop, not just be silently stepped past by the
+    # next nested callback invocation (this function is called very
+    # frequently for timer callbacks).
+    if not cpu.fatal_halt:
+        cpu.halted = False
 
     steps = 0
     while not cpu.halted and steps < max_steps:
@@ -115,7 +120,8 @@ def _invoke_emulated_proc(
     result = cpu.regs[EAX]
 
     cpu.restore_state(saved)
-    cpu.halted = False
+    if not cpu.fatal_halt:
+        cpu.halted = False
     return result
 
 
@@ -148,6 +154,7 @@ def register_user32_gdi32_handlers(
         def _h(cpu: "CPU") -> None:
             logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
         return _h
 
     # ── user32.dll ────────────────────────────────────────────────────────────

@@ -162,7 +162,8 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
     memory.write32(esp, SEH_RETURN_SENTINEL)
     cpu.regs[ESP] = esp
     cpu.eip = handler_addr & 0xFFFFFFFF
-    cpu.halted = False
+    if not cpu.fatal_halt:
+        cpu.halted = False
 
     steps_left = _STEP_LIMIT
     while not cpu.halted and steps_left > 0:
@@ -187,7 +188,8 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
 
     # Only our own sentinel's halt gets cleared -- that one is purely
     # internal bookkeeping for this call, not a real CPU event.
-    cpu.halted = False
+    if not cpu.fatal_halt:
+        cpu.halted = False
     disposition = cpu.regs[EAX] & 0xFFFFFFFF
     cpu.regs[ESP] = esp_before
     return disposition
