@@ -1154,7 +1154,75 @@ def register_kernel32_io_handlers(
 
     # ── Misc ──────────────────────────────────────────────────────────────────
 
-    stubs.register_handler("kernel32.dll", "FormatMessageA",        _halt("FormatMessageA"))
+    # FormatMessageA(dwFlags, lpSource, dwMessageId, dwLanguageId,
+    #                lpBuffer, nSize, Arguments) -> DWORD (chars written)
+    #
+    # Only FORMAT_MESSAGE_FROM_SYSTEM (dwMessageId -> canned message text) and
+    # FORMAT_MESSAGE_FROM_STRING (lpSource is the format string itself) are
+    # handled; %1/%2-style insert substitution is not implemented (every
+    # caller seen so far -- e.g. formatting a COM HRESULT for a log/error
+    # dialog -- uses FORMAT_MESSAGE_IGNORE_INSERTS). Message text below is a
+    # best-effort match to real Windows' system message table for the codes
+    # this emulator's own handlers actually produce (mostly COM HRESULTs) --
+    # exact wording isn't load-bearing, callers just display/log the string.
+    _FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100
+    _FORMAT_MESSAGE_FROM_STRING     = 0x00000400
+    _FORMAT_MESSAGE_FROM_SYSTEM     = 0x00001000
+
+    _SYSTEM_MESSAGES: dict[int, str] = {
+        0x00000000: "The operation completed successfully.",
+        0x80004001: "Not implemented",
+        0x80004002: "No such interface supported",
+        0x80004003: "Invalid pointer",
+        0x80004004: "Operation aborted",
+        0x80004005: "Unspecified error",
+        0x8000FFFF: "Catastrophic failure",
+        0x80040110: "Class does not support aggregation (or class object is remote)",
+        0x80040111: "Class not registered for this server -- the object is not available",
+        0x80040112: "Class is not licensed for use",
+        0x80040154: "Class not registered",
+        0x80070005: "General access denied error",
+    }
+
+    def _format_message_a(cpu: "CPU") -> None:
+        sp            = cpu.regs[ESP]
+        dw_flags      = memory.read32((sp + 4)  & 0xFFFFFFFF)
+        lp_source     = memory.read32((sp + 8)  & 0xFFFFFFFF)
+        dw_message_id = memory.read32((sp + 12) & 0xFFFFFFFF)
+        lp_buffer     = memory.read32((sp + 20) & 0xFFFFFFFF)
+        n_size        = memory.read32((sp + 24) & 0xFFFFFFFF)
+
+        if dw_flags & _FORMAT_MESSAGE_FROM_STRING:
+            text = read_cstring(lp_source, memory) if lp_source else ""
+        elif dw_flags & _FORMAT_MESSAGE_FROM_SYSTEM:
+            text = _SYSTEM_MESSAGES.get(
+                dw_message_id, f"Unknown error (0x{dw_message_id:08x})")
+        else:
+            text = f"Unknown error (0x{dw_message_id:08x})"
+
+        allocate = bool(dw_flags & _FORMAT_MESSAGE_ALLOCATE_BUFFER)
+        if allocate:
+            # lpBuffer is actually LPSTR* here -- we allocate the real
+            # buffer ourselves and write its address into *lpBuffer.
+            out_addr = state.simple_alloc(len(text) + 1)
+            if lp_buffer:
+                memory.write32(lp_buffer, out_addr)
+        else:
+            out_addr = lp_buffer
+            if n_size > 0 and len(text) > n_size - 1:
+                text = text[:n_size - 1]
+
+        if out_addr:
+            for i, ch in enumerate(text):
+                memory.write8(out_addr + i, ord(ch) & 0xFF)
+            memory.write8(out_addr + len(text), 0)
+
+        logger.debug("handlers",
+            f"FormatMessageA(flags=0x{dw_flags:x}, id=0x{dw_message_id:x}) -> \"{text}\"")
+        cpu.regs[EAX] = len(text)
+        cleanup_stdcall(cpu, memory, 28)
+
+    stubs.register_handler("kernel32.dll", "FormatMessageA", _format_message_a)
     stubs.register_handler("kernel32.dll", "GlobalAddAtom",         _halt("GlobalAddAtom"))
     stubs.register_handler("kernel32.dll", "GlobalFindAtom",        _halt("GlobalFindAtom"))
     stubs.register_handler("kernel32.dll", "GlobalGetAtomNameA",    _halt("GlobalGetAtomNameA"))
