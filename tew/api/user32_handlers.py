@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
+    from tew.kernel.scheduler import Scheduler
 
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
@@ -68,6 +69,7 @@ def _invoke_emulated_proc(
     args: list[int],
     sentinel: int,
     max_steps: int = 5_000_000,
+    scheduler: "Scheduler | None" = None,
 ) -> int:
     """Call emulated x86 code (stdcall) and return EAX.
 
@@ -76,6 +78,13 @@ def _invoke_emulated_proc(
 
     args is the argument list in left-to-right (C) order; they are pushed
     right-to-left onto the stack as stdcall requires.
+
+    Pass `scheduler` (state.scheduler) whenever the calling thread might run
+    real, non-trivial code (e.g. a real loaded DLL) rather than a short
+    dialog-proc/timer-callback -- see the native-speed comment below for why
+    this matters. It's optional (kept backward compatible for existing
+    short-callback call sites) but strongly recommended for anything beyond
+    a few thousand instructions.
     """
     saved = cpu.save_state()
 
@@ -107,17 +116,47 @@ def _invoke_emulated_proc(
     if not cpu.fatal_halt:
         cpu.halted = False
 
-    # Run at native speed. The sentinel is a real HLT byte written into
-    # memory (see _get_dialog_sentinel), so the Zig hot loop halts on its
-    # own the instant the call returns -- exactly like any other halt
-    # condition -- with no need to single-step in a Python loop checking
-    # cpu.eip before every instruction. That single-step approach (cpu.step()
-    # is literally cpu.run(1)) was fine for short dialog-proc/timer-callback
-    # calls, but pays a full Python/Zig FFI crossing per *instruction*,
-    # which is ruinously slow for a nested call running real third-party DLL
-    # code (hundreds of thousands+ of real instructions -- e.g. DAO's
-    # DllMain/DllGetClassObject).
-    cpu.run(max_steps)
+    # Run at native speed via cpu.run(), not single-stepping -- the sentinel
+    # is a real HLT byte in memory (see _get_dialog_sentinel), so the Zig
+    # hot loop halts on its own the instant the call returns, same as any
+    # other halt condition.
+    #
+    # BUT: cpu.run() has no concept of logical threads. If the calling
+    # thread hits anything that makes our cooperative scheduler switch away
+    # (Sleep, WaitForSingleObject, a contested critical section -- all
+    # implemented by directly swapping CPU state via scheduler._save_current
+    # /_load_next), cpu.run() would just keep executing whatever thread is
+    # now live, for up to max_steps, with no awareness that it's no longer
+    # running the code we actually called. A halt hit on that OTHER thread
+    # (its own unrelated sentinel from a nested call of its own, or worse, a
+    # __chkesp/unimplemented-API halt in its own unrelated code) would then
+    # be misread as "our nested call returned". Live-verified this actually
+    # happens: calling dao350.dll's real DllMain, virtual time jumped 1.4s
+    # and five unrelated threads ran to completion inside one nested call,
+    # immediately followed by a stack-corruption halt that had nothing to
+    # do with DAO. Run in bounded chunks and check which thread is actually
+    # live after each one to guard against this.
+    started_thread_idx = scheduler.current_idx if scheduler is not None else None
+    _CHUNK = 200_000
+    steps_run = 0
+    while steps_run < max_steps:
+        cpu.run(min(_CHUNK, max_steps - steps_run))
+        steps_run += _CHUNK
+
+        if cpu.fatal_halt:
+            break  # must stop everything regardless of which thread caused it
+
+        if scheduler is not None and scheduler.current_idx != started_thread_idx:
+            # Scheduler swapped to a different thread -- whatever just
+            # happened (including any halt) belongs to it, not our nested
+            # call. Clear a non-fatal halt and keep going; our thread will
+            # be rescheduled once the other thread blocks/sleeps/finishes.
+            if cpu.halted:
+                cpu.halted = False
+            continue
+
+        if cpu.halted:
+            break  # halted while on OUR thread -- sentinel or unexpected; evaluate below
 
     if not cpu.halted:
         logger.warn("dialog", f"[_invoke_emulated_proc] max_steps reached calling 0x{proc_addr:08x}")

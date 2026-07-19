@@ -556,7 +556,8 @@ def register_oleaut32_ole32_handlers(
             sentinel = _get_dialog_sentinel(state, memory)
             handle = loaded.base_address & 0xFFFFFFFF
             result = _invoke_emulated_proc(
-                cpu, memory, loaded.entry_point, [handle, 1, 0], sentinel)
+                cpu, memory, loaded.entry_point, [handle, 1, 0], sentinel,
+                scheduler=state.scheduler)
             logger.info("com", f"{dll_filename}: DllMain(DLL_PROCESS_ATTACH) -> {result}")
             if result == 0:
                 # Real LoadLibrary treats a FALSE DllMain(DLL_PROCESS_ATTACH)
@@ -577,7 +578,9 @@ def register_oleaut32_ole32_handlers(
             logger.warn("com", f"{loaded.name}: no DllGetClassObject export found")
             return REGDB_E_CLASSNOTREG
         sentinel = _get_dialog_sentinel(state, memory)
-        return _invoke_emulated_proc(cpu, memory, addr, [rclsid, riid, ppv], sentinel) & 0xFFFFFFFF
+        return _invoke_emulated_proc(
+            cpu, memory, addr, [rclsid, riid, ppv], sentinel,
+            scheduler=state.scheduler) & 0xFFFFFFFF
 
     def _hr_failed(hr: int) -> bool:
         """HRESULT failure = bit 31 set. hr here is always an unsigned
@@ -590,7 +593,9 @@ def register_oleaut32_ole32_handlers(
         vtable = memory.read32(obj_addr)
         method_addr = memory.read32((vtable + slot * 4) & 0xFFFFFFFF)
         sentinel = _get_dialog_sentinel(state, memory)
-        return _invoke_emulated_proc(cpu, memory, method_addr, [obj_addr] + args, sentinel) & 0xFFFFFFFF
+        return _invoke_emulated_proc(
+            cpu, memory, method_addr, [obj_addr] + args, sentinel,
+            scheduler=state.scheduler) & 0xFFFFFFFF
 
     # CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv) -> HRESULT
     def _CoCreateInstance(cpu: "CPU") -> None:
