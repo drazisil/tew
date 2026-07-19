@@ -71,8 +71,8 @@ in the code comment so a future reader doesn't go looking for a third auto-click
   dead-code global so this is expected, not a regression) — still not root-caused
   why this specific `cpu.halted = True` gets cleared; likely one of the ~85
   unmarked sites above.
-- Git: `main` is 4 commits ahead of `origin/main`, not pushed (per this project's
-  "never push without being asked" norm).
+- Git: `main` is 5 commits ahead of `origin/main` (as of `8473b26`), not pushed
+  (per this project's "never push without being asked" norm).
 
 ## Run command
 ```bash
