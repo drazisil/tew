@@ -279,13 +279,20 @@ class Win32Handlers:
                 nt_dispatcher.dispatch(c)
                 return
             if int_num == 3:
-                # INT3 debug breakpoint — halt so the run loop dumps state
+                # INT3 debug breakpoint — halt so the run loop dumps state.
+                # Must be a fatal_halt: a plain halted=True gets silently
+                # cleared by the very next scheduler thread-switch or nested
+                # _invoke_emulated_proc call (same class of gap as the
+                # unimplemented-API halts fixed earlier), so execution was
+                # continuing right past this "halt" instead of actually
+                # stopping.
                 from tew.logger import logger
                 logger.warn(
                     "handlers",
                     f"INT3 breakpoint at EIP=0x{(c.eip & 0xFFFFFFFF):08x} — halting",
                 )
                 c.halted = True
+                c.fatal_halt = True
                 return
             # Delegate to whatever was installed before us
             if existing_handler is not None:
