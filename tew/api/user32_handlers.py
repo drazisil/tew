@@ -1370,6 +1370,18 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "ShowWindow", _ShowWindow)
 
+    # IsIconic(HWND hWnd) -> BOOL -- TRUE if the window is minimized.
+    # ShowWindow only distinguishes SW_HIDE from "show" (no per-window
+    # minimized/maximized state is tracked anywhere), so there is no real
+    # minimize state to report here -- a window this emulator manages is
+    # never actually put into a minimized state by anything it models,
+    # so FALSE is the honest answer, not a guess.
+    def _IsIconic(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # FALSE
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "IsIconic", _IsIconic)
+
     # ── GDI object table ─────────────────────────────────────────────────────
     # Maps HGDIOBJ → _GdiObj.  Stock objects are pre-populated here with
     # stable handles (0x2001 + fnObject index) so GetStockObject returns a
