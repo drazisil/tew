@@ -6,24 +6,51 @@ stubs, and the ordinal-aliased exports from WinXP OLEAUT32.dll.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
+    from tew.loader.dll_loader import DLLLoader, LoadedDLL
 
 from tew.hardware.cpu import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
 from tew.logger import logger
 
+S_OK = 0
+E_NOINTERFACE = 0x80004002
+REGDB_E_CLASSNOTREG = 0x80040154
+
+# Real, period-correct COM in-proc servers this emulator can actually load
+# and execute (as opposed to Python-faked). Registry entries whose
+# InprocServer32 names something not in this set are honestly reported as
+# unregistered, same as a real, unmodified install missing that component.
+#
+# dao350.dll: extracted from the game's OWN real installer
+# (~/.emu32/DBInst/DAO/data1.cab, "DAO registered\dao350.dll") -- the exact
+# version this game's CLSID {00000010-...} actually belongs to (confirmed:
+# a newer dao360.dll, also available on this host, does NOT contain that
+# CLSID -- DAO 3.5 and 3.6 are different, non-interchangeable installed
+# components, not just a version bump). Placed at
+# C:\WINDOWS\System32\dao350.dll (~/.emu32/WINDOWS/System32/), i.e. exactly
+# where the real installer would have put it -- kept out of the tew repo
+# itself since these are Microsoft-copyrighted redistributable binaries,
+# not project source.
+_KNOWN_COM_SERVER_DIR = "/home/drazisil/.emu32/WINDOWS/System32"
+_KNOWN_COM_SERVERS = {"dao350.dll"}
+
 
 def register_oleaut32_ole32_handlers(
     stubs: "Win32Handlers",
     memory: "Memory",
     state: "CRTState",
+    dll_loader: Optional["DLLLoader"] = None,
 ) -> None:
     """Register all oleaut32.dll and ole32.dll handlers."""
+
+    if dll_loader is not None:
+        dll_loader.add_search_path(_KNOWN_COM_SERVER_DIR)
 
     # ── oleaut32.dll — BSTR / VARIANT / SafeArray ─────────────────────────────
     #
@@ -456,12 +483,153 @@ def register_oleaut32_ole32_handlers(
 
     stubs.register_handler("ole32.dll", "CoUninitialize", _CoUninitialize)
 
+    # ── ole32.dll — COM activation ─────────────────────────────────────────────
+    # Registry-driven, like real Windows: CoGetClassObject/CoCreateInstance
+    # look the CLSID up under hkcr\clsid\{...}\inprocserver32 (see
+    # registry.json). A CLSID nobody registered fails honestly with
+    # REGDB_E_CLASSNOTREG, exactly as an unmodified real install would. A
+    # CLSID registered to a server this emulator doesn't actually have also
+    # fails honestly, rather than faking success. For servers we do have
+    # (_KNOWN_COM_SERVERS), the real DLL is loaded from disk and its real
+    # DllGetClassObject is invoked via _invoke_emulated_proc — genuine COM
+    # activation against real, period-correct compiled code, not a Python
+    # stand-in.
+
+    # Local import to avoid a circular dependency (user32_handlers.py does
+    # not import oleaut32_handlers.py, but this keeps the same
+    # import-inside-function convention crt_handlers.py/kernel32_system.py
+    # already use for this exact same import).
+    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+
+    def _read_guid_str(addr: int) -> str:
+        d1 = memory.read32(addr)
+        d2 = memory.read16(addr + 4)
+        d3 = memory.read16(addr + 6)
+        d4 = bytes(memory.read8(addr + 8 + i) for i in range(8))
+        return (f"{d1:08x}-{d2:04x}-{d3:04x}-"
+                f"{d4[0]:02x}{d4[1]:02x}-"
+                f"{d4[2]:02x}{d4[3]:02x}{d4[4]:02x}{d4[5]:02x}{d4[6]:02x}{d4[7]:02x}")
+
+    def _write_guid(addr: int, guid: str) -> None:
+        memory.write32(addr, int(guid[0:8], 16))
+        memory.write16(addr + 4, int(guid[9:13], 16))
+        memory.write16(addr + 6, int(guid[14:18], 16))
+        for i, b in enumerate(bytes.fromhex(guid[19:23] + guid[24:36])):
+            memory.write8(addr + 8 + i, b)
+
+    # Scratch IID_IClassFactory, needed for the internal
+    # DllGetClassObject(..., IID_IClassFactory, ...) call every real
+    # CoCreateInstance makes before dispatching to CreateInstance. Allocated
+    # lazily on first use (like user32_handlers._get_dialog_sentinel) so
+    # registration doesn't touch the heap for emulator setups/tests that
+    # never exercise COM activation at all.
+    _iid_iclassfactory_addr_box = [0]
+
+    def _get_iid_iclassfactory_addr() -> int:
+        if _iid_iclassfactory_addr_box[0] == 0:
+            addr = state.simple_alloc(16)
+            _write_guid(addr, "00000001-0000-0000-C000-000000000046")
+            _iid_iclassfactory_addr_box[0] = addr
+        return _iid_iclassfactory_addr_box[0]
+
+    def _resolve_com_server(clsid_addr: int) -> "str | None":
+        key = f"hkcr\\clsid\\{{{_read_guid_str(clsid_addr)}}}\\inprocserver32"
+        entry = state.registry_values.get(key, {}).get("")
+        return str(entry.value) if entry is not None else None
+
+    def _ensure_dll_ready(dll_filename: str, cpu: "CPU") -> "LoadedDLL | None":
+        if dll_loader is None:
+            return None
+        was_loaded = dll_loader.get_dll(dll_filename) is not None
+        loaded = dll_loader.load_dll(dll_filename, memory)
+        if loaded is None:
+            return None
+        if not was_loaded:
+            # patch_dll_iats re-scans EVERY DLL's accumulated IAT entries,
+            # not just this one's -- only worth paying for right after a
+            # genuinely new load actually added entries. Calling it again
+            # on every subsequent CoGetClassObject/CoCreateInstance for an
+            # already-loaded DLL was pure repeated waste (confirmed live:
+            # each successive DAO call was measurably slower than the last).
+            dll_loader.patch_dll_iats(memory, stubs)
+        if not was_loaded and loaded.entry_point != 0:
+            sentinel = _get_dialog_sentinel(state, memory)
+            handle = loaded.base_address & 0xFFFFFFFF
+            result = _invoke_emulated_proc(
+                cpu, memory, loaded.entry_point, [handle, 1, 0], sentinel)
+            logger.info("com", f"{dll_filename}: DllMain(DLL_PROCESS_ATTACH) -> {result}")
+            if result == 0:
+                # Real LoadLibrary treats a FALSE DllMain(DLL_PROCESS_ATTACH)
+                # as a load failure and never calls further into the DLL.
+                # Calling DllGetClassObject on a DLL that just told us its
+                # own init failed is undefined territory -- don't.
+                logger.error("com",
+                    f"{dll_filename}: DllMain(DLL_PROCESS_ATTACH) returned FALSE"
+                    " -- treating load as failed")
+                return None
+        return loaded
+
+    def _call_dll_get_class_object(
+        cpu: "CPU", loaded: "LoadedDLL", rclsid: int, riid: int, ppv: int,
+    ) -> int:
+        addr = dll_loader.get_export_address(loaded.name, "DllGetClassObject") if dll_loader else None
+        if not addr:
+            logger.warn("com", f"{loaded.name}: no DllGetClassObject export found")
+            return REGDB_E_CLASSNOTREG
+        sentinel = _get_dialog_sentinel(state, memory)
+        return _invoke_emulated_proc(cpu, memory, addr, [rclsid, riid, ppv], sentinel) & 0xFFFFFFFF
+
+    def _hr_failed(hr: int) -> bool:
+        """HRESULT failure = bit 31 set. hr here is always an unsigned
+        32-bit Python int (masked by every producer below), so `hr < 0`
+        would never trigger -- REGDB_E_CLASSNOTREG (0x80040154) is a large
+        *positive* Python int, not negative."""
+        return bool(hr & 0x80000000)
+
+    def _dispatch_com_method(cpu: "CPU", obj_addr: int, slot: int, args: list[int]) -> int:
+        vtable = memory.read32(obj_addr)
+        method_addr = memory.read32((vtable + slot * 4) & 0xFFFFFFFF)
+        sentinel = _get_dialog_sentinel(state, memory)
+        return _invoke_emulated_proc(cpu, memory, method_addr, [obj_addr] + args, sentinel) & 0xFFFFFFFF
+
     # CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv) -> HRESULT
     def _CoCreateInstance(cpu: "CPU") -> None:
-        rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
-        riid   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        logger.warn("com", f"CoCreateInstance(clsid@0x{rclsid:08x}, riid@0x{riid:08x}) — returning REGDB_E_CLASSNOTREG (COM not implemented)")
-        cpu.regs[EAX] = 0x80040154  # REGDB_E_CLASSNOTREG
+        rclsid     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        p_unk_outer = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        riid       = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        ppv        = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+
+        clsid_str = _read_guid_str(rclsid)
+        dll_name = _resolve_com_server(rclsid)
+        hr = REGDB_E_CLASSNOTREG
+        if dll_name is None:
+            logger.warn("com", f"CoCreateInstance(clsid={{{clsid_str}}}) — not registered, REGDB_E_CLASSNOTREG")
+        elif dll_name.lower() not in _KNOWN_COM_SERVERS:
+            logger.warn("com", f"CoCreateInstance(clsid={{{clsid_str}}}) — registered to \"{dll_name}\", which this emulator doesn't implement — REGDB_E_CLASSNOTREG")
+        else:
+            loaded = _ensure_dll_ready(dll_name, cpu)
+            if loaded is None:
+                # _ensure_dll_ready already logged the specific reason
+                # (file not found, or DllMain returned FALSE) -- don't
+                # assert a cause here too, it's not always "from disk".
+                logger.warn("com", f"CoCreateInstance: \"{dll_name}\" activation failed (see above)")
+            else:
+                hr = _call_dll_get_class_object(cpu, loaded, rclsid, _get_iid_iclassfactory_addr(), ppv)
+                if not _hr_failed(hr):
+                    factory_obj = memory.read32(ppv)
+                    if factory_obj:
+                        hr = _dispatch_com_method(cpu, factory_obj, 3, [p_unk_outer, riid, ppv])  # IClassFactory::CreateInstance
+                        _dispatch_com_method(cpu, factory_obj, 2, [])  # IUnknown::Release
+                    else:
+                        hr = 0x80004005  # E_FAIL — DllGetClassObject "succeeded" but returned NULL
+                final_obj = memory.read32(ppv) if ppv else 0
+                logger.info("com",
+                    f"CoCreateInstance(clsid={{{clsid_str}}}, riid={{{_read_guid_str(riid)}}}) "
+                    f"via real {dll_name} -> hr=0x{hr & 0xFFFFFFFF:08x} *ppv=0x{final_obj:08x}")
+
+        if ppv and _hr_failed(hr):
+            memory.write32(ppv, 0)
+        cpu.regs[EAX] = hr & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("ole32.dll", "CoCreateInstance", _CoCreateInstance)
@@ -471,10 +639,31 @@ def register_oleaut32_ole32_handlers(
         rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         riid   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         ppv    = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        logger.warn("com", f"CoGetClassObject(clsid@0x{rclsid:08x}, riid@0x{riid:08x}) — returning REGDB_E_CLASSNOTREG (COM not implemented)")
-        if ppv:
+
+        clsid_str = _read_guid_str(rclsid)
+        dll_name = _resolve_com_server(rclsid)
+        hr = REGDB_E_CLASSNOTREG
+        if dll_name is None:
+            logger.warn("com", f"CoGetClassObject(clsid={{{clsid_str}}}) — not registered, REGDB_E_CLASSNOTREG")
+        elif dll_name.lower() not in _KNOWN_COM_SERVERS:
+            logger.warn("com", f"CoGetClassObject(clsid={{{clsid_str}}}) — registered to \"{dll_name}\", which this emulator doesn't implement — REGDB_E_CLASSNOTREG")
+        else:
+            loaded = _ensure_dll_ready(dll_name, cpu)
+            if loaded is None:
+                # _ensure_dll_ready already logged the specific reason
+                # (file not found, or DllMain returned FALSE) -- don't
+                # assert a cause here too, it's not always "from disk".
+                logger.warn("com", f"CoGetClassObject: \"{dll_name}\" activation failed (see above)")
+            else:
+                hr = _call_dll_get_class_object(cpu, loaded, rclsid, riid, ppv)
+                obj_addr = memory.read32(ppv) if ppv else 0
+                logger.info("com",
+                    f"CoGetClassObject(clsid={{{clsid_str}}}, riid={{{_read_guid_str(riid)}}}) "
+                    f"via real {dll_name} -> hr=0x{hr & 0xFFFFFFFF:08x} *ppv=0x{obj_addr:08x}")
+
+        if ppv and _hr_failed(hr):
             memory.write32(ppv, 0)  # *ppv = NULL on failure, per COM contract
-        cpu.regs[EAX] = 0x80040154  # REGDB_E_CLASSNOTREG
+        cpu.regs[EAX] = hr & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("ole32.dll", "CoGetClassObject", _CoGetClassObject)

@@ -81,6 +81,17 @@ _FORWARDING_MAP: dict[str, list[str]] = {
     "api-ms-win-gdi-":                ["gdi32", "kernel32"],
 }
 
+# Legacy DLL names real-loaded third-party components sometimes import from,
+# aliased to the DLL name tew's own handlers are actually registered under.
+# e.g. dao350.dll (VC4-era build) imports from "MSVCRT40.dll", not the
+# "MSVCRT.dll" tew/api/msvcrt_handlers.py registers under -- same functions,
+# older DLL naming. Used by patch_dll_iats as a last-resort lookup.
+_LEGACY_DLL_ALIASES: dict[str, str] = {
+    "msvcrt40.dll": "msvcrt.dll",
+    "msvcrt20.dll": "msvcrt.dll",
+    "crtdll.dll":   "msvcrt.dll",
+}
+
 
 class DLLLoader:
     _DLL_SIZE = 0x01000000   # 16 MB per DLL
@@ -261,6 +272,10 @@ class DLLLoader:
                 win32_handlers.get_handler_address(entry.imported_dll_name, entry.func_name)
                 or win32_handlers.get_handler_address(entry.imported_dll_name + ".dll", entry.func_name)
             )
+            if handler_addr is None:
+                alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
+                if alias is not None:
+                    handler_addr = win32_handlers.get_handler_address(alias, entry.func_name)
             if handler_addr is not None:
                 memory.write32(entry.iat_addr, handler_addr)
                 patched_count += 1

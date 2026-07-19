@@ -266,5 +266,11 @@
       "type": 1,
       "value": "C:\\MCity_d.exe"
     }
+  },
+  "hkcr\\clsid\\{00000010-0000-0010-8000-00aa006d2ea4}\\inprocserver32": {
+    "": {
+      "type": 1,
+      "value": "DAO350.DLL"
+    }
   }
 }
