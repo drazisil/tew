@@ -4,6 +4,203 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-19 (night) — Real COM activation: CoGetClassObject/CoCreateInstance
+now load and execute real DLLs (DAO 3.5); several real emulator bugs found
+and fixed along the way; final DAO object handoff still broken (open)
+
+**Architecture change**: `CoGetClassObject`/`CoCreateInstance`
+(`tew/api/oleaut32_handlers.py`) previously always returned
+`REGDB_E_CLASSNOTREG` — no COM was implemented at all. They're now
+registry-driven, the same way real Windows COM activation works: look the
+requested CLSID up under `hkcr\clsid\{...}\inprocserver32` in
+`registry.json` (new entries use this key shape; `registry.json`'s own
+`_comment` already documented `hkcr` as a supported hive short name). A
+CLSID nobody registered fails honestly with `REGDB_E_CLASSNOTREG`, exactly
+like a real, unmodified install missing that component — no hardcoded
+per-CLSID branching.
+
+For CLSIDs registered to a server in the new `_KNOWN_COM_SERVERS` set, the
+real DLL is loaded and executed via the existing `DLLLoader` machinery
+(same mechanism already proven for `authlogin.dll`/`NPSAnlyz.dll`/
+`dx8z.dll` — real PE load, real section mapping, real code execution; this
+is architecturally the *opposite* of the Python-handler-interception
+approach used for OS-level DLLs like kernel32/user32, and was a deliberate
+choice discussed with the user rather than building fake Python vtable
+objects). `DllMain(DLL_PROCESS_ATTACH)` is invoked for real, then the real
+exported `DllGetClassObject` is called; for `CoCreateInstance`, the
+resulting `IClassFactory`'s real `CreateInstance`/`Release` vtable methods
+are dispatched through too. A `FALSE` return from `DllMain` is now treated
+as a real load failure (matches real `LoadLibrary` semantics) rather than
+proceeding to call into a DLL that just reported its own init failed.
+
+**The DAO CLSID version mismatch** (this session's whole reason for
+investigating): the game's compiled-in CLSID `{00000010-0000-0010-8000-
+00AA006D2EA4}` is DAO **3.5**'s, confirmed via `dump_bytes` byte-scanning —
+`dao360.dll` (from the generic period-correct-binaries collection at
+`/data/Downloads/i386-binaries/`) does NOT contain this CLSID anywhere in
+its binary; `dao350.dll`, extracted from the game's own real installer
+(`~/.emu32/DBInst/DAO/data1.cab`, `DAO registered\dao350.dll`, via
+`unshield x`), DOES. DAO 3.5 and 3.6 are different, non-interchangeable
+installed components, not just a version bump — a newer DLL doesn't
+substitute for an older CLSID a game statically compiled against. Placed
+at `~/.emu32/WINDOWS/System32/dao350.dll` (i.e. exactly where the real
+installer would have put it) — kept out of the tew repo itself since these
+are Microsoft-copyrighted redistributable binaries, not project source.
+
+**Real bugs found and fixed while getting this far** (each independently
+live-verified and test-suite-clean, 582/582 throughout):
+
+1. **`_invoke_emulated_proc` (`tew/api/user32_handlers.py`) was
+   single-stepping one instruction at a time** via a Python `while` loop
+   (`cpu.step()` is literally `cpu.run(1)` under the hood — same native FFI
+   call, `max_steps=1`), paying a full Python/Zig crossing per instruction.
+   Fine for the short dialog-proc/timer-callback calls this helper was
+   originally built for, ruinously slow for a nested call running real
+   third-party DLL code end to end. Fixed: call `cpu.run(max_steps)` once —
+   the sentinel this waits for is a real `HLT` byte in memory
+   (`_get_dialog_sentinel`), so the native Zig hot loop already halts on
+   its own the instant the call returns, exactly like any other halt
+   condition. Had to account for `HLT` advancing EIP past its own 1-byte
+   opcode (lands at `sentinel+1`, not `sentinel`) when checking where the
+   call actually stopped. Measured effect live: DAO's `DllMain` call
+   dropped from ~7s to ~1.3s wall-clock; the first `CoGetClassObject` from
+   ~17s to ~9.2s (still slow in absolute terms — DAO's real code makes many
+   Win32/CRT calls, each of which still needs a real Python handler
+   round-trip regardless of how the between-calls instructions are driven).
+
+2. **`patch_dll_iats` was being called unconditionally on every
+   `CoGetClassObject`/`CoCreateInstance`**, re-scanning the *entire*
+   accumulated IAT-entry list for every DLL ever loaded (`MCity_d.exe` +
+   `authlogin.dll` + `NPSAnlyz.dll` + `dx8z.dll` + `dao350.dll`, hundreds of
+   entries) even when nothing new had been loaded since the previous call.
+   Fixed: only call it right after a genuinely new `load_dll` (`not
+   was_loaded`). Directly observed contributing to each successive DAO call
+   being measurably slower than the last.
+
+3. **`dao350.dll` imports from the legacy `MSVCRT40.dll`** (VC4-era CRT
+   naming), not `MSVCRT.dll` like `dao360.dll` and everything else tew has
+   loaded so far — so its IAT entries for that DLL were silently left
+   unpatched (`win32_handlers.get_handler_address("msvcrt40.dll", ...)`
+   never matches tew's `"msvcrt.dll"`-registered handlers). Fixed: a small
+   `_LEGACY_DLL_ALIASES` table in `dll_loader.patch_dll_iats`
+   (`msvcrt40.dll`/`msvcrt20.dll`/`crtdll.dll` → `msvcrt.dll`), tried as a
+   last resort after the normal and `.dll`-suffixed lookups.
+
+4. **The INT3 debug-breakpoint halt (`tew/api/win32_handlers.py`) was
+   missing `cpu.fatal_halt`** — set `cpu.halted = True` only. Exactly the
+   same class of gap the section-15 scheduler fix closed for unimplemented
+   Win32 API halts: a plain `halted` without `fatal_halt` gets silently
+   cleared by the very next scheduler thread-switch or nested
+   `_invoke_emulated_proc` call, so this "halt" was never actually stopping
+   anything — execution continued right past `INT3 breakpoint at
+   EIP=0x00688c69 — halting` instead of genuinely halting there. This
+   explains an observation from earlier tonight that looked like
+   nondeterministic "bouncing" between reaching a second `CoGetClassObject`
+   call versus hitting this INT3: it isn't random — when DAO's real
+   `DllMain` fails fast, very little wall-clock is spent inside it, so the
+   rest of boot has time to reach the (unrelated, later) INT3 milestone
+   within a fixed timeout; when DAO succeeds, the real `CoGetClassObject`
+   calls burn most of the wall-clock budget, so the run simply hasn't
+   reached that later point yet when the timeout fires. Not yet
+   independently re-verified in isolation (a full run since this fix always
+   also has the DAO work active).
+
+5. **`GetLastError`/`SetLastError` (`tew/kernel/scheduler.py`) shared one
+   fixed memory-backed value (`TEB_BASE+0x34`) across every thread** —
+   real Windows gives each thread its own TEB/last-error slot; here, one
+   thread's `SetLastError` could silently clobber every other thread's
+   `GetLastError` result across a context switch. Fixed: added
+   `ThreadState.last_error`, saved/restored on every context switch
+   (`_save_current`/`_load_thread`/`_init_thread_stack`), exactly mirroring
+   the existing TLS-slot save/restore (`_save_tls`/`_load_tls`) shape.
+   Found while reasoning about whether real third-party DLL code (far more
+   likely than tew's own handlers to actually race multiple threads through
+   Win32 calls) could be exposing this kind of latent gap.
+
+6. **`FormatMessageA` (`tew/api/kernel32_io.py`) was an unconditional
+   halt.** The game's own COM error-handling path (`dbcode.c`, called when
+   `CoGetClassObject`/`CoCreateInstance` fail) calls this to turn an
+   HRESULT into readable text before logging/displaying it, so the halt was
+   masking the actual diagnostic message rather than just being an
+   unrelated missing API. Implemented: `FORMAT_MESSAGE_FROM_SYSTEM` (a
+   small table of the HRESULTs this emulator's own COM handlers actually
+   produce, e.g. `0x80040111` → "Class not registered for this server --
+   the object is not available") and `FORMAT_MESSAGE_FROM_STRING`;
+   `ALLOCATE_BUFFER` supported; `%1`/`%2`-style insert-argument
+   substitution is not, since every caller seen so far uses
+   `FORMAT_MESSAGE_IGNORE_INSERTS`.
+
+7. **`Channel_DebugPrint` (`channel.c`, `FUN_004cc5b0`) was entirely
+   unpatched real game code** whose real routing target (a per-`(user,
+   channel)` listener table gated on a runtime debug-console-enabled flag)
+   is the game's own unrendered debug console — meaning nothing it logs
+   ever reached tew's log regardless of that gate. Patched the whole
+   function like `_CrtDbgReport`: format the `%s`/`%d` varargs ourselves
+   (multi-arg, in appearance order — the existing `_CrtDbgReport` pattern
+   only substituted one), always surface the result at `WARN`, skip
+   replicating the real listener-routing plumbing.
+
+**Logging noise cleanup** (several call sites moved from `debug`/`info`
+down to `trace`, the quietest level, below `debug` — found while trying to
+actually read a `LOG_LEVEL=debug` capture of the DAO work above and
+discovering it was 90%+ drowned out): `_CrtDbgReport`'s routine
+`_CRT_WARN`-type end-of-process memory-leak dump (fires dozens of times
+per run, zero signal — the fatal `_CRT_ERROR`/`_CRT_ASSERT` path, which
+halts, is untouched); `timeSetEvent` (fires roughly every 1ms via the
+game's self-rescheduling multimedia timer — also quieted a second, dead/
+overridden duplicate registration in `advapi32_handlers.py` for
+consistency); `free`/`operator delete` (fire on every one of the bump
+allocator's no-op releases); `GetFullPathNameA` (fires per file-path
+lookup); `SNDMEMI_validate`'s per-pool-entry OK/not-OK detail (its
+corruption-summary line, which fires only when something's actually wrong,
+stays at `warn`).
+
+**Also fixed, smaller correctness/observability items**:
+- Two "activation failed" log messages in the new `CoGetClassObject`/
+  `CoCreateInstance` code unconditionally claimed the DLL "failed to load
+  from disk", which was actively misleading whenever the real, already-
+  logged reason was a `DllMain` failure instead — now a generic, accurate
+  "activation failed (see above)".
+- The `IID_IClassFactory` scratch GUID buffer (needed for
+  `CoCreateInstance`'s internal `DllGetClassObject(IID_IClassFactory)`
+  call) was being allocated unconditionally at handler-registration time —
+  broke small-memory test harnesses that construct `CRTState` without ever
+  touching COM. Now allocated lazily on first use, mirroring the existing
+  `user32_handlers._get_dialog_sentinel` pattern.
+- Success log lines for `CoGetClassObject`/`CoCreateInstance` now include
+  the resulting `*ppv` object address, not just the HRESULT — this is what
+  actually surfaced the open bug below; before this, the two-line log
+  looked identical apart from the requested IID and gave no way to tell
+  whether two calls returned distinct objects or nothing at all.
+
+**Open, not resolved tonight**: with all of the above fixed and `dao350.dll`
+loading and running for real, both `CoGetClassObject` calls the game makes
+(`IID_IClassFactory`, then `IID_IClassFactory2`) return genuine `hr=S_OK`
+from real compiled DAO 3.5 code — but `*ppv` is `0x00000000` (NULL) on both,
+a real COM contract violation (success must guarantee a valid object
+pointer). No `_invoke_emulated_proc` timeout or unexpected-halt warning
+fires during these calls, so this isn't a scheduler/timing artifact — the
+nested call genuinely runs to completion and hits the real sentinel
+normally; `dao350.dll`'s own code is doing this. `CoCreateInstance`'s
+internal `DllGetClassObject(IID_IClassFactory)` call hits the identical
+bug, and the existing NULL-check fallback correctly reports `E_FAIL` rather
+than crashing on a null vtable dispatch, but the DAO handshake still can't
+complete. Separately, `DllMain`'s own return value is non-deterministic
+across runs (`0`, `70959764`, `105`, `70905676` observed in separate runs)
+— currently handled defensively, not root-caused. Next step if this is
+picked up again: `dao350.dll` itself has never been opened as its own
+Ghidra program (only `MCity_d.exe` has been analyzed) — import it and read
+its real `DllGetClassObject` implementation directly.
+
+**Commits** (`main`, not pushed): `2d5f69d` `_CrtDbgReport` → debug,
+`adff060` `Channel_DebugPrint`, `b163faa` `FormatMessageA`, `836ff95`
+per-thread last-error, `30a1cc6` more trace-level noise, `166f0d6`
+`_invoke_emulated_proc` native speed, `ed1f685` INT3 `fatal_halt`,
+`bc6ac2d` real `dao350.dll` COM activation, `f59d4ef` remaining trace-level
+noise.
+
+---
+
 ## 2026-07-19 — MessageBoxA/W log severity now matches dialog icon; fatal dialogs
 tracked so a voluntary ExitProcess after one can't be logged as a clean exit
 

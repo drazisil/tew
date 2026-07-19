@@ -11,94 +11,117 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status (2026-07-19, live-reconfirmed): full boot, zero emulator crashes,
-but exit is a real game-side ABORT, not a clean run
+### Current status (2026-07-19 night session): real DAO COM activation works,
+but the final object handoff is broken — `*ppv` stays NULL despite `S_OK`
 
-Fresh run against `main` today (commit below): **~201M steps in ~56-62s wall-clock,
-zero emulator crashes, zero unimplemented-API halts on the boot path**. Login
-succeeds, real Vulkan rendering happens, then the game hits its own `abortmessage`
-abort (a real, game-side DAO/DCOM database-init failure — `depthconv.c:1137`,
-"Failed to initialize database...") and calls `ExitProcess(0)` afterward. The run
-log now says so explicitly (`=== Emulation Complete (NOT a clean exit) ===`, see
-"Fixed today" below) — the emulator itself is healthy, but this is NOT the same
-thing as the game reaching a successful end state. This matches the milestone
-documented in [[tew_fake_kernel_gaps]] sections 16-17 — re-verified live today, not
-just carried over from memory.
+The `abortmessage`/DAO database-init abort documented earlier today is now
+understood far more precisely, via a real architectural shift: rather than
+faking DAO's COM objects in Python, `CoGetClassObject`/`CoCreateInstance`
+(`tew/api/oleaut32_handlers.py`) are now **registry-driven** (`hkcr\clsid\
+{...}\inprocserver32` in `registry.json`, exactly like real Windows) and, for
+CLSIDs registered to a server this emulator actually has
+(`_KNOWN_COM_SERVERS`), **load and execute the real DLL** the same way
+`authlogin.dll`/`NPSAnlyz.dll`/`dx8z.dll` already are — genuine COM activation
+against real compiled code, not a Python stand-in. See changelog.md for the
+full sequence of fixes that got this working tonight.
 
-**Fixed today: `MessageBoxA`/`MessageBoxW` now log at a severity matching the
-dialog's own icon** (`MB_ICONERROR`/`MB_ICONSTOP`/`MB_ICONHAND` → `error`,
-`MB_ICONWARNING` → `warn`, else `info`), and `CRTState.fatal_dialogs` records every
-error-severity dialog so `run_exe.py`'s final summary can no longer look clean when
-it wasn't. Previously the fatal `abortmessage` dialog and the harmless "run full
-screen?" prompt both logged at flat `INFO`, indistinguishable in a real triage. Full
-details in changelog.md.
+**Live-verified tonight**: the game's real DAO CLSID (`{00000010-0000-0010-
+8000-00AA006D2EA4}`) is DAO **3.5**'s, not 3.6's — confirmed by `dump_bytes`
+scanning both `dao360.dll` (generic period-correct binaries collection, does
+NOT contain this CLSID) and `dao350.dll` (extracted from the game's OWN real
+installer, `~/.emu32/DBInst/DAO/data1.cab`, DOES contain it). With the real
+`dao350.dll` loaded (`~/.emu32/WINDOWS/System32/dao350.dll`):
+- `DllMain(DLL_PROCESS_ATTACH)` returns nonzero (TRUE) most runs — see "open"
+  below, this value is non-deterministic across runs.
+- Both `CoGetClassObject` calls the game makes (`IID_IClassFactory`, then
+  `IID_IClassFactory2`) return genuine `hr=S_OK` from real dao350.dll code.
+- **But `*ppv` is `0x00000000` (NULL) on both, despite `S_OK`** — a real COM
+  contract violation (success must guarantee a valid object pointer).
+  `CoCreateInstance`'s internal `DllGetClassObject(IID_IClassFactory)` call
+  hits the same bug, and the existing NULL-check fallback correctly reports
+  `E_FAIL` rather than crashing on a null vtable dispatch — but the DAO
+  handshake still can't complete.
+- No `_invoke_emulated_proc` timeout/unexpected-halt warning fires during
+  these calls — the nested call genuinely runs to completion and hits the
+  real sentinel normally. This is not a timing/scheduler artifact; dao350's
+  own code is doing this.
 
-**Two unattended-boot dialog auto-clicks** (`run_exe.py:182-209`) — these are the
-only two interactive prompts MCity_d.exe shows before real gameplay starts, and the
-run would otherwise sit blocked on real mouse input without them:
+**Not yet root-caused**: why real `DllGetClassObject` returns success without
+writing `*ppv`. Next step, if this is picked up again: open `dao350.dll`
+itself in Ghidra (not yet analyzed as its own program — only `MCity_d.exe`
+has been) and read its real `DllGetClassObject` implementation to find what
+its success-and-write-`*ppv` branch actually requires.
 
-1. **Login dialog** (`_auto_click_login_continue`, resource 114, title "Motor City
-   Online Login"). Username/password are already sourced from `registry.json` by
-   the game itself (`LoginName`/`LoginPW` registry reads, confirmed in today's log
-   at 2.778s–2.792s) — the hook only clicks the Continue button
-   (`wm.click_control(dlg_hwnd, _LOGIN_CONTINUE_ID)`, control ID `0x0001`). Installed
-   via `window_manager.set_dialog_step_hook`.
-2. **"Run full screen?" prompt** (`_auto_decline_fullscreen_prompt`, `MB_YESNO`,
-   text contains "full screen", from `FUN_006b13b0`). Auto-answers `IDNO` (7) to
-   default to windowed mode. Installed via `window_manager.set_messagebox_hook`.
-   Confirmed in today's log at 3.602s, `MessageBoxA(...) type=0x4 -> 7`.
+**Also not yet root-caused**: `DllMain(DLL_PROCESS_ATTACH)`'s return value is
+non-deterministic across separate runs (`0`, `70959764`, `105`, `70905676`
+observed) — currently handled defensively (a `0`/FALSE return is treated as
+a real load failure, matching real `LoadLibrary` semantics), but a real DLL's
+`DllMain` returning different garbage-looking values across otherwise-
+identical runs suggests something in our environment it depends on isn't
+being initialized consistently.
 
-A third window (dialog resource 106, untitled splash bitmap, no buttons) also
-appears in this stretch of boot but dismisses itself and needs no hook — documented
-in the code comment so a future reader doesn't go looking for a third auto-click.
+**Fixed tonight, real bugs found along the way** (see changelog.md for full
+detail): `_invoke_emulated_proc` (user32_handlers.py) was single-stepping
+one instruction at a time via Python — now runs at native Zig speed via
+`cpu.run()`, since the sentinel it waits for is a real `HLT` byte and halts
+the native loop on its own. The INT3 debug-breakpoint halt
+(`win32_handlers.py`) was missing `fatal_halt`, so it was being silently
+un-halted by the next scheduler switch instead of actually stopping —
+now fixed, not yet independently live-verified in isolation (always seen
+together with the DAO work above). `GetLastError`/`SetLastError`
+(`scheduler.py`) were sharing one memory-backed value across ALL threads
+instead of being per-thread — now saved/restored per `ThreadState` on every
+context switch, same shape as the existing TLS-slot handling.
+`FormatMessageA` (`kernel32_io.py`) was an unconditional halt — now
+implemented (`FORMAT_MESSAGE_FROM_SYSTEM`/`FROM_STRING`, small table of the
+HRESULTs this emulator's own COM handlers produce). `Channel_DebugPrint`
+(`patch_internals.py`, channel.c) now surfaces at WARN instead of being
+silently dropped (its real routing target — the game's own debug console —
+never reaches tew's log regardless). Several very-high-frequency,
+zero-signal log lines (`_CrtDbgReport`'s routine leak dump, `timeSetEvent`,
+`free`/`operator delete`, `GetFullPathNameA`, `SNDMEMI_validate`'s per-entry
+detail) moved from `debug`/`info` down to `trace`.
 
-**Still open, not touched today:**
+**Still open, not touched tonight:**
 - **~85 of ~90 `cpu.halted = True` call sites still lack the `cpu.fatal_halt`
-  marker** from the section-15 scheduler fix (`kernel32_memory.py`, the d3d8 files,
-  `oleaut32_handlers.py`, `wsock32_handlers.py`, and more — see
-  [[tew_fake_kernel_gaps]] section 17's closing paragraph). Only the 5 shared
-  `_halt()` factories plus `__chkesp`/`_CrtDbgReport` in `patch_internals.py` are
-  covered. Any of these ~85 sites can still be silently un-halted by the same
-  scheduler/nested-call mechanisms section 15 fixed for the covered sites.
+  marker** (unchanged from this morning — see [[tew_fake_kernel_gaps]]
+  section 17's closing paragraph). The INT3 site got fixed tonight as one
+  specific instance of this same class of gap; the rest are untouched.
 - **SDL window is 1536x1248**, not the 1024x768 the D3D8/GDI `GetDeviceCaps`
-  fix (memory section 9) standardized on — confirmed still true in today's log
-  (`Created SDL window ... (1536x1248)`, `swapchain 1536x1248`). This is a
-  *different* code path from the one section 9 fixed (window creation vs.
-  device-caps reporting) — not yet investigated which one is authoritative or
-  whether they need to agree.
-- `INT3 breakpoint at EIP=0x00688c69 — halting` still fires (57.0s in today's run)
-  and still doesn't actually stop execution (per memory section 8, gated behind a
-  dead-code global so this is expected, not a regression) — still not root-caused
-  why this specific `cpu.halted = True` gets cleared; likely one of the ~85
-  unmarked sites above.
-- Git: `main` is 5 commits ahead of `origin/main` (as of `8473b26`), not pushed
-  (per this project's "never push without being asked" norm).
+  fix standardized on (unchanged from this morning, not re-checked tonight).
+- Git: `main` is **9 commits ahead** of `origin/main` (as of `f59d4ef`), not
+  pushed (per this project's "never push without being asked" norm).
 
 ## Run command
 ```bash
 cd /data/Code/tew
-timeout -k 5 90 env LOG_LEVEL=info /data/Code/tew/.venv/bin/python -u /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -20
+timeout -k 5 600 env LOG_LEVEL=debug LOG_CATEGORIES=com,dll,loader,handlers,startup,registry,exception /data/Code/tew/.venv/bin/python -u /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -40
 ```
-**Updated 2026-07-19: raised from `timeout 30` to `timeout -k 5 90`.** A clean run
-now legitimately takes ~62s wall-clock (201M steps) to reach voluntary
-`ExitProcess(0)` — the old 30s budget would truncate every clean run before it
-finishes and misreport it as a hang. `-k 5` sends `SIGKILL` 5s after `SIGTERM`
-since plain `timeout`'s `SIGTERM` has been observed not to kill this process
-(suspected Vulkan-driver thread signal mask, see [[tew_fake_kernel_gaps]]
-section 14). uutils `timeout` (installed on this system) does not support inline
-env vars — use `env KEY=VAL` prefix and absolute paths. `-u` on python keeps
-output unbuffered.
+**Updated tonight**: a run that reaches and completes the real DAO handshake
+needs far more than the `timeout 90` from this morning — real `dao350.dll`
+execution alone can take 60-90s+ of wall-clock across its several nested
+calls (each individual `CoGetClassObject`/`CoCreateInstance` call has been
+observed taking anywhere from ~1s to ~30s). A 600s budget was sufficient
+tonight; the process actually finished in ~118s once it ran to completion.
+Add `com,dll,loader,registry` to `LOG_CATEGORIES` when investigating DAO
+specifically — `loader` carries the IAT-patch confirmation
+(`Patched N/M DLL IAT entries`), `registry` would show any registry calls
+dao350.dll makes internally (none observed so far).
+
+The morning's simpler run command (`timeout -k 5 90`, `LOG_LEVEL=info`, no
+extra categories) is still correct for a general boot-health check that
+doesn't need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- Dedicated pass on the ~85 unmarked `cpu.halted` sites (priority order not yet
-  established — start with whichever subsystem is next actually exercised)
+- Root-cause `dao350.dll`'s `DllGetClassObject` returning `S_OK` with NULL
+  `*ppv` — open `dao350.dll` itself in Ghidra (new program, not yet
+  analyzed) and read its real implementation
+- Root-cause `DllMain`'s non-deterministic return value across runs
+- Dedicated pass on the ~85 unmarked `cpu.halted` sites (priority order not
+  yet established)
 - SDL window resolution (1536x1248) vs. `GetDeviceCaps` (1024x768) mismatch
-- `abortmessage`'s DAO/DCOM database-init failure (`depthconv.c:1137`) is a real
-  game-side blocker to reaching actual gameplay past this point — root cause not
-  investigated (likely a missing/incomplete DAO/DCOM COM stub, same family as
-  `CoGetClassObject`)
-- DrawPrimitive / DrawIndexedPrimitive coverage beyond what's needed to reach the
-  abort above — not yet assessed how much is implemented
+- DrawPrimitive / DrawIndexedPrimitive coverage beyond what's needed to
+  reach the DAO abort — not yet assessed how much is implemented
 - `[alive]` heartbeat silent during `GetMessageA` host-sleep — low priority
 
 ## Architecture
@@ -106,12 +129,24 @@ output unbuffered.
 - Rendering path: Game → THRASH API (dx8z.dll) → D3D8 (fake COM, Vulkan backend)
 - WinINet connects to localhost:443 (HTTPS)
 - authlogin.dll reads AuthLoginServer from registry (localhost)
-- Login dialog (SDL2): admin/admin from registry, auto-filled — see the two
-  dialog auto-clicks documented above
+- Login dialog (SDL2): admin/admin from registry, auto-filled
 - Timer thread: FUN_00a30ea0, runs as tid=1006 via CRT wrapper at 0x9fc3a0
   `mmtimer_callback` (0x00a30a40) is the multimedia timer proc AND a `_tmrsub[]` subscriber.
   It calls `_SIGNAL_set(event)` + re-registers via `timeSetEvent` each tick.
   Event handle at runtime is 0x7012 (may vary).
+- **COM activation** (new tonight): registry-driven (`hkcr\clsid\{...}\
+  inprocserver32`), real DLLs loaded and executed for CLSIDs in
+  `_KNOWN_COM_SERVERS` (`oleaut32_handlers.py`) — currently just DAO 3.5
+  (`dao350.dll`, real file at `~/.emu32/WINDOWS/System32/`, kept out of the
+  repo since it's a Microsoft-copyrighted redistributable). Unregistered or
+  unimplemented CLSIDs fail honestly with `REGDB_E_CLASSNOTREG`, matching a
+  real unmodified install missing that component. This pattern (search a
+  directory of real DLLs, fall back to Python stub) is worth reusing for
+  *other* pure user-mode COM/utility libraries the game touches — NOT for
+  anything DirectX/hardware-driver-dependent (`d3d8.dll`, `ddraw.dll`,
+  `dsound.dll` etc. all need a real kernel-mode HAL/driver stack this
+  emulator doesn't have; tew's existing hand-built D3D8-over-Vulkan is
+  already the correct solution to that problem, not something to replace).
 
 ## Test suite
-582 tests (all passing, reconfirmed 2026-07-19 via `pytest --collect-only`).
+582 tests (all passing, reconfirmed tonight).
