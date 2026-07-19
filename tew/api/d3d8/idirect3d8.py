@@ -118,6 +118,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         import ctypes
         import vulkan as vk
         from vulkan import ffi
+        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND
         from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
@@ -166,9 +167,18 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         # ── Create VkSurfaceKHR ────────────────────────────────────────────
-        # SDL_Vulkan_CreateSurface handles the X11/Wayland/XWayland selection
-        # automatically — avoids forcing vkCreateWaylandSurfaceKHR on systems
-        # where SDL is actually running through XWayland (NVIDIA + Wayland).
+        # Branch on wm_info.subsystem (what SDL actually initialized), NOT on
+        # the WAYLAND_DISPLAY env var: NVIDIA's proprietary driver commonly
+        # falls back to X11/XWayland even in a real Wayland session with
+        # WAYLAND_DISPLAY set, so the env-var check picked the Wayland path
+        # and fed garbage wl_display/wl_surface pointers (SDL's wl union
+        # member is never populated when it initialized the x11 backend)
+        # into vkCreateWaylandSurfaceKHR — surface creation didn't validate
+        # them and "succeeded", but the NVIDIA driver segfaulted inside
+        # wl_proxy_create_wrapper the first time it actually dereferenced
+        # them (vkGetPhysicalDeviceSurfaceCapabilitiesKHR, during swapchain
+        # setup). Confirmed live: SDL_GetCurrentVideoDriver() returns b'x11'
+        # on this machine despite WAYLAND_DISPLAY being set.
         try:
             wm_info = SDL_SysWMinfo()
             wm_info.version.major = 2
@@ -176,7 +186,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             wm_info.version.patch = 0
             SDL_GetWindowWMInfo(sdl_window, ctypes.byref(wm_info))
 
-            if os.environ.get("WAYLAND_DISPLAY"):
+            if wm_info.subsystem == SDL_SYSWM_WAYLAND:
                 vkCreateSurface = vk.vkGetInstanceProcAddr(
                     _state._vk_instance, 'vkCreateWaylandSurfaceKHR')
                 wl_display_ptr = wm_info.info.wl.display or 0
