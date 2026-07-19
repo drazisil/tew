@@ -335,7 +335,7 @@ def patch_crt_internals(
             lo_val = memory.read32(lo_addr) if lo_addr < 0x7FFFFFFF else 0
             hi_val = memory.read32(hi_addr) if hi_addr < 0x7FFFFFFF else 0
             ok = "✓" if (lo_val == 0xDEADDEAD and hi_val == 0xDEADDEAD) else "✗"
-            logger.info("handlers",
+            logger.trace("handlers",
                 f"[SNDMEMI_validate] [{ok}] idx={idx} entry={entry:#010x} "
                 f"start={start:#x} size={size:#x} "
                 f"lo={lo_addr:#010x}={lo_val:#010x} hi={hi_addr:#010x}={hi_val:#010x}")

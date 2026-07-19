@@ -856,7 +856,7 @@ def register_kernel32_io_handlers(
                 else:
                     memory.write32(lp_part, 0)
             cpu.regs[EAX] = len(result)
-            logger.debug("handlers", f'GetFullPathNameA({raw!r}) -> {result!r}')
+            logger.trace("handlers", f'GetFullPathNameA({raw!r}) -> {result!r}')
         else:
             cpu.regs[EAX] = needed
         cleanup_stdcall(cpu, memory, 16)
