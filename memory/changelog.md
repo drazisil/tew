@@ -4,6 +4,117 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-19 (night, continued) — _invoke_emulated_proc made thread-aware
+(real, separate bug, found and fixed); DAO's real DllGetClassObject read
+directly in Ghidra and confirmed correct; the actual bug is now precisely
+localized to a deterministic stack corruption, not yet root-caused
+
+Continuation of the same night's DAO investigation (previous entry below).
+
+**`dao350.dll` opened in Ghidra as its own program** (`import_and_analyze`,
+`~/.emu32/WINDOWS/System32/dao350.dll` — previously only `MCity_d.exe` had
+ever been analyzed) and its real `DllGetClassObject`/`QueryInterface` read
+directly, at the user's request, after live logging showed both
+`CoGetClassObject` calls returning `hr=S_OK` with `*ppv` staying NULL.
+Ghidra's decompiled C was actively misleading for the CLSID-matching logic
+— it rendered real 16-byte `REP CMPSB` GUID comparisons (confirmed from the
+*raw disassembly*, not the decompile) as fake 1-2 byte C string literals,
+making it look like only the first byte of the CLSID was being checked.
+The real logic does a full, correct 16-byte compare against several
+DAO-family candidate CLSIDs and correctly matches ours (live-confirmed via
+a Zig-level logpoint at the match branch — fires every time, regardless of
+outcome). The same investigation found what looked like a bug (the same
+8-byte-allocated object's vtable-pointer field gets overwritten 4 times in
+a row by `FUN_0447d398`) but is actually a completely ordinary
+Borland/Delphi-style multi-level virtual-inheritance constructor chain —
+each write is a different base class setting its own vtable, only the
+last one (the most-derived class, set last) matters. `QueryInterface`
+itself (found via `dump_bytes` on the real vtable address, after an
+initial logpoint at a *wrong* guessed address never fired) correctly
+recognizes `IUnknown`/`IClassFactory`/`IClassFactory2`, calls `AddRef`,
+and writes itself into `*ppv` — this code, read statically, is completely
+correct for what the game requests. None of tonight's earlier suspicion
+that DAO's own code was somehow buggy held up under direct inspection.
+
+**Root cause re-localized, live, via logpoints and Ghidra raw disassembly
+cross-referencing**: a deterministic ~496-byte stack corruption, always
+detected by the game's own `__chkesp` at the exact instruction
+(`0x008f4f0b` in `FUN_008f4e70`, confirmed via raw disassembly down to the
+individual `PUSH`/`CALL COMPUTED_CALL`/`CMP EBP,ESP`/`CALL __chkesp`
+instructions) immediately following the game's first
+`CoGetClassObject(rclsid, 1, NULL, IID_IClassFactory, &local_2c)` call —
+not, as first suspected, something specific to `CoCreateInstance` (an
+earlier run's corruption happened to surface there instead, but that was
+this same underlying bug manifesting at a different point, not a second
+distinct bug — confirmed by the address being identical to the
+`CoGetClassObject`-triggered case in other runs).
+
+**Found and fixed a real, separate bug while chasing this**:
+`_invoke_emulated_proc` (`user32_handlers.py`) ran `cpu.run(max_steps)` in
+one single 5,000,000-step call with no awareness of logical threads. If
+the calling thread hits anything that makes the cooperative scheduler
+switch away (`Sleep`, `WaitForSingleObject`, a contested critical section
+— all implemented by directly swapping CPU state via
+`scheduler._save_current`/`_load_next`), the nested call would keep
+executing whatever thread was live next, for up to the full step budget,
+with zero awareness it was no longer running the code it actually called.
+A halt hit on that other thread (its own unrelated sentinel, or worse, an
+unrelated fatal halt) would then be misread as "our nested call returned".
+**Live-verified this genuinely happens**: calling `dao350.dll`'s real
+`DllMain`, virtual time jumped 1.4 seconds and five unrelated threads
+(1000, 1004, 1005, 1007, 1009) ran to completion inside what was supposed
+to be one narrow nested call. Fixed: run in bounded 200,000-step chunks;
+after each chunk, if `scheduler.current_idx` no longer matches the thread
+that started the call, clear any non-fatal halt (it belongs to the other
+thread) and keep going — the calling thread eventually gets rescheduled.
+A genuine `fatal_halt` still stops everything immediately regardless of
+which thread caused it. New optional `scheduler` parameter, backward
+compatible for the existing short dialog-proc/timer-callback call sites
+that don't pass it (their calls are short enough this was never observed
+to matter); wired into the three DAO call sites where it was found.
+
+**This fix did NOT resolve the stack corruption** — live-verified after
+the fix, the exact same `__chkesp` failure (same address `0x008f4f0b`,
+same ~496-byte delta) still occurred. So scheduler thread-switching, while
+a real and worth-fixing bug in its own right, was not the (sole) cause of
+this specific corruption. Since `_invoke_emulated_proc` forcibly restores
+`ESP` as a *register* via `cpu.save_state()`/`restore_state()` regardless
+of how the real DAO code cleans up internally, the corruption has to be
+in stack *memory content*, not the ESP register itself — meaning
+register-level instrumentation (which is all that was used tonight) can't
+see it directly. `DllMain`'s return value also remains non-deterministic
+across runs (`0`, `70959764`, `105`, `70959264`, `70961940`, `70957766`
+observed) — not distinguished yet whether this is the same underlying
+issue or separate.
+
+**Diagnostic instrumentation used tonight, all discarded (`git checkout --`)
+once it had served its purpose, not committed**: `run_exe.py` temporarily
+grew three Zig-level logpoints (`cpu.add_logpoint`, not breakpoints —
+breakpoints halt execution and aren't dispatched from inside a nested
+`_invoke_emulated_proc` call, so they'd be silently misinterpreted as "the
+call returned") tracing the outer CLSID-match branch and the real vtable
+call site in `dao350.dll`'s `DllGetClassObject`. `oleaut32_handlers.py`
+temporarily grew an ESP/EBP bracket around the nested calls in
+`_CoGetClassObject`/`_CoCreateInstance`. Both served their purpose (found
+the thread-switching bug, precisely localized the corruption's trigger
+point) and were removed once done, per this project's established
+"TEMP diagnostics get discarded, not shipped" convention.
+
+**Next step, if this is picked up again**: a memory-write-level trace is
+needed, not more register-level logpoints. The ClickHouse execution-history
+capture tooling from `~/pe-walker/history-poc` (already proven for exactly
+this "what wrote to this address" question in earlier sessions — see
+[[tew_fake_kernel_gaps]] section 10 via the wiki/memory system) is likely
+the right tool, scoped narrowly to the ~496-byte window between the game's
+ESP and EBP during the first `CoGetClassObject` call specifically.
+
+**Commits** (`main`, not pushed): `5e49168` `_invoke_emulated_proc`
+thread-awareness (the only code change that survived this half of the
+session — the corruption investigation itself produced no shippable fix
+yet).
+
+---
+
 ## 2026-07-19 (night) — Real COM activation: CoGetClassObject/CoCreateInstance
 now load and execute real DLLs (DAO 3.5); several real emulator bugs found
 and fixed along the way; final DAO object handoff still broken (open)

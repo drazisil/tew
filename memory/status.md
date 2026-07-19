@@ -11,8 +11,8 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status (2026-07-19 night session): real DAO COM activation works,
-but the final object handoff is broken — `*ppv` stays NULL despite `S_OK`
+### Current status (2026-07-19 night session, continued): root-caused down to
+a deterministic stack-corruption bug, precisely localized but not yet fixed
 
 The `abortmessage`/DAO database-init abort documented earlier today is now
 understood far more precisely, via a real architectural shift: rather than
@@ -25,62 +25,99 @@ CLSIDs registered to a server this emulator actually has
 against real compiled code, not a Python stand-in. See changelog.md for the
 full sequence of fixes that got this working tonight.
 
-**Live-verified tonight**: the game's real DAO CLSID (`{00000010-0000-0010-
-8000-00AA006D2EA4}`) is DAO **3.5**'s, not 3.6's — confirmed by `dump_bytes`
-scanning both `dao360.dll` (generic period-correct binaries collection, does
-NOT contain this CLSID) and `dao350.dll` (extracted from the game's OWN real
-installer, `~/.emu32/DBInst/DAO/data1.cab`, DOES contain it). With the real
-`dao350.dll` loaded (`~/.emu32/WINDOWS/System32/dao350.dll`):
-- `DllMain(DLL_PROCESS_ATTACH)` returns nonzero (TRUE) most runs — see "open"
-  below, this value is non-deterministic across runs.
-- Both `CoGetClassObject` calls the game makes (`IID_IClassFactory`, then
-  `IID_IClassFactory2`) return genuine `hr=S_OK` from real dao350.dll code.
-- **But `*ppv` is `0x00000000` (NULL) on both, despite `S_OK`** — a real COM
-  contract violation (success must guarantee a valid object pointer).
-  `CoCreateInstance`'s internal `DllGetClassObject(IID_IClassFactory)` call
-  hits the same bug, and the existing NULL-check fallback correctly reports
-  `E_FAIL` rather than crashing on a null vtable dispatch — but the DAO
-  handshake still can't complete.
-- No `_invoke_emulated_proc` timeout/unexpected-halt warning fires during
-  these calls — the nested call genuinely runs to completion and hits the
-  real sentinel normally. This is not a timing/scheduler artifact; dao350's
-  own code is doing this.
+**The DAO CLSID version mismatch, confirmed**: the game's real CLSID
+(`{00000010-0000-0010-8000-00AA006D2EA4}`) is DAO **3.5**'s, not 3.6's —
+`dao360.dll` (generic period-correct binaries collection) does NOT contain
+this CLSID anywhere in its binary; `dao350.dll` (extracted from the game's
+OWN real installer, `~/.emu32/DBInst/DAO/data1.cab`) DOES. Real `dao350.dll`
+now loads and runs from `~/.emu32/WINDOWS/System32/dao350.dll`.
 
-**Not yet root-caused**: why real `DllGetClassObject` returns success without
-writing `*ppv`. Next step, if this is picked up again: open `dao350.dll`
-itself in Ghidra (not yet analyzed as its own program — only `MCity_d.exe`
-has been) and read its real `DllGetClassObject` implementation to find what
-its success-and-write-`*ppv` branch actually requires.
+**`dao350.dll` opened in Ghidra and its real `DllGetClassObject`/
+`QueryInterface` read directly** (previously only `MCity_d.exe` had been
+analyzed). Confirmed by decompile + raw disassembly (Ghidra's decompiled C
+was actively misleading here — rendered real 16-byte `REP CMPSB` GUID
+comparisons as fake 1-2 byte string literals):
+- `DllGetClassObject` does a real, correct full 16-byte CLSID comparison
+  against several DAO-family candidates and correctly matches our CLSID —
+  live-confirmed via a logpoint at the match branch, fires every time.
+- It builds a small helper object via a completely ordinary
+  Borland/Delphi-style multi-level constructor chain (looked like a bug at
+  first — the same memory field gets written 4 times in a row — but each
+  write is a different base class's vtable in a multi-inheritance chain;
+  only the last write matters, which is normal compiled-code shape, not
+  a bug).
+- That helper's `QueryInterface` (found the real vtable slot address, not
+  the wrong one my first static-analysis guess landed on) correctly
+  recognizes `IUnknown`/`IClassFactory`/`IClassFactory2`, calls `AddRef`,
+  and writes itself into `*ppv` — this code, read statically, looks
+  completely correct for what the game requests.
 
-**Also not yet root-caused**: `DllMain(DLL_PROCESS_ATTACH)`'s return value is
-non-deterministic across separate runs (`0`, `70959764`, `105`, `70905676`
-observed) — currently handled defensively (a `0`/FALSE return is treated as
-a real load failure, matching real `LoadLibrary` semantics), but a real DLL's
-`DllMain` returning different garbage-looking values across otherwise-
-identical runs suggests something in our environment it depends on isn't
-being initialized consistently.
+**The real, now precisely localized bug**: a **deterministic stack
+corruption**, always detected by the game's own `__chkesp` at the exact
+instruction right after the game's **first** `CoGetClassObject(rclsid, 1,
+NULL, IID_IClassFactory, &local_2c)` call (confirmed via raw disassembly —
+`0x008f4f0b` in `FUN_008f4e70`, immediately after that call's own
+`CMP EBP,ESP; CALL __chkesp`), with a consistent ~496-byte ESP/EBP
+imbalance. This happens across every run so far, regardless of whether
+`DllMain` returned 0 or nonzero. Since `_invoke_emulated_proc` forcibly
+restores `ESP` as a register via `cpu.save_state()`/`restore_state()`
+regardless of how the real DAO code cleans up internally, this is not a
+stdcall/cdecl argument-count mismatch on our side — the corruption is in
+stack **memory content**, not the register.
+
+**Ruled out tonight**: scheduler thread-switching mid-nested-call. Found and
+fixed a real, separate bug this session (`_invoke_emulated_proc` now
+detects when the scheduler swaps to a different thread mid-call and no
+longer misreads that thread's halt as "our call returned" — see
+changelog.md) — genuinely necessary and confirmed live (virtual time
+jumped 1.4s and five unrelated threads ran inside one nested `DllMain`
+call before the fix). But the exact same `__chkesp` failure (same address,
+same ~496-byte delta) still occurred after this fix, so thread-switching
+was not the (sole) cause of this specific corruption.
+
+**Also still not root-caused**: `DllMain(DLL_PROCESS_ATTACH)`'s return value
+is non-deterministic across separate runs (`0`, `70959764`, `105`,
+`70959264`, `70961940`, `70957766` observed) — currently handled
+defensively (a `0`/FALSE return is treated as a real load failure, matching
+real `LoadLibrary` semantics). Possibly the same underlying corruption
+affecting DllMain's own local state before it returns, or a separate issue
+— not distinguished yet.
+
+**Next step, if this is picked up again**: the corruption is in stack
+memory, not registers, so static analysis and the register-only
+instrumentation used tonight can't see it directly. Options: (a) a
+finer-grained live memory-write trace bracketing the first
+`CoGetClassObject` nested call specifically (watch for writes landing in
+the ~496-byte window between the game's current ESP and EBP during the
+call), or (b) the ClickHouse execution-history capture tooling from
+`~/pe-walker/history-poc` (already proven for exactly this kind of
+"what wrote to this address" question in earlier sessions — see
+[[tew_fake_kernel_gaps]] section 10) — likely a more systematic fit than
+more one-off logpoint guessing at this point.
 
 **Fixed tonight, real bugs found along the way** (see changelog.md for full
-detail): `_invoke_emulated_proc` (user32_handlers.py) was single-stepping
+detail): `_invoke_emulated_proc` (`user32_handlers.py`) was single-stepping
 one instruction at a time via Python — now runs at native Zig speed via
-`cpu.run()`, since the sentinel it waits for is a real `HLT` byte and halts
-the native loop on its own. The INT3 debug-breakpoint halt
-(`win32_handlers.py`) was missing `fatal_halt`, so it was being silently
-un-halted by the next scheduler switch instead of actually stopping —
-now fixed, not yet independently live-verified in isolation (always seen
-together with the DAO work above). `GetLastError`/`SetLastError`
-(`scheduler.py`) were sharing one memory-backed value across ALL threads
-instead of being per-thread — now saved/restored per `ThreadState` on every
-context switch, same shape as the existing TLS-slot handling.
-`FormatMessageA` (`kernel32_io.py`) was an unconditional halt — now
-implemented (`FORMAT_MESSAGE_FROM_SYSTEM`/`FROM_STRING`, small table of the
-HRESULTs this emulator's own COM handlers produce). `Channel_DebugPrint`
-(`patch_internals.py`, channel.c) now surfaces at WARN instead of being
-silently dropped (its real routing target — the game's own debug console —
-never reaches tew's log regardless). Several very-high-frequency,
-zero-signal log lines (`_CrtDbgReport`'s routine leak dump, `timeSetEvent`,
-`free`/`operator delete`, `GetFullPathNameA`, `SNDMEMI_validate`'s per-entry
-detail) moved from `debug`/`info` down to `trace`.
+`cpu.run()` in bounded chunks, checking after each chunk whether the
+scheduler swapped to a different thread (see "ruled out" above — a real,
+separately-necessary fix, just not the cause of the corruption being
+chased). The INT3 debug-breakpoint halt (`win32_handlers.py`) was missing
+`fatal_halt`, so it was being silently un-halted by the next scheduler
+switch instead of actually stopping — now fixed, not yet independently
+live-verified in isolation (always seen together with the DAO work above).
+`GetLastError`/`SetLastError` (`scheduler.py`) were sharing one
+memory-backed value across ALL threads instead of being per-thread — now
+saved/restored per `ThreadState` on every context switch, same shape as
+the existing TLS-slot handling. `FormatMessageA` (`kernel32_io.py`) was an
+unconditional halt — now implemented (`FORMAT_MESSAGE_FROM_SYSTEM`/
+`FROM_STRING`, small table of the HRESULTs this emulator's own COM
+handlers produce). `Channel_DebugPrint` (`patch_internals.py`, channel.c)
+now surfaces at WARN instead of being silently dropped (its real routing
+target — the game's own debug console — never reaches tew's log
+regardless). Several very-high-frequency, zero-signal log lines
+(`_CrtDbgReport`'s routine leak dump, `timeSetEvent`, `free`/`operator
+delete`, `GetFullPathNameA`, `SNDMEMI_validate`'s per-entry detail) moved
+from `debug`/`info` down to `trace`.
 
 **Still open, not touched tonight:**
 - **~85 of ~90 `cpu.halted = True` call sites still lack the `cpu.fatal_halt`
@@ -89,34 +126,35 @@ detail) moved from `debug`/`info` down to `trace`.
   specific instance of this same class of gap; the rest are untouched.
 - **SDL window is 1536x1248**, not the 1024x768 the D3D8/GDI `GetDeviceCaps`
   fix standardized on (unchanged from this morning, not re-checked tonight).
-- Git: `main` is **9 commits ahead** of `origin/main` (as of `f59d4ef`), not
-  pushed (per this project's "never push without being asked" norm).
+- Git: `main` is **11 commits ahead** of `origin/main` (as of `5e49168`),
+  not pushed (per this project's "never push without being asked" norm).
 
 ## Run command
 ```bash
 cd /data/Code/tew
-timeout -k 5 600 env LOG_LEVEL=debug LOG_CATEGORIES=com,dll,loader,handlers,startup,registry,exception /data/Code/tew/.venv/bin/python -u /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -40
+timeout -k 5 300 env LOG_LEVEL=info LOG_CATEGORIES=com,dll,loader,exception /data/Code/tew/.venv/bin/python -u /data/Code/tew/run_exe.py 2>&1 | tee /tmp/emu.log | tail -60
 ```
-**Updated tonight**: a run that reaches and completes the real DAO handshake
-needs far more than the `timeout 90` from this morning — real `dao350.dll`
-execution alone can take 60-90s+ of wall-clock across its several nested
-calls (each individual `CoGetClassObject`/`CoCreateInstance` call has been
-observed taking anywhere from ~1s to ~30s). A 600s budget was sufficient
-tonight; the process actually finished in ~118s once it ran to completion.
-Add `com,dll,loader,registry` to `LOG_CATEGORIES` when investigating DAO
-specifically — `loader` carries the IAT-patch confirmation
-(`Patched N/M DLL IAT entries`), `registry` would show any registry calls
-dao350.dll makes internally (none observed so far).
+**Updated tonight**: real `dao350.dll` execution takes anywhere from ~1s to
+~30s per individual `CoGetClassObject`/`CoCreateInstance` call, so a run
+reaching the DAO section needs far more than the `timeout 90` from this
+morning. In practice, every run so far has stopped via the `__chkesp`
+stack-corruption halt (see above) before ever reaching a full, clean
+completion — a 300s budget is generous headroom, not an observed
+requirement. Add `registry`/`handlers` to `LOG_CATEGORIES` for deeper
+investigation; `loader` carries the IAT-patch confirmation (`Patched N/M
+DLL IAT entries`).
 
 The morning's simpler run command (`timeout -k 5 90`, `LOG_LEVEL=info`, no
 extra categories) is still correct for a general boot-health check that
 doesn't need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- Root-cause `dao350.dll`'s `DllGetClassObject` returning `S_OK` with NULL
-  `*ppv` — open `dao350.dll` itself in Ghidra (new program, not yet
-  analyzed) and read its real implementation
+- Root-cause the deterministic ~496-byte stack corruption detected right
+  after the game's first `CoGetClassObject` call — corruption is in stack
+  memory content, not registers, so needs a memory-write-level trace (or
+  ClickHouse execution history) rather than more register-only logpoints
 - Root-cause `DllMain`'s non-deterministic return value across runs
+  (possibly the same underlying issue, not distinguished yet)
 - Dedicated pass on the ~85 unmarked `cpu.halted` sites (priority order not
   yet established)
 - SDL window resolution (1536x1248) vs. `GetDeviceCaps` (1024x768) mismatch
