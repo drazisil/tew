@@ -170,6 +170,60 @@ def patch_crt_internals(
 
     stubs.patch_address(0x009F9300, "_CrtDbgReport", _crt_dbg_report)
 
+    # Channel_DebugPrint (0x004cc5b0), channel.c: __cdecl
+    # Channel_DebugPrint(int user, int channel, const char *format, ...).
+    # Real implementation asserts user/channel bounds, formats the varargs,
+    # then routes the string to up to 4 registered per-(user,channel)
+    # listeners (FUN_004ce660) gated on a runtime debug-console-enabled
+    # flag (DAT_013e0518/DAT_013e051c) -- those listeners target the game's
+    # own (unrendered) debug console, so nothing reaches tew's log today
+    # regardless of that gate. We bypass the real routing entirely and just
+    # always surface the formatted message at WARN -- same "CRT-internal
+    # patch, not worth replicating the real plumbing" rationale as
+    # _CrtDbgReport above.
+    def _channel_debug_print(cpu: "CPU") -> None:
+        sp        = cpu.regs[ESP]
+        user      = memory.read32((sp + 4)  & 0xFFFFFFFF)
+        channel   = memory.read32((sp + 8)  & 0xFFFFFFFF)
+        fmt_ptr   = memory.read32((sp + 12) & 0xFFFFFFFF)
+
+        fmt = "(null)"
+        if fmt_ptr > 0x1000:
+            try:
+                fmt = read_cstring(fmt_ptr, memory)
+            except Exception as e:
+                logger.debug("channel", f"Channel_DebugPrint: read_cstring(fmt) failed: {e}")
+
+        # Substitute %s/%d in appearance order, one vararg (4 bytes) each,
+        # starting at sp+16 (first vararg slot after the 3 fixed params).
+        arg_off = 16
+        out = []
+        i = 0
+        while i < len(fmt):
+            if fmt[i] == '%' and i + 1 < len(fmt) and fmt[i + 1] in ('s', 'd'):
+                arg_ptr = memory.read32((sp + arg_off) & 0xFFFFFFFF)
+                arg_off += 4
+                if fmt[i + 1] == 's':
+                    val = "(null)"
+                    if arg_ptr > 0x1000:
+                        try:
+                            val = read_cstring(arg_ptr, memory)
+                        except Exception:
+                            val = f"<bad ptr {arg_ptr:#010x}>"
+                    out.append(val)
+                else:
+                    out.append(str(arg_ptr))
+                i += 2
+            else:
+                out.append(fmt[i])
+                i += 1
+        msg = "".join(out)
+
+        logger.warn("channel", f"Channel_DebugPrint(user={user}, channel={channel}) — {msg}")
+        # cdecl variadic -- no stack cleanup by callee
+
+    stubs.patch_address(0x004CC5B0, "Channel_DebugPrint", _channel_debug_print)
+
     # abortmessage (0x00a30140): the game's own assert/abort handler --
     # deliberately NOT patched. Decompiled and confirmed: it formats the
     # message, calls ShowCursor/MessageBoxA (both already have real
