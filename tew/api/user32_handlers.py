@@ -107,15 +107,29 @@ def _invoke_emulated_proc(
     if not cpu.fatal_halt:
         cpu.halted = False
 
-    steps = 0
-    while not cpu.halted and steps < max_steps:
-        if cpu.eip == sentinel:
-            break
-        cpu.step()
-        steps += 1
+    # Run at native speed. The sentinel is a real HLT byte written into
+    # memory (see _get_dialog_sentinel), so the Zig hot loop halts on its
+    # own the instant the call returns -- exactly like any other halt
+    # condition -- with no need to single-step in a Python loop checking
+    # cpu.eip before every instruction. That single-step approach (cpu.step()
+    # is literally cpu.run(1)) was fine for short dialog-proc/timer-callback
+    # calls, but pays a full Python/Zig FFI crossing per *instruction*,
+    # which is ruinously slow for a nested call running real third-party DLL
+    # code (hundreds of thousands+ of real instructions -- e.g. DAO's
+    # DllMain/DllGetClassObject).
+    cpu.run(max_steps)
 
-    if steps >= max_steps:
+    if not cpu.halted:
         logger.warn("dialog", f"[_invoke_emulated_proc] max_steps reached calling 0x{proc_addr:08x}")
+    elif not cpu.fatal_halt and cpu.eip not in (sentinel, (sentinel + 1) & 0xFFFFFFFF):
+        # The only intentionally non-fatal halt in this codebase is the
+        # sentinel's own HLT (EIP lands at sentinel+1 once it executes,
+        # since EIP advances past HLT's one opcode byte before the handler
+        # runs) -- anything else halted here unexpectedly without being
+        # fatal, which shouldn't normally happen. Not gated on; just logged.
+        logger.warn("dialog",
+            f"[_invoke_emulated_proc] halted at unexpected EIP=0x{cpu.eip:08x} "
+            f"(expected sentinel 0x{sentinel:08x}) calling 0x{proc_addr:08x}")
 
     result = cpu.regs[EAX]
 
