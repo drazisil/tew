@@ -103,6 +103,7 @@ def patch_crt_internals(
                 f" delta={esp_at_cmp - ebp}",
             )
             cpu.halted = True
+            cpu.fatal_halt = True
         # On pass: cdecl no args, EAX preserved (caller continues using it), plain RET
 
     stubs.patch_address(0x009F1BC0, "__chkesp", _chkesp)
@@ -159,62 +160,24 @@ def patch_crt_internals(
         else:
             logger.error("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
             cpu.halted = True
+            cpu.fatal_halt = True
             cpu.regs[EAX] = 1  # retry = __debugbreak (moot since we halted)
         # cdecl variadic — no stack cleanup by callee
 
     stubs.patch_address(0x009F9300, "_CrtDbgReport", _crt_dbg_report)
 
-    # abortmessage (0x00a30140): game's own assert/abort handler.
-    # Called with _REALabortfilename/_REALabortlinenum already set by the caller.
-    # Signature: __cdecl abortmessage(const char *fmt, ...)
-    # Without patching this reaches MessageBoxA then INT3 — log and halt instead.
-    def _abort_message(cpu: "CPU") -> None:
-        sp      = cpu.regs[ESP]
-        fmt_ptr = memory.read32((sp + 4) & 0xFFFFFFFF)
-
-        fmt = "(null)"
-        if fmt_ptr > 0x1000:
-            try:
-                fmt = read_cstring(fmt_ptr, memory)
-            except Exception as e:
-                logger.debug("exception", f"abortmessage: read_cstring(fmt) failed: {e}")
-
-        # _REALabortfilename (0x020d84b4) and _REALabortlinenum (0x020d84b8) set by caller
-        filename_ptr = memory.read32(0x020D84B4)
-        line_num     = memory.read32(0x020D84B8)
-        filename = "(none)"
-        if filename_ptr > 0x1000:
-            try:
-                filename = read_cstring(filename_ptr, memory)
-            except Exception as e:
-                logger.debug("exception", f"abortmessage: read_cstring(filename) failed: {e}")
-
-        # Format variadic args: handle %s (pointer) and %d/%i (int) substitutions
-        if '%' in fmt:
-            args_base = (sp + 8) & 0xFFFFFFFF  # first variadic arg after fmt_ptr
-            parts = fmt.split('%')
-            out = parts[0]
-            for i, part in enumerate(parts[1:]):
-                arg_ptr = memory.read32((args_base + i * 4) & 0xFFFFFFFF)
-                if part.startswith('s'):
-                    val = "(null)"
-                    if arg_ptr > 0x1000:
-                        try:
-                            val = read_cstring(arg_ptr, memory)
-                        except Exception:
-                            val = f"<bad ptr {arg_ptr:#010x}>"
-                    out += val + part[1:]
-                elif part.startswith(('d', 'i')):
-                    out += str(arg_ptr) + part[1:]  # arg_ptr holds the int value
-                else:
-                    out += '%' + part  # unknown spec, pass through
-            fmt = out
-
-        logger.error("exception", f"abortmessage: {filename}:{line_num} — {fmt}")
-        cpu.halted = True
-        # cdecl variadic — no stack cleanup by callee
-
-    stubs.patch_address(0x00A30140, "abortmessage", _abort_message)
+    # abortmessage (0x00a30140): the game's own assert/abort handler --
+    # deliberately NOT patched. Decompiled and confirmed: it formats the
+    # message, calls ShowCursor/MessageBoxA (both already have real
+    # handlers), then ExitProcess(0). The one conditional trap-via-INT3
+    # branch (gated on DAT_0128298c) is dead code for this build -- the two
+    # places that ever write that flag (both early game-setup routines)
+    # only ever set it to 0, never non-zero, confirmed via get_references_to.
+    # Everything else abortmessage calls is either an already-supported
+    # Win32 API or the game's own regular code -- there's nothing here that
+    # needs a Python stand-in the way __chkesp (a hot path) or _CrtDbgReport
+    # (CRT-internal) do. The game already knows how to handle its own
+    # errors; let it.
 
     # __free_dbg (0x009f6e20): internal MSVC debug CRT free, called by __freeptd and
     # other CRT internals. Validates an MSVC debug block header (_BLOCK_TYPE_IS_VALID)
