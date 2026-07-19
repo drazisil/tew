@@ -466,6 +466,19 @@ def register_oleaut32_ole32_handlers(
 
     stubs.register_handler("ole32.dll", "CoCreateInstance", _CoCreateInstance)
 
+    # CoGetClassObject(rclsid, dwClsContext, pServerInfo, riid, ppv) -> HRESULT
+    def _CoGetClassObject(cpu: "CPU") -> None:
+        rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        riid   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        ppv    = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        logger.warn("com", f"CoGetClassObject(clsid@0x{rclsid:08x}, riid@0x{riid:08x}) — returning REGDB_E_CLASSNOTREG (COM not implemented)")
+        if ppv:
+            memory.write32(ppv, 0)  # *ppv = NULL on failure, per COM contract
+        cpu.regs[EAX] = 0x80040154  # REGDB_E_CLASSNOTREG
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("ole32.dll", "CoGetClassObject", _CoGetClassObject)
+
     # OleInitialize(pvReserved) -> HRESULT
     def _OleInitialize(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0  # S_OK — 1 stdcall arg (pvReserved, must be NULL)
