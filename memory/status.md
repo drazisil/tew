@@ -11,8 +11,9 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status (2026-07-19 night session, continued): root-caused down to
-a deterministic stack-corruption bug, precisely localized but not yet fixed
+### Current status (2026-07-19 night session, continued further): the
+"stack corruption" was a NULL-vtable dispatch crash, root cause now
+understood; the crash itself and the SEH recovery path are still unfixed
 
 The `abortmessage`/DAO database-init abort documented earlier today is now
 understood far more precisely, via a real architectural shift: rather than
@@ -52,18 +53,47 @@ comparisons as fake 1-2 byte string literals):
   and writes itself into `*ppv` — this code, read statically, looks
   completely correct for what the game requests.
 
-**The real, now precisely localized bug**: a **deterministic stack
-corruption**, always detected by the game's own `__chkesp` at the exact
-instruction right after the game's **first** `CoGetClassObject(rclsid, 1,
-NULL, IID_IClassFactory, &local_2c)` call (confirmed via raw disassembly —
-`0x008f4f0b` in `FUN_008f4e70`, immediately after that call's own
-`CMP EBP,ESP; CALL __chkesp`), with a consistent ~496-byte ESP/EBP
-imbalance. This happens across every run so far, regardless of whether
-`DllMain` returned 0 or nonzero. Since `_invoke_emulated_proc` forcibly
-restores `ESP` as a register via `cpu.save_state()`/`restore_state()`
-regardless of how the real DAO code cleans up internally, this is not a
-stdcall/cdecl argument-count mismatch on our side — the corruption is in
-stack **memory content**, not the register.
+**Corrected understanding (later the same night, via live `seh`-category
+logging + direct disassembly cross-referencing, prompted by "nothing I'm
+seeing would explain a 496-byte object")**: this was never generic stack
+corruption. It's a genuine NULL-pointer vtable-dispatch crash:
+
+- `dao350.dll`'s real `DllGetClassObject` returns `S_OK` for the game's
+  first `CoGetClassObject(rclsid, 1, NULL, IID_IClassFactory, &local_2c)`
+  call but never actually populates `*ppv` — confirmed live by logging
+  `*ppv`'s value alongside `hr` at the call site.
+- The game's **own** fallback code doesn't NULL-check `local_2c` before
+  dispatching through its vtable, so it wild-jumps to `EIP=0xfefc8d8f`
+  (garbage read through a NULL vtable pointer) — a real x86
+  `0xc0000005` ACCESS_VIOLATION, not an emulator artifact.
+- SEH (`tew/kernel/seh.py`) walks the real `FS:[0]` chain (15 frames),
+  finds no handler, and hits the "unhandled fault, halting as before"
+  path. This recovery is **not a clean unwind** — it leaves stale return
+  addresses sitting on the stack. That's what `__chkesp` was actually
+  detecting: not a mystery corruption, but the aftermath of this crash.
+  Confirmed two ways: (a) the ~496-byte delta is consistent with stale
+  frames left behind by the 15-frame walk, not a fixed-size overwrite;
+  (b) `__chkesp`'s own reported return address is wrong — it prints
+  `0x008f55a0` when the real return address at that call site is
+  `0x008f5351` (verified via `dump_bytes`), which only makes sense if the
+  recovery path left old data in place rather than restoring the true
+  frame.
+- Separately, the `_chkesp` diagnostic (`patch_internals.py`,
+  `0x009F1BC0`) itself has a **real, independent bug**: the ZF check it
+  performs is correct and sign-agnostic, but its delta-computation
+  message hardcodes `EBP` as "the" pre-call ESP snapshot register. At the
+  specific call site `0x008f4f04`/`06` the compiler actually cached the
+  snapshot in `ESI` (`3B F4` = `CMP ESI,ESP`, confirmed via raw byte
+  decoding, not `CMP EBP,ESP` as the message claims) — the snapshot
+  register is a compiler register-allocation choice, not always EBP, so
+  the diagnostic can print a nonsense delta whenever it isn't. Not yet
+  fixed in code.
+
+Net effect: the actual open bug is **"why does `dao350.dll`'s real
+`DllGetClassObject` return `S_OK` without writing `*ppv`?"**, plus **"why
+does our SEH unhandled-fault path not unwind cleanly, and should it?"** —
+not a stack-corruption hunt. This happens across every run so far,
+regardless of whether `DllMain` returned 0 or nonzero.
 
 **Ruled out tonight**: scheduler thread-switching mid-nested-call. Found and
 fixed a real, separate bug this session (`_invoke_emulated_proc` now
@@ -83,17 +113,29 @@ real `LoadLibrary` semantics). Possibly the same underlying corruption
 affecting DllMain's own local state before it returns, or a separate issue
 — not distinguished yet.
 
-**Next step, if this is picked up again**: the corruption is in stack
-memory, not registers, so static analysis and the register-only
-instrumentation used tonight can't see it directly. Options: (a) a
-finer-grained live memory-write trace bracketing the first
-`CoGetClassObject` nested call specifically (watch for writes landing in
-the ~496-byte window between the game's current ESP and EBP during the
-call), or (b) the ClickHouse execution-history capture tooling from
-`~/pe-walker/history-poc` (already proven for exactly this kind of
-"what wrote to this address" question in earlier sessions — see
-[[tew_fake_kernel_gaps]] section 10) — likely a more systematic fit than
-more one-off logpoint guessing at this point.
+**Next step, if this is picked up again**: three distinct, now well-scoped
+items (no longer "chase a mystery corruption"):
+1. Root-cause why `dao350.dll`'s real `DllGetClassObject` leaves `*ppv`
+   NULL despite returning `S_OK` — its `QueryInterface`/vtable-write logic
+   read statically correct (see above), so the gap is likely in something
+   this emulator provides it (an OLE/COM environment call it depends on
+   that's stubbed wrong, or a memory-layout assumption it makes that we
+   don't satisfy) rather than in the DLL's own code. Worth a memory-write
+   trace across the `QueryInterface` call specifically (the ClickHouse
+   execution-history tooling from `~/pe-walker/history-poc`, see
+   [[tew_fake_kernel_gaps]] section 10, is likely the right tool) to see
+   whether the write to `*ppv` happens and gets clobbered, or never
+   happens at all.
+2. Decide whether `tew/kernel/seh.py`'s unhandled-fault path should do a
+   real stack unwind instead of "halt in place" — real Windows would
+   terminate the process cleanly here; our current behavior's stale-stack
+   side effect is actively misleading downstream diagnostics (see the
+   `__chkesp` wrong-return-address symptom above).
+3. Fix `_chkesp`'s diagnostic message (`patch_internals.py`) to report the
+   actual snapshot register's value instead of hardcoding EBP — either by
+   determining the register from the instruction bytes at the call site,
+   or by not attempting to name a specific register at all if that's not
+   reliably derivable.
 
 **Fixed tonight, real bugs found along the way** (see changelog.md for full
 detail): `_invoke_emulated_proc` (`user32_handlers.py`) was single-stepping
@@ -149,10 +191,15 @@ extra categories) is still correct for a general boot-health check that
 doesn't need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- Root-cause the deterministic ~496-byte stack corruption detected right
-  after the game's first `CoGetClassObject` call — corruption is in stack
-  memory content, not registers, so needs a memory-write-level trace (or
-  ClickHouse execution history) rather than more register-only logpoints
+- Root-cause why `dao350.dll`'s real `DllGetClassObject` returns `S_OK`
+  without writing `*ppv` — the NULL-vtable crash and everything downstream
+  of it (SEH walk, `__chkesp` failure) is a consequence of this, not a
+  separate bug
+- Decide/implement a real unwind for `seh.py`'s unhandled-fault path
+  instead of "halt in place with stale stack data"
+- Fix `_chkesp`'s diagnostic (`patch_internals.py`) hardcoding EBP as the
+  snapshot register when it's a compiler register-allocation choice
+  (confirmed ESI at one real call site)
 - Root-cause `DllMain`'s non-deterministic return value across runs
   (possibly the same underlying issue, not distinguished yet)
 - Dedicated pass on the ~85 unmarked `cpu.halted` sites (priority order not

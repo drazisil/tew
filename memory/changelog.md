@@ -4,6 +4,55 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-19 (night, continued further) — the "~496-byte stack corruption"
+was actually a NULL-vtable dispatch crash; real root cause identified for
+the crash chain, none of it fixed yet
+
+Continuation of the same night's DAO investigation (previous entry below),
+picked back up via a run of clarifying COM questions (IID vs IClassFactory,
+what `ppv` points to, whether the `__chkesp` signed-comparison handling was
+correct) that led to actually re-examining the evidence rather than trusting
+the earlier "stack corruption" framing.
+
+**The corruption framing was wrong.** Re-running with the `seh` log
+category (prompted by "nothing I'm seeing would explain a 496-byte
+object") showed the real sequence: `dao350.dll`'s real `DllGetClassObject`
+returns `S_OK` for the game's first `CoGetClassObject` call but never
+populates `*ppv` (confirmed by logging `*ppv` alongside `hr` at the call
+site — it stays NULL). The game's own fallback code doesn't NULL-check
+`local_2c` before dispatching through its vtable, wild-jumps to
+`EIP=0xfefc8d8f`, and takes a real `0xc0000005` ACCESS_VIOLATION. SEH
+(`tew/kernel/seh.py`) walks 15 real `FS:[0]` frames, finds no handler, and
+takes the "unhandled fault, halting as before" path — which is not a clean
+unwind, and leaves stale return addresses on the stack. `__chkesp` was
+detecting *that* leftover stale data, not a fixed-size corruption: the
+~496-byte delta is consistent with stale frames from the 15-frame walk,
+and — the clinching piece — `__chkesp`'s own reported return address
+(`0x008f55a0`) doesn't match the real one at that call site (`0x008f5351`,
+confirmed via `dump_bytes`), which only makes sense if recovery left old
+data in place instead of restoring the true frame.
+
+**Also found, while chasing this**: `_chkesp`'s diagnostic
+(`patch_internals.py`, `0x009F1BC0`) hardcodes `EBP` as "the" pre-call ESP
+snapshot register in its delta-computation message. The ZF check it
+performs to decide pass/fail is correct and sign-agnostic (`ZF_BIT` only),
+but the snapshot register is actually a compiler register-allocation
+choice, not always EBP — at the specific call site `0x008f4f04`/`06` the
+real instruction is `CMP ESI,ESP` (`3B F4`, confirmed via raw byte
+decoding), not `CMP EBP,ESP` as the message claims. Not yet fixed.
+
+**Net result**: the open bug is no longer "find what's corrupting the
+stack." It's now three concrete, well-scoped items — see status.md's
+"Next step" section: (1) why `DllGetClassObject` leaves `*ppv` NULL
+despite `S_OK` (its own code reads correct, so likely something this
+emulator provides it that's wrong), (2) whether `seh.py`'s unhandled-fault
+path should do a real unwind instead of halting with stale stack state,
+and (3) fixing `_chkesp`'s hardcoded-EBP diagnostic message. Nothing code-
+level was changed this entry — this was pure re-diagnosis of existing
+behavior via more targeted logging and disassembly cross-referencing.
+
+---
+
 ## 2026-07-19 (night, continued) — _invoke_emulated_proc made thread-aware
 (real, separate bug, found and fixed); DAO's real DllGetClassObject read
 directly in Ghidra and confirmed correct; the actual bug is now precisely
