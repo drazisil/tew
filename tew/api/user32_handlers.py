@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from tew.kernel.scheduler import Scheduler
 
 from tew.hardware.cpu import EAX, ESP
+from tew.kernel.scheduler import ThreadStatus
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
 from tew.api.window_manager import (
@@ -139,12 +140,33 @@ def _invoke_emulated_proc(
     started_thread_idx = scheduler.current_idx if scheduler is not None else None
     _CHUNK = 200_000
     steps_run = 0
+    started_thread_died = False
     while steps_run < max_steps:
         cpu.run(min(_CHUNK, max_steps - steps_run))
         steps_run += _CHUNK
 
         if cpu.fatal_halt:
             break  # must stop everything regardless of which thread caused it
+
+        if (scheduler is not None and started_thread_idx is not None
+                and scheduler.threads[started_thread_idx].status == ThreadStatus.DEAD):
+            # The thread that made this nested call is dead -- e.g. its stack
+            # unwound straight past the sentinel we pushed for this call's
+            # return (skipping it entirely) and landed back at its own
+            # THREAD_SENTINEL instead. scheduler.current_idx can never equal
+            # started_thread_idx again (dead threads are permanently excluded
+            # by _pick_next_ready), so "wait for our thread to come back" is
+            # not just unlikely but mathematically impossible from here on --
+            # no max_steps budget, however large, would ever complete this
+            # call. Live-verified this is exactly what made DllMain's call
+            # burn through a 50,000,000-step budget doing nothing useful.
+            logger.error("dialog",
+                f"[_invoke_emulated_proc] thread idx={started_thread_idx} that made this "
+                f"nested call to 0x{proc_addr:08x} has died (skipped past our sentinel "
+                f"0x{sentinel:08x}) -- returning 0 now instead of exhausting max_steps "
+                "waiting for a thread that can never run again")
+            started_thread_died = True
+            break
 
         if scheduler is not None and scheduler.current_idx != started_thread_idx:
             # Scheduler swapped to a different thread -- whatever just
@@ -158,19 +180,55 @@ def _invoke_emulated_proc(
         if cpu.halted:
             break  # halted while on OUR thread -- sentinel or unexpected; evaluate below
 
-    if not cpu.halted:
-        logger.warn("dialog", f"[_invoke_emulated_proc] max_steps reached calling 0x{proc_addr:08x}")
-    elif not cpu.fatal_halt and cpu.eip not in (sentinel, (sentinel + 1) & 0xFFFFFFFF):
-        # The only intentionally non-fatal halt in this codebase is the
-        # sentinel's own HLT (EIP lands at sentinel+1 once it executes,
-        # since EIP advances past HLT's one opcode byte before the handler
-        # runs) -- anything else halted here unexpectedly without being
-        # fatal, which shouldn't normally happen. Not gated on; just logged.
-        logger.warn("dialog",
-            f"[_invoke_emulated_proc] halted at unexpected EIP=0x{cpu.eip:08x} "
-            f"(expected sentinel 0x{sentinel:08x}) calling 0x{proc_addr:08x}")
+    # Did this call genuinely complete -- our own thread, halted right at the
+    # sentinel? Any other outcome means cpu.regs[EAX] does NOT hold our
+    # call's return value, and reading it anyway silently misattributes
+    # whatever's leftover in that register as "this call returned <it>".
+    # Live-verified this is exactly what made DllMain's return value look
+    # non-deterministic (0, 105, 70959764, ... all just leftover EAX from
+    # unrelated code, not anything the real DllMain computed -- its actual
+    # machine code only ever returns 0 or 1).
+    genuinely_completed = (
+        cpu.halted
+        and cpu.eip in (sentinel, (sentinel + 1) & 0xFFFFFFFF)
+        and (scheduler is None or scheduler.current_idx == started_thread_idx)
+    )
 
-    result = cpu.regs[EAX]
+    if not genuinely_completed:
+        if started_thread_died:
+            pass  # already logged inside the loop, right when it was detected
+        elif not cpu.halted:
+            # Exhausted max_steps without our thread ever getting back to
+            # its sentinel -- other cooperative threads (or our own call's
+            # real work) simply needed more budget than was given.
+            logger.error("dialog",
+                f"[_invoke_emulated_proc] max_steps={max_steps} exhausted before thread "
+                f"idx={started_thread_idx} completed its nested call to 0x{proc_addr:08x} "
+                "-- returning 0, not leftover EAX from whatever was executing at cutoff")
+        elif cpu.fatal_halt and scheduler is not None and scheduler.current_idx != started_thread_idx:
+            # The fatal-halt loop-exit above (`if cpu.fatal_halt: break`)
+            # fires regardless of which thread caused it -- this one
+            # belongs to a DIFFERENT thread that ran while ours was
+            # legitimately swapped out (e.g. a background timer thread
+            # hitting __chkesp/an unimplemented API). The whole emulator is
+            # stopping regardless (fatal_halt propagates to the main loop),
+            # so the value doesn't matter -- 0 is the safe sentinel every
+            # caller already treats as "didn't complete".
+            logger.error("dialog",
+                f"[_invoke_emulated_proc] fatal halt on thread idx={scheduler.current_idx} "
+                f"(this call started on idx={started_thread_idx}) while nested-calling "
+                f"0x{proc_addr:08x} -- returning 0, not that thread's EAX; see its own "
+                "Halt Diagnostic below for the real cause")
+        else:
+            # The only remaining case: halted on OUR OWN thread, but not at
+            # the sentinel -- some other non-fatal halt fired mid-call.
+            logger.warn("dialog",
+                f"[_invoke_emulated_proc] halted at unexpected EIP=0x{cpu.eip:08x} "
+                f"(expected sentinel 0x{sentinel:08x}) calling 0x{proc_addr:08x} "
+                "-- returning 0, not this unrelated halt's EAX")
+        result = 0
+    else:
+        result = cpu.regs[EAX]
 
     cpu.restore_state(saved)
     if not cpu.fatal_halt:

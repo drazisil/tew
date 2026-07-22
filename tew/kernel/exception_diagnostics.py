@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import re
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
 from tew.logger import logger
@@ -10,6 +10,8 @@ from tew.logger import logger
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.loader.import_resolver import ImportResolver
+
+LogFn = Callable[[str, str], None]
 
 
 def _annotate_address(value: int, import_resolver: "ImportResolver | None") -> str:
@@ -36,30 +38,73 @@ def _walk_ebp_chain(
     cpu: "CPU",
     import_resolver: "ImportResolver | None",
     ebp_val: int,
+    log_fn: LogFn,
+    category: str,
     max_frames: int = 32,
 ) -> None:
     """Reconstructs the call stack from saved frame pointers (fs:[EBP]/[EBP+4] chain)."""
-    logger.error("exception", "EBP chain (call frames):")
+    log_fn(category, "EBP chain (call frames):")
     frame_ebp = ebp_val
     frame_depth = 0
     seen = set()
     while frame_depth < max_frames and frame_ebp and cpu.memory.is_valid_address(frame_ebp):
         if frame_ebp in seen:
-            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (cycle — stopping)")
+            log_fn(category, f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (cycle — stopping)")
             break
         seen.add(frame_ebp)
         try:
             saved_ebp = cpu.memory.read32(frame_ebp) & 0xFFFFFFFF
             ret_addr = cpu.memory.read32(frame_ebp + 4) & 0xFFFFFFFF
         except Exception:
-            logger.error("exception", f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (read error)")
+            log_fn(category, f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x} (read error)")
             break
-        logger.error(
-            "exception",
+        log_fn(
+            category,
             f"  frame[{frame_depth}] EBP=0x{frame_ebp:08x}  ret=0x{ret_addr:08x}{_annotate_address(ret_addr, import_resolver)}",
         )
         frame_ebp = saved_ebp
         frame_depth += 1
+
+
+def _dump_cpu_state(
+    cpu: "CPU",
+    import_resolver: "ImportResolver | None",
+    log_fn: LogFn,
+    category: str,
+    stack_slots: int,
+    annotate_validity: bool = False,
+) -> None:
+    """Shared register + stack + EBP-chain dump used by every diagnostic entry point.
+
+    The single place that reads cpu.regs[i] for all 8 GPRs -- previously
+    diagnose_fault/diagnose_halt/diagnose_thread_end each carried their own
+    copy of this loop, so a register (e.g. ESI) added to one didn't reach
+    the others. All 8 REG_NAMES are always included; annotate_validity adds
+    the fault-only [ok]/[!!] address-validity prefix.
+    """
+    log_fn(category, "General Purpose Registers:")
+    for i in range(8):
+        val = cpu.regs[i] & 0xFFFFFFFF
+        if annotate_validity:
+            status = "ok" if cpu.memory.is_valid_address(val) else "!!"
+            log_fn(category, f"  [{status}] {REG_NAMES[i]}: 0x{val:08x}")
+        else:
+            log_fn(category, f"  {REG_NAMES[i]}: 0x{val:08x}")
+
+    esp = cpu.regs[ESP] & 0xFFFFFFFF
+    ebp = cpu.regs[EBP] & 0xFFFFFFFF
+    log_fn(category, f"Stack: ESP=0x{esp:08x}  EBP=0x{ebp:08x}")
+    log_fn(category, f"Stack dump ({stack_slots} slots):")
+    for i in range(stack_slots):
+        slot_addr = esp + i * 4
+        try:
+            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
+        except Exception:
+            log_fn(category, f"  [ESP+{i*4:03x}] (read error)")
+            break
+        log_fn(category, f"  [ESP+{i*4:03x}] 0x{value:08x}{_annotate_address(value, import_resolver)}")
+
+    _walk_ebp_chain(cpu, import_resolver, ebp, log_fn, category)
 
 
 def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
@@ -124,29 +169,7 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
             if cpu.eip < 0x00100000:
                 logger.error("exception", "LIKELY UNRESOLVED IMPORT: EIP < 1MB, indirect call through unfilled IAT entry")
 
-    logger.error("exception", "General Purpose Registers:")
-    for i in range(8):
-        val = cpu.regs[i] & 0xFFFFFFFF
-        is_valid = cpu.memory.is_valid_address(val)
-        status = "ok" if is_valid else "!!"
-        logger.error("exception", f"  [{status}] {REG_NAMES[i]}: 0x{val:08x}")
-
-    esp_val = cpu.regs[ESP] & 0xFFFFFFFF
-    ebp_val = cpu.regs[EBP] & 0xFFFFFFFF
-    stack_status = "valid" if cpu.memory.is_valid_address(esp_val) else "INVALID"
-    logger.error("exception", f"Stack: ESP=0x{esp_val:08x} EBP=0x{ebp_val:08x} ({stack_status})")
-
-    logger.error("exception", "Stack dump (64 slots):")
-    for i in range(64):
-        slot_addr = esp_val + i * 4
-        try:
-            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
-        except Exception:
-            logger.error("exception", f"  [ESP+{i*4:03x}] (read error)")
-            break
-        logger.error("exception", f"  [ESP+{i*4:03x}] 0x{value:08x}{_annotate_address(value, import_resolver)}")
-
-    _walk_ebp_chain(cpu, import_resolver, ebp_val)
+    _dump_cpu_state(cpu, import_resolver, logger.error, "exception", stack_slots=64, annotate_validity=True)
 
     logger.error("exception", "Execution stopped.")
 
@@ -170,22 +193,22 @@ def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
                 f"Location: {dll['name']}+0x{cpu.eip - dll['base_address']:x}",
             )
 
-    logger.error("exception", "General Purpose Registers:")
-    for i in range(8):
-        val = cpu.regs[i] & 0xFFFFFFFF
-        logger.error("exception", f"  {REG_NAMES[i]}: 0x{val:08x}")
+    _dump_cpu_state(cpu, import_resolver, logger.error, "exception", stack_slots=16)
 
-    esp = cpu.regs[ESP] & 0xFFFFFFFF
-    ebp = cpu.regs[EBP] & 0xFFFFFFFF
-    logger.error("exception", f"Stack: ESP=0x{esp:08x}  EBP=0x{ebp:08x}")
-    logger.error("exception", "Stack walk (top 16 slots):")
-    for i in range(16):
-        slot_addr = esp + i * 4
-        try:
-            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
-        except Exception:
-            logger.error("exception", f"  [ESP+{i*4:02x}] (read error)")
-            break
-        logger.error("exception", f"  [ESP+{i*4:02x}] 0x{value:08x}{_annotate_address(value, import_resolver)}")
 
-    _walk_ebp_chain(cpu, import_resolver, ebp)
+def diagnose_thread_end(
+    cpu: "CPU",
+    import_resolver: "ImportResolver | None",
+    thread_id: int,
+    stack_slots: int = 48,
+) -> None:
+    """Stack dump fired when a thread hits THREAD_SENTINEL (returns normally).
+
+    Not a fault/halt diagnostic -- logged under "thread" so it can be
+    filtered independently of real crash reports. Exists to answer "was a
+    pushed nested-call sentinel skipped over, or overwritten?": a skipped
+    sentinel still appears verbatim somewhere in the raw stack dump below
+    ESP; an overwritten one is simply gone.
+    """
+    logger.debug("thread", f"--- Thread End Stack Dump (tid={thread_id}) ---")
+    _dump_cpu_state(cpu, import_resolver, logger.debug, "thread", stack_slots=stack_slots)

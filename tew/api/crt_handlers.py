@@ -158,11 +158,24 @@ def patch_crt_internals(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+# TEMP diagnostic, tid=1012 investigation (see memory/status.md): DAO's
+# DllMain-calling worker thread reaches THREAD_SENTINEL ("returns normally")
+# without ever hitting the nested-call sentinel _invoke_emulated_proc pushed
+# for its call into DllMain -- i.e. it skips past that pushed return address
+# entirely. tid numbering is deterministic run-to-run, so hardcoding the tid
+# here is enough to isolate this thread's dump from the many other threads
+# that complete normally every run. Discard once root-caused.
+_THREAD_END_STACK_DUMP_TIDS: set[int] = {1012}
+
+
 def _make_thread_return_handler(state: CRTState, memory: "Memory"):
     """Build the handler called when a spawned thread returns to THREAD_SENTINEL."""
     def _handler(cpu: "CPU") -> None:
         thread = state.scheduler.current_thread()
         logger.debug("thread", f"Thread {thread.thread_id} returned normally")
+        if thread.thread_id in _THREAD_END_STACK_DUMP_TIDS:
+            from tew.kernel.exception_diagnostics import diagnose_thread_end
+            diagnose_thread_end(cpu, None, thread.thread_id)
         state.scheduler.mark_current_dead(cpu, memory)
 
     return _handler

@@ -557,6 +557,16 @@ def register_oleaut32_ole32_handlers(
             handle = loaded.base_address & 0xFFFFFFFF
             result = _invoke_emulated_proc(
                 cpu, memory, loaded.entry_point, [handle, 1, 0], sentinel,
+                # Default max_steps=5_000_000 was too small here: with real
+                # cooperative threads (timers etc.) running while this
+                # thread is swapped out, the whole budget was routinely
+                # exhausted before this thread ever got back to finish its
+                # own call -- see _invoke_emulated_proc's "max_steps
+                # exhausted" diagnostic for the fix that stopped this from
+                # silently returning garbage; this raises the budget so the
+                # call actually gets a real chance to complete instead of
+                # relying on that fallback every time.
+                max_steps=50_000_000,
                 scheduler=state.scheduler)
             logger.info("com", f"{dll_filename}: DllMain(DLL_PROCESS_ATTACH) -> {result}")
             if result == 0:

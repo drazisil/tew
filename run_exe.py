@@ -21,7 +21,7 @@ import time
 from os.path import dirname
 
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU as CPU, ESP, EBP, REG_NAMES
+from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, ESP, EBP, ESI, REG_NAMES
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.emulator.opcodes import register_all_opcodes
@@ -348,6 +348,56 @@ def _dispatch_breakpoint() -> None:
     if keep and hit_eip in _bp_handlers:
         cpu.add_breakpoint(hit_eip)
 
+
+# ── TEMP diagnostic: DAO350.DLL DllGetClassObject -> QueryInterface *ppv trace ──
+#
+# Investigating why real dao350.dll's DllGetClassObject returns S_OK but
+# leaves *ppv NULL (see memory/status.md). Raw-disassembly review confirmed
+# the real machine code is calling-convention-correct at every hop and
+# unconditionally writes *ppv on the success path, so the remaining suspects
+# are the two indirect CALLs (opFF /2, CALL r/m32) and the MOV [ECX],EAX
+# write itself. TEMP — discard once root-caused, not meant to ship.
+def _log_dgco_call_queryinterface(eip, regs, memory, memory_size) -> None:
+    logger.error("com", f"[TRACE] 0x{eip:08x} CALL [EAX] (QueryInterface) -- EAX(vtbl)=0x{regs[EAX]:08x} ESP=0x{regs[ESP]:08x}")
+
+def _log_dgco_call_release(eip, regs, memory, memory_size) -> None:
+    logger.error("com", f"[TRACE] 0x{eip:08x} CALL [EAX+8] (Release) -- EAX(vtbl)=0x{regs[EAX]:08x} ESP=0x{regs[ESP]:08x}")
+
+def _log_qi_ppv_write(eip, regs, memory, memory_size) -> None:
+    logger.error("com", f"[TRACE] 0x{eip:08x} MOV [ECX],EAX (*ppv=this) -- ECX(ppv addr)=0x{regs[ECX]:08x} EAX(this)=0x{regs[EAX]:08x}")
+
+def _log_dgco_entry(eip, regs, memory, memory_size) -> None:
+    logger.error("com", f"[TRACE] 0x{eip:08x} DllGetClassObject entry -- ESP=0x{regs[ESP]:08x}")
+
+# Canary: DllGetClassObject's own entry is definitely reached whenever
+# CoGetClassObject logs a real hr from DAO350.DLL. If this doesn't fire
+# either, the bug is systemic to logpoints-during-nested-calls, not these
+# three specific addresses.
+cpu.add_logpoint(0x04478a31, _log_dgco_entry)
+cpu.add_logpoint(0x04478d0d, _log_dgco_call_queryinterface)
+cpu.add_logpoint(0x04478d1b, _log_dgco_call_release)
+cpu.add_logpoint(0x0447d458, _log_qi_ppv_write)
+
+# ── TEMP diagnostic: tid=1012 investigation -- IsDBCSLeadByte via cached ESI ──
+#
+# DllMain (dao350.dll, 0x04479f74) calls FUN_044c63fc, which loads the
+# IAT-resolved IsDBCSLeadByte pointer into ESI ONCE (`MOV ESI,[0x04471074]`)
+# before looping `CALL ESI` 256 times. tew has NO handler registered for
+# IsDBCSLeadByte anywhere. Suspected cause: patch_dll_iats (dll_loader.py,
+# used for secondary DLLs like dao350.dll -- unlike write_iat_handlers for
+# the main EXE) has no fallback for an unmatched import; it silently leaves
+# the IAT slot as whatever raw bytes were in the DLL file, rather than
+# writing a fatal_halt-raising [UNIMPLEMENTED] stub like the main-EXE path
+# does. If so, CALL ESI jumps into that raw, unrelocated placeholder value
+# as if it were code -- explaining why tid=1012 dies with no fatal_halt, no
+# SEH activity, and every intervening real stack frame left untouched (see
+# memory/status.md). This logpoint fires on every iteration to see ESI's
+# actual value and how many of the 256 calls complete before whatever kills
+# the thread. TEMP -- discard once confirmed either way.
+def _log_isdbcs_call(eip, regs, memory, memory_size) -> None:
+    logger.error("thread", f"[TRACE] 0x{eip:08x} CALL ESI (IsDBCSLeadByte?) -- ESI=0x{regs[ESI]:08x} ESP=0x{regs[ESP]:08x}")
+
+cpu.add_logpoint(0x044c6410, _log_isdbcs_call)
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 

@@ -276,6 +276,7 @@ def register_kernel32_io_handlers(
         logger.info("thread",
             f"CreateThread(start=0x{lp_start:x}, param=0x{lp_param:x}, "
             f"flags=0x{dw_flags:x}) -> handle=0x{handle:x}, tid={tid}")
+        idx = len(state.scheduler.threads)
         thread = state.scheduler.create_thread(
             thread_id=tid,
             handle=handle,
@@ -283,6 +284,7 @@ def register_kernel32_io_handlers(
             parameter=lp_param,
             suspended=is_susp,
         )
+        logger.debug("thread", f"  tid={tid} assigned scheduler idx={idx}")
         state.pending_threads.append(thread)
         if lp_tid:
             memory.write32(lp_tid, tid)

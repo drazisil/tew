@@ -93,6 +93,76 @@ _LEGACY_DLL_ALIASES: dict[str, str] = {
 }
 
 
+def _make_unimplemented_handler(dll_name: str, func_name: str):
+    def _handler(cpu):
+        logger.error("handlers", f"[UNIMPLEMENTED] {dll_name}!{func_name} — halting")
+        logger.error(
+            "cpu",
+            f"  EIP=0x{(cpu.eip) & 0xFFFFFFFF:08x}  "
+            f"EAX=0x{cpu.regs[0] & 0xFFFFFFFF:08x}  "
+            f"ECX=0x{cpu.regs[1] & 0xFFFFFFFF:08x}  "
+            f"ESP=0x{cpu.regs[4] & 0xFFFFFFFF:08x}  "
+            f"EBP=0x{cpu.regs[5] & 0xFFFFFFFF:08x}",
+        )
+        cpu.halted = True
+        cpu.fatal_halt = True
+    return _handler
+
+
+def patch_iat_entry(
+    memory: "Memory",
+    win32_handlers: "Win32Handlers",
+    iat_addr: int,
+    dll_name: str,
+    func_name: str,
+    real_addr: int | None = None,
+    alias: str | None = None,
+) -> str:
+    """Resolve one IAT slot and write the result to iat_addr.
+
+    Tries, in order: a registered handler, the legacy alias's handler (if
+    given), a real DLL export address (if given), and finally an
+    auto-generated fatal-halt stub -- the single fallback path shared by the
+    main EXE's IAT (import_resolver.write_iat_handlers) and secondary DLLs'
+    IATs (DLLLoader.patch_dll_iats). Without this fallback, an unmatched
+    import's IAT slot is left holding whatever raw, unrelocated bytes were on
+    disk. Since tew's memory is an unprotected flat bytearray, CALLing
+    through that garbage doesn't fault the way it would on real Windows -- it
+    silently executes whatever's there, with no halt, no SEH activity, and no
+    log line, until it wanders somewhere that happens to look like a return.
+    That's exactly what made tid=1012 (DAO's DllMain-calling worker thread,
+    dao350.dll's IsDBCSLeadByte import) appear to "return normally" while
+    actually skipping every real stack frame above it -- confirmed via a
+    logpoint at the CALL site, which showed ESI holding a bogus address
+    instead of a resolved handler. See memory/status.md.
+
+    Returns "handler", "real", or "auto" so callers can keep their own counts.
+    """
+    handler_addr = (
+        win32_handlers.get_handler_address(dll_name, func_name)
+        or win32_handlers.get_handler_address(dll_name + ".dll", func_name)
+    )
+    if handler_addr is None and alias is not None:
+        handler_addr = win32_handlers.get_handler_address(alias, func_name)
+
+    if handler_addr is not None:
+        memory.write32(iat_addr, handler_addr)
+        return "handler"
+
+    if real_addr:
+        memory.write32(iat_addr, real_addr)
+        return "real"
+
+    win32_handlers.register_handler(dll_name, func_name, _make_unimplemented_handler(dll_name, func_name))
+    auto_addr = (
+        win32_handlers.get_handler_address(dll_name, func_name)
+        or win32_handlers.get_handler_address(dll_name + ".dll", func_name)
+    )
+    if auto_addr is not None:
+        memory.write32(iat_addr, auto_addr)
+    return "auto"
+
+
 class DLLLoader:
     _DLL_SIZE = 0x01000000   # 16 MB per DLL
     _MAX_ADDRESS = 0x40000000
@@ -265,21 +335,30 @@ class DLLLoader:
             return None
 
     def patch_dll_iats(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
-        """Re-patch all loaded DLLs' IAT entries with Win32 stubs where available."""
+        """Re-patch all loaded DLLs' IAT entries with Win32 stubs where available.
+
+        See patch_iat_entry (module-level) for what happens to an unmatched
+        import -- this is the secondary-DLL side of that shared fallback;
+        write_iat_handlers (import_resolver.py) is the main-EXE side.
+        """
         patched_count = 0
+        auto_handler_count = 0
         for entry in self._dll_iat_entries:
-            handler_addr = (
-                win32_handlers.get_handler_address(entry.imported_dll_name, entry.func_name)
-                or win32_handlers.get_handler_address(entry.imported_dll_name + ".dll", entry.func_name)
+            alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
+            outcome = patch_iat_entry(
+                memory, win32_handlers, entry.iat_addr,
+                entry.imported_dll_name, entry.func_name, alias=alias,
             )
-            if handler_addr is None:
-                alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
-                if alias is not None:
-                    handler_addr = win32_handlers.get_handler_address(alias, entry.func_name)
-            if handler_addr is not None:
-                memory.write32(entry.iat_addr, handler_addr)
+            if outcome == "handler":
                 patched_count += 1
-        logger.info("loader", f"Patched {patched_count}/{len(self._dll_iat_entries)} DLL IAT entries with stubs")
+            elif outcome == "auto":
+                auto_handler_count += 1
+
+        logger.info(
+            "loader",
+            f"Patched {patched_count}/{len(self._dll_iat_entries)} DLL IAT entries with stubs "
+            f"({auto_handler_count} auto-stubs for unimplemented imports)",
+        )
 
     def patch_dll_exports(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
         """Patch DLL export addresses in-place with INT 0xFE; RET trampolines."""

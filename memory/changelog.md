@@ -4,6 +4,154 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-21 (later session) — Root-caused and fixed tid=1012's premature
+death: an unmatched secondary-DLL import (IsDBCSLeadByte) silently executed
+garbage instead of halting
+
+Picked up where the previous session's `DllMain` fix left off: `tid=1012`
+still died mid-call on every run, blocking DAO activation. Added a
+thread-end stack dump (`diagnose_thread_end`, `tew/kernel/
+exception_diagnostics.py`, fired from `_make_thread_return_handler` in
+`crt_handlers.py`) gated to `tid=1012` to see what the stack actually looked
+like at the moment of "death." It showed the nested-call sentinel
+`_invoke_emulated_proc` had pushed for the `DllMain` call, and every real
+frame above it (`Dbcode_InitDao` → `DBThreadCpp` → `DBThread` →
+`lpStartAddress_009fc3a0`, confirmed via Ghidra decompilation of MCity_d.exe),
+all still sitting untouched in memory -- proving something jumped straight
+past all of them without ever executing a matching `RET`, and ruling out an
+SEH/C++ `terminate()` explanation (no `[seh]` log activity anywhere in the
+run, and none of `Dbcode_InitDao`'s own error-print branches ever fired --
+its real code never got control back at all).
+
+Traced into `dao350.dll` itself (project `debug_clean` in Ghidra, not
+`mcity`): `DllMain`'s real code (`0x04479f74`) is trivial and safe --
+`InitializeCriticalSection` x2, `TlsAlloc`, then a 256-iteration loop
+calling `IsDBCSLeadByte` through a cached register (`FUN_044c63fc`, raw
+bytes confirmed `MOV ESI,[0x04471074]` once before the loop, `CALL ESI`
+each iteration). tew has no handler registered for `IsDBCSLeadByte`
+anywhere. A one-shot logpoint at the `CALL ESI` site (`0x044c6410`)
+confirmed it: only 1 of the expected 256 calls fired, with
+`ESI=0x000735ba` -- not a valid code address in any known range.
+
+Root cause: `patch_dll_iats` (`tew/loader/dll_loader.py`), the IAT-patching
+path used for secondary DLLs loaded at runtime (unlike `write_iat_handlers`
+for the main EXE), had no fallback for an unmatched import -- it silently
+left the IAT slot holding whatever raw, unrelocated bytes were in the DLL
+file on disk. Since tew's memory (`tew/hardware/memory.py`) is an
+unprotected flat `bytearray`, `CALL ESI` into that garbage doesn't fault the
+way it would on real Windows; it just silently executes whatever's there
+(almost certainly zero bytes), with no halt, no SEH activity, and no log
+line, until it wanders far enough to land on `THREAD_SENTINEL` by
+coincidence -- exactly matching every symptom observed.
+
+**Fix**: unified IAT-patching into one shared function, `patch_iat_entry`
+(`tew/loader/dll_loader.py`), used by both `write_iat_handlers`
+(`import_resolver.py`) and `patch_dll_iats`. Any unmatched import -- main
+EXE or secondary DLL -- now gets the same auto-generated `[UNIMPLEMENTED]`
+fatal-halt stub. Live-verified: `IsDBCSLeadByte` now produces
+`[UNIMPLEMENTED] kernel32.dll!IsDBCSLeadByte — halting` instead of silent
+garbage execution, and `DllMain`/`CoGetClassObject` report an honest,
+traceable failure. Also consolidated the three diagnostic dump functions
+(`diagnose_fault`/`diagnose_halt`/`diagnose_thread_end`,
+`tew/kernel/exception_diagnostics.py`) onto one shared `_dump_cpu_state`
+helper -- the original `diagnose_thread_end` didn't dump full GPRs (only
+ESP/EBP), a gap caught mid-investigation since ESI was exactly the register
+that mattered here.
+
+Added `tests/unit/api/test_invoke_emulated_proc_thread_death.py`, a unit
+test for the "calling thread died mid-call" detection fixed in the previous
+session -- previously untested at the unit level. Verified it fails without
+the fix (asserts on garbage EAX) and passes with it. 583/583 tests passing.
+
+## 2026-07-21 — DllMain's "non-deterministic" return value fully diagnosed
+and fixed: it was register misattribution on top of a real thread
+(`tid=1012`) dying mid-call, not corruption
+
+Started as "explain the DllMain non-determinism" (status.md's
+2026-07-19-night open item: `0`, `105`, `70959764`, `70959264`,
+`70961940`, `70957766` observed across separate runs). Ended up finding two
+independent, real bugs in `_invoke_emulated_proc` (`tew/api/user32_handlers.py`),
+plus new scheduler debug visibility that made the second one findable at all.
+
+**Bug 1 — result misattribution.** `_invoke_emulated_proc`'s polling loop
+(added in the 2026-07-19 thread-switch fix) unconditionally read
+`cpu.regs[EAX]` as "the call's return value" after breaking out of its
+chunked `cpu.run()` loop, regardless of *why* it broke: a fatal halt on an
+unrelated thread, or exhausting `max_steps` while some other cooperative
+thread was live. Both cases leave whatever register state that *other*
+code left behind, misattributed as "this call returned `<it>`". Confirmed
+via raw disassembly of the real `entry()`/`DllMain` wrapper
+(`0x04479f74`, `dao350.dll`) that it can only ever return exactly `0` or
+`1` — so every other observed value was leftover EAX from unrelated code,
+not anything `DllMain` computed. Fix: track whether the call "genuinely
+completed" (halted on the *originating* thread, at the sentinel) and
+return `0` with a clear diagnostic for every other exit path, instead of
+reading a register that doesn't hold what's claimed.
+
+**Bug 2 — the real root cause.** Even with budget raised 10x (5,000,000 →
+50,000,000 steps), `DllMain`'s call still never completed. New scheduler
+debug logging (see below) traced it exactly: the real calling thread is
+`tid=1012` (idx=12), a short-lived worker spawned via the same generic CRT
+thread wrapper (`0x9fc3a0`) as the timer thread and others — spawned ~57s
+in, and **dead 244ms later**, having hit its own `THREAD_SENTINEL` (i.e.
+its stack unwound straight past the sentinel `_invoke_emulated_proc`
+pushed for `DllMain`'s return). Since dead threads are permanently excluded
+from `_pick_next_ready`, the loop's "wait for `scheduler.current_idx` to
+become `started_thread_idx` again" condition was mathematically
+unsatisfiable from that point on — no `max_steps` budget, however large,
+was ever going to complete it. Fix: detect
+`threads[started_thread_idx].status == DEAD` inside the polling loop and
+bail immediately instead of exhausting the budget uselessly.
+
+**Live-verified**: the run now reaches the identical final halt
+(`EIP=0x00200c00`, same registers/stack) at **57.4s instead of 71.4s**
+(~14s faster), with an honest `DllMain(DLL_PROCESS_ATTACH) -> 0` log
+instead of a misleading garbage number or a multi-second stall. *Why*
+`tid=1012` dies prematurely is still open — see status.md's new top
+priority.
+
+**New scheduler debug visibility** (`tew/kernel/scheduler.py`,
+`tew/api/kernel32_io.py`) — this is what made the `tid=1012` diagnosis
+possible at all; without it, the initial "scheduler fairness/starvation"
+hypothesis would have been very hard to rule out:
+- `create_thread`'s caller (`_create_thread`, `kernel32_io.py`) now logs
+  the assigned scheduler `idx` alongside `tid` — previously `idx` was
+  completely untraceable from logs, only `tid` was ever printed.
+- Every actual context switch is now logged in `_load_next`: `switch:
+  idx=X (tid=Y) -> idx=Z (tid=W)`.
+- Every block transition now logs *why* (`block_current_on_cs`,
+  `block_current_on_handles`, `sleep_current`) — previously only the
+  *wake-up* side (`unblock_cs`, `unblock_handle`, `tick` sleep-wake) was
+  logged, never what a thread actually blocked on or when.
+- Enable via `LOG_LEVEL=debug LOG_CATEGORIES=scheduler,thread`.
+
+**Ruled out this session** (worth recording so it isn't re-investigated):
+a `tid=1007`/`tid=1009` wait/signal ping-pong on handle `0x701a` dominates
+the scheduler log for the entire stall window and initially looked like a
+starvation livelock — but the same wait/signal/wait-again shape is present
+in `tid=1006` (the timer thread) from as early as 4s into the run, which is
+its normal, designed per-tick behavior. Not a bug on its own; the real
+cause was the dead-thread issue above, unrelated to this pattern.
+Separately, `mmtimer_callback`'s own nested call was suspected of calling
+`abortmessage` on failure — decompiled directly (`0x00a30a40`) and
+confirmed it does NOT; its `timeSetEvent`-failure path is just a silent
+`_DEBUG_trace` + graceful shutdown (`_TIMERhz = 0`, `timeEndPeriod`).
+`_TIMER_init` (`0x00a30be0`) does have real `abortmessage` calls, but none
+of its guard conditions are triggered by our stubs, and its one
+retry-exhaustion path takes several real seconds via a `_THREAD_yield`
+spin-loop — timing doesn't match the observed ~microsecond-scale event.
+The final `EIP=0x00200c00` halt is confirmed unrelated to DAO/`DllMain`
+(happens at the same relative point regardless of how `DllMain` resolves)
+but its real cause (which unimplemented API) is still unidentified.
+
+**Status**: 582/582 tests pass. Live-verified against the real
+`MCity_d.exe` + `dao350.dll`. **Uncommitted** in the working tree
+(`run_exe.py`, `tew/api/kernel32_io.py`, `tew/api/oleaut32_handlers.py`,
+`tew/api/user32_handlers.py`, `tew/kernel/scheduler.py`) — not committed
+per "only commit when explicitly asked."
+
+---
+
 ## 2026-07-19 (night, continued further) — the "~496-byte stack corruption"
 was actually a NULL-vtable dispatch crash; real root cause identified for
 the crash chain, none of it fixed yet

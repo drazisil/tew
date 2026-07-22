@@ -198,6 +198,10 @@ class Scheduler:
     def _load_next(self, idx: int, cpu: "CPU", memory: "Memory") -> None:
         """Load thread idx into the CPU. Current thread must already be saved."""
         target = self.threads[idx]
+        from_idx = self.current_idx
+        from_tid = self.threads[from_idx].thread_id if 0 <= from_idx < len(self.threads) else None
+        logger.debug("scheduler",
+            f"switch: idx={from_idx} (tid={from_tid}) -> idx={idx} (tid={target.thread_id})")
         self._last_scheduled_idx = idx
         if target.saved_state is None:
             self._init_thread_stack(cpu, memory, target)
@@ -334,6 +338,9 @@ class Scheduler:
         thread.waiting_on_cs = cs_ptr
         thread.status = ThreadStatus.BLOCKED_CS
         cpu.eip = retry_eip
+        logger.debug("scheduler",
+            f"block_current_on_cs: idx={self.current_idx} tid={thread.thread_id} "
+            f"blocking on CS 0x{cs_ptr:08x}, retry_eip=0x{retry_eip:08x}")
         self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
@@ -360,6 +367,10 @@ class Scheduler:
         thread.wait_timed_out = False
         thread.status = ThreadStatus.BLOCKED_HANDLES
         cpu.eip = retry_eip
+        logger.debug("scheduler",
+            f"block_current_on_handles: idx={self.current_idx} tid={thread.thread_id} "
+            f"blocking on handles={sorted(hex(h) for h in handles)}, "
+            f"deadline={deadline_ms}, retry_eip=0x{retry_eip:08x}")
         self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
@@ -386,6 +397,9 @@ class Scheduler:
         cpu.regs[EAX] = eax_val
         thread.sleep_until_ms = self.virtual_ticks_ms + sleep_ms
         thread.status = ThreadStatus.SLEEPING
+        logger.debug("scheduler",
+            f"sleep_current: idx={self.current_idx} tid={thread.thread_id} "
+            f"sleeping {sleep_ms}ms (until vtime={thread.sleep_until_ms}ms)")
         self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
