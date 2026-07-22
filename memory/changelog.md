@@ -4,6 +4,49 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-22 — Implemented IsDBCSLeadByte properly (codepage-derived);
+DllMain now completes for real; DllGetClassObject/*ppv NULL mystery
+reproducing again with new evidence
+
+Picked up right where the previous session left off: `IsDBCSLeadByte` was
+the concrete cause of `tid=1012`'s death, confirmed by the fatal-halt fix
+landing exactly there (`[UNIMPLEMENTED] kernel32.dll!IsDBCSLeadByte —
+halting`). Rather than a bare always-FALSE stub, checked whether that
+answer is actually *true* for this game rather than merely convenient: tew
+already hardcodes `GetACP() -> 1252` (Western/Latin) everywhere, and
+`GetCPInfo`'s `LeadByte[]` table was already written as all-zero — so
+"no lead bytes" isn't a new assumption, it's what tew's own environment
+already asserts. Also confirmed MCity_d.exe itself never imports
+`IsDBCSLeadByte` at all (string search of the whole exe found zero
+matches) — only `dao350.dll` does. Separately confirmed `dao350.dll`
+references `MSJET35.DLL` (the real Jet 3.5 engine) as a DLL it loads
+dynamically by name -- Jet's own code hasn't been analyzed or reached by
+the emulator at all, so no DAO-specific guarantee is made about it;
+instead, implemented `IsDBCSLeadByte` (`tew/api/kernel32_locale.py`) so
+`GetACP`/`GetCPInfo`/`IsDBCSLeadByte` all derive from one `ANSI_CODEPAGE`
+constant and a shared `_DBCS_LEAD_BYTE_RANGES` table (covering
+932/936/949/950 too, not just 1252) -- correct by construction for
+whichever of these three APIs any future caller (Jet included) happens to
+use, rather than three independently-stubbed constants that could drift
+out of sync.
+
+Live-verified: all 256 `IsDBCSLeadByte` loop iterations now complete (was
+1 of 256 before the fix), `DllMain(DLL_PROCESS_ATTACH) -> 1` (correct,
+matching the real decompiled `entry()` function), and the run reaches
+`DllGetClassObject` for real -- `CoGetClassObject(...) -> hr=0x00000000
+*ppv=0x00000000`, reproducing the `*ppv` NULL mystery documented in the
+previous session, now unblocked.
+
+New evidence while there: of the four existing TEMP logpoints
+(`_log_dgco_entry`, `_log_dgco_call_queryinterface`, `_log_dgco_call_release`,
+`_log_qi_ppv_write`, all in `run_exe.py`), only the entry logpoint fired.
+Neither the `QueryInterface` CALL site nor the `*ppv`-write site fired at
+all -- meaning `DllGetClassObject`'s real code takes an early-exit path
+*before* reaching the helper-object construction/`QueryInterface` call
+the earlier session's static analysis reviewed (and found calling-
+convention-correct). That earlier analysis may be entirely accurate for
+code that's simply never reached. 583/583 tests passing.
+
 ## 2026-07-21 (later session) — Root-caused and fixed tid=1012's premature
 death: an unmatched secondary-DLL import (IsDBCSLeadByte) silently executed
 garbage instead of halting

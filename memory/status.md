@@ -11,8 +11,45 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 ---
 
-### Current status (2026-07-21, later session): `tid=1012`'s premature death
-is fully root-caused and fixed. Real cause: `dao350.dll`'s `IsDBCSLeadByte`
+### Current status (2026-07-22): `IsDBCSLeadByte` implemented (codepage-
+derived, not a hardcoded constant) — DAO's `DllMain` now genuinely completes
+(`DllMain(DLL_PROCESS_ATTACH) -> 1`, correct per the real decompiled code)
+and the run reaches `DllGetClassObject` for real. The previously-diagnosed
+`*ppv` stays-NULL mystery (see "Background" below) is reproducing again as
+predicted -- `CoGetClassObject(...) -> hr=0x00000000 *ppv=0x00000000` --
+now unblocked and under active investigation.
+
+**New evidence from this run**: of the four existing TEMP logpoints in
+`run_exe.py` (`_log_dgco_entry`, `_log_dgco_call_queryinterface`,
+`_log_dgco_call_release`, `_log_qi_ppv_write`), only the entry one
+(`0x04478a31`) fired. Neither the `QueryInterface` CALL site (`0x04478d0d`)
+nor the `*ppv` write site (`0x0447d458`) fired at all -- meaning
+`DllGetClassObject`'s real code takes an early-exit path *before* ever
+reaching the helper-object construction/`QueryInterface` call the earlier
+session's static analysis focused on. Not yet root-caused; next step is
+decompiling the ~0x2dc bytes between entry and the `QueryInterface` call
+site to find the actual branch taken. See [[tew_fake_kernel_gaps]].
+
+**Fixed 2026-07-22**: `IsDBCSLeadByte` (`tew/api/kernel32_locale.py`) --
+previously had no handler at all (see "Background" below for the tid=1012
+bug this caused). Implemented properly rather than a bare always-FALSE
+stub: `GetACP`/`GetCPInfo`/`IsDBCSLeadByte` now all derive from one
+`ANSI_CODEPAGE` constant (1252, Western/no lead bytes) and a shared
+`_DBCS_LEAD_BYTE_RANGES` table (also covering 932/936/949/950 for
+correctness if the codepage constant is ever changed) -- confirmed via
+direct evidence (`GetACP`/`GetCPInfo`'s `LeadByte[]` array were already
+hardcoded for 1252 everywhere else in tew) rather than assumed, and
+confirmed MCity_d.exe itself never imports `IsDBCSLeadByte` (string search
+of the whole exe found zero matches) so this only affects `dao350.dll`'s
+own init path. Jet (`MSJET35.DLL`, confirmed by string search of
+`dao350.dll` as a real DLL it loads dynamically) has NOT been analyzed and
+hasn't been reached by the emulator yet, so no guarantee is made about it
+specifically -- only that whatever it asks GetACP/GetCPInfo/IsDBCSLeadByte
+will get an answer consistent with the rest of the environment, by
+construction, not by DAO-specific luck.
+
+### Background (2026-07-21, later session): `tid=1012`'s premature death,
+fully root-caused and fixed. Real cause: `dao350.dll`'s `IsDBCSLeadByte`
 import (called from `DllMain`, `0x044c63fc`) had no registered handler, and
 `patch_dll_iats` (secondary-DLL IAT patching) had no fallback for an
 unmatched import — it silently left the IAT slot holding raw, unrelocated
@@ -25,23 +62,13 @@ skipping every real stack frame above it without ever executing a matching
 (`0x044c6410`): only 1 of the expected 256 loop iterations fired, with
 `ESI=0x000735ba` (not a valid code address).
 
-**Fixed**: unified IAT-patching into one shared function, `patch_iat_entry`
+Fixed by unifying IAT-patching into one shared function, `patch_iat_entry`
 (`tew/loader/dll_loader.py`), used by both `write_iat_handlers` (main EXE,
 `import_resolver.py`) and `patch_dll_iats` (secondary DLLs). Any unmatched
 import now gets the same auto-generated `[UNIMPLEMENTED]` fatal-halt stub
-regardless of which loading path found it missing. Live-verified:
-`IsDBCSLeadByte` now produces a clean
-`[UNIMPLEMENTED] kernel32.dll!IsDBCSLeadByte — halting` instead of silent
-garbage execution, and `DllMain`/`CoGetClassObject` now report an honest,
-traceable failure instead of the old mystery "thread returned normally."
+regardless of which loading path found it missing.
 
-**New current blocker**: DAO activation still fails (as it did before, just
-for a diagnosable reason now) because `IsDBCSLeadByte` isn't implemented.
-Once it is, DAO's `DllMain` should complete for real and the run should
-reach the previously-diagnosed `DllGetClassObject`/`*ppv` NULL mystery below
-(now reachable again, unblocked).
-
-**Also added while investigating**: `_invoke_emulated_proc`'s "calling
+Also added while investigating: `_invoke_emulated_proc`'s "calling
 thread died mid-call" detection (the 2026-07-19/21 fix) now has a dedicated
 unit test (`tests/unit/api/test_invoke_emulated_proc_thread_death.py`) —
 previously untested at the unit level. A thread-end stack dump
@@ -308,14 +335,14 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: implement `IsDBCSLeadByte` (kernel32.dll) so
-  `dao350.dll`'s `DllMain` can complete for real — see "Current status."
-  Trivial API (DBCS lead-byte lookup by codepage); a simple always-false or
-  codepage-table-driven stub should be enough to get past this specific call.
-- Root-cause why `dao350.dll`'s real `DllGetClassObject` returns `S_OK`
-  without writing `*ppv` — the NULL-vtable crash and everything downstream
-  of it (SEH walk, `__chkesp` failure) is a consequence of this, not a
-  separate bug. Now reachable again once `IsDBCSLeadByte` is implemented.
+- **New top priority**: root-cause why `dao350.dll`'s real
+  `DllGetClassObject` returns `S_OK` without writing `*ppv` — see "Current
+  status." Now reachable and actively reproducing; new evidence narrows it
+  to an early-exit path before the `QueryInterface`/helper-construction
+  code the earlier static analysis focused on (that code may be entirely
+  correct and simply never reached). The NULL-vtable crash and everything
+  downstream of it (SEH walk, `__chkesp` failure) is a consequence of this,
+  not a separate bug.
 - Identify the `EIP=0x00200c00` final halt's real cause — confirmed
   unrelated to DAO/`DllMain` timing, still unidentified which API it is.
 - Decide whether `mmtimer_callback`'s own nested-call halt (lands back at
@@ -364,4 +391,4 @@ need to reach all the way through the DAO handshake.
   already the correct solution to that problem, not something to replace).
 
 ## Test suite
-583 tests (all passing, reconfirmed 2026-07-21).
+583 tests (all passing, reconfirmed 2026-07-22).

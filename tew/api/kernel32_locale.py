@@ -16,6 +16,27 @@ from tew.api.char_type import GetStringTypeArgs, classify_wide_string
 from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string
 from tew.logger import logger
 
+# ── Codepage identity ─────────────────────────────────────────────────────────
+# Single source of truth for "what ANSI codepage does this process report" --
+# GetACP/GetCPInfo/IsDBCSLeadByte must all agree, since real code (DAO, Jet,
+# or the game itself) can reasonably expect these three APIs to describe the
+# same codepage rather than being independently, disconnectedly stubbed.
+ANSI_CODEPAGE = 1252  # Western European (Windows-1252) -- no lead bytes
+
+# DBCS lead-byte ranges (inclusive) for codepages that have them. Windows-1252
+# has no entry -- it's single-byte, so every value is a standalone character
+# and IsDBCSLeadByte/GetCPInfo's LeadByte table are both correctly empty.
+_DBCS_LEAD_BYTE_RANGES: dict[int, list[tuple[int, int]]] = {
+    932: [(0x81, 0x9F), (0xE0, 0xFC)],   # Shift-JIS (Japanese)
+    936: [(0x81, 0xFE)],                 # GBK (Simplified Chinese)
+    949: [(0x81, 0xFE)],                 # Unified Hangul Code (Korean)
+    950: [(0x81, 0xFE)],                 # Big5 (Traditional Chinese)
+}
+
+
+def _is_dbcs_lead_byte_value(codepage: int, byte_val: int) -> bool:
+    return any(lo <= byte_val <= hi for lo, hi in _DBCS_LEAD_BYTE_RANGES.get(codepage, ()))
+
 
 def register_kernel32_locale_handlers(
     stubs: "Win32Handlers",
@@ -34,15 +55,20 @@ def register_kernel32_locale_handlers(
     # ── Code pages ────────────────────────────────────────────────────────────
 
     def _get_acp(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1252
+        cpu.regs[EAX] = ANSI_CODEPAGE
 
     def _get_cp_info(cpu: "CPU") -> None:
         lp = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         memory.write32(lp, 1)
         memory.write8(lp + 4, 0x3F)  # '?'
         memory.write8(lp + 5, 0)
-        for i in range(12):
-            memory.write8(lp + 6 + i, 0)
+        # LeadByte[]: up to 5 (lo, hi) range pairs + a terminating (0, 0) pair
+        # -- real CPINFO format. Empty for a single-byte codepage like 1252.
+        ranges = _DBCS_LEAD_BYTE_RANGES.get(ANSI_CODEPAGE, [])
+        for i in range(6):
+            lo, hi = ranges[i] if i < len(ranges) else (0, 0)
+            memory.write8(lp + 6 + i * 2, lo)
+            memory.write8(lp + 7 + i * 2, hi)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
@@ -50,9 +76,15 @@ def register_kernel32_locale_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
+    def _is_dbcs_lead_byte(cpu: "CPU") -> None:
+        test_char = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
+        cpu.regs[EAX] = 1 if _is_dbcs_lead_byte_value(ANSI_CODEPAGE, test_char) else 0
+        cleanup_stdcall(cpu, memory, 4)
+
     stubs.register_handler("kernel32.dll", "GetACP",           _get_acp)
     stubs.register_handler("kernel32.dll", "GetCPInfo",        _get_cp_info)
     stubs.register_handler("kernel32.dll", "IsValidCodePage",  _is_valid_code_page)
+    stubs.register_handler("kernel32.dll", "IsDBCSLeadByte",   _is_dbcs_lead_byte)
 
     # ── String conversion ─────────────────────────────────────────────────────
 
