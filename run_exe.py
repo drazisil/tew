@@ -378,6 +378,46 @@ cpu.add_logpoint(0x04478d0d, _log_dgco_call_queryinterface)
 cpu.add_logpoint(0x04478d1b, _log_dgco_call_release)
 cpu.add_logpoint(0x0447d458, _log_qi_ppv_write)
 
+# ── TEMP diagnostic: why FUN_044947fc's per-thread init skips TlsSetValue ──
+#
+# DllGetClassObject's helper-object allocator (FUN_0447d31e) reads a
+# per-thread arena pointer via TlsGetValue(dwTlsIndex), but nothing in
+# DllMain ever calls TlsSetValue for it. FUN_044947fc (called first, before
+# TlsGetValue) DOES call TlsSetValue -- at 0x04494b55 -- but only if it
+# doesn't take an "already initialized" shortcut first. Raw disassembly
+# (Ghidra's decompile of this region was misleading, same as elsewhere in
+# this DLL) shows the shortcut check at 0x04494900 is `CMP [EBP-0x14], 0`
+# -- if that's unexpectedly non-zero on what should be this thread's first
+# call, it wrongly skips straight past the whole init block (including
+# TlsSetValue) as if a real prior call had already set things up. Logging
+# both offsets everywhere to settle which stack slot is "real" here.
+def _log_dao_init_shortcut_check(eip, regs, memory, memory_size) -> None:
+    # 0x04494860: MOV EAX,[EBP-0x1C] (local_20, result of FUN_044d4dd6)
+    # 0x04494863: CMP [EAX+0x30],0 -- ==0 continues real init; !=0 takes the
+    # "already initialized" shortcut straight to LAB_04494b7c, skipping
+    # TlsSetValue entirely. Firing at 0x04494860, before EAX is overwritten.
+    ebp = regs[EBP]
+    local_20 = memory.read32((ebp - 0x1C) & 0xFFFFFFFF)
+    flag = memory.read32((local_20 + 0x30) & 0xFFFFFFFF) if local_20 else None
+    flag_s = f"0x{flag:08x}" if flag is not None else "N/A (local_20 is NULL)"
+    logger.error("com", f"[TRACE] 0x{eip:08x} shortcut-check -- local_20=0x{local_20:08x} [local_20+0x30]={flag_s}")
+
+def _log_dao_tlssetvalue_call(eip, regs, memory, memory_size) -> None:
+    ebp = regs[EBP]
+    local_20 = memory.read32((ebp - 0x1C) & 0xFFFFFFFF)
+    logger.error("com", f"[TRACE] 0x{eip:08x} TlsSetValue(dwTlsIndex, local_20) about to run -- local_20=0x{local_20:08x}")
+
+cpu.add_logpoint(0x04494860, _log_dao_init_shortcut_check)
+cpu.add_logpoint(0x04494b55, _log_dao_tlssetvalue_call)
+
+def _log_fn_entry(name):
+    def _h(eip, regs, memory, memory_size) -> None:
+        logger.error("com", f"[TRACE] 0x{eip:08x} entered {name}")
+    return _h
+
+cpu.add_logpoint(0x0447d31e, _log_fn_entry("FUN_0447d31e (helper-object allocator)"))
+cpu.add_logpoint(0x044947fc, _log_fn_entry("FUN_044947fc (per-thread init)"))
+
 # ── TEMP diagnostic: tid=1012 investigation -- IsDBCSLeadByte via cached ESI ──
 #
 # DllMain (dao350.dll, 0x04479f74) calls FUN_044c63fc, which loads the

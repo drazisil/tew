@@ -4,6 +4,53 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-22 (later session) — Root-caused the *ppv NULL mystery:
+CoGetMalloc is unimplemented; found a related hr/S_OK sentinel collision
+along the way
+
+Continued straight from the same session's IsDBCSLeadByte fix, which
+unblocked `DllGetClassObject`. Of the four existing TEMP logpoints on
+`DllGetClassObject`'s internals, only the entry one fired -- meaning the
+real code takes an early-exit path before ever reaching the
+`QueryInterface`/helper-construction code the previous session's static
+analysis had reviewed (and found calling-convention-correct). That analysis
+was accurate; it just wasn't the code actually being hit.
+
+Traced further into `dao350.dll`'s real functions (`debug_clean` Ghidra
+project): `DllGetClassObject`'s helper-object allocator (`FUN_0447d31e`)
+calls `FUN_044947fc` for per-thread init, which needs a per-thread
+"task memory" arena stored via `TlsSetValue`. Two rounds of manually
+computed instruction offsets for logpoints (guessing which stack slot held
+which decompiled variable) both missed -- Ghidra's decompile of this DLL
+has already been shown misleading twice before in this investigation, and
+manual offset math compounded it a third time. Switched to logging simple
+function-entry points instead of guessed mid-function offsets, which
+immediately showed the real problem: `FUN_044947fc` calls `CoGetMalloc`
+(`ole32.dll`) as its very first real dependency, and tew has no handler for
+it at all -- `[UNIMPLEMENTED] ole32.dll!CoGetMalloc — halting` fires
+immediately, long before `TlsSetValue` or the "already initialized"
+shortcut check (the branch two rounds of guessed logpoints were aimed at)
+are ever reached. The whole arena-init chain aborts at this first
+dependency; `FUN_0447d31e` returns NULL; `DllGetClassObject` takes its
+`local_c == NULL` branch, skipping `QueryInterface`/`*ppv` writes entirely.
+
+Found a second, structurally separate bug while confirming this:
+`hr=0x00000000` in the `CoGetClassObject(...) -> hr=0x00000000
+*ppv=0x00000000` log line isn't `DllGetClassObject` genuinely returning
+`S_OK` -- `_invoke_emulated_proc` returns a bare `0` whenever a nested call
+doesn't complete (fatal halt, dead thread, `max_steps` exhausted), which is
+a safe, conservative sentinel for `DllMain`-style callers (`0` = FALSE) but
+collides with `S_OK` for any `HRESULT`-returning nested call
+(`_call_dll_get_class_object`, `oleaut32_handlers.py`, is the one hit here,
+but the same collision would affect any future `HRESULT` nested-call site).
+Not fixed yet -- flagged in status.md as its own queued item.
+
+Also surfaced, not yet root-caused: `cpu.fatal_halt` is documented
+everywhere as "the whole emulator must stop" and is never cleared anywhere
+in the codebase, yet the run visibly continued past `CoGetMalloc`'s fatal
+halt to a later, unrelated halt rather than stopping immediately. Queued as
+the new top priority.
+
 ## 2026-07-22 — Implemented IsDBCSLeadByte properly (codepage-derived);
 DllMain now completes for real; DllGetClassObject/*ppv NULL mystery
 reproducing again with new evidence

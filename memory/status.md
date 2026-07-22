@@ -15,20 +15,44 @@ Path: ~/Documents/i386.pdf (421 pages)
 derived, not a hardcoded constant) — DAO's `DllMain` now genuinely completes
 (`DllMain(DLL_PROCESS_ATTACH) -> 1`, correct per the real decompiled code)
 and the run reaches `DllGetClassObject` for real. The previously-diagnosed
-`*ppv` stays-NULL mystery (see "Background" below) is reproducing again as
-predicted -- `CoGetClassObject(...) -> hr=0x00000000 *ppv=0x00000000` --
-now unblocked and under active investigation.
+`*ppv` stays-NULL mystery (see "Background" below) is now **fully
+root-caused**.
 
-**New evidence from this run**: of the four existing TEMP logpoints in
-`run_exe.py` (`_log_dgco_entry`, `_log_dgco_call_queryinterface`,
-`_log_dgco_call_release`, `_log_qi_ppv_write`), only the entry one
-(`0x04478a31`) fired. Neither the `QueryInterface` CALL site (`0x04478d0d`)
-nor the `*ppv` write site (`0x0447d458`) fired at all -- meaning
-`DllGetClassObject`'s real code takes an early-exit path *before* ever
-reaching the helper-object construction/`QueryInterface` call the earlier
-session's static analysis focused on. Not yet root-caused; next step is
-decompiling the ~0x2dc bytes between entry and the `QueryInterface` call
-site to find the actual branch taken. See [[tew_fake_kernel_gaps]].
+**Root cause**: `CoGetMalloc` (`ole32.dll`) has no handler registered in
+tew at all. Traced live via targeted logpoints at `dao350.dll`'s real
+addresses (`FUN_0447d31e`, the `DllGetClassObject` helper-object allocator;
+`FUN_044947fc`, its per-thread init routine): `FUN_044947fc` calls
+`CoGetMalloc` as its very first real dependency and gets an
+`[UNIMPLEMENTED] ole32.dll!CoGetMalloc — halting` fatal halt immediately —
+long before ever reaching `TlsSetValue` or the "already initialized"
+shortcut check that earlier static analysis (correctly, in hindsight) had
+flagged as the interesting branch. That's why none of the four existing
+`DllGetClassObject`-internals logpoints (`_log_dgco_call_queryinterface`,
+`_log_dgco_call_release`, `_log_qi_ppv_write`) ever fired: the whole
+per-thread-arena chain aborts at the first dependency, `FUN_0447d31e`
+returns NULL, and `DllGetClassObject` takes its `local_c == NULL` branch,
+skipping `QueryInterface`/`*ppv` entirely.
+
+**Second, connected bug found in the same investigation**: `hr=0x00000000`
+in the `CoGetClassObject(...) -> hr=0x00000000 *ppv=0x00000000` log line is
+*not* the real `DllGetClassObject` returning `S_OK`. `_invoke_emulated_proc`
+returns a bare `0` whenever a nested call doesn't genuinely complete (a
+fatal halt, a dead thread, `max_steps` exhausted) — a safe sentinel for
+`DllMain`-style callers where `0` means FALSE, but `_call_dll_get_class_object`
+(`oleaut32_handlers.py`) treats that same `0` as the return `HRESULT`, where
+`0` *is* `S_OK`. So an aborted call is structurally indistinguishable from a
+genuine success to any `HRESULT`-returning nested-call site, not just this
+one. Not yet fixed -- needs its own decision (a distinguishable sentinel
+value, or having `_invoke_emulated_proc` signal "didn't complete" out of
+band rather than through the return value).
+
+**New top-priority blocker, found while chasing the above**: `cpu.fatal_halt`
+is documented everywhere ("must stop everything regardless of which thread
+caused it") and is never cleared anywhere in the codebase (confirmed:
+`grep -rn "fatal_halt\s*=\s*False"` across the whole repo returns nothing)
+-- yet the run visibly continues past the `CoGetMalloc` fatal halt to a
+later, unrelated halt seconds afterward, rather than stopping immediately.
+Not yet root-caused. Actively being fixed next.
 
 **Fixed 2026-07-22**: `IsDBCSLeadByte` (`tew/api/kernel32_locale.py`) --
 previously had no handler at all (see "Background" below for the tid=1012
@@ -335,14 +359,19 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: root-cause why `dao350.dll`'s real
-  `DllGetClassObject` returns `S_OK` without writing `*ppv` — see "Current
-  status." Now reachable and actively reproducing; new evidence narrows it
-  to an early-exit path before the `QueryInterface`/helper-construction
-  code the earlier static analysis focused on (that code may be entirely
-  correct and simply never reached). The NULL-vtable crash and everything
-  downstream of it (SEH walk, `__chkesp` failure) is a consequence of this,
-  not a separate bug.
+- **New top priority**: make `cpu.fatal_halt` actually stop the whole
+  emulator immediately instead of letting execution continue to a later,
+  unrelated halt — see "Current status." Actively being fixed.
+- Implement `CoGetMalloc` (`ole32.dll`) — root cause of the `*ppv` NULL
+  mystery, see "Current status." Real OLE API returning the process's
+  `IMalloc`; tew likely has enough COM/vtable infrastructure already to
+  build one. Once implemented, `dao350.dll`'s `DllGetClassObject` should
+  reach its real `QueryInterface` call and populate `*ppv` for real.
+- Decide how `_invoke_emulated_proc`'s "didn't complete" sentinel should
+  work for `HRESULT`-returning nested calls — its current bare `0` fallback
+  collides with `S_OK`, making any aborted call (not just `CoGetMalloc`'s)
+  look like a clean success to `_call_dll_get_class_object` and any future
+  `HRESULT` nested-call site. See "Current status."
 - Identify the `EIP=0x00200c00` final halt's real cause — confirmed
   unrelated to DAO/`DllMain` timing, still unidentified which API it is.
 - Decide whether `mmtimer_callback`'s own nested-call halt (lands back at
