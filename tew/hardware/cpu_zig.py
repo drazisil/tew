@@ -91,6 +91,11 @@ def _load_lib() -> ctypes.CDLL:
     lib.cpu_clear_halted.argtypes= [_vp]
     lib.cpu_clear_halted.restype = None
 
+    lib.cpu_set_fatal_halt.argtypes   = [_vp]
+    lib.cpu_set_fatal_halt.restype    = None
+    lib.cpu_is_fatal_halted.argtypes  = [_vp]
+    lib.cpu_is_fatal_halted.restype   = _b
+
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
     lib.cpu_get_run_id.argtypes      = [_vp]
@@ -297,14 +302,18 @@ class ZigCPU:
         # Override flags for handle_exception() called from Python (not from Zig)
         self._py_halted:        bool = False
         self._py_faulted:       bool = False
-        # Set by handlers that mean "the whole emulator must stop" (e.g. an
-        # unimplemented Win32 API), as opposed to a routine per-thread halt.
-        # Not part of SavedCPUState/save_state()/restore_state() — this is
-        # deliberately global, not per-thread: the scheduler's thread-switch
-        # bookkeeping (scheduler.py's _load_thread/_load_next) checks this
-        # before clearing `halted`, so a fatal halt survives a thread switch
-        # instead of being silently erased by unrelated scheduling activity.
-        self.fatal_halt:         bool = False
+        # `fatal_halt` itself is a property (see below) backed by native
+        # CpuState.fatal_halted — not a plain Python attribute. It has no
+        # real x86 analog (there's no hardware concept of "an unimplemented
+        # Win32 API"); it means the emulator hit something it cannot
+        # simulate and must stop the whole session, permanently. Enforcing
+        # this natively (rather than via scattered Python-side checks before
+        # every halt-clearing/state-restoring call) means it survives
+        # anything Python does afterward — thread switches, state restores,
+        # a future call site that forgets to check it — by construction: the
+        # native per-instruction loop, and every register/eflags/FPU setter,
+        # refuse to proceed once it's set. See cpu/src/cpu.zig's
+        # cpu_set_fatal_halt/cpu_clear_halted/cpu_run.
 
         # Keep C callback alive for the lifetime of this object
         self._c_callback = _IntHandlerCType(self._c_int_dispatch)
@@ -439,6 +448,17 @@ class ZigCPU:
         else:
             self._py_halted = True
             _lib.cpu_set_halted(self._state)
+
+    @property
+    def fatal_halt(self) -> bool:
+        return _lib.cpu_is_fatal_halted(self._state)
+
+    @fatal_halt.setter
+    def fatal_halt(self, val: bool) -> None:
+        if val:
+            _lib.cpu_set_fatal_halt(self._state)
+        # Deliberately no "clear" path -- a fatal halt is terminal for the
+        # lifetime of this CPU instance.
 
     @property
     def faulted(self) -> bool:

@@ -46,13 +46,65 @@ one. Not yet fixed -- needs its own decision (a distinguishable sentinel
 value, or having `_invoke_emulated_proc` signal "didn't complete" out of
 band rather than through the return value).
 
-**New top-priority blocker, found while chasing the above**: `cpu.fatal_halt`
-is documented everywhere ("must stop everything regardless of which thread
-caused it") and is never cleared anywhere in the codebase (confirmed:
-`grep -rn "fatal_halt\s*=\s*False"` across the whole repo returns nothing)
--- yet the run visibly continues past the `CoGetMalloc` fatal halt to a
-later, unrelated halt seconds afterward, rather than stopping immediately.
-Not yet root-caused. Actively being fixed next.
+### Current status (2026-07-23): `cpu.fatal_halt` is now a real, unclearable
+native CPU lockup -- fully fixed, live-verified. Root cause (found while
+chasing why execution continued past the `CoGetMalloc` fatal halt to a
+later, unrelated halt): `ZigCPU.faulted`'s setter (`tew/hardware/cpu_zig.py`)
+called the native `cpu_clear_halted` unconditionally whenever `cpu.faulted`
+was cleared (the SEH-resume path does this after deciding a fault was
+"handled") -- `cpu_clear_halted` (`cpu/src/cpu.zig`) cleared native `s.halted`
+regardless of `fatal_halt`, desyncing it from the Python-side sticky flags
+that every other check in the codebase reads. `cpu_run`'s own per-instruction
+loop obeys native `s.halted`, not the Python property, so later `cpu.run()`
+calls (notably `_invoke_emulated_proc`'s polling loop) genuinely executed
+more real instructions after what was supposed to be a permanent stop.
+
+**Fixed at the CPU/Zig layer, not Python orchestration** -- deliberate,
+discussed and agreed choice: `fatal_halt` has no real x86 analog (there's no
+hardware concept of "an unimplemented Win32 API"), but this emulator models
+exactly one physical core, so once it fires, nothing should be able to hand
+the core to a different thread as if it were merely idling -- a genuine
+single-core lockup, not something Python-level scheduling can be trusted to
+enforce (scattered `if not cpu.fatal_halt:` checks before every halt-clearing
+call site is exactly the pattern that let this bug through in the first
+place). Added a new native `fatal_halted` field on `CpuState`
+(`cpu/src/core.zig`), a dedicated `cpu_set_fatal_halt`/`cpu_is_fatal_halted`
+pair with no clear path, made `cpu_clear_halted` and `cpu_run`'s loop respect
+it, and made every register/eflags/FPU setter refuse to write once set
+(reads stay fully open) -- this also neutralizes `_invoke_emulated_proc`'s
+cleanup path, which unconditionally calls `cpu.restore_state(saved)` even
+when fatally halted; that write is now silently a no-op instead of clobbering
+the real failure-point state before any diagnostic sees it. `tew/kernel/
+scheduler.py`'s `preempt_slice` and the four other CPU-state-mutating entry
+points (`block_current_on_cs`/`block_current_on_handles`/`sleep_current`/
+`mark_current_dead`) now refuse to act once fatally halted too, for the same
+reason, though none were concretely reachable post-fatal-halt once the
+native fix landed.
+
+Live-verified against the exact `CoGetMalloc` scenario: the run now stops
+dead at `[UNIMPLEMENTED] ole32.dll!CoGetMalloc — halting` with zero further
+scheduler activity, and the Halt Diagnostic shows the full, accurate 7-frame
+call chain at the true failure point (`DllGetClassObject` → our own
+`_invoke_emulated_proc` sentinel → `Dbcode_InitDao` → `DBThreadCpp` → thread
+wrapper → `THREAD_SENTINEL`) instead of a shallow, unrelated, later trace.
+New tests (`tests/unit/hardware/test_cpu_zig_fatal_halt.py`,
+`TestPreemptSlice` in `test_scheduler.py`) confirmed to fail against the
+pre-fix build and pass against the fix. 589/589 tests passing.
+
+**Side investigation, deferred, not yet fixed**: while figuring out what
+"real CPU" `fatal_halt`/`HLT` should match, found `cpu/src/two_byte.zig`'s
+`CPUID` handler doesn't self-consistently identify as any real chip (current
+`EAX=0x00000600` doesn't match Pentium Pro, Pentium II, or Pentium II
+OverDrive's real documented signatures). Since MMX is a hard requirement
+(tew's `cpu/src/mmx.zig` opcodes are load-bearing) and Pentium Pro's own
+feature table has no MMX bit at all, the correct target is real Pentium II
+(Family 6, Model 3 "Klamath" or Model 5 "Deschutes" -- identical feature
+sets) — corrected `EAX` would be `0x00000630` or `0x00000650`. This also
+reconciles with this file's own "Pentium II instruction set" header, which
+was already correct; only the actual `CPUID` value and the "source of truth"
+reference below (currently the unrelated, far earlier 80386 manual) need
+correcting. Blocked on locating the exact Pentium II spec manual to confirm
+Model/Stepping before committing to a value -- not blocking anything else.
 
 **Fixed 2026-07-22**: `IsDBCSLeadByte` (`tew/api/kernel32_locale.py`) --
 previously had no handler at all (see "Background" below for the tid=1012
@@ -359,14 +411,17 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: make `cpu.fatal_halt` actually stop the whole
-  emulator immediately instead of letting execution continue to a later,
-  unrelated halt — see "Current status." Actively being fixed.
-- Implement `CoGetMalloc` (`ole32.dll`) — root cause of the `*ppv` NULL
-  mystery, see "Current status." Real OLE API returning the process's
-  `IMalloc`; tew likely has enough COM/vtable infrastructure already to
-  build one. Once implemented, `dao350.dll`'s `DllGetClassObject` should
-  reach its real `QueryInterface` call and populate `*ppv` for real.
+- **New top priority**: implement `CoGetMalloc` (`ole32.dll`) — root cause of
+  the `*ppv` NULL mystery, see "Current status." Real OLE API returning the
+  process's `IMalloc`; tew likely has enough COM/vtable infrastructure
+  already to build one. Once implemented, `dao350.dll`'s `DllGetClassObject`
+  should reach its real `QueryInterface` call and populate `*ppv` for real —
+  and now that `fatal_halt` genuinely stops everything, this and any future
+  unimplemented dependency will surface as a clean, accurate Halt Diagnostic
+  immediately, not a misleading later halt.
+- Correct `cpu/src/two_byte.zig`'s `CPUID` signature to real Pentium II
+  (`0x00000630`/`0x00000650`) and fix this file's "source of truth" reference
+  — see "Current status," blocked on locating the exact spec manual.
 - Decide how `_invoke_emulated_proc`'s "didn't complete" sentinel should
   work for `HRESULT`-returning nested calls — its current bare `0` fallback
   collides with `S_OK`, making any aborted call (not just `CoGetMalloc`'s)
@@ -420,4 +475,4 @@ need to reach all the way through the DAO handshake.
   already the correct solution to that problem, not something to replace).
 
 ## Test suite
-583 tests (all passing, reconfirmed 2026-07-22).
+589 tests (all passing, reconfirmed 2026-07-23).

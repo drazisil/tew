@@ -4,6 +4,81 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-23 — cpu.fatal_halt is now a real, unclearable native CPU lockup
+
+Picked up directly from the previous session's discovery that execution
+visibly continued past the `CoGetMalloc` fatal halt to a later, unrelated
+halt seconds afterward, instead of stopping immediately. Root-caused:
+`ZigCPU.faulted`'s setter (`tew/hardware/cpu_zig.py`) called the native
+`cpu_clear_halted` (`cpu/src/cpu.zig`) unconditionally whenever `cpu.faulted`
+was cleared back to `False` -- the emulator's SEH-resume path does exactly
+this after deciding a CPU fault was "handled." `cpu_clear_halted` cleared
+native `s.halted` regardless of `fatal_halt`, desyncing it from the
+Python-side sticky flags every other check in the codebase reads (every
+*other* halt-clearing call site was already guarded with
+`if not cpu.fatal_halt:` -- confirmed via grep this was the one unguarded
+site). `cpu_run`'s own per-instruction loop obeys native `s.halted`, not the
+Python property, so later `cpu.run()` calls (notably
+`_invoke_emulated_proc`'s polling loop, which calls `cpu.run()` before
+re-checking halted state) genuinely executed more real instructions.
+
+Fixed at the CPU/Zig layer rather than with another Python-level guard --
+discussed at length and a deliberate choice, not the default one. `fatal_halt`
+has no real x86 analog (there's no hardware concept of "an unimplemented
+Win32 API"), but this emulator models exactly one physical core, so once it
+fires, nothing should be able to hand the core to a different thread as if
+it were merely idling -- scattered Python-level `if not cpu.fatal_halt:`
+checks before every halt-clearing call site is exactly the pattern that let
+this bug through in the first place, and a Plan agent's alternative
+recommendation (a pure-Python guard on the `faulted` setter, matching that
+same idiom) was explicitly overridden for the same reason.
+
+Added a new native `fatal_halted` field on `CpuState` (`cpu/src/core.zig`),
+a dedicated `cpu_set_fatal_halt`/`cpu_is_fatal_halted` pair with deliberately
+no clear path, made `cpu_clear_halted` and `cpu_run`'s loop condition respect
+it, and made every register/eflags/FPU setter (`cpu_set_reg`, `cpu_set_eip`,
+`cpu_set_eflags`, `cpu_fpu_set*`) refuse to write once set -- reads stay
+completely open, so diagnostics can still inspect the frozen state. This
+also neutralizes a second bug found along the way: `_invoke_emulated_proc`'s
+cleanup path unconditionally calls `cpu.restore_state(saved)` even when
+fatally halted, which would silently overwrite the real failure-point EIP/
+registers with their pre-nested-call values before any diagnostic saw them;
+that write is now just a no-op. `tew/kernel/scheduler.py`'s `preempt_slice`
+and the four other CPU-state-mutating entry points
+(`block_current_on_cs`/`block_current_on_handles`/`sleep_current`/
+`mark_current_dead`) now also refuse to act once fatally halted, for
+defense-in-depth consistency, though none were concretely reachable
+post-fatal-halt once the native fix landed.
+
+Live-verified against the exact `CoGetMalloc` scenario from the previous
+session: the run now stops dead at
+`[UNIMPLEMENTED] ole32.dll!CoGetMalloc — halting` with zero further
+scheduler activity (`grep`-confirmed no `switch:`/`[alive]` lines follow),
+and the Halt Diagnostic shows the full, accurate 7-frame call chain at the
+true failure point (`DllGetClassObject` → `_invoke_emulated_proc`'s own
+sentinel → `Dbcode_InitDao` → `DBThreadCpp` → thread wrapper →
+`THREAD_SENTINEL`) instead of the old shallow, unrelated, later trace.
+
+Added `tests/unit/hardware/test_cpu_zig_fatal_halt.py` (real `ZigCPU`, no
+mocks -- the original bug was a native-state desync a mocked CPU can't
+reproduce) and a `TestPreemptSlice` class in `test_scheduler.py`. Verified
+both fail against a rebuilt pre-fix `libcpu.so` and pass against the fix
+(stashed the Zig/Python changes, rebuilt, confirmed 4 failures; restored,
+rebuilt, confirmed all pass). 589/589 tests passing.
+
+Also documented (not yet fixed, deferred, unrelated to the above): while
+figuring out what "real CPU" this should match, traced `cpu/src/two_byte.zig`'s
+`CPUID` handler against actual Intel datasheets (Pentium Pro's feature table,
+Pentium II OverDrive's CPUID table) and found it doesn't self-consistently
+identify as any real chip. Since MMX is a hard requirement and Pentium Pro's
+own documented feature set has no MMX bit at all, the correct target is real
+Pentium II (Family 6, Model 3 "Klamath" or Model 5 "Deschutes") -- reconciles
+with `memory/status.md`'s existing "Pentium II instruction set" header, which
+was already right; only the actual `CPUID` value (currently `0x00000600`,
+should be `0x00000630`/`0x00000650`) and the "source of truth" reference
+(currently the unrelated 80386 manual) need correcting. Blocked on locating
+the exact Pentium II spec manual to confirm Model/Stepping.
+
 ## 2026-07-22 (later session) — Root-caused the *ppv NULL mystery:
 CoGetMalloc is unimplemented; found a related hr/S_OK sentinel collision
 along the way

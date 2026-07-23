@@ -313,6 +313,8 @@ class Scheduler:
 
         Returns True if a context switch occurred.
         """
+        if cpu.fatal_halt:
+            return False  # single core, fatally locked up -- nothing to hand it to
         current = self.threads[self.current_idx]
         if current.status != ThreadStatus.READY:
             return False  # Thread blocked mid-batch; switch already happened.
@@ -334,6 +336,8 @@ class Scheduler:
         retry_eip should be the address of the INT 0xFE stub (cpu.eip - 2)
         so the EnterCriticalSection call is retried when this thread resumes.
         """
+        if cpu.fatal_halt:
+            return  # single core, fatally locked up -- nothing left to block/resume
         thread = self.threads[self.current_idx]
         thread.waiting_on_cs = cs_ptr
         thread.status = ThreadStatus.BLOCKED_CS
@@ -361,6 +365,8 @@ class Scheduler:
         retry_eip should be the stub address (cpu.eip - 2) so the Wait call
         is retried when this thread is unblocked.
         """
+        if cpu.fatal_halt:
+            return  # single core, fatally locked up -- nothing left to block/resume
         thread = self.threads[self.current_idx]
         thread.waiting_on_handles = handles
         thread.wait_deadline_ms = deadline_ms
@@ -392,6 +398,8 @@ class Scheduler:
         return_eip is the caller's return address (past the Sleep stub) so the
         thread resumes as if Sleep just returned.  eax_val is Sleep's return value.
         """
+        if cpu.fatal_halt:
+            return  # single core, fatally locked up -- nothing left to sleep/resume
         thread = self.threads[self.current_idx]
         cpu.eip = return_eip
         cpu.regs[EAX] = eax_val
@@ -417,6 +425,8 @@ class Scheduler:
 
         If no threads remain, sets cpu.halted = True (process exit).
         """
+        if cpu.fatal_halt:
+            return  # single core, fatally locked up -- no thread state to update
         thread = self.threads[self.current_idx]
         thread.status = ThreadStatus.DEAD
         thread.saved_state = None

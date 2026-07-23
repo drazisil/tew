@@ -289,6 +289,40 @@ class TestSwitchTo:
         cpu.save_state.assert_not_called()
 
 
+# ── preempt_slice ─────────────────────────────────────────────────────────────
+
+class TestPreemptSlice:
+    def test_switches_to_next_ready_thread(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        mem = make_memory()
+
+        result = s.preempt_slice(cpu, mem)
+
+        assert result is True
+        assert s.current_idx == 1
+
+    def test_does_nothing_when_fatally_halted(self):
+        # Single core, fatally locked up: preempt_slice must not hand
+        # execution to a different thread as if the core were merely idling.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        cpu.fatal_halt = True
+        mem = make_memory()
+
+        result = s.preempt_slice(cpu, mem)
+
+        assert result is False
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+
+
 # ── block_current_on_cs ───────────────────────────────────────────────────────
 
 class TestBlockCurrentOnCs:
