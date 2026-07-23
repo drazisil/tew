@@ -350,6 +350,10 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(2, _ord2)
 
+    # Ordinal 4 — SysAllocStringLen (same handler as the named export above;
+    # DAO350.DLL imports OLEAUT32 by ordinal, not by name)
+    _ole_ord(4, _SysAllocStringLen)
+
     # Ordinal 6 — SysFreeString(bstr) -> void
     def _ord6(cpu: "CPU") -> None:
         cleanup_stdcall(cpu, memory, 4)

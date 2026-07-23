@@ -1497,6 +1497,23 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = dst
         cleanup_stdcall(cpu, memory, 8)
 
+    def _lstrcmp_w(cpu: "CPU") -> None:
+        p1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        p2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        result = 0
+        i = 0
+        while True:
+            c1 = memory.read16((p1 + i * 2) & 0xFFFFFFFF) if p1 else 0
+            c2 = memory.read16((p2 + i * 2) & 0xFFFFFFFF) if p2 else 0
+            if c1 != c2:
+                result = -1 if c1 < c2 else 1
+                break
+            if c1 == 0:
+                break
+            i += 1
+        cpu.regs[EAX] = result & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 8)
+
     def _local_alloc(cpu: "CPU") -> None:
         flags  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_bytes = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -1530,13 +1547,33 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
+    def _global_lock(cpu: "CPU") -> None:
+        # _global_alloc above always hands out fixed (non-moveable) memory --
+        # a direct pointer, not a real HGLOBAL needing indirection -- so
+        # locking it is the real-Windows-documented no-op for fixed memory:
+        # GlobalLock just returns the same pointer back.
+        h_mem = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cpu.regs[EAX] = h_mem
+        cleanup_stdcall(cpu, memory, 4)
+
+    def _global_unlock(cpu: "CPU") -> None:
+        # Same rationale as _global_lock: fixed memory has no real lock
+        # count to decrement. Real Windows returns FALSE here for fixed
+        # memory (GetLastError == NO_ERROR), which real callers already
+        # treat as "not an error", not "still locked".
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 4)
+
     stubs.register_handler("kernel32.dll", "SetErrorMode", _set_error_mode)
     stubs.register_handler("kernel32.dll", "lstrlenA",     _lstrlen_a)
     stubs.register_handler("kernel32.dll", "lstrcpyA",     _lstrcpy_a)
+    stubs.register_handler("kernel32.dll", "lstrcmpW",     _lstrcmp_w)
     stubs.register_handler("kernel32.dll", "LocalAlloc",   _local_alloc)
     stubs.register_handler("kernel32.dll", "LocalFree",    _local_free)
     stubs.register_handler("kernel32.dll", "GlobalAlloc",  _global_alloc)
     stubs.register_handler("kernel32.dll", "GlobalFree",   _global_free)
+    stubs.register_handler("kernel32.dll", "GlobalLock",   _global_lock)
+    stubs.register_handler("kernel32.dll", "GlobalUnlock", _global_unlock)
 
     # ── Heap / handle ops ─────────────────────────────────────────────────────
 

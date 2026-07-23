@@ -4,6 +4,57 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-23 (night session) — oleaut32.dll ordinal #4, lstrcmpW, GlobalLock/
+GlobalUnlock: DAO's entire COM activation chain now completes and returns
+to the game's own code
+
+Continued straight from the evening session's fatal_halt exception work,
+live-verifying against the real `dao350.dll` after each fix:
+
+1. **`oleaut32.dll` ordinal #4** (`SysAllocStringLen`) — same missing-
+   ordinal-alias shape as #15/#21 fixed earlier today; aliased to the
+   existing named-export handler, no new logic
+   (`tew/api/oleaut32_handlers.py`).
+
+With that fixed, DAO's `CoGetClassObject` ×2 and `CoCreateInstance` all
+complete with real, non-fake results (`hr=0x80040112`, matching every
+prior run — no regression), and for the first time execution genuinely
+**returns to `MCity_d.exe`'s own code** (EBP chain frames show `← exe`
+instead of `← DAO350.DLL`) — the "ole32 block" that motivated this whole
+multi-day investigation is fully cleared.
+
+Two more gaps found immediately after, both in the game's own code path
+rather than DAO internals:
+
+2. **`kernel32.dll!lstrcmpW`** — real UTF-16 word-by-word comparison,
+   standard strcmp-style sign semantics (`tew/api/kernel32_io.py`,
+   alongside the existing `lstrlenA`/`lstrcpyA`).
+3. **`kernel32.dll!GlobalLock`/`GlobalUnlock`** — implemented as
+   pass-through no-ops. Correct per real Windows' own documented behavior
+   for fixed (non-moveable) memory, which is all this emulator's
+   `GlobalAlloc` has ever handed out (a direct pointer via
+   `state.simple_alloc`, no true `HGLOBAL` indirection) — `GlobalUnlock`
+   added proactively alongside `GlobalLock` since real callers always pair
+   them and it's equally trivial.
+
+593/593 tests passing throughout (no new tests this session — all three
+fixes are simple enough that live verification against real `dao350.dll`
+was judged sufficient, consistent with how ordinals #15/#21/#4 were
+handled).
+
+**New blocker found, a genuinely different shape than every fix above**:
+right after `CoCreateInstance` succeeds, DAO starts probing for the Jet
+database engine DLL and locks onto
+`GetProcAddress("msjter35.dll", "ordinal#2") -> NULL` — repeated 7,005
+times verbatim with zero progress, burning the full 500,000,000-step
+budget without ever halting. Not a missing-API halt; a genuine busy-loop.
+`msjter35.dll` was flagged in status.md months ago as "referenced by
+`dao350.dll`, never analyzed, never reached" — now actually reached, and
+it hangs rather than failing cleanly. Not yet investigated. See status.md
+"Current status"/queued issues for the specific open questions.
+
+---
+
 ## 2026-07-23 (evening session) — `_invoke_emulated_proc`'s "didn't complete"
 `0`-return sentinel replaced with a raised exception
 

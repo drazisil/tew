@@ -39,11 +39,32 @@ that any `HRESULT`-returning caller could misread as `S_OK`. Full detail:
 changelog.md, "2026-07-23 (evening session) — `_invoke_emulated_proc`'s
 'didn't complete' `0`-return sentinel replaced with a raised exception."
 
-**Current blocker**: `[UNIMPLEMENTED] oleaut32.dll!Ordinal #4 — halting`,
-hit immediately after the three fixes above while live-verifying them —
-almost certainly the same "named export exists, ordinal alias missing"
-shape as #15/#21 (ordinal 4 = `SysAllocStringLen`, whose named export
-already exists in `oleaut32_handlers.py`). See Queued issues, top item.
+With `oleaut32.dll` ordinal #4 (`SysAllocStringLen`) also fixed the same
+way as #15/#21, DAO's entire COM activation chain now completes cleanly
+end-to-end: `CoGetClassObject` ×2 and `CoCreateInstance` all return real,
+non-fake results, and execution genuinely **returns to the game's own
+code** (`MCity_d.exe`) for the first time — the "ole32 block" that
+motivated this whole multi-day investigation is fully cleared. Two more
+small gaps found and fixed live-verifying that: `kernel32.dll!lstrcmpW`
+(real UTF-16 comparison, `kernel32_io.py`) and `kernel32.dll!GlobalLock`/
+`GlobalUnlock` (pass-through no-ops, correct for the fixed/non-moveable
+memory this emulator's `GlobalAlloc` always hands out).
+
+**Current blocker, a different shape than the last several**: not a
+missing API, a genuine busy-loop. Right after `CoCreateInstance` succeeds,
+DAO starts probing for the Jet database engine DLL and locks onto
+`GetProcAddress("msjter35.dll", "ordinal#2") -> NULL` — repeated **7,005
+times** verbatim with zero progress, burning the entire 500,000,000-step
+budget without ever halting or falling back. (`msjter35.dll` was flagged
+in this file months ago as "referenced by `dao350.dll`, never analyzed,
+never reached" — now it's actually been reached, and hitting it hangs
+rather than failing cleanly.) Not yet investigated: whether
+`msjter35.dll`/`msjet35.dll` gets a `LoadLibraryA` call that "succeeds"
+with a bogus handle (making `GetProcAddress` look retryable when it
+shouldn't be), whether DAO's real decompiled loop logic is waiting on
+something that can never happen in this emulator, or whether a real Jet
+3.5 DLL file (the same pattern used for `dao350.dll`) needs to be
+supplied. See Queued issues, top item.
 
 593/593 tests passing (reconfirmed 2026-07-23).
 
@@ -67,14 +88,21 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: implement `oleaut32.dll` ordinal #4
-  (`SysAllocStringLen`) — new blocker found live-verifying the `CoGetMalloc`
-  fix, see "Current status." Almost certainly the same "named export
-  exists, ordinal alias missing" shape as ordinals 15/21 fixed 2026-07-23 —
-  the named `SysAllocStringLen` handler already exists in
-  `oleaut32_handlers.py`, just needs `_ole_ord(4, ...)` wired to it, pending
-  confirmation it doesn't need different stack-argument handling than the
-  ordinal-2 (`SysAllocString`) sibling already there.
+- **New top priority**: root-cause the `msjter35.dll` `GetProcAddress`
+  busy-loop — see "Current status." Different shape than every fix so far
+  today (all single missing-API halts): this is a genuine hang, 7,005
+  identical `GetProcAddress("msjter35.dll", "ordinal#2") -> NULL` calls
+  with zero progress, burning the full step budget. First things to check:
+  (1) does `msjter35.dll`/`msjet35.dll` get a `LoadLibraryA` call, and does
+  it "succeed" with a handle that shouldn't exist (making the retry loop
+  look plausible instead of hitting an immediate, honest failure); (2) what
+  does `dao350.dll`'s real decompiled loop around this call actually check
+  to decide whether to keep retrying vs. give up; (3) whether this needs a
+  real Jet 3.5 DLL file supplied, the same pattern used for `dao350.dll`
+  itself (`_KNOWN_COM_SERVERS`/`_KNOWN_COM_SERVER_DIR` in
+  `oleaut32_handlers.py` — though `msjter35.dll` is loaded directly by
+  DAO via `LoadLibrary`, not through COM activation, so may need a
+  different mechanism entirely).
 - Revisit `SafeArrayLock`/`SafeArrayUnaccessData` (`oleaut32.dll` ordinals
   21/24, `oleaut32_handlers.py`) at some point — both are hardcoded no-ops
   returning `S_OK` with no real lock-count tracking, harmless only because
