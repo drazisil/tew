@@ -4,6 +4,142 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-23 (evening session) — `_invoke_emulated_proc`'s "didn't complete"
+`0`-return sentinel replaced with a raised exception
+
+Implemented the design agreed earlier the same day (see the previous
+entry's "sentinel collision" discussion, and the full design that was
+saved to status.md pending a prerequisite task): `cpu.fatal_halt` newly
+becoming true during a call now makes `CPU.run()`/`CPU.step()`
+(`tew/hardware/cpu_zig.py`) raise a new `FatalHaltError` instead of just
+returning, so a fatally-halted nested call can no longer be silently
+misread as a real return value downstream.
+
+`_lib.cpu_run` (the actual FFI call into Zig) has exactly two callers in
+the whole codebase, both inside `CPU.run()`/`CPU.step()` — every other
+caller (`_invoke_emulated_proc`, `seh.py`'s `_invoke_handler`, the
+top-level loop in `run_exe.py`) goes through those, never touches Zig
+directly, so that's the one chokepoint the check needed adding to instead
+of the 94 scattered `cpu.halted = True` call sites. The exact condition:
+capture `was_fatal = self.fatal_halt` before calling `_lib.cpu_run`, raise
+only if it's newly `True` afterward. This distinction matters and is
+directly tested: an *already*-fatally-halted CPU at entry must stay a
+silent no-op (the existing `test_cpu_zig_fatal_halt.py` tests from the
+morning session already assert exactly this and would have caught a naive
+"raise whenever fatal_halt is true" implementation). Deliberately **not**
+raised for plain `cpu.faulted` — that stays a polled, SEH-recoverable
+flag; `run_exe.py`'s main loop still gives it to `seh.py`'s
+`dispatch_exception` for a real recovery attempt before giving up.
+
+`_invoke_emulated_proc` (`user32_handlers.py`) needed no new logic, only
+deletions: its `if cpu.fatal_halt: break` loop-exit and the matching
+`elif cpu.fatal_halt and ...` branch in the "not genuinely_completed"
+reporting are now unreachable (the exception already leaves the function
+before either could run) and were removed, along with the now-always-true
+`if not cpu.fatal_halt:` guard on the final `cpu.halted = False` cleanup.
+`seh.py` and `_c_int_dispatch` needed zero changes -- reasoned through
+ahead of time and confirmed live: Win32 handlers run as native ctypes
+callbacks, which must catch any Python exception before it crosses back
+into C, so when the exception escapes a handler mid-callback it's caught
+there and discarded same as always; that's harmless because `fatal_halt`
+is already permanently set by then, and the *next* `cpu.run()`/`cpu.step()`
+call anywhere further up the (non-callback) Python stack sees it and
+raises again, re-escaping at each ctypes boundary until it reaches
+ordinary Python. `run_exe.py`'s top-level loop is the single real `except
+FatalHaltError` for the whole program -- catches it, logs a one-line note,
+and falls through into the existing (unchanged) watchpoint/faulted/halted
+post-run reporting, since `cpu.halted` is guaranteed true by then and that
+code already does the right thing.
+
+Added 5 new tests: `CPU.run()`/`CPU.step()` raise when fatal_halt newly
+fires mid-call (via a real `INT 0xFE` dispatch, not a mock), an
+already-halted CPU stays a no-op, and a new
+`test_invoke_emulated_proc_fatal_halt.py` exercising the full propagation
+path end-to-end (a nested call hitting a fake unimplemented handler now
+raises out of `_invoke_emulated_proc` instead of returning `0`). 593/593
+tests passing.
+
+Live-verified against the real `oleaut32.dll!Ordinal #4` blocker
+(`SysAllocStringLen`, still unfixed, next up): the halt now surfaces as
+`[UNIMPLEMENTED] oleaut32.dll!Ordinal #4 — halting` → `Fatal halt: fatal
+halt at EIP=0x00209022` → one clean `Halt Diagnostic`, no duplication, run
+exits immediately. Also reconfirmed the `CoGetMalloc`/ordinal-15/21 fixes
+from earlier today still produce genuine non-NULL `*ppv` and a real
+`hr=0x80040112` all the way up to this blocker -- no regression introduced
+by this refactor.
+
+---
+
+## 2026-07-23 (later session) — CoGetMalloc/IMalloc implemented; DAO `*ppv`
+NULL mystery resolved as a side effect
+
+Picked up the top-priority queued item from earlier today: `ole32.dll!
+CoGetMalloc` had no handler at all, and `dao350.dll`'s `DllGetClassObject`
+helper-object init calls it as its very first real dependency. Implemented
+in `tew/api/oleaut32_handlers.py` as a lazily-allocated singleton `IMalloc`
+COM object (real COM vtable dispatch via the same `register_handler`/
+`get_handler_address` trampoline mechanism D3D8's fake COM objects use, not
+a Python-only shortcut) — `AddRef`'d on every `CoGetMalloc` call like real
+Windows, with `Alloc`/`Realloc`/`Free`/`GetSize`/`DidAlloc` sharing
+`state.simple_alloc` + `heap_alloc_sizes` bookkeeping with `HeapAlloc`/
+`HeapFree`/`HeapSize` (`kernel32_memory.py`) so answers are consistent
+across both allocators rather than a second, disagreeing bump heap.
+
+Live-verifying this (per the emu32 skill's tee-once-grep-many workflow, one
+short focused run per fix) surfaced two more, smaller gaps in the same
+`DllGetClassObject` call path, both the identical shape — a named
+`oleaut32.dll` export already implemented, but no ordinal alias registered
+for it, so DAO's ordinal-only imports hit the auto-generated
+`[UNIMPLEMENTED] ... — halting` stub instead:
+- **Ordinal #15** (`SafeArrayCreate`) — aliased to the existing
+  `_SafeArrayCreate` handler, no new logic.
+- **Ordinal #21** (`SafeArrayLock`) — implemented as a no-op returning
+  `S_OK`, following the precedent `SafeArrayUnaccessData` already set two
+  lines above it (this emulator tracks no lock count anywhere).
+
+With all three fixes in place, live-verified: `DllGetClassObject` now
+genuinely completes its real `QueryInterface` call and writes `*ppv` for
+real (`MOV [ECX],EAX (*ppv=this)` at `0x0447d458`, non-NULL), across three
+separate `CoGetClassObject`/`CoCreateInstance` calls for different riids —
+**resolving the `*ppv`-stays-NULL mystery** that the 2026-07-19/21
+investigation (see status.md "Background") had statically diagnosed but
+left blocked on `tid=1012`'s premature death (fixed 2026-07-21) and then on
+`CoGetMalloc` itself. Root cause confirmed exactly as the 2026-07-22 entry
+below predicted: `dao350.dll`'s helper-object init chain was aborting on
+missing dependencies before ever reaching its own (statically-verified-
+correct) `QueryInterface` code, and `_invoke_emulated_proc`'s bare-`0`-on-
+abort sentinel was indistinguishable from a genuine `S_OK`, disguising the
+abort as a clean "success with NULL `*ppv`" — not a bug in DAO's own code
+at all, as suspected.
+
+Next real blocker, immediately after: `oleaut32.dll!Ordinal #4`
+(`SysAllocStringLen`) — almost certainly the same missing-ordinal-alias
+shape as #15/#21 above; not yet fixed. Also noticed but not fixed: two
+leftover debug logpoint callbacks from the earlier investigation
+(`_log_dao_tlssetvalue_call`, `_log_dao_init_shortcut_check` in
+`run_exe.py`) now throw on every call (`AttributeError: 'LP_c_ubyte' object
+has no attribute 'read32'`, silently swallowed by ctypes) — harmless but
+noisy, low priority. See status.md "Current status" for full detail.
+
+589/589 tests still passing throughout (no test changes this session — all
+three fixes verified live against the real `dao350.dll` binary rather than
+via new unit tests, consistent with this investigation's existing
+verification style).
+
+Follow-up cleanup: removed all five now-resolved TEMP diagnostic logpoints
+from `run_exe.py` (`_log_dgco_entry`/`_log_dgco_call_queryinterface`/
+`_log_dgco_call_release`/`_log_qi_ppv_write` for the `*ppv` investigation
+just closed above; `_log_dao_init_shortcut_check`/`_log_dao_tlssetvalue_call`
+for the superseded `TlsSetValue`-skip hypothesis; `_log_isdbcs_call` for the
+`tid=1012` investigation resolved 2026-07-21) — each was explicitly marked
+"TEMP -- discard once root-caused/confirmed" in its own comment, and the two
+`_log_dao_*` ones had gone stale, throwing `AttributeError: 'LP_c_ubyte'
+object has no attribute 'read32'` on every call. Also dropped the
+now-unused `EAX`/`ECX`/`ESI` register-constant imports these left behind.
+589/589 tests still passing.
+
+---
+
 ## 2026-07-23 — cpu.fatal_halt is now a real, unclearable native CPU lockup
 
 Picked up directly from the previous session's discovery that execution

@@ -399,6 +399,21 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(12, _ord12)
 
+    # Ordinal 15 — SafeArrayCreate (same handler as the named export above;
+    # DAO350.DLL imports OLEAUT32 by ordinal, not by name)
+    _ole_ord(15, _SafeArrayCreate)
+
+    # Ordinal 21 — SafeArrayLock(psa) -> HRESULT
+    # Spec: increments the array's lock count to pin pvData in place. Like
+    # SafeArrayUnaccessData above, we don't track locks -- nothing in this
+    # emulator moves/frees a SAFEARRAY's data out from under a caller, so a
+    # harmless no-op returning S_OK is sufficient.
+    def _ord21(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # S_OK
+        cleanup_stdcall(cpu, memory, 4)
+
+    _ole_ord(21, _ord21)
+
     # Ordinal 82 — VarR8FromCy(cyIn, pdblOut) -> HRESULT
     def _ord82(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VarR8FromCy (Ordinal 82) — halting")
@@ -482,6 +497,141 @@ def register_oleaut32_ole32_handlers(
         cleanup_stdcall(cpu, memory, 0)
 
     stubs.register_handler("ole32.dll", "CoUninitialize", _CoUninitialize)
+
+    # ── ole32.dll — CoGetMalloc / IMalloc ───────────────────────────────────────
+    # The process-wide task allocator real COM code fetches via CoGetMalloc.
+    # Previously unimplemented entirely -- dao350.dll's DllGetClassObject
+    # helper-object init (FUN_044947fc) calls this as its very first real
+    # dependency and hit an [UNIMPLEMENTED] fatal halt long before reaching
+    # QueryInterface/*ppv (see memory/status.md, "Current status 2026-07-22").
+    # A single lazily-allocated singleton object is returned on every call,
+    # AddRef'd each time, matching real CoGetMalloc semantics (always the same
+    # IMalloc*, refcounted like any other COM interface). Alloc/Realloc/Free
+    # ride the same state.simple_alloc bump allocator + heap_alloc_sizes
+    # bookkeeping that HeapAlloc/HeapFree/HeapSize already use (kernel32_memory.py)
+    # so GetSize/DidAlloc report real, consistent answers.
+
+    IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046"
+    IID_IMALLOC  = "00000002-0000-0000-c000-000000000046"
+
+    _imalloc_box = {"obj_addr": 0, "refcount": 0}
+
+    def _com_method(name: str, handler, stack_arg_bytes: int) -> int:
+        """Register an IMalloc vtable method ('this' pushed on stack as an
+        implicit first arg, standard COM __stdcall ABI) and return its
+        trampoline address."""
+        def _h(cpu: "CPU") -> None:
+            handler(cpu)
+            cleanup_stdcall(cpu, memory, 4 + stack_arg_bytes)
+        stubs.register_handler("ole32", name, _h)
+        return stubs.get_handler_address("ole32", name) or 0
+
+    def _imalloc_query_interface(cpu: "CPU") -> None:
+        riid = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        ppv  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        riid_str = _read_guid_str(riid)
+        if riid_str in (IID_IUNKNOWN, IID_IMALLOC):
+            if ppv:
+                memory.write32(ppv, _imalloc_box["obj_addr"])
+            _imalloc_box["refcount"] += 1
+            logger.info("com", f"IMalloc::QueryInterface({{{riid_str}}}) -> S_OK")
+            cpu.regs[EAX] = S_OK
+        else:
+            if ppv:
+                memory.write32(ppv, 0)
+            logger.info("com", f"IMalloc::QueryInterface({{{riid_str}}}) -> E_NOINTERFACE")
+            cpu.regs[EAX] = E_NOINTERFACE
+
+    def _imalloc_add_ref(cpu: "CPU") -> None:
+        _imalloc_box["refcount"] += 1
+        cpu.regs[EAX] = _imalloc_box["refcount"] & 0xFFFFFFFF
+
+    def _imalloc_release(cpu: "CPU") -> None:
+        _imalloc_box["refcount"] = max(0, _imalloc_box["refcount"] - 1)
+        cpu.regs[EAX] = _imalloc_box["refcount"] & 0xFFFFFFFF
+
+    def _imalloc_alloc(cpu: "CPU") -> None:
+        cb = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        addr = state.simple_alloc(cb or 1)
+        cpu.regs[EAX] = addr & 0xFFFFFFFF
+
+    def _imalloc_realloc(cpu: "CPU") -> None:
+        pv = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        cb = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if pv == 0:
+            cpu.regs[EAX] = state.simple_alloc(cb or 1) & 0xFFFFFFFF if cb else 0
+            return
+        if cb == 0:
+            state.heap_alloc_sizes.pop(pv, None)
+            cpu.regs[EAX] = 0
+            return
+        old_size = state.heap_alloc_sizes.get(pv)
+        if old_size is None:
+            logger.error("com", f"IMalloc::Realloc — untracked pointer 0x{pv:08x} — halting")
+            cpu.halted = True
+            return
+        new_addr = state.simple_alloc(cb)
+        for i in range(min(old_size, cb)):
+            memory.write8(new_addr + i, memory.read8(pv + i))
+        state.heap_alloc_sizes.pop(pv, None)
+        cpu.regs[EAX] = new_addr & 0xFFFFFFFF
+
+    def _imalloc_free(cpu: "CPU") -> None:
+        pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        if pv == 0:
+            return
+        if pv not in state.heap_alloc_sizes:
+            logger.error("com", f"IMalloc::Free — untracked pointer 0x{pv:08x} — halting")
+            cpu.halted = True
+            return
+        del state.heap_alloc_sizes[pv]
+
+    def _imalloc_get_size(cpu: "CPU") -> None:
+        pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        sz = state.heap_alloc_sizes.get(pv)
+        cpu.regs[EAX] = sz if sz is not None else 0xFFFFFFFF
+
+    def _imalloc_did_alloc(cpu: "CPU") -> None:
+        pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        cpu.regs[EAX] = 1 if pv in state.heap_alloc_sizes else 0
+
+    def _imalloc_heap_minimize(cpu: "CPU") -> None:
+        pass  # no-op, void return — bump allocator has nothing to minimize
+
+    def _get_imalloc_obj() -> int:
+        if _imalloc_box["obj_addr"] == 0:
+            vtable_addr = state.simple_alloc(9 * 4)
+            obj_addr = state.simple_alloc(4)
+            memory.write32(obj_addr, vtable_addr)
+            slots = [
+                _com_method("IMalloc::QueryInterface", _imalloc_query_interface, 8),
+                _com_method("IMalloc::AddRef",         _imalloc_add_ref,         0),
+                _com_method("IMalloc::Release",        _imalloc_release,         0),
+                _com_method("IMalloc::Alloc",           _imalloc_alloc,          4),
+                _com_method("IMalloc::Realloc",         _imalloc_realloc,        8),
+                _com_method("IMalloc::Free",            _imalloc_free,           4),
+                _com_method("IMalloc::GetSize",         _imalloc_get_size,       4),
+                _com_method("IMalloc::DidAlloc",        _imalloc_did_alloc,      4),
+                _com_method("IMalloc::HeapMinimize",    _imalloc_heap_minimize,  0),
+            ]
+            for i, addr in enumerate(slots):
+                memory.write32(vtable_addr + i * 4, addr)
+            _imalloc_box["obj_addr"] = obj_addr
+            logger.info("com", f"IMalloc singleton created @ 0x{obj_addr:08x} (vtable @ 0x{vtable_addr:08x})")
+        return _imalloc_box["obj_addr"]
+
+    # CoGetMalloc(dwMemContext, ppMalloc) -> HRESULT
+    def _CoGetMalloc(cpu: "CPU") -> None:
+        ppmalloc = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = _get_imalloc_obj()
+        _imalloc_box["refcount"] += 1
+        if ppmalloc:
+            memory.write32(ppmalloc, obj_addr)
+        logger.info("com", f"CoGetMalloc -> S_OK *ppMalloc=0x{obj_addr:08x}")
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("ole32.dll", "CoGetMalloc", _CoGetMalloc)
 
     # ── ole32.dll — COM activation ─────────────────────────────────────────────
     # Registry-driven, like real Windows: CoGetClassObject/CoCreateInstance

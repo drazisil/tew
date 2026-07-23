@@ -17,7 +17,9 @@ tests, which passed throughout even though this bug was live.
 """
 from __future__ import annotations
 
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP, EBP
+import pytest
+
+from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP, EBP, FatalHaltError
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 1 * 1024 * 1024
@@ -77,6 +79,60 @@ def test_fatal_halt_cannot_be_cleared():
 
     assert cpu.fatal_halt is True
     assert cpu.halted is True
+
+
+def test_run_raises_when_fatal_halt_newly_fires_mid_call():
+    """(2026-07-23) cpu.run()/cpu.step() are the single chokepoint into the
+    native cpu_run FFI call -- the fix for the sentinel-collision bug
+    (memory/status.md: _invoke_emulated_proc's bare-0-on-abort fallback was
+    indistinguishable from a genuine S_OK to any HRESULT-returning caller,
+    exactly what disguised the CoGetMalloc/ordinal-15/21 aborts as fake
+    DllGetClassObject successes) is to raise here the instant fatal_halt
+    newly becomes true during a call, instead of returning normally and
+    leaving callers to notice via a polled flag."""
+    cpu, mem = _make_cpu()
+    mem.write8(PROC_ADDR, 0xCD)     # INT
+    mem.write8(PROC_ADDR + 1, 0xFE)  # 0xFE -- triggers on_interrupt
+
+    def _handler(int_num: int, c: CPU) -> None:
+        c.halted = True
+        c.fatal_halt = True
+
+    cpu.on_interrupt(_handler)
+
+    with pytest.raises(FatalHaltError):
+        cpu.run(100)
+
+    assert cpu.fatal_halt is True
+
+
+def test_step_raises_when_fatal_halt_newly_fires():
+    cpu, mem = _make_cpu()
+    mem.write8(PROC_ADDR, 0xCD)
+    mem.write8(PROC_ADDR + 1, 0xFE)
+
+    def _handler(int_num: int, c: CPU) -> None:
+        c.halted = True
+        c.fatal_halt = True
+
+    cpu.on_interrupt(_handler)
+
+    with pytest.raises(FatalHaltError):
+        cpu.step()
+
+    assert cpu.fatal_halt is True
+
+
+def test_run_does_not_raise_when_already_fatally_halted_at_entry():
+    """The distinguishing condition is "newly" true -- was_fatal captured at
+    entry. An already-halted CPU (the two tests above this one) must stay a
+    silent no-op, never raise; only a fatal halt that occurs *during* this
+    specific call should."""
+    cpu, mem = _make_cpu()
+    cpu.fatal_halt = True
+
+    cpu.run(100)  # must not raise
+    cpu.step()    # must not raise
 
 
 def test_register_and_flag_writes_are_frozen_but_reads_still_work():

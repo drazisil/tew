@@ -38,6 +38,31 @@ _RUN_HALTED     = 1
 _RUN_FAULTED    = 2
 _RUN_STEP_LIMIT = 3
 
+
+class FatalHaltError(Exception):
+    """Raised by CPU.run()/CPU.step() the moment cpu.fatal_halt newly becomes
+    true during that call -- i.e. it was NOT set when the call started (an
+    already-fatally-halted CPU stays a silent no-op, per fatal_halt's own
+    "must stop the whole session, permanently" contract; see
+    ZigCPU.fatal_halt's docstring). Deliberately not raised for plain
+    cpu.faulted: that stays a polled, SEH-recoverable flag.
+
+    cpu.run()/cpu.step() (tew/hardware/cpu_zig.py) are the only two callers
+    of the native cpu_run FFI call in the whole codebase, so this is the
+    single chokepoint every caller -- _invoke_emulated_proc, seh.py's
+    _invoke_handler, run_exe.py's top-level loop -- funnels through. Win32
+    handlers run as native ctypes callbacks (_c_int_dispatch), which must
+    catch any Python exception before it crosses back into C; when this
+    escapes from inside one, it gets caught there like any other exception
+    and silently discarded -- harmless, because fatal_halt is already
+    permanently set by then and the *next* run()/step() call anywhere
+    further up the (non-callback) Python stack will see it and raise again.
+    It re-raises at each such boundary until it clears the last one and
+    reaches ordinary Python, which is where it should actually be handled."""
+
+
+
+
 # ── Load libcpu.so ────────────────────────────────────────────────────────────
 
 _LIB_PATH = Path(__file__).parent.parent.parent / "cpu" / "zig-out" / "lib" / "libcpu.so"
@@ -404,19 +429,25 @@ class ZigCPU:
 
     def step(self) -> None:
         self._sync_fs_gs()
+        was_fatal = self.fatal_halt
         result = _lib.cpu_run(self._state, 1)
         if result == _RUN_FAULTED and self.last_error is None:
             self.last_error = RuntimeError(
                 f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
             )
+        if self.fatal_halt and not was_fatal:
+            raise FatalHaltError(f"fatal halt at EIP=0x{self.eip & 0xFFFFFFFF:08x}")
 
     def run(self, max_steps: int = 1_000_000) -> None:
         self._sync_fs_gs()
+        was_fatal = self.fatal_halt
         result = _lib.cpu_run(self._state, max_steps)
         if result == _RUN_FAULTED and self.last_error is None:
             self.last_error = RuntimeError(
                 f"CPU fault at EIP=0x{self.eip:08x} opcode=0x{_lib.cpu_get_last_opcode(self._state):02x}"
             )
+        if self.fatal_halt and not was_fatal:
+            raise FatalHaltError(f"fatal halt at EIP=0x{self.eip & 0xFFFFFFFF:08x}")
 
     # ── Register/state properties ─────────────────────────────────────────────
 

@@ -21,7 +21,7 @@ import time
 from os.path import dirname
 
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, ESP, EBP, ESI, REG_NAMES
+from tew.hardware.cpu_zig import ZigCPU as CPU, ESP, EBP, REG_NAMES, FatalHaltError
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.emulator.opcodes import register_all_opcodes
@@ -349,96 +349,6 @@ def _dispatch_breakpoint() -> None:
         cpu.add_breakpoint(hit_eip)
 
 
-# ── TEMP diagnostic: DAO350.DLL DllGetClassObject -> QueryInterface *ppv trace ──
-#
-# Investigating why real dao350.dll's DllGetClassObject returns S_OK but
-# leaves *ppv NULL (see memory/status.md). Raw-disassembly review confirmed
-# the real machine code is calling-convention-correct at every hop and
-# unconditionally writes *ppv on the success path, so the remaining suspects
-# are the two indirect CALLs (opFF /2, CALL r/m32) and the MOV [ECX],EAX
-# write itself. TEMP — discard once root-caused, not meant to ship.
-def _log_dgco_call_queryinterface(eip, regs, memory, memory_size) -> None:
-    logger.error("com", f"[TRACE] 0x{eip:08x} CALL [EAX] (QueryInterface) -- EAX(vtbl)=0x{regs[EAX]:08x} ESP=0x{regs[ESP]:08x}")
-
-def _log_dgco_call_release(eip, regs, memory, memory_size) -> None:
-    logger.error("com", f"[TRACE] 0x{eip:08x} CALL [EAX+8] (Release) -- EAX(vtbl)=0x{regs[EAX]:08x} ESP=0x{regs[ESP]:08x}")
-
-def _log_qi_ppv_write(eip, regs, memory, memory_size) -> None:
-    logger.error("com", f"[TRACE] 0x{eip:08x} MOV [ECX],EAX (*ppv=this) -- ECX(ppv addr)=0x{regs[ECX]:08x} EAX(this)=0x{regs[EAX]:08x}")
-
-def _log_dgco_entry(eip, regs, memory, memory_size) -> None:
-    logger.error("com", f"[TRACE] 0x{eip:08x} DllGetClassObject entry -- ESP=0x{regs[ESP]:08x}")
-
-# Canary: DllGetClassObject's own entry is definitely reached whenever
-# CoGetClassObject logs a real hr from DAO350.DLL. If this doesn't fire
-# either, the bug is systemic to logpoints-during-nested-calls, not these
-# three specific addresses.
-cpu.add_logpoint(0x04478a31, _log_dgco_entry)
-cpu.add_logpoint(0x04478d0d, _log_dgco_call_queryinterface)
-cpu.add_logpoint(0x04478d1b, _log_dgco_call_release)
-cpu.add_logpoint(0x0447d458, _log_qi_ppv_write)
-
-# ── TEMP diagnostic: why FUN_044947fc's per-thread init skips TlsSetValue ──
-#
-# DllGetClassObject's helper-object allocator (FUN_0447d31e) reads a
-# per-thread arena pointer via TlsGetValue(dwTlsIndex), but nothing in
-# DllMain ever calls TlsSetValue for it. FUN_044947fc (called first, before
-# TlsGetValue) DOES call TlsSetValue -- at 0x04494b55 -- but only if it
-# doesn't take an "already initialized" shortcut first. Raw disassembly
-# (Ghidra's decompile of this region was misleading, same as elsewhere in
-# this DLL) shows the shortcut check at 0x04494900 is `CMP [EBP-0x14], 0`
-# -- if that's unexpectedly non-zero on what should be this thread's first
-# call, it wrongly skips straight past the whole init block (including
-# TlsSetValue) as if a real prior call had already set things up. Logging
-# both offsets everywhere to settle which stack slot is "real" here.
-def _log_dao_init_shortcut_check(eip, regs, memory, memory_size) -> None:
-    # 0x04494860: MOV EAX,[EBP-0x1C] (local_20, result of FUN_044d4dd6)
-    # 0x04494863: CMP [EAX+0x30],0 -- ==0 continues real init; !=0 takes the
-    # "already initialized" shortcut straight to LAB_04494b7c, skipping
-    # TlsSetValue entirely. Firing at 0x04494860, before EAX is overwritten.
-    ebp = regs[EBP]
-    local_20 = memory.read32((ebp - 0x1C) & 0xFFFFFFFF)
-    flag = memory.read32((local_20 + 0x30) & 0xFFFFFFFF) if local_20 else None
-    flag_s = f"0x{flag:08x}" if flag is not None else "N/A (local_20 is NULL)"
-    logger.error("com", f"[TRACE] 0x{eip:08x} shortcut-check -- local_20=0x{local_20:08x} [local_20+0x30]={flag_s}")
-
-def _log_dao_tlssetvalue_call(eip, regs, memory, memory_size) -> None:
-    ebp = regs[EBP]
-    local_20 = memory.read32((ebp - 0x1C) & 0xFFFFFFFF)
-    logger.error("com", f"[TRACE] 0x{eip:08x} TlsSetValue(dwTlsIndex, local_20) about to run -- local_20=0x{local_20:08x}")
-
-cpu.add_logpoint(0x04494860, _log_dao_init_shortcut_check)
-cpu.add_logpoint(0x04494b55, _log_dao_tlssetvalue_call)
-
-def _log_fn_entry(name):
-    def _h(eip, regs, memory, memory_size) -> None:
-        logger.error("com", f"[TRACE] 0x{eip:08x} entered {name}")
-    return _h
-
-cpu.add_logpoint(0x0447d31e, _log_fn_entry("FUN_0447d31e (helper-object allocator)"))
-cpu.add_logpoint(0x044947fc, _log_fn_entry("FUN_044947fc (per-thread init)"))
-
-# ── TEMP diagnostic: tid=1012 investigation -- IsDBCSLeadByte via cached ESI ──
-#
-# DllMain (dao350.dll, 0x04479f74) calls FUN_044c63fc, which loads the
-# IAT-resolved IsDBCSLeadByte pointer into ESI ONCE (`MOV ESI,[0x04471074]`)
-# before looping `CALL ESI` 256 times. tew has NO handler registered for
-# IsDBCSLeadByte anywhere. Suspected cause: patch_dll_iats (dll_loader.py,
-# used for secondary DLLs like dao350.dll -- unlike write_iat_handlers for
-# the main EXE) has no fallback for an unmatched import; it silently leaves
-# the IAT slot as whatever raw bytes were in the DLL file, rather than
-# writing a fatal_halt-raising [UNIMPLEMENTED] stub like the main-EXE path
-# does. If so, CALL ESI jumps into that raw, unrelocated placeholder value
-# as if it were code -- explaining why tid=1012 dies with no fatal_halt, no
-# SEH activity, and every intervening real stack frame left untouched (see
-# memory/status.md). This logpoint fires on every iteration to see ESI's
-# actual value and how many of the 256 calls complete before whatever kills
-# the thread. TEMP -- discard once confirmed either way.
-def _log_isdbcs_call(eip, regs, memory, memory_size) -> None:
-    logger.error("thread", f"[TRACE] 0x{eip:08x} CALL ESI (IsDBCSLeadByte?) -- ESI=0x{regs[ESI]:08x} ESP=0x{regs[ESP]:08x}")
-
-cpu.add_logpoint(0x044c6410, _log_isdbcs_call)
-
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
 logger.info("startup", "=== Starting Emulation ===")
@@ -518,99 +428,109 @@ _last_heartbeat_wall_time = time.monotonic()
 _sample_countdown = 1_000_000
 _progress_countdown = 5_000_000
 
-while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
-    eip_before = cpu.eip
-    batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
-    cpu.run(batch)
-    step_count += batch
+try:
+    while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
+        eip_before = cpu.eip
+        batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
+        cpu.run(batch)
+        step_count += batch
 
-    if cpu.faulted:
-        # Give the game's own SEH chain a chance to handle this before
-        # giving up -- see tew/kernel/seh.py. Real Windows would report
-        # this as an access violation; that's the only fault shape this
-        # CPU core currently produces (see core.zig's memRead8/memWrite8),
-        # so it's the honest default rather than a guess.
-        fault_eip = cpu.eip & 0xFFFFFFFF
-        logger.warn("seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
-        handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
-        if handled:
-            logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
-            cpu.faulted = False
-        else:
-            logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
+        if cpu.faulted:
+            # Give the game's own SEH chain a chance to handle this before
+            # giving up -- see tew/kernel/seh.py. Real Windows would report
+            # this as an access violation; that's the only fault shape this
+            # CPU core currently produces (see core.zig's memRead8/memWrite8),
+            # so it's the honest default rather than a guess.
+            fault_eip = cpu.eip & 0xFFFFFFFF
+            logger.warn("seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
+            handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
+            if handled:
+                logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
+                cpu.faulted = False
+            else:
+                logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
 
-    if _bp_handlers:
-        _dispatch_breakpoint()
-    crt_state.scheduler.preempt_slice(cpu, mem)
+        if _bp_handlers:
+            _dispatch_breakpoint()
+        crt_state.scheduler.preempt_slice(cpu, mem)
 
-    _heartbeat_countdown -= batch
-    if _heartbeat_countdown <= 0:
-        _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
-        _run_timer_heartbeat()
+        _heartbeat_countdown -= batch
+        if _heartbeat_countdown <= 0:
+            _heartbeat_countdown = _TIMER_HEARTBEAT_INTERVAL
+            _run_timer_heartbeat()
 
-    _sample_countdown -= batch
-    if _sample_countdown <= 0:
-        _sample_countdown = 1_000_000
-        logger.debug(
-            "watch",
-            f"[EIP sample @ {step_count}] EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
-            f" ESP=0x{cpu.regs[ESP] & 0xFFFFFFFF:08x}",
-        )
+        _sample_countdown -= batch
+        if _sample_countdown <= 0:
+            _sample_countdown = 1_000_000
+            logger.debug(
+                "watch",
+                f"[EIP sample @ {step_count}] EIP=0x{cpu.eip & 0xFFFFFFFF:08x}"
+                f" ESP=0x{cpu.regs[ESP] & 0xFFFFFFFF:08x}",
+            )
 
-    _progress_countdown -= batch
-    if _progress_countdown <= 0:
-        _progress_countdown = 5_000_000
-        eip_now = cpu.eip & 0xFFFFFFFF
-        stub_note = ""
-        if 0x00200000 <= eip_now < 0x00220000:
-            recent = win32_handlers._call_log[-8:]
-            stub_note = f" calls={recent}"
-        logger.info(
-            "startup",
-            f"[alive] step={step_count:,} EIP=0x{eip_now:08x}{stub_note}"
-            f" vtime={crt_state.virtual_ticks_ms}ms",
-        )
+        _progress_countdown -= batch
+        if _progress_countdown <= 0:
+            _progress_countdown = 5_000_000
+            eip_now = cpu.eip & 0xFFFFFFFF
+            stub_note = ""
+            if 0x00200000 <= eip_now < 0x00220000:
+                recent = win32_handlers._call_log[-8:]
+                stub_note = f" calls={recent}"
+            logger.info(
+                "startup",
+                f"[alive] step={step_count:,} EIP=0x{eip_now:08x}{stub_note}"
+                f" vtime={crt_state.virtual_ticks_ms}ms",
+            )
 
-    region = is_valid_eip(cpu.eip)
-    if region:
-        last_valid_step = step_count
-        last_valid_eip = eip_before
-        last_valid_region = region
-    elif not detected_runaway and step_count > 100:
-        detected_runaway = True
-        logger.error("cpu", f"RUNAWAY DETECTED at step {step_count}")
-        logger.error("cpu", f"  Current EIP: 0x{cpu.eip & 0xFFFFFFFF:08x} (INVALID)")
-        logger.error(
-            "cpu",
-            f"  Last valid step: {last_valid_step},"
-            f" EIP: 0x{last_valid_eip & 0xFFFFFFFF:08x} in {last_valid_region}",
-        )
-        try:
-            raw = [f"{mem.read8(cpu.eip + i):02x}" for i in range(16)]
-            logger.error("cpu", f"  Bytes at EIP: {' '.join(raw)}")
-        except Exception:
-            logger.error("cpu", "  Bytes at EIP: (out of bounds)")
-        logger.error("cpu", "  Registers at crash:")
-        for i in range(8):
-            val = cpu.regs[i] & 0xFFFFFFFF
-            logger.error("cpu", f"    {REG_NAMES[i]}: 0x{val:08x}")
-        esp_val = cpu.regs[ESP] & 0xFFFFFFFF
-        logger.error("cpu", "  Stack at crash (top 32):")
-        for i in range(32):
+        region = is_valid_eip(cpu.eip)
+        if region:
+            last_valid_step = step_count
+            last_valid_eip = eip_before
+            last_valid_region = region
+        elif not detected_runaway and step_count > 100:
+            detected_runaway = True
+            logger.error("cpu", f"RUNAWAY DETECTED at step {step_count}")
+            logger.error("cpu", f"  Current EIP: 0x{cpu.eip & 0xFFFFFFFF:08x} (INVALID)")
+            logger.error(
+                "cpu",
+                f"  Last valid step: {last_valid_step},"
+                f" EIP: 0x{last_valid_eip & 0xFFFFFFFF:08x} in {last_valid_region}",
+            )
             try:
-                slot = mem.read32(esp_val + i * 4) & 0xFFFFFFFF
-                logger.error("cpu", f"    [ESP+{i*4:02x}] 0x{slot:08x}")
+                raw = [f"{mem.read8(cpu.eip + i):02x}" for i in range(16)]
+                logger.error("cpu", f"  Bytes at EIP: {' '.join(raw)}")
             except Exception:
-                break
-        logger.error("cpu", "  Last 30 Win32 handler calls:")
-        for call in win32_handlers.get_call_log()[-30:]:
-            logger.error("cpu", f"    {call}")
-        # Run a few more steps to capture the pattern
-        for _ in range(20):
-            if cpu.halted:
-                break
-            cpu.step()
-            step_count += 1
+                logger.error("cpu", "  Bytes at EIP: (out of bounds)")
+            logger.error("cpu", "  Registers at crash:")
+            for i in range(8):
+                val = cpu.regs[i] & 0xFFFFFFFF
+                logger.error("cpu", f"    {REG_NAMES[i]}: 0x{val:08x}")
+            esp_val = cpu.regs[ESP] & 0xFFFFFFFF
+            logger.error("cpu", "  Stack at crash (top 32):")
+            for i in range(32):
+                try:
+                    slot = mem.read32(esp_val + i * 4) & 0xFFFFFFFF
+                    logger.error("cpu", f"    [ESP+{i*4:02x}] 0x{slot:08x}")
+                except Exception:
+                    break
+            logger.error("cpu", "  Last 30 Win32 handler calls:")
+            for call in win32_handlers.get_call_log()[-30:]:
+                logger.error("cpu", f"    {call}")
+            # Run a few more steps to capture the pattern
+            for _ in range(20):
+                if cpu.halted:
+                    break
+                cpu.step()
+                step_count += 1
+except FatalHaltError as e:
+    # cpu.run()/cpu.step() (tew/hardware/cpu_zig.py) raise this the moment
+    # cpu.fatal_halt newly becomes true anywhere in the call chain, however
+    # deeply nested -- the single real "except" for the whole run, per the
+    # design in memory/status.md. cpu.halted is guaranteed true by the time
+    # this is caught, so the existing watchpoint/faulted/halted reporting
+    # below (unchanged) already does the right thing once control falls
+    # through -- no separate diagnostic call needed here.
+    logger.error("cpu", f"Fatal halt: {e}")
 
 if step_count >= MAX_STEPS:
     logger.warn("cpu", f"Execution limit reached ({MAX_STEPS} steps)")

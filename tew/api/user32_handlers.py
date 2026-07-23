@@ -145,9 +145,6 @@ def _invoke_emulated_proc(
         cpu.run(min(_CHUNK, max_steps - steps_run))
         steps_run += _CHUNK
 
-        if cpu.fatal_halt:
-            break  # must stop everything regardless of which thread caused it
-
         if (scheduler is not None and started_thread_idx is not None
                 and scheduler.threads[started_thread_idx].status == ThreadStatus.DEAD):
             # The thread that made this nested call is dead -- e.g. its stack
@@ -205,20 +202,6 @@ def _invoke_emulated_proc(
                 f"[_invoke_emulated_proc] max_steps={max_steps} exhausted before thread "
                 f"idx={started_thread_idx} completed its nested call to 0x{proc_addr:08x} "
                 "-- returning 0, not leftover EAX from whatever was executing at cutoff")
-        elif cpu.fatal_halt and scheduler is not None and scheduler.current_idx != started_thread_idx:
-            # The fatal-halt loop-exit above (`if cpu.fatal_halt: break`)
-            # fires regardless of which thread caused it -- this one
-            # belongs to a DIFFERENT thread that ran while ours was
-            # legitimately swapped out (e.g. a background timer thread
-            # hitting __chkesp/an unimplemented API). The whole emulator is
-            # stopping regardless (fatal_halt propagates to the main loop),
-            # so the value doesn't matter -- 0 is the safe sentinel every
-            # caller already treats as "didn't complete".
-            logger.error("dialog",
-                f"[_invoke_emulated_proc] fatal halt on thread idx={scheduler.current_idx} "
-                f"(this call started on idx={started_thread_idx}) while nested-calling "
-                f"0x{proc_addr:08x} -- returning 0, not that thread's EAX; see its own "
-                "Halt Diagnostic below for the real cause")
         else:
             # The only remaining case: halted on OUR OWN thread, but not at
             # the sentinel -- some other non-fatal halt fired mid-call.
@@ -231,8 +214,7 @@ def _invoke_emulated_proc(
         result = cpu.regs[EAX]
 
     cpu.restore_state(saved)
-    if not cpu.fatal_halt:
-        cpu.halted = False
+    cpu.halted = False
     return result
 
 
