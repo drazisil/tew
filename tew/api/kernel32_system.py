@@ -6,11 +6,11 @@ import time as _time_module
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
+from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.api._state import CRTState, FileHandleEntry, TEB_BASE
 from tew.logger import logger

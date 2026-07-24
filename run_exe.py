@@ -24,7 +24,6 @@ from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import ZigCPU as CPU, ESP, EBP, REG_NAMES, FatalHaltError
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
-from tew.emulator.opcodes import register_all_opcodes
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
@@ -162,9 +161,7 @@ exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
 
 exe.import_resolver.build_iat_map(exe.import_table, exe.optional_header.image_base)
 
-# ── Register opcodes and Win32 stubs ──────────────────────────────────────────
-
-register_all_opcodes(cpu)
+# ── Register Win32 stubs ──────────────────────────────────────────────────────
 
 win32_handlers = Win32Handlers(mem)
 crt_state = register_crt_handlers(

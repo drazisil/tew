@@ -5,7 +5,7 @@ import pytest
 from tew.api._state import CRTState
 from tew.api.msvcrt_handlers import register_msvcrt_handlers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 
 
 # ── Shared test infrastructure ────────────────────────────────────────────────

@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX, EBX, ECX, EDX, ESI, EDI, ESP, EBP
+from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESI, EDI, ESP, EBP
 from tew.logger import logger
 
 # ── Constants (mirror tew/api/_state.py) ─────────────────────────────────────

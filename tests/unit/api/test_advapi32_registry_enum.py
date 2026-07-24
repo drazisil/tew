@@ -6,7 +6,7 @@ import pytest
 from tew.api._state import CRTState, RegistryEntry
 from tew.api.advapi32_handlers import register_advapi32_handlers, _reg_key_names
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 
 
 class _StubHandlers:

@@ -27,10 +27,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
 from tew.api._state import CRTState

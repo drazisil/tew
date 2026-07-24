@@ -13,10 +13,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX
+from tew.hardware.cpu_zig import EAX
 from tew.logger import logger
 
 # ── Windows XP SP2/SP3 x86-32 syscall name table ────────────────────────────

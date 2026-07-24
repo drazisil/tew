@@ -6,7 +6,7 @@ import pytest
 from tew.api._state import CRTState, MutexHandle
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 
 WAIT_OBJECT_0  = 0x00000000
 WAIT_TIMEOUT   = 0x00000102

@@ -6,7 +6,7 @@ import pytest
 from tew.api._state import CRTState
 from tew.api.kernel32_sync import register_kernel32_sync_handlers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 
 
 class _StubHandlers:
