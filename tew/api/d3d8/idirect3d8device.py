@@ -105,13 +105,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
 
 import struct as _struct
 
-from tew.hardware.cpu import EAX, ECX, ESP
+from tew.hardware.cpu_zig import EAX, ECX, ESP
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
 from tew.api.d3d8._helpers import _alloc_resource_obj, _alloc_surface_obj, _alloc_texture_obj, _com_stub, _set_eax, vk_pump

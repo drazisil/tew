@@ -45,11 +45,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
 from tew.api.d3d8._helpers import _com_stub, _set_eax
 from tew.api.d3d8.idirect3d8resource import _add_ref, _release

@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
     from tew.api._state import EmulatorConfig

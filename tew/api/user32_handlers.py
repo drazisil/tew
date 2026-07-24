@@ -14,13 +14,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.kernel.scheduler import Scheduler
     from tew.loader.dll_loader import DLLLoader
     from tew.api.pe_resources import PEResources
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.kernel.scheduler import ThreadStatus
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState

@@ -8,7 +8,7 @@ from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
 from tew.logger import logger
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.loader.import_resolver import ImportResolver
 
 LogFn = Callable[[str, str], None]

@@ -5,12 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
     from tew.api._state import CRTState
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.api.char_type import GetStringTypeArgs, classify_wide_string
 from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string

@@ -14,11 +14,11 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
 from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
 from tew.logger import logger

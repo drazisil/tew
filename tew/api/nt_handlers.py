@@ -13,11 +13,11 @@ import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.nt_syscall import NtSyscallDispatcher
 
-from tew.hardware.cpu import EAX, EDX
+from tew.hardware.cpu_zig import EAX, EDX
 from tew.logger import logger
 
 STATUS_SUCCESS = 0x00000000

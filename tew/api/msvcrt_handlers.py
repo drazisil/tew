@@ -13,10 +13,10 @@ import struct
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
 from tew.api._state import CRTState, read_cstring, THREAD_SENTINEL
 from tew.logger import logger

@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu import ESP
+from tew.hardware.cpu_zig import ESP
 from tew.logger import logger
 from tew.api.nt_syscall import NtSyscallDispatcher
 

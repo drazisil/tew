@@ -27,12 +27,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
     from tew.api.window_manager import WindowManager
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK

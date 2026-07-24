@@ -40,11 +40,11 @@ def vk_pump(fn):
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu import CPU
+    from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE
 
 # ── D3D8 private bump-heap (separate from CRT heap at 0x04000000) ─────────────

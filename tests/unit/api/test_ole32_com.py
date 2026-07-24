@@ -6,7 +6,7 @@ import pytest
 from tew.api._state import CRTState
 from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
 
 
 class _StubHandlers:
