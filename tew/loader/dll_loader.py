@@ -199,7 +199,7 @@ class DLLLoader:
             f"No available address space for DLL (needed 0x{self._DLL_SIZE:08x} bytes)"
         )
 
-    def _find_dll_file(self, dll_name: str) -> str | None:
+    def find_dll_file(self, dll_name: str) -> str | None:
         for path in self._search_paths:
             full_path = os.path.join(path, dll_name)
             resolved = find_file_ci(full_path)
@@ -221,7 +221,7 @@ class DLLLoader:
         if key in self._loaded_dlls:
             return self._loaded_dlls[key]
 
-        dll_path = self._find_dll_file(dll_name)
+        dll_path = self.find_dll_file(dll_name)
         if not dll_path:
             if dll_name.startswith("api-ms-win-"):
                 logger.debug("dll", f"{dll_name} not found (API forwarding DLL - imports will be resolved at runtime)")
@@ -339,25 +339,37 @@ class DLLLoader:
 
         See patch_iat_entry (module-level) for what happens to an unmatched
         import -- this is the secondary-DLL side of that shared fallback;
-        write_iat_handlers (import_resolver.py) is the main-EXE side.
+        write_iat_handlers (import_resolver.py) is the main-EXE side. Passes
+        the already-resolved real export address (from load_dll) through as
+        real_addr, so a genuine DLL-to-DLL call (e.g. msjet35.dll calling
+        into msjint35.dll) keeps executing as real code unless a Python
+        handler specifically overrides it -- without this, every such call
+        lacking a matching handler was silently clobbered with the
+        unimplemented-stub fallback, even though load_dll had already wired
+        up the correct address.
         """
         patched_count = 0
+        real_count = 0
         auto_handler_count = 0
         for entry in self._dll_iat_entries:
             alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
+            imported_dll = self._loaded_dlls.get(entry.imported_dll_name)
+            real_addr = imported_dll.exports.get(entry.func_name) if imported_dll else None
             outcome = patch_iat_entry(
                 memory, win32_handlers, entry.iat_addr,
-                entry.imported_dll_name, entry.func_name, alias=alias,
+                entry.imported_dll_name, entry.func_name, real_addr=real_addr, alias=alias,
             )
             if outcome == "handler":
                 patched_count += 1
+            elif outcome == "real":
+                real_count += 1
             elif outcome == "auto":
                 auto_handler_count += 1
 
         logger.info(
             "loader",
             f"Patched {patched_count}/{len(self._dll_iat_entries)} DLL IAT entries with stubs "
-            f"({auto_handler_count} auto-stubs for unimplemented imports)",
+            f"({real_count} real DLL exports, {auto_handler_count} auto-stubs for unimplemented imports)",
         )
 
     def patch_dll_exports(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:

@@ -99,6 +99,19 @@ def _reg_build_path(h_key_in: int, sub_key: str) -> str:
     return parent or sub
 
 
+def _reg_list_subkeys(h_key: int, state: "CRTState") -> list[str]:
+    """Immediate child subkey names under h_key, derived from registry_values paths."""
+    parent_path = (_reg_key_names.get(h_key) or "").lower()
+    if parent_path:
+        prefix = parent_path + "\\"
+        return sorted([
+            k[len(prefix):]
+            for k in state.registry_values
+            if k.startswith(prefix) and "\\" not in k[len(prefix):]
+        ])
+    return sorted([k for k in state.registry_values if "\\" not in k])
+
+
 def _reg_query_value(
     key_handle: int,
     value_name: str,
@@ -440,16 +453,7 @@ def register_advapi32_handlers(
         lp_name   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lpch_name = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
 
-        parent_path = (_reg_key_names.get(h_key) or "").lower()
-        if parent_path:
-            prefix  = parent_path + "\\"
-            subkeys = sorted([
-                k[len(prefix):]
-                for k in state.registry_values
-                if k.startswith(prefix) and "\\" not in k[len(prefix):]
-            ])
-        else:
-            subkeys = sorted([k for k in state.registry_values if "\\" not in k])
+        subkeys = _reg_list_subkeys(h_key, state)
 
         if dw_index >= len(subkeys):
             cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
@@ -475,6 +479,35 @@ def register_advapi32_handlers(
         cleanup_stdcall(cpu, memory, 32)
 
     stubs.register_handler("advapi32.dll", "RegEnumKeyExA", _reg_enum_key_ex_a)
+
+    # RegEnumKeyA(hKey, dwIndex, lpName, cchName) - 4 args (16 bytes)
+    # Older, simpler sibling of RegEnumKeyExA: cchName is the buffer size
+    # passed by value (not a pointer to a DWORD), and there's no class/
+    # last-write-time output.
+    def _reg_enum_key_a(cpu: "CPU") -> None:
+        h_key    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        dw_index = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_name  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        cch_name = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        subkeys = _reg_list_subkeys(h_key, state)
+
+        if dw_index >= len(subkeys):
+            cpu.regs[EAX] = ERROR_NO_MORE_ITEMS
+            cleanup_stdcall(cpu, memory, 16)
+            return
+
+        name = subkeys[dw_index]
+        if lp_name and cch_name >= len(name) + 1:
+            _write_ansi_str(lp_name, name, memory)
+            logger.debug("registry", f'RegEnumKeyA(0x{h_key:x}, {dw_index}) -> "{name}"')
+            cpu.regs[EAX] = ERROR_SUCCESS
+        else:
+            logger.debug("registry", f'RegEnumKeyA(0x{h_key:x}, {dw_index}) -> "{name}" (buffer too small)')
+            cpu.regs[EAX] = ERROR_MORE_DATA
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("advapi32.dll", "RegEnumKeyA", _reg_enum_key_a)
 
     # RegEnumValueA(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
     #               lpData, lpcbData) - 8 args (32 bytes)

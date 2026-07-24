@@ -11,12 +11,14 @@ implemented.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from tew.hardware.cpu import CPU
     from tew.hardware.memory import Memory
     from tew.kernel.scheduler import Scheduler
+    from tew.loader.dll_loader import DLLLoader
+    from tew.api.pe_resources import PEResources
 
 from tew.hardware.cpu import EAX, ESP
 from tew.kernel.scheduler import ThreadStatus
@@ -222,10 +224,38 @@ def register_user32_gdi32_handlers(
     stubs: "Win32Handlers",
     memory: "Memory",
     state: "CRTState",
+    dll_loader: Optional["DLLLoader"] = None,
 ) -> None:
     """Register all user32.dll and gdi32.dll handlers."""
 
     wm: WindowManager = state.window_manager
+    _module_resources_cache: dict[str, "PEResources | None"] = {}
+
+    def _resources_for_module(h_instance: int) -> "PEResources | None":
+        """Resolve an HINSTANCE to a PEResources for that module's own .rsrc.
+
+        0x00400000 is the main EXE's fixed load base elsewhere in this
+        codebase (e.g. kernel32_handlers.py's GetProcAddress); anything else
+        is looked up via dll_loader (a real loaded DLL calling back into
+        user32 for its own resources, e.g. MSJET35.DLL/MSJINT35.DLL).
+        """
+        if h_instance == 0x00400000:
+            return state.pe_resources
+        if dll_loader is None:
+            return None
+        loaded = dll_loader.find_dll_for_address(h_instance)
+        if loaded is None:
+            return None
+        if loaded.name in _module_resources_cache:
+            return _module_resources_cache[loaded.name]
+        path = dll_loader.find_dll_file(loaded.name)
+        resources = None
+        if path:
+            from tew.api.pe_resources import PEResources
+            with open(path, "rb") as f:
+                resources = PEResources(f.read())
+        _module_resources_cache[loaded.name] = resources
+        return resources
 
     # ── Win32 hook infrastructure ─────────────────────────────────────────────
     # idHook constants
@@ -794,6 +824,45 @@ def register_user32_gdi32_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "LoadIconA", _LoadIconA)
+
+    # LoadStringA(hInstance, uID, lpBuffer, cchBufferMax) -> int (chars copied)
+    def _LoadStringA(cpu: "CPU") -> None:
+        h_instance = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        u_id       = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        lp_buffer  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        cch_max    = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        if cch_max == 0:
+            # Spec requires lpBuffer be treated as LPSTR* here: write a real
+            # pointer to the resource string's own storage into *lpBuffer,
+            # no copy. We have no stable address for the resource string
+            # (it only exists as a materialized Python str from
+            # PEResources.find_string), so we cannot honestly implement
+            # this path -- silently returning a plausible length with
+            # lpBuffer untouched would hand the caller a garbage pointer.
+            logger.error("handlers", "[UNIMPLEMENTED] LoadStringA(cchBufferMax=0) — halting")
+            cpu.halted = True
+            return
+
+        resources = _resources_for_module(h_instance)
+        text = resources.find_string(u_id) if resources else None
+        if text is None:
+            text = ""
+
+        if lp_buffer:
+            ansi = text.encode("ascii", errors="replace")[: cch_max - 1]
+            for i, b in enumerate(ansi):
+                memory.write8(lp_buffer + i, b)
+            memory.write8(lp_buffer + len(ansi), 0)
+            copied = len(ansi)
+        else:
+            copied = len(text)
+
+        logger.debug("handlers", f'LoadStringA(hInst=0x{h_instance:x}, id={u_id}) -> "{text}" ({copied} chars)')
+        cpu.regs[EAX] = copied
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("user32.dll", "LoadStringA", _LoadStringA)
 
     # SetCursor(HCURSOR hCursor) -> HCURSOR (previous cursor)
     def _SetCursor(cpu: "CPU") -> None:

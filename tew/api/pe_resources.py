@@ -78,6 +78,7 @@ _CTRL_CLASS: dict[int, str] = {
 # Win32 resource type IDs
 _RT_BITMAP = 2
 _RT_DIALOG = 5
+_RT_STRING = 6
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -121,6 +122,38 @@ class PEResources:
             logger.warn("window", f"[PEResources] Bitmap {bitmap_id} not found")
             return None
         return raw
+
+    def find_string(self, string_id: int) -> str | None:
+        """Return the RT_STRING table string for the given resource ID, or None.
+
+        RT_STRING resources are packed 16-per-block: block (string_id>>4)+1
+        holds a sequence of 16 [WORD length][length WCHARs] entries (no null
+        terminator), one per string_id in that block's range; a zero length
+        means no string is defined for that slot.
+        """
+        if not self._valid:
+            return None
+        block_id = (string_id >> 4) + 1
+        index = string_id & 0xF
+        raw = self._find_resource(_RT_STRING, block_id)
+        if raw is None:
+            logger.debug("window", f"[PEResources] String block {block_id} (for id {string_id}) not found")
+            return None
+        pos = 0
+        for i in range(16):
+            if pos + 2 > len(raw):
+                return None
+            length = struct.unpack_from("<H", raw, pos)[0]
+            pos += 2
+            if i == index:
+                if length == 0:
+                    return ""
+                if pos + length * 2 > len(raw):
+                    return None
+                chars = struct.unpack_from(f"<{length}H", raw, pos)
+                return "".join(chr(c) for c in chars)
+            pos += length * 2
+        return None
 
     # ── PE header parsing ─────────────────────────────────────────────────────
 

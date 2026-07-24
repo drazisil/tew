@@ -933,6 +933,46 @@ def register_kernel32_io_handlers(
             cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
+    # FILETIME epoch (1601-01-01) to Unix epoch (1970-01-01) offset, in 100ns units
+    _FILETIME_EPOCH_DIFF = 116444736000000000
+
+    def _unix_to_filetime(unix_seconds: float) -> int:
+        return int(unix_seconds * 10_000_000) + _FILETIME_EPOCH_DIFF
+
+    def _write_filetime(addr: int, ft: int) -> None:
+        memory.write32(addr,     ft & 0xFFFFFFFF)
+        memory.write32(addr + 4, (ft >> 32) & 0xFFFFFFFF)
+
+    def _get_file_information_by_handle(cpu: "CPU") -> None:
+        h_file  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_info = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = state.file_handle_map.get(h_file)
+        if not entry or not lp_info:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+        try:
+            st = os.fstat(entry.fd) if entry.fd is not None else os.stat(entry.path)
+        except OSError:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 8)
+            return
+
+        attrs = FILE_ATTRIBUTE_DIRECTORY if stat.S_ISDIR(st.st_mode) else FILE_ATTRIBUTE_ARCHIVE
+        memory.write32(lp_info + 0x00, attrs)                          # dwFileAttributes
+        _write_filetime(lp_info + 0x04, _unix_to_filetime(st.st_ctime))  # ftCreationTime
+        _write_filetime(lp_info + 0x0C, _unix_to_filetime(st.st_atime))  # ftLastAccessTime
+        _write_filetime(lp_info + 0x14, _unix_to_filetime(st.st_mtime))  # ftLastWriteTime
+        memory.write32(lp_info + 0x1C, 0x12345678)                     # dwVolumeSerialNumber
+        memory.write32(lp_info + 0x20, 0)                              # nFileSizeHigh
+        memory.write32(lp_info + 0x24, st.st_size & 0xFFFFFFFF)        # nFileSizeLow
+        memory.write32(lp_info + 0x28, 1)                              # nNumberOfLinks
+        memory.write32(lp_info + 0x2C, 0)                              # nFileIndexHigh
+        memory.write32(lp_info + 0x30, st.st_ino & 0xFFFFFFFF)         # nFileIndexLow
+        logger.debug("fileio", f'GetFileInformationByHandle(0x{h_file:x}) -> size={st.st_size}')
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 8)
+
     def _flush_file_buffers(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
@@ -950,6 +990,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "SetFilePointer",   _set_file_pointer)
     stubs.register_handler("kernel32.dll", "GetFileSize",      _get_file_size)
     stubs.register_handler("kernel32.dll", "GetFileSizeEx",    _get_file_size_ex)
+    stubs.register_handler("kernel32.dll", "GetFileInformationByHandle", _get_file_information_by_handle)
     stubs.register_handler("kernel32.dll", "FlushFileBuffers", _flush_file_buffers)
     stubs.register_handler("kernel32.dll", "SetEndOfFile",     _set_end_of_file)
 
@@ -988,6 +1029,67 @@ def register_kernel32_io_handlers(
             memory.write8(lp_buf + len(d), 0)
         cpu.regs[EAX] = len(d)
         cleanup_stdcall(cpu, memory, 8)
+
+    def _get_temp_path_a(cpu: "CPU") -> None:
+        n_buf  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        d = "C:\\WINDOWS\\TEMP\\"
+        if lp_buf and n_buf > len(d):
+            for i, ch in enumerate(d):
+                memory.write8(lp_buf + i, ord(ch))
+            memory.write8(lp_buf + len(d), 0)
+            cpu.regs[EAX] = len(d)
+        else:
+            cpu.regs[EAX] = len(d) + 1  # required size, including null terminator
+        logger.debug("handlers", f'GetTempPathA({n_buf}) -> "{d}"')
+        cleanup_stdcall(cpu, memory, 8)
+
+    _temp_file_unique = [0xA000]
+
+    def _get_temp_file_name_a(cpu: "CPU") -> None:
+        lp_path_name = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_prefix    = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        u_unique     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_temp_file = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+
+        path   = read_cstring(lp_path_name, memory, 260) if lp_path_name else ""
+        prefix = (read_cstring(lp_prefix, memory, 260) if lp_prefix else "")[:3]
+        if path and not path.endswith("\\"):
+            path += "\\"
+
+        if u_unique:
+            unique = u_unique & 0xFFFF
+        else:
+            unique = _temp_file_unique[0] & 0xFFFF
+            _temp_file_unique[0] += 1
+
+        full_name = f"{path}{prefix}{unique:04X}.TMP"
+
+        # uUnique == 0 means the caller wants the name *and* the file reserved
+        # (created, 0 bytes) — same real-file-creation path CreateFileA's
+        # writable branch uses, so a later real CreateFileA/ReadFile against
+        # this name (e.g. Jet's own scratch-file use) sees a real file.
+        if u_unique == 0:
+            real_path = state.translate_windows_path(full_name)
+            try:
+                dirname = os.path.dirname(real_path)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
+                os.close(os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644))
+            except OSError as e:
+                logger.warn("fileio", f'GetTempFileNameA: failed to reserve "{full_name}": {e}')
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 16)
+                return
+
+        if lp_temp_file:
+            for i, ch in enumerate(full_name):
+                memory.write8(lp_temp_file + i, ord(ch))
+            memory.write8(lp_temp_file + len(full_name), 0)
+
+        logger.debug("fileio", f'GetTempFileNameA(path="{path}", prefix="{prefix}", unique={u_unique}) -> "{full_name}"')
+        cpu.regs[EAX] = unique
+        cleanup_stdcall(cpu, memory, 16)
 
     def _get_disk_free_space_a(cpu: "CPU") -> None:
         lp_spc = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
@@ -1031,6 +1133,8 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetCurrentDirectoryA", _get_current_dir_a)
     stubs.register_handler("kernel32.dll", "SetCurrentDirectoryA", _set_current_dir_a)
     stubs.register_handler("kernel32.dll", "GetWindowsDirectoryA", _get_windows_dir_a)
+    stubs.register_handler("kernel32.dll", "GetTempPathA",         _get_temp_path_a)
+    stubs.register_handler("kernel32.dll", "GetTempFileNameA",     _get_temp_file_name_a)
     stubs.register_handler("kernel32.dll", "GetDiskFreeSpaceA",    _get_disk_free_space_a)
     stubs.register_handler("kernel32.dll", "GetDriveTypeA",        _get_drive_type_a)
     def _global_memory_status(cpu: "CPU") -> None:
@@ -1497,6 +1601,39 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = dst
         cleanup_stdcall(cpu, memory, 8)
 
+    def _lstrcat_a(cpu: "CPU") -> None:
+        dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        src = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        dst_len = 0
+        while dst_len < 65535 and memory.read8(dst + dst_len) != 0:
+            dst_len += 1
+        i = 0
+        while dst_len + i < 65535:
+            ch = memory.read8(src + i)
+            memory.write8(dst + dst_len + i, ch)
+            if ch == 0:
+                break
+            i += 1
+        cpu.regs[EAX] = dst
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _lstrcpyn_a(cpu: "CPU") -> None:
+        dst     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        src     = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        max_len = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        max_len = min(max_len, 65535)
+        if dst and max_len > 0:
+            i = 0
+            while i < max_len - 1:
+                ch = memory.read8(src + i) if src else 0
+                if ch == 0:
+                    break
+                memory.write8(dst + i, ch)
+                i += 1
+            memory.write8(dst + i, 0)
+        cpu.regs[EAX] = dst
+        cleanup_stdcall(cpu, memory, 12)
+
     def _lstrcmp_w(cpu: "CPU") -> None:
         p1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         p2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -1567,6 +1704,8 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "SetErrorMode", _set_error_mode)
     stubs.register_handler("kernel32.dll", "lstrlenA",     _lstrlen_a)
     stubs.register_handler("kernel32.dll", "lstrcpyA",     _lstrcpy_a)
+    stubs.register_handler("kernel32.dll", "lstrcpynA",    _lstrcpyn_a)
+    stubs.register_handler("kernel32.dll", "lstrcatA",     _lstrcat_a)
     stubs.register_handler("kernel32.dll", "lstrcmpW",     _lstrcmp_w)
     stubs.register_handler("kernel32.dll", "LocalAlloc",   _local_alloc)
     stubs.register_handler("kernel32.dll", "LocalFree",    _local_free)

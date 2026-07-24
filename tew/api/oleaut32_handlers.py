@@ -637,6 +637,219 @@ def register_oleaut32_ole32_handlers(
 
     stubs.register_handler("ole32.dll", "CoGetMalloc", _CoGetMalloc)
 
+    # ── oleaut32.dll ordinal 202 — CreateErrorInfo ──────────────────────────────
+    # CreateErrorInfo(ICreateErrorInfo **pperrinfo) -> HRESULT
+    # Real OLEAUT32.dll's generic error object implements both
+    # ICreateErrorInfo (Set* methods, filled in by the creator) and IErrorInfo
+    # (Get* methods, read by SetErrorInfo/GetErrorInfo consumers) on one
+    # object via two vtables at a fixed +4 offset -- the standard C++
+    # multiple-inheritance "this-adjustor" layout, not an emulator-specific
+    # simplification. A fresh object is allocated per call (unlike the
+    # IMalloc singleton above); only the two vtables are built once and
+    # shared across every instance, since they're stateless function tables.
+
+    IID_ICREATEERRORINFO = "22f03340-547d-101b-8e65-08002b2bd119"
+    IID_IERRORINFO        = "1cf2b120-547d-101b-8e65-08002b2bd119"
+
+    # Object layout: +0x00 vtable_create, +0x04 vtable_errinfo, +0x08 refcount,
+    # +0x0C guid(16), +0x1C source BSTR, +0x20 description BSTR,
+    # +0x24 helpfile BSTR, +0x28 helpcontext DWORD. Size 0x2C.
+    _ERRINFO_OBJ_SIZE = 0x2C
+
+    def _errinfo_qi_core(obj_addr: int, riid_str: str, ppv: int) -> int:
+        if riid_str in (IID_IUNKNOWN, IID_ICREATEERRORINFO):
+            target = obj_addr
+        elif riid_str == IID_IERRORINFO:
+            target = obj_addr + 4
+        else:
+            target = None
+        if ppv:
+            memory.write32(ppv, target if target is not None else 0)
+        if target is not None:
+            memory.write32(obj_addr + 8, (memory.read32(obj_addr + 8) + 1) & 0xFFFFFFFF)
+        return S_OK if target is not None else E_NOINTERFACE
+
+    def _errinfo_addref_core(obj_addr: int) -> int:
+        rc = (memory.read32(obj_addr + 8) + 1) & 0xFFFFFFFF
+        memory.write32(obj_addr + 8, rc)
+        return rc
+
+    def _errinfo_release_core(obj_addr: int) -> int:
+        rc = max(0, memory.read32(obj_addr + 8) - 1)
+        memory.write32(obj_addr + 8, rc)
+        return rc
+
+    # ICreateErrorInfo face (this == obj_addr)
+    def _errinfo_create_qi(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        riid = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        ppv  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        riid_str = _read_guid_str(riid)
+        result = _errinfo_qi_core(this_addr, riid_str, ppv)
+        logger.info("com", f"ICreateErrorInfo(0x{this_addr:x})::QueryInterface({{{riid_str}}}) -> {'S_OK' if result == S_OK else 'E_NOINTERFACE'}")
+        cpu.regs[EAX] = result
+
+    def _errinfo_create_addref(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cpu.regs[EAX] = _errinfo_addref_core(this_addr)
+
+    def _errinfo_create_release(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cpu.regs[EAX] = _errinfo_release_core(this_addr)
+
+    def _errinfo_set_guid(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        rguid = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        for i in range(16):
+            memory.write8(this_addr + 0x0C + i, memory.read8(rguid + i) if rguid else 0)
+        logger.info("com", f"ICreateErrorInfo(0x{this_addr:x})::SetGUID({{{_read_guid_str(rguid) if rguid else 'NULL'}}})")
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_set_source(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        sz = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        memory.write32(this_addr + 0x1C, sz)
+        from tew.api._state import read_wide_string
+        text = read_wide_string(sz, memory) if sz else "(null)"
+        logger.info("com", f'ICreateErrorInfo(0x{this_addr:x})::SetSource("{text}")')
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_set_description(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        sz = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        memory.write32(this_addr + 0x20, sz)
+        from tew.api._state import read_wide_string
+        text = read_wide_string(sz, memory) if sz else "(null)"
+        logger.info("com", f'ICreateErrorInfo(0x{this_addr:x})::SetDescription("{text}")')
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_set_help_file(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        sz = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        memory.write32(this_addr + 0x24, sz)
+        logger.info("com", f"ICreateErrorInfo(0x{this_addr:x})::SetHelpFile(0x{sz:x})")
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_set_help_context(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        ctx = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        memory.write32(this_addr + 0x28, ctx)
+        logger.info("com", f"ICreateErrorInfo(0x{this_addr:x})::SetHelpContext({ctx})")
+        cpu.regs[EAX] = S_OK
+
+    # IErrorInfo face (this == obj_addr + 4; adjust back to obj_addr)
+    def _errinfo_face2_qi(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        riid = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        ppv  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        riid_str = _read_guid_str(riid)
+        result = _errinfo_qi_core((this_addr - 4) & 0xFFFFFFFF, riid_str, ppv)
+        logger.info("com", f"IErrorInfo(0x{this_addr:x})::QueryInterface({{{riid_str}}}) -> {'S_OK' if result == S_OK else 'E_NOINTERFACE'}")
+        cpu.regs[EAX] = result
+
+    def _errinfo_face2_addref(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cpu.regs[EAX] = _errinfo_addref_core((this_addr - 4) & 0xFFFFFFFF)
+
+    def _errinfo_face2_release(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        cpu.regs[EAX] = _errinfo_release_core((this_addr - 4) & 0xFFFFFFFF)
+
+    def _errinfo_get_guid(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pguid = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = (this_addr - 4) & 0xFFFFFFFF
+        if pguid:
+            for i in range(16):
+                memory.write8(pguid + i, memory.read8(obj_addr + 0x0C + i))
+        logger.info("com", f"IErrorInfo(0x{this_addr:x})::GetGUID() -> {{{_read_guid_str(obj_addr + 0x0C)}}}")
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_get_source(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pbstr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = (this_addr - 4) & 0xFFFFFFFF
+        if pbstr:
+            memory.write32(pbstr, memory.read32(obj_addr + 0x1C))
+        logger.info("com", f"IErrorInfo(0x{this_addr:x})::GetSource() -> 0x{memory.read32(obj_addr + 0x1C):x}")
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_get_description(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pbstr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = (this_addr - 4) & 0xFFFFFFFF
+        if pbstr:
+            memory.write32(pbstr, memory.read32(obj_addr + 0x20))
+        logger.info("com", f"IErrorInfo(0x{this_addr:x})::GetDescription() -> 0x{memory.read32(obj_addr + 0x20):x}")
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_get_help_file(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pbstr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = (this_addr - 4) & 0xFFFFFFFF
+        if pbstr:
+            memory.write32(pbstr, memory.read32(obj_addr + 0x24))
+        cpu.regs[EAX] = S_OK
+
+    def _errinfo_get_help_context(cpu: "CPU") -> None:
+        this_addr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        pdw = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        obj_addr = (this_addr - 4) & 0xFFFFFFFF
+        if pdw:
+            memory.write32(pdw, memory.read32(obj_addr + 0x28))
+        cpu.regs[EAX] = S_OK
+
+    _errinfo_vtables_box = {"create": 0, "err": 0}
+
+    def _ensure_errinfo_vtables() -> tuple[int, int]:
+        if _errinfo_vtables_box["create"] == 0:
+            create_vt = state.simple_alloc(8 * 4)
+            err_vt    = state.simple_alloc(8 * 4)
+            create_slots = [
+                _com_method("ICreateErrorInfo::QueryInterface", _errinfo_create_qi,        8),
+                _com_method("ICreateErrorInfo::AddRef",         _errinfo_create_addref,    0),
+                _com_method("ICreateErrorInfo::Release",        _errinfo_create_release,   0),
+                _com_method("ICreateErrorInfo::SetGUID",        _errinfo_set_guid,         4),
+                _com_method("ICreateErrorInfo::SetSource",      _errinfo_set_source,       4),
+                _com_method("ICreateErrorInfo::SetDescription", _errinfo_set_description,  4),
+                _com_method("ICreateErrorInfo::SetHelpFile",    _errinfo_set_help_file,    4),
+                _com_method("ICreateErrorInfo::SetHelpContext", _errinfo_set_help_context, 4),
+            ]
+            for i, addr in enumerate(create_slots):
+                memory.write32(create_vt + i * 4, addr)
+
+            err_slots = [
+                _com_method("IErrorInfo::QueryInterface",  _errinfo_face2_qi,         8),
+                _com_method("IErrorInfo::AddRef",          _errinfo_face2_addref,     0),
+                _com_method("IErrorInfo::Release",         _errinfo_face2_release,    0),
+                _com_method("IErrorInfo::GetGUID",         _errinfo_get_guid,         4),
+                _com_method("IErrorInfo::GetSource",       _errinfo_get_source,       4),
+                _com_method("IErrorInfo::GetDescription",  _errinfo_get_description,  4),
+                _com_method("IErrorInfo::GetHelpFile",     _errinfo_get_help_file,    4),
+                _com_method("IErrorInfo::GetHelpContext",  _errinfo_get_help_context, 4),
+            ]
+            for i, addr in enumerate(err_slots):
+                memory.write32(err_vt + i * 4, addr)
+
+            _errinfo_vtables_box["create"] = create_vt
+            _errinfo_vtables_box["err"] = err_vt
+        return _errinfo_vtables_box["create"], _errinfo_vtables_box["err"]
+
+    def _CreateErrorInfo(cpu: "CPU") -> None:
+        pperrinfo = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        create_vt, err_vt = _ensure_errinfo_vtables()
+        obj_addr = state.simple_alloc(_ERRINFO_OBJ_SIZE)
+        memory.write32(obj_addr, create_vt)
+        memory.write32(obj_addr + 4, err_vt)
+        memory.write32(obj_addr + 8, 1)   # initial refcount = 1 (caller's own ref)
+        if pperrinfo:
+            memory.write32(pperrinfo, obj_addr)
+        logger.info("com", f"CreateErrorInfo -> S_OK *pperrinfo=0x{obj_addr:08x}")
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 4)
+
+    _ole_ord(202, _CreateErrorInfo)
+
     # ── ole32.dll — COM activation ─────────────────────────────────────────────
     # Registry-driven, like real Windows: CoGetClassObject/CoCreateInstance
     # look the CLSID up under hkcr\clsid\{...}\inprocserver32 (see

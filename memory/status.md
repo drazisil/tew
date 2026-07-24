@@ -50,23 +50,134 @@ small gaps found and fixed live-verifying that: `kernel32.dll!lstrcmpW`
 `GlobalUnlock` (pass-through no-ops, correct for the fixed/non-moveable
 memory this emulator's `GlobalAlloc` always hands out).
 
-**Current blocker, a different shape than the last several**: not a
-missing API, a genuine busy-loop. Right after `CoCreateInstance` succeeds,
-DAO starts probing for the Jet database engine DLL and locks onto
-`GetProcAddress("msjter35.dll", "ordinal#2") -> NULL` — repeated **7,005
-times** verbatim with zero progress, burning the entire 500,000,000-step
-budget without ever halting or falling back. (`msjter35.dll` was flagged
-in this file months ago as "referenced by `dao350.dll`, never analyzed,
-never reached" — now it's actually been reached, and hitting it hangs
-rather than failing cleanly.) Not yet investigated: whether
-`msjter35.dll`/`msjet35.dll` gets a `LoadLibraryA` call that "succeeds"
-with a bogus handle (making `GetProcAddress` look retryable when it
-shouldn't be), whether DAO's real decompiled loop logic is waiting on
-something that can never happen in this emulator, or whether a real Jet
-3.5 DLL file (the same pattern used for `dao350.dll`) needs to be
-supplied. See Queued issues, top item.
+The `msjter35.dll`/`msjet35.dll` busy-loop described above (7,005×
+`GetProcAddress` repeats, zero progress) is **resolved** — two independent
+bugs, both in `kernel32_handlers.py`: (1) `LoadLibraryA`'s fallback for
+DLLs not found on disk unconditionally fabricated a fake-success handle
+even with zero handler coverage, unlike `GetModuleHandleA`'s equivalent
+path — DAO saw a fake "loaded" DLL and kept retrying instead of getting an
+honest failure; (2) `GetProcAddress`'s ordinal-lookup key format
+(`"ordinal#N"`) never matched how ordinals are actually registered/parsed
+everywhere else in the codebase (`"Ordinal #N"`), so ordinal lookups could
+never succeed regardless of whether the export existed. Full diagnosis and
+fix: changelog.md, "2026-07-23 (late-night session)".
 
-593/593 tests passing (reconfirmed 2026-07-23).
+Separately, since the actual goal is a working Access Jet 3 database (not
+just DAO's COM activation succeeding), the real Microsoft Jet 3.5 Database
+Engine redistributable was sourced from `~/.emu32/DBInst/DAO/data1.cab`
+(same InstallShield package `dao350.dll` came from — confirmed via sha256)
+and deployed to `~/.emu32/WINDOWS/System32/`: `msjet35.dll`, `msjter35.dll`,
+`msjint35.dll`, `vbajet32.dll`, `msrd2x35.dll`, `expsrv.dll`, and
+`msvcrt40.dll` (the last one incidentally fixing a previously-unresolved
+static import of DAO350.DLL's own). See Architecture section.
+
+`advapi32.dll!RegEnumKeyA` — the older, non-Ex sibling of
+`RegEnumKeyExA` (4 args, `cchName` passed by value not by pointer, no
+class/last-write-time output) — was simply never implemented, only
+`RegEnumKeyExA` existed. Added it in `advapi32_handlers.py`, sharing a new
+`_reg_list_subkeys()` helper factored out of `RegEnumKeyExA`'s subkey-
+derivation logic. Confirmed live: execution now sails through the entire
+`HKLM\Software\Microsoft\Jet\3.5\Engines` enumeration and `Engines\ODBC`
+config reads (all honest `NOT FOUND`s, gracefully tolerated) — no seeding
+of `registry.json` was needed for this. 593/593 tests still passing.
+
+`kernel32.dll!GetTempPathA` was next: added in `kernel32_io.py`, returns
+`C:\WINDOWS\TEMP\` (backed by a real, newly-created
+`~/.emu32/WINDOWS/TEMP/` host directory so later real file I/O against
+that path works). Confirmed live: cleared the halt.
+
+`kernel32.dll!GetTempFileNameA` was the halt right after that — Jet
+generating its scratch filename. Added in `kernel32_io.py`: builds
+`<path><3-char prefix><4 hex digits>.TMP`, and when `uUnique == 0` (the
+common case) actually creates the 0-byte file on the host filesystem via
+the same `os.open(..., O_CREAT|O_TRUNC)` pattern `CreateFileA`'s writable
+branch uses — so a later real `CreateFileA`/`ReadFile` against that exact
+name (Jet's own scratch-file use) sees a real file, not just a name.
+Confirmed live: cleared the halt. 593/593 tests passing after both.
+
+`kernel32.dll!GetFileInformationByHandle` was next — Jet querying the
+new temp file's attributes/timestamps. Added in `kernel32_io.py`: looks
+up the handle in `state.file_handle_map`, `os.fstat`s the real fd (or
+`os.stat`s `entry.path` for read-only entries with no fd), and fills a
+real `BY_HANDLE_FILE_INFORMATION` struct (attributes via `stat.S_ISDIR`,
+real `ctime`/`atime`/`mtime` converted to `FILETIME`, real size, `1` for
+link count, real inode as file index). Confirmed live: cleared the halt.
+
+`kernel32.dll!lstrcpynA` was next — added in `kernel32_io.py` next to
+the existing `lstrcpyA`/`lstrlenA` (bounded copy, always null-terminates
+within `iMaxLength`). Confirmed live: cleared the halt.
+
+**Real bug found and fixed, not just a missing handler**: the very next
+halt, `[UNIMPLEMENTED] msjint35.dll!Ordinal #2`, looked like another
+missing-handler case but wasn't — direct inspection of the real
+`msjint35.dll`'s export table (via `tew`'s own `EXEFile`/`ExportTable`
+parser, offline, no emulator run needed) confirmed ordinal #2
+(`CchLszOfId2`) genuinely exists and `DLLLoader.load_dll` already
+resolves and writes its real address into the IAT correctly. The actual
+bug: `DLLLoader.patch_dll_iats` (`tew/loader/dll_loader.py`) runs
+*after* `load_dll` and unconditionally re-patches every secondary-DLL
+IAT entry via `patch_iat_entry` — but never passed the already-known
+real address as `real_addr`, so any entry without a matching Python
+handler fell straight through to the unimplemented auto-stub fallback,
+silently clobbering correct real-DLL-to-real-DLL calls (e.g. `msjet35
+.dll` calling into `msjint35.dll`) with a fatal halt. Fixed by having
+`patch_dll_iats` look up `self._loaded_dlls[...].exports` and pass that
+through as `real_addr`; also added a `real_count` outcome bucket to the
+existing "Patched X/Y ... (N auto-stubs)" summary log so this class of
+bug is visible going forward instead of silently inflating the
+auto-stub count. Confirmed live: MSJET35.DLL's own IAT patch pass went
+from 23 auto-stubs/0 real to 1 auto-stub/7 real. 593/593 tests passing
+after all three fixes above.
+
+`user32.dll!LoadStringA` was next — added in `user32_handlers.py`. Real
+`RT_STRING` resource lookup was added to `pe_resources.py`
+(`PEResources.find_string`, block=(id>>4)+1 / index=id&0xF packing) and
+threaded per-module: `dll_loader` is now passed into
+`register_user32_gdi32_handlers` (previously it wasn't) so a real loaded
+DLL's own hInstance (not just the main EXE's) resolves to that DLL's own
+`.rsrc`, cached per-DLL-name. `cchBufferMax == 0` (pointer-swap mode, no
+copy) is explicitly **not** implemented and halts loudly instead of
+silently returning a plausible-but-wrong result — confirmed live this
+session that real callers never actually hit that path, so the halt is
+inert in practice, not a live gap. Confirmed live: cleared the halt.
+
+`kernel32.dll!lstrcatA` was next — added next to `lstrcpyA`/`lstrcpynA`
+in `kernel32_io.py`, matching real (unbounded, like real `strcat`)
+semantics. Confirmed live: cleared the halt.
+
+`oleaut32.dll!Ordinal #202` (`CreateErrorInfo`, confirmed via the real
+`oleaut32.dll`'s export table at `/data/Downloads/i386-binaries/`) was
+next. Implemented as a real dual-interface COM object in
+`oleaut32_handlers.py`: one allocated object with two vtables at a
++4 offset (`ICreateErrorInfo` at the object's own address, `IErrorInfo`
+at +4 — a C++-style "this-adjustor" split), `QueryInterface` switching
+between them, shared refcount, and real Set*/Get* method bodies that
+actually read/write the object's fields (no fake success). **Live-
+verified this design was necessary, not speculative over-engineering**:
+DAO's real code calls `QueryInterface(IID_IErrorInfo)` on the returned
+pointer immediately after creation (succeeds via the +4 face), then
+fills the object via the original `ICreateErrorInfo` pointer with real
+content — `SetSource("DAO.DbEngine")`, a help context ID, a help file
+pointer — before the next call. Session process note: this session
+skipped `CLAUDE.md`'s mandatory HANDLER DECLARATION step (state
+Function/Signature/Spec/Truthful-YES-NO in chat before writing any
+handler) for every handler above; a retroactive audit found one real
+violation — `LoadStringA`'s `cchBufferMax==0` path was silently
+returning a plausible-but-spec-incomplete result instead of halting —
+now fixed as described above. No other violations found (grep audit for
+TODO/FAKE/stub/silent-pass patterns across every file touched this
+session came back clean).
+
+**Current blocker**: `oleaut32.dll!Ordinal #201` (`SetErrorInfo`,
+confirmed via the same export-table lookup), called immediately after
+`CreateErrorInfo`'s object is fully populated. Not yet implemented —
+next up. This is furthest any session has reached: past all of
+`MSJET35.DLL`'s and `MSJINT35.DLL`'s init-time gaps, into DAO's own
+error-reporting plumbing.
+
+Two small non-blocking gaps surfaced earlier, before the `RegEnumKeyA`
+halt (`kernel32.dll!IsTNT`, `kernel32.dll!GetProcessAffinityMask` — both
+harmlessly return NULL, Jet handles the miss and keeps going).
 
 ## Run command
 ```bash
@@ -88,21 +199,27 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: root-cause the `msjter35.dll` `GetProcAddress`
-  busy-loop — see "Current status." Different shape than every fix so far
-  today (all single missing-API halts): this is a genuine hang, 7,005
-  identical `GetProcAddress("msjter35.dll", "ordinal#2") -> NULL` calls
-  with zero progress, burning the full step budget. First things to check:
-  (1) does `msjter35.dll`/`msjet35.dll` get a `LoadLibraryA` call, and does
-  it "succeed" with a handle that shouldn't exist (making the retry loop
-  look plausible instead of hitting an immediate, honest failure); (2) what
-  does `dao350.dll`'s real decompiled loop around this call actually check
-  to decide whether to keep retrying vs. give up; (3) whether this needs a
-  real Jet 3.5 DLL file supplied, the same pattern used for `dao350.dll`
-  itself (`_KNOWN_COM_SERVERS`/`_KNOWN_COM_SERVER_DIR` in
-  `oleaut32_handlers.py` — though `msjter35.dll` is loaded directly by
-  DAO via `LoadLibrary`, not through COM activation, so may need a
-  different mechanism entirely).
+- **New top priority**: implement `oleaut32.dll!Ordinal #201`
+  (`SetErrorInfo`) — see "Current status." Blocks right after DAO fully
+  populates its error-info object. State a HANDLER DECLARATION first
+  per `CLAUDE.md` before writing it — check what pointer it actually
+  receives (the `ICreateErrorInfo` face or the `IErrorInfo` face
+  obtained via the QI already observed) rather than assuming.
+- Worth a dedicated pass later: now that `patch_dll_iats`'s real-address
+  bug is fixed, re-check whether any of the *other* previously-"fixed"
+  halts in this session were actually this same class of bug
+  (real-DLL-to-real-DLL call wrongly auto-stubbed) rather than a truly
+  missing Win32 API — unlikely for the kernel32/advapi32 fixes already
+  made (those were genuinely-unimplemented Python-handler gaps, confirmed
+  by checking the handler registry directly each time), but worth keeping
+  in mind for future `[UNIMPLEMENTED] <dll>.dll!Ordinal #N` or
+  `<dll>.dll!<name>` halts where `<dll>` is one of the real Jet-family
+  DLLs (`msjet35.dll`, `msjint35.dll`, `vbajet32.dll`, `msrd2x35.dll`,
+  `expsrv.dll`) rather than a standard Win32 system DLL.
+- Low priority, not currently blocking: `kernel32.dll!IsTNT` and
+  `kernel32.dll!GetProcessAffinityMask` are unimplemented (`GetProcAddress`
+  returns NULL for both) — `MSJET35.DLL` tolerates the miss and continues,
+  but a real caller elsewhere might not.
 - Revisit `SafeArrayLock`/`SafeArrayUnaccessData` (`oleaut32.dll` ordinals
   21/24, `oleaut32_handlers.py`) at some point — both are hardcoded no-ops
   returning `S_OK` with no real lock-count tracking, harmless only because
@@ -187,6 +304,23 @@ need to reach all the way through the DAO handshake.
   `dsound.dll` etc. all need a real kernel-mode HAL/driver stack this
   emulator doesn't have; tew's existing hand-built D3D8-over-Vulkan is
   already the correct solution to that problem, not something to replace).
+- **Jet 3.5 database engine**: real files, same pattern as `dao350.dll`,
+  also at `~/.emu32/WINDOWS/System32/` (kept out of the repo, Microsoft-
+  copyrighted): `msjet35.dll` (core engine), `msjter35.dll` (error-message
+  resource), `msjint35.dll` (international/collation), `vbajet32.dll`,
+  `msrd2x35.dll` (Jet Red ISAM driver), `expsrv.dll` (expression service),
+  `msvcrt40.dll` (DAO350.DLL's own CRT dependency). All sourced from
+  `~/.emu32/DBInst/DAO/data1.cab` (InstallShield cabinet, extract with
+  `unshield -d <dir> x data1.cab`) — the same install package `dao350.dll`
+  itself came from, confirmed via sha256 match. Unlike `dao350.dll`, these
+  are *not* gated through `_KNOWN_COM_SERVERS` (they're not COM-activated —
+  DAO loads them directly via `LoadLibraryA`/`GetProcAddress` by name); they
+  work because `~/.emu32/WINDOWS/System32/` was already a generic
+  `DLLLoader` search path, not one scoped to COM servers only. This is the
+  first case where a real DLL genuinely needs to *execute meaningfully*
+  (actual Jet database reads/writes for an Access `.mdb` file), not just
+  activate and hand back to caller code — expect deeper Win32/advapi32
+  registry surface area to be needed than DAO alone required.
 
 ## Test suite
 593 tests (all passing, reconfirmed 2026-07-23).
