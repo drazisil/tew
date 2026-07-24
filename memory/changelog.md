@@ -4,6 +4,153 @@ Entries are newest-first.
 
 ---
 
+## 2026-07-24 (cont'd) — bump-allocator ported to Zig; Zig/Python FFI
+boundary consolidated into a kernel module; merged to main and pushed
+
+Continuing the same day's incremental Zig-porting work: `CRTState.simple_alloc`'s
+guest-heap bump-pointer arithmetic (`(current + size + 15) & ~15`, backing
+`malloc`/`HeapAlloc`/`operator new` etc. across ~30 call sites) moved to a new
+`cpu/src/alloc.zig`, exported as `bump_alloc_next(current, size) -> u32` and
+called from a new `tew/hardware/alloc_zig.py` wrapper. Same split as the memory
+port: the cursor itself and the `heap_alloc_sizes`/`heap_alloc_owner` bookkeeping
+dicts (used by `realloc`/`HeapSize`/`HeapFree`) stay Python-owned; only the pure
+pointer math moved. Still a bump allocator, no free list — scope kept minimal on
+purpose.
+
+While tracing how the CPU's own memory access works (investigating a "how do
+Python and Zig actually talk to each other" question), found that `core.zig`'s
+CpuState-bound `memRead8`/`memWrite8` and `memory.zig`'s Python-facing
+`mem_read8`/`mem_write8` independently reimplemented the same bounds-check
+arithmetic — two implementations of the same logic with no shared source of
+truth. Went beyond a point-fix: designed and built a proper kernel-module
+architecture for the whole Zig/Python FFI boundary (CPU + memory + alloc, not
+just memory), in three separately-verified, separately-merged stages:
+
+- **Stage 1** — new `cpu/src/primitives.zig`: `inBounds1`/`inBoundsWidth`/
+  `readByte`/`writeByte`, the single shared implementation of "is this address
+  in bounds, read/write the byte(s)." `core.zig`'s `memRead8`/`memWrite8` and
+  `memory.zig`'s `mem_read8`/`mem_write8` both now delegate to it — zero
+  file-layout change otherwise. `inBounds1` (single-byte, core.zig's original
+  formula) and `inBoundsWidth` (combined-width, memory.zig's original formula)
+  deliberately kept as two distinct functions, not unified into one: a 16-bit
+  access straddling the end of memory behaves observably differently under
+  each (per-byte-composed access keeps the first byte's real value before
+  faulting on the second; a combined-width pre-check would reject both bytes
+  up front), so collapsing them would have been a real behavior change, not a
+  pure refactor.
+- **Stage 2** — physically split `cpu.zig` (2006 lines, was doing double duty
+  as both the internal execution engine and the entire Python-facing C ABI)
+  into `cpu/src/kernel.zig` (new build root — every one of the project's 63
+  `export fn`s, and only those, absorbing `memory.zig`'s 11 and `alloc.zig`'s
+  1) and `cpu/src/engine.zig` (dispatch table, `cpuStep`, all opcode handlers
+  — internal only, never exported, called from `kernel.zig`'s `cpu_run`).
+  Because every export is now a top-level declaration directly in the build
+  root, the `comptime { _ = &...; }` force-reference block (needed back when
+  `memory.zig`/`alloc.zig`'s exports weren't naturally referenced from the old
+  root and Zig's lazy per-declaration analysis silently dropped them from the
+  compiled `.so`) is gone — the underlying problem it worked around no longer
+  exists structurally, not just patched over. Fixed two live (not just
+  commented-out) `@import("../cpu.zig")` sites in `history/capture.zig`'s test
+  bodies that an earlier audit pass had missed. (Correction to the earlier
+  audit: the true export count was always 63, not 53 — cpu.zig alone had 51
+  exports, not 41; verified against `nm -D` throughout, so this was a
+  documentation-only miscount, not a functional gap.)
+- **Stage 3** — new `tew/hardware/_kernel_lib.py`: one shared `ctypes.CDLL`
+  handle instead of three independent `dlopen` calls (`cpu_zig.py`,
+  `memory_zig.py`, `alloc_zig.py` each used to call `ctypes.CDLL()` on the same
+  path separately). No Zig changes; purely how the existing symbols get bound.
+
+Each stage done on its own worktree/branch, verified independently (`zig build
+test`, `nm -D` symbol-set diff against the pre-stage baseline, 593/593 pytest,
+a live `run_exe.py` run diffed against the saved baseline on `[com]`/
+`[exception]`/`[dll]`), then merged to `main` before the next stage started.
+
+Also chased down an unrelated false alarm mid-session: a live run started
+crashing immediately after `SDL2 initialized` with an `X_GLXCreateContext
+BadValue` error, right after the memory/cpu.py work had been merged, which
+briefly looked like a regression from that merge. Bisected the last 5 commits
+on `main` (checking out each individually, rebuilding, running) — every single
+one crashed identically, including a commit that predates the memory port
+entirely, ruling out a code cause. Confirmed independently via plain `glxinfo`
+(unrelated to this repo) failing the exact same way, and via `journalctl`
+showing `kwin_wayland_wrapper` repeatedly logging `XCB error: BadWindow` for
+the same stale resource ID at every crashed run's timestamp — a wedged
+Xwayland/kwin compositor resource, most likely caused by the crashed runs
+themselves never cleaning up their SDL/GL window on the abrupt X IO-error
+exit. Logging out and back in cleared it; re-verified full clean runs on both
+`main` and the in-progress worktree afterward with zero code changes.
+
+All three stages merged to `main` and pushed. Final state re-verified end to
+end on `main` itself (not just in the stage worktrees): `zig build test`
+clean, 593/593 pytest, and three separate live `run_exe.py` runs (including
+one requested purely "for peace of mind" after everything else was done) all
+landing on the identical documented halt — same registers, same stack dump,
+same `Final EIP: 0x00209402` — with byte-identical `[com]`/`[exception]`/
+`[dll]` output versus the original saved baseline throughout.
+
+---
+
+## 2026-07-24 — hardware/memory.py ported to Zig; dead pure-Python CPU
+class and entire emulator/opcodes package retired; merged to main and
+pushed
+
+`tew/hardware/memory.py` (flat bytearray-backed address space:
+read8/16/32, write8/16/32, bounds checks) ported to a Zig-backed
+`ZigMemory`, following the exact FFI pattern the earlier `cpu.zig`/
+`ZigCPU` port established. New `cpu/src/memory.zig`: bounds-checked
+`mem_read8/16/32`, `mem_write8/16/32`, `mem_load`,
+`mem_is_valid_address/range` C-ABI functions operating on a
+caller-owned `(ptr, size)` pair (no allocator, no ownership change —
+Python's `bytearray` still owns the buffer, exactly as `ZigCPU` already
+borrows it via `ctypes.from_buffer`). `tew/hardware/memory.py` is now a
+12-line re-export shim (`Memory = ZigMemory`), mirroring how
+`run_exe.py` already aliases `ZigCPU as CPU`. Along the way, closed two
+latent gaps the old pure-Python `Memory` had and that `test_memory.py`
+never actually covered: `read16`/`write16` had no explicit bounds
+check (relied on `struct.error` leaking through instead of
+`ValueError`), and `write8`/`write16` silently accepted negative
+addresses via Python's list/struct wraparound semantics instead of
+rejecting them.
+
+Separately, investigated whether `tew/hardware/cpu.py` (the original
+pure-Python CPU class, kept around post-Zig-port only for its
+register/flag constants) was safe to delete. Found it was worse than
+just unused: `run_exe.py` calls `register_all_opcodes(cpu)` on every
+startup, which imports all 10 files under `tew/emulator/opcodes/`
+(`data_movement.py`, `arithmetic.py`, `logic.py`, etc. — the entire
+pure-Python x86 instruction-decode implementation) and registers every
+opcode handler onto the CPU — but `ZigCPU.register()` (`cpu_zig.py`)
+is a literal no-op (`def register(self, opcode, handler): pass`,
+comment: "Zig handles all opcodes"), so every one of those
+registrations was silently discarded on every run. Deleted
+`tew/hardware/cpu.py` and the entire `tew/emulator/` tree (12 files,
+~2,700 lines) outright. 38 files' register/flag-constant imports
+(`EAX`, `ESP`, `CF_BIT`, etc.) redirected from `tew.hardware.cpu` to
+`tew.hardware.cpu_zig`, which already defined byte-identical constants
+(confirmed by diff before redirecting); the handful of
+`TYPE_CHECKING`-only `CPU` type-hint imports now alias `ZigCPU`
+instead — confirmed via full-repo sweep that every `CPU`-class import
+was type-hint-only, zero live uses.
+
+Verification for both changes: gitnexus's `IMPORTS`-edge query against
+`tew.hardware.cpu` found the same 51 importing files as a manual grep
+sweep — nothing missed. 593/593 tests pass throughout. Two full
+DAO-reaching `run_exe.py` sessions (`LOG_CATEGORIES=com,dll,loader,
+exception`, ~57s to the halt) — one after the memory port, one after
+the cpu.py/opcodes retirement — produced **byte-identical** `[com]`,
+`[exception]`, and `[dll]` log output versus the pre-change baseline:
+same COM/CreateErrorInfo sequence, same halt at `EIP: 0x00209402`
+(`SetErrorInfo`, still unimplemented — unchanged, expected), same
+registers, same stack dump. Both changes done on isolated
+branches/worktrees, merged into `main`, and pushed to `origin/main`
+(`0fd35bd..90bc231`). Stale branches cleaned up afterward: 2 local
+(fully merged) and 2 remote (`origin/combined`, `origin/nt-syscall-
+layer` — both fully subsumed into `main`, zero unique commits)
+deleted; `origin/renovate/configure` left alone (has 1 unmerged
+commit, a real open item, not dead weight).
+
+---
+
 ## 2026-07-23 (post-midnight session, cont'd 3) — LoadStringA, lstrcatA,
 and CreateErrorInfo (oleaut32 ordinal 202) added; real RT_STRING resource
 parsing added; per-DLL resource resolution wired through user32; one

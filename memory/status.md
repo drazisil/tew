@@ -277,6 +277,33 @@ need to reach all the way through the DAO handshake.
   is touched again for other reasons; not worth a dedicated pass on its own.
 
 ## Architecture
+- **CPU + memory backend**: fully Zig now, no pure-Python fallback path
+  remains. `tew/hardware/cpu.py` (the original pure-Python CPU class) and
+  the entire `tew/emulator/opcodes/` package (pure-Python x86 instruction
+  decode) were deleted 2026-07-24 — confirmed dead (`ZigCPU.register()`
+  was a no-op; opcodes were built and registered every run but never
+  executed). `tew/hardware/memory.py` is likewise now a re-export shim
+  over `ZigMemory` (`tew/hardware/memory_zig.py`), and the guest heap's
+  bump-allocator cursor math (`CRTState.simple_alloc`) now delegates to
+  `tew/hardware/alloc_zig.py`. Register/flag constants (`EAX`, `CF_BIT`,
+  etc.) now come from `tew.hardware.cpu_zig`, not the deleted `cpu.py`.
+  See changelog.md, "2026-07-24."
+- **Zig/Python FFI boundary — kernel module**: as of 2026-07-24 (cont'd),
+  the whole Zig side of `libcpu.so` is organized as a real kernel-style
+  split. `cpu/src/kernel.zig` is the build root and the *only* file with
+  `export fn`s anywhere in the project (63 total: CPU control, memory
+  access, guest-heap allocator) — the Python-facing C ABI, full stop.
+  `cpu/src/engine.zig` holds the internal execution engine (dispatch
+  table, `cpuStep`, all opcode handlers), never exported, driven only by
+  `kernel.zig`'s `cpu_run`. `cpu/src/primitives.zig` holds the one shared
+  bounds-check/byte-access implementation both `core.zig`'s CpuState-bound
+  memory helpers and `kernel.zig`'s `mem_*` C ABI delegate to (previously
+  two independent reimplementations of the same logic). On the Python
+  side, `tew/hardware/_kernel_lib.py` is now the single `ctypes.CDLL`
+  loader shared by `cpu_zig.py`/`memory_zig.py`/`alloc_zig.py` (previously
+  three independent `dlopen` calls to the same `.so`). `cpu/src/memory.zig`
+  and `cpu/src/alloc.zig` no longer exist — absorbed into `kernel.zig`.
+  See changelog.md, "2026-07-24 (cont'd)."
 - Game does NOT call D3D8 directly.
 - Rendering path: Game → THRASH API (dx8z.dll) → D3D8 (fake COM, Vulkan backend)
 - WinINet connects to localhost:443 (HTTPS)
@@ -323,4 +350,6 @@ need to reach all the way through the DAO handshake.
   registry surface area to be needed than DAO alone required.
 
 ## Test suite
-593 tests (all passing, reconfirmed 2026-07-23).
+593 tests (all passing, reconfirmed 2026-07-24 after the memory.py Zig
+port, cpu.py/opcodes retirement, the bump-allocator port, and the
+kernel.zig/engine.zig/primitives.zig FFI-boundary refactor, on `main`).
