@@ -24,14 +24,6 @@ from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, 
 from tew.logger import logger
 
 
-def _fake_dll_handle(name: str) -> int:
-    """Compute a fake module handle from the DLL name (hash-based)."""
-    h = 0
-    for ch in name.lower():
-        h = ((h << 5) - h + ord(ch)) & 0xFFFFFFFF
-    return (h & 0x7FFFFFFF) | 0x10000000
-
-
 def _load_dll_with_dllmain(
     cpu: "CPU", memory: "Memory", stubs: Win32Handlers,
     state: CRTState, dll_loader, loaded, handle: int, arg_bytes: int,
@@ -126,7 +118,7 @@ def register_kernel32_handlers(
         name_ptr  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         proc_name: str
         if (name_ptr & 0xFFFF0000) == 0:
-            proc_name = f"ordinal#{name_ptr}"
+            proc_name = f"Ordinal #{name_ptr}"
         else:
             proc_name = read_cstring(name_ptr, memory)
 
@@ -220,14 +212,20 @@ def register_kernel32_handlers(
                         cpu.regs[EAX] = handle
                         cleanup_stdcall(cpu, memory, arg_bytes)
                         return True
-                fh = _fake_dll_handle(os.path.basename(name))
-                state.dynamic_modules[fh] = DynamicModule(
-                    dll_name=os.path.basename(name).lower(),
-                    base_address=fh,
-                )
-                logger.debug("handlers",
-                    f'LoadLibraryA("{name}") -> 0x{fh:x} (stub-only, path)')
-                cpu.regs[EAX] = fh
+                basename = os.path.basename(name)
+                stub_handle = stubs.get_stub_dll_handle(basename)
+                if stub_handle is not None:
+                    state.dynamic_modules[stub_handle] = DynamicModule(
+                        dll_name=basename.lower(),
+                        base_address=stub_handle,
+                    )
+                    logger.debug("handlers",
+                        f'LoadLibraryA("{name}") -> 0x{stub_handle:x} (stub-only, path)')
+                    cpu.regs[EAX] = stub_handle
+                else:
+                    logger.warn("handlers",
+                        f'LoadLibraryA("{name}") -> NULL (not found: no real file, no handler coverage)')
+                    cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, arg_bytes)
                 return True
             if not state.config.interactive_on_missing_file:
@@ -268,11 +266,16 @@ def register_kernel32_handlers(
                 cpu.regs[EAX] = handle
                 cleanup_stdcall(cpu, memory, arg_bytes)
                 return
-        fh = _fake_dll_handle(name)
-        state.dynamic_modules[fh] = DynamicModule(
-            dll_name=name.lower(), base_address=fh)
-        logger.debug("handlers", f'LoadLibraryA("{name}") -> 0x{fh:x} (stub-only)')
-        cpu.regs[EAX] = fh
+        stub_handle = stubs.get_stub_dll_handle(name)
+        if stub_handle is not None:
+            state.dynamic_modules[stub_handle] = DynamicModule(
+                dll_name=name.lower(), base_address=stub_handle)
+            logger.debug("handlers", f'LoadLibraryA("{name}") -> 0x{stub_handle:x} (stub-only)')
+            cpu.regs[EAX] = stub_handle
+        else:
+            logger.warn("handlers",
+                f'LoadLibraryA("{name}") -> NULL (not found: no real file, no handler coverage)')
+            cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, arg_bytes)
 
     def _load_library_a(cpu: "CPU") -> None:
