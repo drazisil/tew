@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from tew.api.window_manager import WindowManager
+from tew.hardware.alloc_zig import bump_alloc_next
 from tew.kernel.kernel import Kernel
 from tew.kernel.scheduler import Scheduler, ThreadState
 
@@ -349,9 +350,12 @@ class CRTState:
     # ── Heap allocation ───────────────────────────────────────────────────────
 
     def simple_alloc(self, size: int) -> int:
-        """Bump-allocator for HeapAlloc/malloc/etc."""
+        """Bump-allocator for HeapAlloc/malloc/etc. Cursor math is done by
+        libcpu.so's bump_alloc_next (cpu/src/alloc.zig); the cursor itself
+        and the size-tracking dict stay Python-owned, same split as
+        ZigMemory leaving the buffer Python-owned in memory_zig.py."""
         addr = self.next_heap_alloc
-        self.next_heap_alloc = (self.next_heap_alloc + size + 15) & ~15
+        self.next_heap_alloc = bump_alloc_next(self.next_heap_alloc, size)
         self.heap_alloc_sizes[addr] = size
         return addr
 
