@@ -6,9 +6,9 @@ import ctypes
 import math
 import os
 import struct
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from tew.hardware._kernel_lib import _lib
 from tew.hardware.memory import Memory
 from tew.logger import logger
 
@@ -63,12 +63,10 @@ class FatalHaltError(Exception):
 
 
 
-# ── Load libcpu.so ────────────────────────────────────────────────────────────
+# ── Bind libcpu.so ────────────────────────────────────────────────────────────
 
-_LIB_PATH = Path(__file__).parent.parent.parent / "cpu" / "zig-out" / "lib" / "libcpu.so"
-
-def _load_lib() -> ctypes.CDLL:
-    lib = ctypes.CDLL(str(_LIB_PATH))
+def _bind_lib() -> ctypes.CDLL:
+    lib = _lib
 
     _u8  = ctypes.c_uint8
     _u16 = ctypes.c_uint16
@@ -208,7 +206,7 @@ def _load_lib() -> ctypes.CDLL:
 
     return lib
 
-_lib = _load_lib()
+_bind_lib()
 
 # C callback type: fn(state: *anyopaque, int_num: u8) callconv(.C) void
 _IntHandlerCType = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint8)

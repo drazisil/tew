@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import ctypes
-from pathlib import Path
 
-_LIB_PATH = Path(__file__).parent.parent.parent / "cpu" / "zig-out" / "lib" / "libcpu.so"
+from tew.hardware._kernel_lib import _lib
 
 
-def _load_lib() -> ctypes.CDLL:
-    lib = ctypes.CDLL(str(_LIB_PATH))
+def _bind_lib() -> ctypes.CDLL:
+    lib = _lib
 
     lib.bump_alloc_next.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
     lib.bump_alloc_next.restype = ctypes.c_uint32
@@ -17,7 +16,7 @@ def _load_lib() -> ctypes.CDLL:
     return lib
 
 
-_lib = _load_lib()
+_bind_lib()
 
 
 def bump_alloc_next(current: int, size: int) -> int:

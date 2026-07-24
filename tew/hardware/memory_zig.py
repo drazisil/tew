@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import ctypes
-from pathlib import Path
 
-_LIB_PATH = Path(__file__).parent.parent.parent / "cpu" / "zig-out" / "lib" / "libcpu.so"
+from tew.hardware._kernel_lib import _lib
 
 
-def _load_lib() -> ctypes.CDLL:
-    lib = ctypes.CDLL(str(_LIB_PATH))
+def _bind_lib() -> ctypes.CDLL:
+    lib = _lib
 
     _u8  = ctypes.c_uint8
     _i8  = ctypes.c_int8
@@ -50,7 +49,7 @@ def _load_lib() -> ctypes.CDLL:
     return lib
 
 
-_lib = _load_lib()
+_bind_lib()
 
 
 class ZigMemory:
