@@ -168,3 +168,120 @@ class TestCdq:
         cpu.regs[EAX] = 0x80000000
         step(cpu, 0x99)
         assert cpu.regs[EDX] == 0xFFFFFFFF
+
+
+class TestByteWidthAccumulatorOps:
+    """8-bit (AL) forms of the accumulator-immediate opcodes. These are
+    separate opcode numbers from the EAX/AX forms (never gated by the 0x66
+    prefix), and unlike their 16/32-bit siblings (see
+    TestAccumImmediate16BitFlags below) they already compute flags at the
+    correct .w8 width -- these tests are coverage, not regression, for that."""
+
+    def test_add_al_imm8_sets_sign_flag_at_bit7(self, cpu):
+        cpu.regs[EAX] = 0x12345600 | 0x7F  # AL=0x7F, upper bytes non-zero
+        step(cpu, 0x04, 0x01)  # ADD AL, 1 -> AL=0x80
+        assert cpu.regs[EAX] == 0x12345680  # upper 24 bits untouched
+        assert cpu.get_flag(SF_BIT) is True  # bit 7 set, not bit 31
+
+    def test_or_al_imm8_preserves_upper_bits(self, cpu):
+        cpu.regs[EAX] = 0xAABBCC00
+        step(cpu, 0x0C, 0x04)  # OR AL, 0x04
+        assert cpu.regs[EAX] == 0xAABBCC04
+
+    def test_and_al_imm8(self, cpu):
+        cpu.regs[EAX] = 0x000000FF
+        step(cpu, 0x24, 0x0F)  # AND AL, 0x0F
+        assert cpu.regs[EAX] == 0x0000000F
+
+    def test_sbb_al_imm8(self, cpu):
+        cpu.regs[EAX] = 0x00000005
+        cpu.set_flag(CF_BIT, True)
+        step(cpu, 0x1C, 0x01)  # SBB AL, 1 (with borrow)
+        assert cpu.regs[EAX] == 0x00000003
+
+    def test_sub_al_imm8_sets_sign_flag_at_bit7(self, cpu):
+        cpu.regs[EAX] = 0x00000000
+        step(cpu, 0x2C, 0x01)  # SUB AL, 1 -> AL=0xFF
+        assert cpu.regs[EAX] == 0x000000FF
+        assert cpu.get_flag(SF_BIT) is True  # bit 7 set, not bit 31
+        assert cpu.get_flag(CF_BIT) is True
+
+    def test_cmp_al_imm8_equal(self, cpu):
+        cpu.regs[EAX] = 0x00000042
+        step(cpu, 0x3C, 0x42)  # CMP AL, 0x42
+        assert cpu.get_flag(ZF_BIT) is True
+        assert cpu.regs[EAX] == 0x00000042  # CMP does not write back
+
+    def test_test_al_imm8(self, cpu):
+        cpu.regs[EAX] = 0x000000F0
+        step(cpu, 0xA8, 0x0F)  # TEST AL, 0x0F -> AND result is 0
+        assert cpu.get_flag(ZF_BIT) is True
+        assert cpu.regs[EAX] == 0x000000F0  # TEST does not write back
+
+
+class TestAccumImmediate16BitFlags:
+    """Regression tests for the 0x66-prefixed (16-bit) accumulator-immediate
+    opcodes: op05/15/1D/2D/3D/0D/25/35/A9 read/write AX correctly via
+    readEaxv/writeEaxv/fetchImm, but used to pass the fixed .w32 width to the
+    flags helper regardless of the 0x66 prefix -- so SF (checked at bit 31)
+    was always False for a result whose real 16-bit sign bit (bit 15) was
+    set. Each case below produces AX=0x8000 (bit 15 set, bit 31 clear),
+    which only reads SF=True once flags are computed at the correct width.
+    Same bug class as the old TypeScript emulator's 0x66-prefix fix and the
+    already-fixed op85 (TEST rmv, rv)."""
+
+    def test_add_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00007FFF
+        step(cpu, 0x66, 0x05, 0x01, 0x00)  # ADD AX, 1 -> AX=0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_adc_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00007FFF
+        cpu.set_flag(CF_BIT, False)
+        step(cpu, 0x66, 0x15, 0x01, 0x00)  # ADC AX, 1 -> AX=0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_sbb_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00008001
+        cpu.set_flag(CF_BIT, False)
+        step(cpu, 0x66, 0x1D, 0x01, 0x00)  # SBB AX, 1 -> AX=0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_sub_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00008001
+        step(cpu, 0x66, 0x2D, 0x01, 0x00)  # SUB AX, 1 -> AX=0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_cmp_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00008000
+        step(cpu, 0x66, 0x3D, 0x00, 0x00)  # CMP AX, 0 -> result 0x8000
+        assert cpu.regs[EAX] == 0x00008000  # CMP does not write back
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_or_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x12340000
+        step(cpu, 0x66, 0x0D, 0x00, 0x80)  # OR AX, 0x8000
+        assert cpu.regs[EAX] == 0x12348000  # upper 16 bits untouched
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_and_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x0000FFFF
+        step(cpu, 0x66, 0x25, 0x00, 0x80)  # AND AX, 0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_xor_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00000000
+        step(cpu, 0x66, 0x35, 0x00, 0x80)  # XOR AX, 0x8000
+        assert cpu.regs[EAX] == 0x00008000
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_test_ax_imm16_sign_flag(self, cpu):
+        cpu.regs[EAX] = 0x00008000
+        step(cpu, 0x66, 0xA9, 0xFF, 0xFF)  # TEST AX, 0xFFFF -> result 0x8000
+        assert cpu.regs[EAX] == 0x00008000  # TEST does not write back
+        assert cpu.get_flag(SF_BIT) is True
