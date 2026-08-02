@@ -303,6 +303,10 @@ class CRTState:
         TLS_MAX_SLOTS = 64
         self.tls_max_slots: int = TLS_MAX_SLOTS
 
+        # ── COM per-thread error info (SetErrorInfo/GetErrorInfo, ordinals
+        # 201/? in oleaut32.dll) ─────────────────────────────────────────
+        self.error_info_store: dict[int, int] = {}   # tid → IErrorInfo ptr (0 = none)
+
         # ── Kernel scheduler ──────────────────────────────────────────────
         # tls_slots is passed by reference so TlsAlloc additions are visible.
         # Main thread TID 1000 matches the tls_current_thread_id() fallback.
