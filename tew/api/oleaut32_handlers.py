@@ -850,6 +850,29 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(202, _CreateErrorInfo)
 
+    # ── oleaut32.dll ordinal 201 — SetErrorInfo ─────────────────────────────────
+    # SetErrorInfo(ULONG dwReserved, IErrorInfo *perrinfo) -> HRESULT
+    # Real OLE32's implementation (re-exported by OLEAUT32 by ordinal on WinXP)
+    # stores perrinfo as the calling thread's current COM error object,
+    # releasing whatever was set before and AddRef'ing the new one. Always
+    # returns S_OK. Stored per-thread (matching this file's existing
+    # tls_current_thread_id() pattern) since real SetErrorInfo/GetErrorInfo
+    # state is per-thread, not process-global.
+    def _SetErrorInfo(cpu: "CPU") -> None:
+        perrinfo = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        tid = state.tls_current_thread_id()
+        prev = state.error_info_store.get(tid, 0)
+        if prev:
+            _errinfo_release_core((prev - 4) & 0xFFFFFFFF)
+        if perrinfo:
+            _errinfo_addref_core((perrinfo - 4) & 0xFFFFFFFF)
+        state.error_info_store[tid] = perrinfo
+        logger.info("com", f"SetErrorInfo(perrinfo=0x{perrinfo:08x}) -> S_OK (tid={tid})")
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 8)
+
+    _ole_ord(201, _SetErrorInfo)
+
     # ── ole32.dll — COM activation ─────────────────────────────────────────────
     # Registry-driven, like real Windows: CoGetClassObject/CoCreateInstance
     # look the CLSID up under hkcr\clsid\{...}\inprocserver32 (see

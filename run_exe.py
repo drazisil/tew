@@ -445,7 +445,38 @@ try:
                 logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
                 cpu.faulted = False
             else:
-                logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
+                logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting")
+                try:
+                    raw = [f"{mem.read8(fault_eip + i):02x}" for i in range(16)]
+                    logger.error("seh", f"  Bytes at fault EIP: {' '.join(raw)}")
+                except Exception:
+                    logger.error("seh", "  Bytes at fault EIP: (out of bounds)")
+                # Previously this branch only logged and let the loop keep
+                # running -- cpu.faulted isn't part of the while condition,
+                # so an unhandled fault silently kept executing from
+                # whatever (corrupted) state the Zig core left EIP/regs in,
+                # and cpu_is_faulted() clears itself on the next successful
+                # cpu_run() call, so the *next* iteration's `if cpu.faulted`
+                # check would already read False. The eventual diagnostic
+                # (if any) reflected wherever execution wandered to much
+                # later, not this fault -- confirmed live: this exact bug
+                # made a real fault at 0x15035655 (inside MSJET35.DLL)
+                # report as an unrelated halt at 0x00688c69 (back in
+                # MCity_d.exe, ~94ms and two more DLL loads later).
+                #
+                # cpu.halted = True alone is NOT enough either -- confirmed
+                # live: it only gates the *next* iteration's while-condition
+                # check, but the rest of *this* iteration's body still runs
+                # first, including crt_state.scheduler.preempt_slice() a few
+                # lines below, which cooperatively context-switches to and
+                # executes *other* threads. That ran two more DLL loads and
+                # several more COM calls after the "halting" log line, on a
+                # CPU already left in an unrecovered fault state, which is
+                # what produced a second, worse native crash (a glibc
+                # buffer-overflow abort/core dump) this same session. Must
+                # break out of the loop immediately, not just flag it.
+                cpu.halted = True
+                break
 
         if _bp_handlers:
             _dispatch_breakpoint()
@@ -565,4 +596,18 @@ elif cpu.halted:
 
 logger.info("startup", f"Final EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
 
-sys.exit(1 if cpu.faulted else 0)
+# Tear down SDL2 (and any windows/renderers it owns) before exiting -- an
+# implicit process exit with SDL2 still live left the NVIDIA driver's own
+# atexit cleanup to run against a live GL/Vulkan-backed context, which
+# segfaulted inside the driver itself (libnvidia-rtcore.so), not our code.
+crt_state.window_manager.shutdown()
+
+# os._exit() instead of sys.exit(): the NVIDIA driver registers its own
+# atexit handlers (GLX, Vulkan RT) regardless of whether this process ever
+# used them, and those handlers crash when run after SDL_Quit() has already
+# closed the X11 connection they expect (libnvidia-rtcore.so segfault seen
+# earlier; libGLX_nvidia.so -> libxcb FORTIFY abort seen 2026-08-02). Skipping
+# exit()/__run_exit_handlers entirely avoids the whole class of driver-atexit
+# bugs. logger.py flushes every line as it's printed, so no output is lost.
+sys.stdout.flush()
+os._exit(1 if cpu.faulted else 0)

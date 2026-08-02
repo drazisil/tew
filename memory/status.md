@@ -11,7 +11,7 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-07-23)
+## Current status (2026-08-02)
 
 The DAO `*ppv`-stays-NULL mystery that this project chased across several
 sessions (2026-07-19 through 2026-07-23) is **resolved**. Root cause: three
@@ -168,16 +168,136 @@ now fixed as described above. No other violations found (grep audit for
 TODO/FAKE/stub/silent-pass patterns across every file touched this
 session came back clean).
 
-**Current blocker**: `oleaut32.dll!Ordinal #201` (`SetErrorInfo`,
-confirmed via the same export-table lookup), called immediately after
-`CreateErrorInfo`'s object is fully populated. Not yet implemented —
-next up. This is furthest any session has reached: past all of
-`MSJET35.DLL`'s and `MSJINT35.DLL`'s init-time gaps, into DAO's own
-error-reporting plumbing.
+`oleaut32.dll!Ordinal #201` (`SetErrorInfo`) is now **implemented and
+confirmed live**: stores `perrinfo` as the calling thread's current COM
+error object in a new per-thread `CRTState.error_info_store` dict (keyed
+by `state.tls_current_thread_id()`), releasing the previous entry and
+AddRef'ing the new one via the existing `_errinfo_release_core`/
+`_errinfo_addref_core` helpers (this emulator has exactly one
+`IErrorInfo` implementation — `CreateErrorInfo`'s, same file — so direct
+field manipulation is equivalent to a real vtable call). Always returns
+S_OK per spec. Confirmed live: `SetErrorInfo(perrinfo=0x06fd2624) ->
+S_OK (tid=1012)` clears the halt, and execution continues into
+`MCity_d.exe`'s **own code** for the first time past this point — a
+6-frame-deep call chain purely in `exe` addresses. 593/593 tests passing
+after the fix. Full detail: changelog.md, "2026-08-02".
+
+The `EIP=0x00688c69` core-dump crash found right after the above is now
+**resolved, and it was never a CPU/memory bug**. `coredumpctl info` on the
+crashed PID showed the segfault happening in `libnvidia-rtcore.so`
+(NVIDIA's proprietary driver), reached via
+`Py_Exit → exit() → __run_exit_handlers` — i.e. *after* our own code had
+already cleanly logged the halt diagnostic and hit `sys.exit()` in
+`run_exe.py`. `libcpu.so` (the Zig CPU) does not appear anywhere in any
+crash-thread stack. Root cause: `WindowManager.shutdown()`
+(`tew/api/window_manager.py`) — which properly destroys SDL2
+textures/renderers/windows and calls `SDL_Quit()` — existed but was never
+called anywhere in `run_exe.py`; separately, the entire Vulkan side
+(`tew/api/d3d8/_state.py` instance/device/swapchain/pipeline/semaphores)
+has no teardown path at all (only one `vkDestroy*` call exists in the
+whole codebase, for swapchain recreation, not shutdown). So `sys.exit()`
+fired with SDL2 and Vulkan still fully live, and the NVIDIA driver's own
+`atexit`-registered "someone forgot to clean up" safety-net handler ran
+against that live context and crashed inside its own code. This is the
+first time this project reached far enough into real game code to create
+a live SDL/Vulkan context and then exit while it was still up — which is
+why this was never seen before. SELinux was checked and ruled out (no AVC
+denials logged for the crash window). Fix: added a call to
+`crt_state.window_manager.shutdown()` right before `sys.exit()` in
+`run_exe.py`. Confirmed live: `[WindowManager] SDL2 shut down` now logs
+and the process exits cleanly — `coredumpctl` shows no new core dump.
+Vulkan itself still has no explicit teardown (only SDL2 does now) — see
+queued issues below.
+
+**Logger bug fixed, and it changed the diagnosis entirely.** `tew/logger.py`'s
+`_emit()` silently dropped any `ERROR`-level message whose category wasn't in
+`LOG_CATEGORIES` -- except `"exception"`, which already had a special
+exemption. But the project's own mandatory "halt loudly" convention
+(CLAUDE.md) requires every halt to log an `ERROR` right before setting
+`cpu.halted`/`cpu.faulted` -- so any run whose `LOG_CATEGORIES` didn't happen
+to include the category that logged the real reason (e.g. `seh`, `handlers`,
+`cpu`) got a halt diagnostic with no cause attached, ever, regardless of how
+much register/stack detail was in it. Fixed by exempting `ERROR`-level
+messages from category filtering the same way `"exception"` already was.
+593/593 tests still pass.
+
+Confirmed live: re-running the *same* narrow `LOG_CATEGORIES` (`com,dll,
+loader,exception,window`, still no `seh`/`cpu`/`handlers`) that previously
+produced the "unexplained" `EIP=0x00688c69` halt now also surfaces:
+```
+[ERROR] [seh] fault at 0x15035655 unhandled by SEH chain -- halting as before
+[ERROR] [cpu] Fatal halt: fatal halt at EIP=0x00688c69
+```
+**This completely relocates the real blocker.** `0x00688c69` was never the
+fault site -- it's where the CPU ended up *after* an unhandled SEH dispatch
+left things in the known "halt in place with stale stack data" state (the
+already-queued `seh.py` gap). The actual fault is a genuine
+`STATUS_ACCESS_VIOLATION` at `EIP=0x15035655`, **inside `MSJET35.DLL`**
+(loaded at `0x15000000-0x15ffffff`), dispatched via `dispatch_exception()`
+in `run_exe.py`, found no handler in the game's own SEH chain, and fell
+through to the "halting as before" path. The `EAX=0xCCCCCCCC` /
+`0x00688c69` diagnostic previously investigated was real but downstream --
+a symptom of the unhandled-fault fallback, not the cause.
+
+**Current blocker**: diagnose the real fault at `EIP=0x15035655` inside
+`MSJET35.DLL` -- needs Ghidra decompilation of the real DLL at that offset
+(`0x35655` into the module) to determine what it's doing and why the access
+violates. Separately noted: the Zig CPU core's fault-reporting
+(`tew/hardware/cpu_zig.py` `run()`/`step()`, `_RUN_FAULTED` path) only
+surfaces `EIP` and the opcode byte, never the actual faulting *memory
+address* -- real Windows access violations carry that (read/write, target
+address), and not having it here made this diagnosis slower than it needed
+to be. Worth a Zig-side follow-up (new `cpu_get_last_fault_addr()`-style
+export) later; not blocking the current investigation since EIP alone
+(0x15035655) is enough to start in Ghidra.
 
 Two small non-blocking gaps surfaced earlier, before the `RegEnumKeyA`
 halt (`kernel32.dll!IsTNT`, `kernel32.dll!GetProcessAffinityMask` — both
 harmlessly return NULL, Jet handles the miss and keeps going).
+
+**Unrelated bug found and fixed the same day (2026-08-02, later session)**:
+what initially looked like "Python crashing while investigating the
+`0x15035655` SEH fault" was actually two separate things. The SEH fault
+itself was never the crash — tew's own dispatch handled it exactly as
+designed (halted cleanly, full diagnostic printed, no host-level fault,
+since guest memory faults never touch real host memory). The actual crash
+was a second, unrelated bug: an NVIDIA driver atexit handler
+(`libGLX_nvidia.so` this time, not the earlier `libnvidia-rtcore.so`)
+aborting during process exit because `SDL_Quit()` had already closed the
+X11 connection it expected to use. Fixed by replacing `sys.exit()` with
+`os._exit()` in `run_exe.py`, which skips the whole atexit chain. Full
+diagnosis: changelog.md, "2026-08-02 (later session)".
+
+**Separately fixed while investigating the above (2026-08-02, later session,
+cont'd)**: the 9 accumulator-immediate opcodes (`op05`/`15`/`1D`/`2D`/`3D`/
+`0D`/`25`/`35`/`A9` in `cpu/src/engine.zig`) had a live instance of the same
+`0x66`-prefix flags-width bug the old TypeScript emulator fixed back in
+2026-03-30 -- correct register read/write, but hardcoded `.w32` for the
+flags width regardless of the prefix, so SF was wrong for 16-bit results
+with bit 15 set. Fixed to match the already-correct `op85` pattern; 16 new
+tests added (7 covering previously-untested 8-bit AL forms, which were
+already correct; 9 regression tests for the fix, each verified to fail
+against the pre-fix build). `libcpu.so` rebuilt, 609/609 tests passing.
+Full detail: changelog.md, "2026-08-02 (later session, cont'd)".
+
+**The `EIP=0x15035655` MSJET35.DLL fault -- the actual current blocker --
+is now RESOLVED (2026-08-02, later session, cont'd again).** Root cause:
+`opMovR32Imm` (`cpu/src/engine.zig`, opcodes `0xB8`-`0xBF`) never checked
+`s.op_size_ovr`, so the 0x66-prefixed 16-bit form (`MOV AX/CX/etc, imm16`)
+always read a bogus 4-byte immediate instead of 2 and wrote the full
+32-bit register instead of just the low 16 bits -- desyncing `EIP` by 2
+bytes from the real instruction stream. Found live using the emulator's
+own logpoint debugger facility (`cpu.add_logpoint`), not static analysis
+alone: traced the exact instruction boundaries in MSJET35.DLL's dispatch
+chain and watched execution diverge at `0x1503564b` (`66 B8 01 00`, `MOV
+AX, 1`). Fixed to branch on `op_size_ovr` like the rest of the file; 3 new
+regression tests in `test_opcodes_mov.py` (`TestMovR16Imm16`), verified to
+fail pre-fix. `libcpu.so` rebuilt, 612/612 tests passing. Confirmed live
+end-to-end: MSJET35.DLL now loads and runs with zero `[seh]` fault lines,
+and execution progresses further (60.045s vs. the previous 58.55s) before
+halting at the separately-tracked `EIP=0x00688c69` (see "New top priority"
+below) -- real forward progress. Full detail: changelog.md, "2026-08-02
+(later session, cont'd again)".
 
 ## Run command
 ```bash
@@ -199,12 +319,50 @@ categories) is still correct for a general boot-health check that doesn't
 need to reach all the way through the DAO handshake.
 
 ## Queued issues (priority order)
-- **New top priority**: implement `oleaut32.dll!Ordinal #201`
-  (`SetErrorInfo`) — see "Current status." Blocks right after DAO fully
-  populates its error-info object. State a HANDLER DECLARATION first
-  per `CLAUDE.md` before writing it — check what pointer it actually
-  receives (the `ICreateErrorInfo` face or the `IErrorInfo` face
-  obtained via the QI already observed) rather than assuming.
+- Worth a broader audit for the same "op_size_ovr-aware read, hardcoded
+  flags width" bug pattern beyond the 9 accumulator-immediate opcodes just
+  fixed (see "Current status") -- that fix was scoped to every call site of
+  `readEaxv`/`writeEaxv` specifically (grepped exhaustively), but other
+  opcode families using `op_size_ovr` directly (e.g. `op21`/`op23`/`op31`/
+  `op33`/`op85`, already correct, found by inspection not a systematic
+  sweep) weren't exhaustively re-verified. Not blocking anything today.
+- **New top priority**: with the `0x15035655` MSJET35.DLL fault fixed,
+  `EIP=0x00688c69` is the current blocker again (execution now reaches it
+  directly, no MSJET35.DLL fault in between). Per the 2026-08-02 diagnosis
+  earlier in this file, `0x00688c69` was already established as *not* the
+  real fault site, just where the CPU ends up after `seh.py`'s
+  unhandled-fault path halts in place with stale stack data (`EAX=
+  0xCCCCCCCC` is the MSVC debug-heap uninitialized-fill pattern, not a
+  real value) -- so this is really the same open item as the "Decide/
+  implement a real unwind for seh.py's unhandled-fault path" bullet further
+  down this list; start there rather than treating `0x00688c69` as a fresh
+  investigation. The `EBP` chain frames already captured at this halt
+  (`0x0068adf2`, `0x00a301a1`, `0x00684de7`, `0x006848ee`, `0x004d8c71`,
+  `0x0068a7d5`, `0x009fcaa6`, all in `MCity_d.exe`) are the real call chain
+  leading into whatever actually faults -- useful starting context, no need
+  to re-derive.
+- Add real faulting-address reporting to the Zig CPU core's fault path
+  (`cpu_run`'s `_RUN_FAULTED` result currently only carries EIP + opcode,
+  not the memory address that was actually being accessed) — would have
+  made the (now-resolved) `0x15035655` diagnosis faster, and would help
+  the `0x00688c69` one too. Not blocking, EIP is enough to start.
+- Vulkan resource teardown is still entirely missing (`tew/api/d3d8/_state.py`
+  tracks instance/device/swapchain/pipeline/semaphores/etc. with zero
+  `vkDestroyInstance`/`vkDestroyDevice` calls anywhere in the codebase —
+  only `vkDestroySwapchainKHR`, used for recreation, not shutdown). Lower
+  urgency as of 2026-08-02 (later session): `run_exe.py` now calls
+  `os._exit()` instead of `sys.exit()` after `window_manager.shutdown()`,
+  which skips `exit()`/`__run_exit_handlers` entirely — so no NVIDIA driver
+  atexit handler runs at all regardless of what graphics state (Vulkan, GLX,
+  or otherwise) is still live. This was in direct response to a *second*
+  NVIDIA-atexit crash (`libGLX_nvidia.so`/`xcb`, distinct from the earlier
+  `libnvidia-rtcore.so` one) that the driver's "undocumented atexit fallback"
+  mentioned below turned out not to reliably cover. See changelog.md,
+  "2026-08-02 (later session)". A proper `vk_shutdown()` (destroy pipeline →
+  framebuffers → image views → render pass → command pool →
+  semaphores/fence → swapchain → device → surface → instance, in that
+  order) is still worth doing for hygiene/correctness, but is no longer
+  covering for a live crash.
 - Worth a dedicated pass later: now that `patch_dll_iats`'s real-address
   bug is fixed, re-check whether any of the *other* previously-"fixed"
   halts in this session were actually this same class of bug

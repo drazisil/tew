@@ -43,6 +43,41 @@ class TestMovR32Imm32:
             assert cpu.regs[r] == v
 
 
+class TestMovR16Imm16:
+    """Regression tests for the 0x66-prefixed (16-bit) form of MOV r32, imm32
+    (opcodes 0xB8-0xBF): the handler used to ignore op_size_ovr entirely and
+    always fetch32() a 4-byte immediate, reading 2 bytes too many and writing
+    the full 32-bit register instead of just the low 16 bits. That silently
+    desynced EIP from the real instruction stream -- found live via a
+    MSJET35.DLL access-violation halt whose actual root cause was this
+    opcode, not the DLL: the emulator kept "executing" whatever garbage bytes
+    the extra 2-byte overread landed on until it hit truly invalid memory
+    several pseudo-instructions later. See changelog.md, 2026-08-02."""
+
+    def test_ax_honors_66_prefix(self, cpu):
+        cpu.regs[EAX] = 0x12340000
+        load(cpu, 0, [0x66, 0xB8, 0x01, 0x00])  # MOV AX, 1
+        cpu.step()
+        assert cpu.regs[EAX] == 0x12340001  # upper 16 bits preserved
+        assert cpu.eip == 4  # exactly 4 bytes consumed, not 6
+
+    def test_cx_honors_66_prefix(self, cpu):
+        cpu.regs[ECX] = 0xABCD0000
+        load(cpu, 0, [0x66, 0xB9, 0xEF, 0xBE])  # MOV CX, 0xBEEF
+        cpu.step()
+        assert cpu.regs[ECX] == 0xABCDBEEF
+        assert cpu.eip == 4
+
+    def test_does_not_overread_following_bytes(self, cpu):
+        # The exact shape of the live bug: two bytes past the real 4-byte
+        # instruction belong to the *next* real instruction and must be
+        # left completely unconsumed/unexecuted by this one.
+        load(cpu, 0, [0x66, 0xB8, 0x01, 0x00, 0x0C, 0x99])  # MOV AX,1 ; OR AL,0x99 (next instr)
+        cpu.step()
+        assert cpu.eip == 4
+        assert cpu.regs[EAX] & 0xFFFF == 0x0001
+
+
 class TestMovRm32R32:
     def test_reg_to_reg(self, cpu):
         cpu.regs[EAX] = 0x12345678
