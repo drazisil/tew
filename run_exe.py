@@ -445,7 +445,38 @@ try:
                 logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
                 cpu.faulted = False
             else:
-                logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting as before")
+                logger.error("seh", f"fault at 0x{fault_eip:08x} unhandled by SEH chain -- halting")
+                try:
+                    raw = [f"{mem.read8(fault_eip + i):02x}" for i in range(16)]
+                    logger.error("seh", f"  Bytes at fault EIP: {' '.join(raw)}")
+                except Exception:
+                    logger.error("seh", "  Bytes at fault EIP: (out of bounds)")
+                # Previously this branch only logged and let the loop keep
+                # running -- cpu.faulted isn't part of the while condition,
+                # so an unhandled fault silently kept executing from
+                # whatever (corrupted) state the Zig core left EIP/regs in,
+                # and cpu_is_faulted() clears itself on the next successful
+                # cpu_run() call, so the *next* iteration's `if cpu.faulted`
+                # check would already read False. The eventual diagnostic
+                # (if any) reflected wherever execution wandered to much
+                # later, not this fault -- confirmed live: this exact bug
+                # made a real fault at 0x15035655 (inside MSJET35.DLL)
+                # report as an unrelated halt at 0x00688c69 (back in
+                # MCity_d.exe, ~94ms and two more DLL loads later).
+                #
+                # cpu.halted = True alone is NOT enough either -- confirmed
+                # live: it only gates the *next* iteration's while-condition
+                # check, but the rest of *this* iteration's body still runs
+                # first, including crt_state.scheduler.preempt_slice() a few
+                # lines below, which cooperatively context-switches to and
+                # executes *other* threads. That ran two more DLL loads and
+                # several more COM calls after the "halting" log line, on a
+                # CPU already left in an unrecovered fault state, which is
+                # what produced a second, worse native crash (a glibc
+                # buffer-overflow abort/core dump) this same session. Must
+                # break out of the loop immediately, not just flag it.
+                cpu.halted = True
+                break
 
         if _bp_handlers:
             _dispatch_breakpoint()

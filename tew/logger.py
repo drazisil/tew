@@ -77,7 +77,17 @@ def set_emit_hook(hook: EmitHook | None) -> None:
 def _emit(level: int, category: str, msg: str) -> None:
     if level > _active_level:
         return
-    if _active_categories is not None and category not in _active_categories and category != "exception":
+    # ERROR is exempt from category filtering, same as "exception" already
+    # was: every halt/fault this emulator produces is required (CLAUDE.md's
+    # "halt loudly" rule) to log an ERROR right before setting cpu.halted --
+    # if that line could be silently dropped by an unrelated LOG_CATEGORIES
+    # scope, the halt diagnostic that follows would have no reason attached.
+    if (
+        _active_categories is not None
+        and category not in _active_categories
+        and category != "exception"
+        and level != ERROR
+    ):
         return
 
     elapsed = time.monotonic() - _start_time
