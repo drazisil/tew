@@ -596,4 +596,18 @@ elif cpu.halted:
 
 logger.info("startup", f"Final EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
 
-sys.exit(1 if cpu.faulted else 0)
+# Tear down SDL2 (and any windows/renderers it owns) before exiting -- an
+# implicit process exit with SDL2 still live left the NVIDIA driver's own
+# atexit cleanup to run against a live GL/Vulkan-backed context, which
+# segfaulted inside the driver itself (libnvidia-rtcore.so), not our code.
+crt_state.window_manager.shutdown()
+
+# os._exit() instead of sys.exit(): the NVIDIA driver registers its own
+# atexit handlers (GLX, Vulkan RT) regardless of whether this process ever
+# used them, and those handlers crash when run after SDL_Quit() has already
+# closed the X11 connection they expect (libnvidia-rtcore.so segfault seen
+# earlier; libGLX_nvidia.so -> libxcb FORTIFY abort seen 2026-08-02). Skipping
+# exit()/__run_exit_handlers entirely avoids the whole class of driver-atexit
+# bugs. logger.py flushes every line as it's printed, so no output is lost.
+sys.stdout.flush()
+os._exit(1 if cpu.faulted else 0)
