@@ -677,8 +677,15 @@ def register_kernel32_io_handlers(
         try:
             os.unlink(real_path)
             success = True
+        except FileNotFoundError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        except PermissionError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
         except OSError:
             success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.debug("fileio", f'[Win32] DeleteFileA("{name}") -> {success}')
         cpu.regs[EAX] = 1 if success else 0
         cleanup_stdcall(cpu, memory, 4)
@@ -690,8 +697,15 @@ def register_kernel32_io_handlers(
         try:
             os.unlink(real_path)
             success = True
+        except FileNotFoundError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        except PermissionError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
         except OSError:
             success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.debug("fileio", f'[Win32] DeleteFileW("{name}") -> {success}')
         cpu.regs[EAX] = 1 if success else 0
         cleanup_stdcall(cpu, memory, 4)
@@ -905,12 +919,36 @@ def register_kernel32_io_handlers(
         h_file    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_high   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
-        if entry and not entry.writable:
+        size = None
+        if entry is not None:
+            # Query the real host file directly (same approach
+            # GetFileInformationByHandle already uses) instead of
+            # entry.data's cached length -- entry.data is only populated
+            # for read-mode entries (empty bytes for write-only, per its own
+            # field comment in _state.py), which made GetFileSize wrongly
+            # fail on every writable handle -- confirmed live: right after
+            # creating and writing its own scratch temp file, msjet35.dll
+            # calls GetFileSize on that exact handle as a completely normal
+            # operation, and GetFileInformationByHandle succeeds on the same
+            # handle moments earlier in the same log, proving it's valid.
+            try:
+                st = os.fstat(entry.fd) if entry.fd is not None else os.stat(entry.path)
+                size = st.st_size
+            except OSError:
+                size = None
+        if size is not None:
             if lp_high:
                 memory.write32(lp_high, 0)
-            cpu.regs[EAX] = len(entry.data) & 0xFFFFFFFF
+            cpu.regs[EAX] = size & 0xFFFFFFFF
         else:
+            # h_file is genuinely unknown, or the real host file is no
+            # longer accessible. Real GetFileSize always calls SetLastError
+            # on this 0xFFFFFFFF failure return -- callers (confirmed live:
+            # msjet35.dll's own error-code translator) read GetLastError()
+            # right after and need a real value, not whatever was already
+            # there.
             cpu.regs[EAX] = 0xFFFFFFFF
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
         cleanup_stdcall(cpu, memory, 8)
 
     def _get_file_size_ex(cpu: "CPU") -> None:
