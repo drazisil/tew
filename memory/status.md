@@ -299,6 +299,57 @@ halting at the separately-tracked `EIP=0x00688c69` (see "New top priority"
 below) -- real forward progress. Full detail: changelog.md, "2026-08-02
 (later session, cont'd again)".
 
+**`EIP=0x00688c69` is now fully diagnosed (2026-08-03) -- and the earlier
+note about it above (`seh.py`'s "halt in place with stale stack data"
+path) was wrong, superseded by fresh investigation.** It's a
+`cpu.fatal_halt`, not the SEH-stale-stack path at all. Root cause: the
+game's own DAO/Jet database-init-failure handler (`Nfs_REALabortcallback`
+-- it's what wrote `except.txt`, noticed earlier this session) checks a
+global, `_Nfs_DebuggerIsPresent`, hardcoded to `1` unconditionally in
+`WinMain` (not an `IsDebuggerPresent()` check -- deliberate debug-build
+behavior, used at 1,780 call sites across 922 functions, the primary
+assertion mechanism for the whole binary), and calls `_Nfs_DebugBreak()`
+-- a real `INT3`. tew's INT3 dispatch was unconditionally fatal, skipping
+any chance for the game's own SEH handling (it installs a real frame,
+`_CLayer_CatchSEH`, specifically for `STATUS_BREAKPOINT`) to run. Fixed to
+route INT3 through the same `dispatch_exception()` machinery already used
+for access violations. 3 new tests, 615/615 passing. Confirmed live:
+`tid=1012`'s real, compiled 11-frame SEH chain now genuinely gets walked
+(handlers at `0x009f5eb8`/`0x00c771b0`/`0x00c93b54`/`0x00c93cc9`, all for
+`code=0x80000003`) -- every one declines, so it's still genuinely
+unhandled and still halts at the same point, but now as a *proven* result
+instead of a skip. This also confirmed `tid=1012` does **not** share
+`_CLayer_CatchSEH`'s coverage (main-thread-only). Full detail:
+changelog.md, "2026-08-03 -- INT3 now routes through the real SEH chain".
+
+**Major forward progress (2026-08-03, cont'd): the run now gets past DAO/Jet
+entirely and reaches ~195.8 million steps** (previous best: a few million).
+Chasing "why does `Nfs_REALabortcallback` fire" led to `msjet35.dll`'s
+own `dbcode.c`-sourced debug log (enabled via a new real `-dbEnableLog`
+command-line flag), which showed DAO's COM activation fully succeeding
+and pinpointed the real failure as `DBEngine::get_Workspaces()`
+(`dao350.dll`, real vtable call) returning null. Traced deep into
+`msjet35.dll` (`FUN_7a876127`/ordinal 154 -> ... -> `FUN_7a876e2b`,
+returning `-1022`) and found two real bugs in `kernel32_io.py`:
+`DeleteFileA`/`DeleteFileW` never called `SetLastError` on failure, and
+`GetFileSize` unconditionally failed on any writable-mode handle (a real
+Windows API restriction that doesn't exist -- confirmed live,
+`GetFileInformationByHandle` already proved the exact same handle valid
+moments earlier in the same log). Fixed both. Also seeded two previously-
+missing Jet 3.5 registry values, `SystemDB` and `TryJetAuth`. None of
+these individually fixed the exact `-1022` (still traces to a third,
+unidentified call site), but the combined effect took the run from halting
+after a few million steps to running clean for ~195.8M steps, well past
+the entire DAO/Jet sequence into real gameplay (`dsound.dll`, `winmm.dll`,
+the `GetMessageA` message pump). Full detail: changelog.md, "2026-08-03
+(cont'd)".
+
+**New blocker at the new frontier**: a `RUNAWAY` (`EIP` in invalid/
+unmapped memory) at step ~195.8M, immediately preceded by two
+`[UNIMPLEMENTED]` `VirtualAlloc` halts (`unsupported flProtect 0x1`, then
+`MEM_COMMIT on unreserved 0x4000000`) that don't actually stop execution
+(~195M more steps ran afterward) -- see "New top priority" below.
+
 ## Run command
 ```bash
 cd /data/Code/tew
@@ -326,21 +377,42 @@ need to reach all the way through the DAO handshake.
   opcode families using `op_size_ovr` directly (e.g. `op21`/`op23`/`op31`/
   `op33`/`op85`, already correct, found by inspection not a systematic
   sweep) weren't exhaustively re-verified. Not blocking anything today.
-- **New top priority**: with the `0x15035655` MSJET35.DLL fault fixed,
-  `EIP=0x00688c69` is the current blocker again (execution now reaches it
-  directly, no MSJET35.DLL fault in between). Per the 2026-08-02 diagnosis
-  earlier in this file, `0x00688c69` was already established as *not* the
-  real fault site, just where the CPU ends up after `seh.py`'s
-  unhandled-fault path halts in place with stale stack data (`EAX=
-  0xCCCCCCCC` is the MSVC debug-heap uninitialized-fill pattern, not a
-  real value) -- so this is really the same open item as the "Decide/
-  implement a real unwind for seh.py's unhandled-fault path" bullet further
-  down this list; start there rather than treating `0x00688c69` as a fresh
-  investigation. The `EBP` chain frames already captured at this halt
-  (`0x0068adf2`, `0x00a301a1`, `0x00684de7`, `0x006848ee`, `0x004d8c71`,
-  `0x0068a7d5`, `0x009fcaa6`, all in `MCity_d.exe`) are the real call chain
-  leading into whatever actually faults -- useful starting context, no need
-  to re-derive.
+- **RESOLVED (2026-08-03, cont'd)**: `EIP=0x00688c69`'s "real next step" --
+  *why does `Nfs_REALabortcallback` fire at all* -- is answered. Root cause
+  was real bugs in tew's own Win32 emulation (`DeleteFileA`/`DeleteFileW`
+  missing `SetLastError`, `GetFileSize` wrongly failing on writable handles)
+  plus two missing Jet 3.5 registry values (`SystemDB`, `TryJetAuth`). Fixed
+  all four; the game no longer hits this DAO/Jet init-failure path at all
+  and execution now runs clean to ~195.8M steps. Full detail: "Current
+  status" above and changelog.md "2026-08-03 (cont'd)". The general
+  `_Nfs_DebuggerIsPresent`/`DebugBreak()` pattern (1,780 other call sites)
+  remains true as a fact about the binary but is no longer an active
+  blocker -- no further action needed unless a *different* one of those
+  1,780 sites is actually hit by a future run.
+- **New top priority**: `RUNAWAY` (EIP in invalid/unmapped memory) at step
+  ~195.8M, the new frontier reached after the DAO/Jet fixes above. Preceded
+  immediately by two `[UNIMPLEMENTED]` `VirtualAlloc` halts that don't
+  actually stop execution (`/tmp/emu.log` lines 382-383: `unsupported
+  flProtect 0x1`, then `MEM_COMMIT on unreserved 0x4000000` -- ~195M more
+  steps ran after these "halts", so this is likely the same "logged as
+  halting but doesn't actually halt" bug class already fixed once this
+  session for unhandled access-violation faults, now recurring for
+  `VirtualAlloc`). Two things to check first: (1) does the `VirtualAlloc`
+  handler actually set `cpu.halted = True` / raise on the unimplemented
+  path, or just log and fall through; (2) is `flProtect 0x1` (PAGE_NOACCESS)
+  and committing 0x4000000 (64MB) unreserved memory actually what the real
+  game does here, or a symptom of bad args from an earlier miscomputation.
+- Historical note, kept for context, now incorrect -- do not act on this:
+  `0x00688c69` was previously guessed to be the same open item as the
+  "Decide/implement a real unwind for seh.py's unhandled-fault path" bullet
+  further down this list. Fresh investigation (see "Current status")
+  disproved that: it's a `cpu.fatal_halt` from INT3 (now properly routed
+  through `dispatch_exception`, see above), not the SEH-stale-stack-data
+  path at all. The `EBP` chain frames captured at this halt (`0x0068adf2`,
+  `0x00a301a1`, `0x00684de7`, `0x006848ee`, `0x004d8c71`, `0x0068a7d5`,
+  `0x009fcaa6`, all in `MCity_d.exe`) are still accurate as the real call
+  chain leading into `Nfs_REALabortcallback` -- useful starting context if
+  chasing the "why does DAO/Jet init fail" question above.
 - Add real faulting-address reporting to the Zig CPU core's fault path
   (`cpu_run`'s `_RUN_FAULTED` result currently only carries EIP + opcode,
   not the memory address that was actually being accessed) — would have

@@ -4,6 +4,222 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-03 (cont'd) — real SetLastError/GetFileSize bugs found and fixed
+while chasing why DAO/Jet database init fails; execution now reaches
+~195.8M steps (previous best: a few million)
+
+Continued the "why does `Nfs_REALabortcallback` fire at all" investigation
+from the entry above. Added a real `-dbEnableLog` command-line flag
+(`crt_handlers.py`'s `GetCommandLineA`/`W` strings, `msvcrt_handlers.py`'s
+`__getmainargs` argv array -- both updated to carry
+`"MCity_d.exe -nomovie -dbEnableLog"`) after the game's own debug log
+(`dbcode.c`-sourced, written to `c:\dblog.txt` -> `~/.emu32/dblog.txt`)
+turned out to be exactly the DAO/Jet trace the game already supports,
+rather than something to reconstruct by hand. It showed the DAO COM
+activation succeeding end-to-end (`DAO Engine version: 3.51`, `Workspace
+type is Jet.`) and then `ERROR: get workspaces failed.` -- a real vtable
+call, `DBEngine::get_Workspaces()` (`dao350.dll`, vtable offset `0x3c`),
+returning null.
+
+Traced live (logpoints/breakpoints at addresses found via Ghidra, same
+methodology as the MSJET35.DLL investigation) through `dao350.dll`'s
+`FUN_0448a033` -> `msjet35.dll` ordinal 154 (`FUN_7a876127`) ->
+`FUN_7a8761fa` -> `FUN_7a876425` -> `FUN_7a876e2b`, which returns
+`0xfffffc02` (-1022). Found the real source: `FUN_7a873691`, msjet35.dll's
+own `GetLastError()` -> internal-error-code translation table (found via a
+random Ghidra address the user was independently looking at,
+`7a8caafa`/`7a8caac6`, landing inside this exact function). `-1022` is
+produced either by a cluster of real I/O-fault-class Win32 error codes
+(`ERROR_INVALID_HANDLE`, `ERROR_WRITE_FAULT`/`ERROR_READ_FAULT`,
+`ERROR_UNEXP_NET_ERR`, etc.) or, notably, by *any unrecognized*
+`GetLastError()` value via a generic "Unmapped error code" fallback path.
+
+Live-traced (breakpoint at the translator's entry, reading
+`TEB_BASE+0x34` directly rather than single-stepping the emulated
+`GetLastError()` call) and found `GetLastError()` reading back as `0`
+(success) at both of its two call sites in this exact sequence -- meaning
+some *real* failure was happening, but tew was reporting "no error"
+afterward instead of the actual reason. Traced the immediate callers (the
+return address at `[ESP+0]` is reliable for one level even though full
+EBP-chain walking isn't -- see below) to two genuine bugs in
+`kernel32_io.py`:
+
+- `_delete_file_a`/`_delete_file_w`: correctly returned `FALSE` on
+  failure, but never called `SetLastError` at all, leaving whatever
+  error code happened to already be set. Fixed to map the real Python
+  exception (`FileNotFoundError` -> `ERROR_FILE_NOT_FOUND`,
+  `PermissionError` -> `ERROR_ACCESS_DENIED`, other `OSError` ->
+  `ERROR_FILE_NOT_FOUND`) the same way `CreateFileA`'s existing
+  `SetLastError` calls already do nearby in the same file.
+- `_get_file_size`: same missing-`SetLastError` bug, but also a deeper,
+  separate one -- it only ever supported read-mode handles
+  (`if entry and not entry.writable`), unconditionally failing for any
+  writable-mode handle regardless of whether the handle was valid. Real
+  `GetFileSize` works fine on writable handles. Confirmed live this
+  wasn't hypothetical: right after `msjet35.dll` creates and writes its
+  own scratch temp file (`GetTempFileNameA` -> `JETA000.TMP`, opened for
+  write), it calls `GetFileSize` on that exact handle as a completely
+  normal operation -- and `GetFileInformationByHandle` on the *same*
+  handle, moments earlier in the same log, already proved it was valid.
+  Rewrote `_get_file_size` to query the real host file directly via
+  `os.fstat(entry.fd)` (falling back to `os.stat(entry.path)`), the same
+  approach `_get_file_information_by_handle` already used correctly --
+  works for both read and write mode now, only fails (with
+  `ERROR_INVALID_HANDLE`) when the handle is genuinely unknown or the
+  real host file is inaccessible.
+
+Also seeded two real Jet 3.5 registry values that were previously
+`NOT FOUND` in `registry.json`: `SystemDB` (under
+`HKLM\Software\Microsoft\Jet\3.5\Engines`, value `C:\System.mdb` --
+confirmed via a hardcoded literal string found directly in `msjet35.dll`'s
+own compiled code, `FUN_7a876276`, that the `.mdb` extension is correct,
+not `.mdw` as first guessed) and `TryJetAuth` (under
+`...\Jet\3.5\Engines\ODBC` -- found by direct runtime introspection after
+two wrong guesses at its location, `Debug` and bare `Engines`, both
+disproven by adding a temporary debug print inside `_reg_query_value`
+itself and reading back the exact `key_name` being checked at query time;
+value `"N"`, tried as a "skip workgroup auth" hypothesis -- didn't change
+the failure on its own, but left seeded since it's a real, previously-
+missing value either way).
+
+None of these fixes individually resolved the exact `-1022` propagating
+out of `FUN_7a876e2b` (confirmed still identical, `0xfffffc02`, at the
+same checkpoint even after every fix above) -- the two `GetLastError()`
+call sites turned out to feed a separate error-recording path (likely
+DAO's `Errors` collection), not the function's own direct return value,
+which still traces to a third, not-yet-identified call to `FUN_7a873691`.
+**But the combined effect of all of the above took the run from
+halting after a few million steps to running clean for ~195.8 million
+steps** -- past the entire DAO/Jet database-initialization sequence
+entirely, into real gameplay activity (`dsound.dll` buffer status/lock,
+`winmm.dll!timeSetEvent`, `user32.dll!GetMessageA` -- the actual message
+pump). Whatever was gating progress past DAO/Jet is now effectively
+cleared in practice, even without having pinned the exact `-1022` call
+site with certainty.
+
+New, unrelated blocker found at the new frontier (step ~195.8M): a
+`RUNAWAY` with `EIP` landing in invalid/unmapped memory, preceded by two
+`[UNIMPLEMENTED]`-labeled `VirtualAlloc` halts (`unsupported flProtect
+0x1`, then `MEM_COMMIT on unreserved 0x4000000`) that evidently don't
+actually stop execution (confirmed: ~195 million more steps ran
+afterward) -- very likely the real cause of the eventual runaway, and a
+strong candidate to also be the same "logged as halting but doesn't
+actually halt" bug class already fixed once this session for unhandled
+access-violation faults. Not investigated further this session -- next
+priority.
+
+Along the way, confirmed two things that turned out not to be the
+answer, worth recording so they aren't re-derived: (1) tew has zero
+native NT syscall (`INT 0x2E`) activity anywhere in this entire run
+(`NtSyscallDispatcher` logs at `logger.debug("nt", ...)`, category never
+included in earlier runs this session -- checked with it included,
+found nothing), ruling out a missing-native-syscall explanation. (2) EBP
+frame-based call-stack dumps (`_walk_ebp_chain`, reused from
+`exception_diagnostics.py`) cannot see *into* `dao350.dll`/`msjet35.dll`
+at all -- both are evidently frame-pointer-omitted (optimized/release)
+builds, so unwinding through them just returns stale `EBP` state from
+whatever `MCity_d.exe` frame was last active before the whole DAO/Jet
+excursion began. This retroactively explains why *every* EBP chain dump
+this whole project has ever produced only ever shows `MCity_d.exe`
+addresses. For visibility inside these DLLs, targeted breakpoints/
+logpoints at addresses found via Ghidra remain the only working method --
+confirmed the *immediate* return address at `[ESP+0]` is still reliable
+for one call-depth level even when full chain-walking isn't, since it's
+pushed by `CALL` regardless of whether the callee sets up its own frame.
+
+Also found and flagged, not yet fixed: `LCMapStringA` is a genuine
+unimplemented halt-stub (`kernel32_io.py`), while its Unicode sibling
+`LCMapStringW` is fully implemented. Notable because this entire game is
+ANSI-only throughout (every API call seen this whole session has been the
+`A` suffix, never `W`) -- if anything ever calls it (a real candidate:
+`msjint35.dll`, Jet's own "international"/collation support DLL, already
+loaded in this exact chain), it's an immediate hard halt. Queued for a
+future session.
+
+615/615 tests passing throughout (no new tests this entry -- this was a
+live/runtime debugging session, verification was via the checkpoint-trace
+methodology rather than new unit tests; the `GetFileSize`/`DeleteFileA`
+fixes are exercised indirectly by the existing kernel32_io test coverage
+but don't yet have dedicated regression tests of their own -- worth
+adding later).
+
+## 2026-08-03 — INT3 now routes through the real SEH chain instead of an
+unconditional fatal_halt
+
+Root-caused the `EIP=0x00688c69` halt that surfaced once the MSJET35.DLL
+fault (previous entries) was fixed. Traced the caller chain in Ghidra:
+`Nfs_REALabortcallback` (the game's own DAO/Jet database-init-failure
+handler -- it's what wrote `except.txt`, the "Failed to initialize
+database..." file noticed earlier this session) checks a global,
+`_Nfs_DebuggerIsPresent`, and calls `_Nfs_DebugBreak()` (a thunk at
+`0x0040eaca` jumping to the real body at `0x00688c50`, whose entire "work"
+is a single `INT3` byte at `0x00688c68`) when it's true. That flag is
+**hardcoded to `1` unconditionally** in `WinMain` (`0068a5e1`, right before
+registering `Nfs_exitCallback` via `atexit()`) -- not read from
+`IsDebuggerPresent()` or any environment check -- so this is deliberate,
+by-design debug-build behavior, not something dependent on tew's Win32
+emulation. The same pattern (`if (_Nfs_DebuggerIsPresent) DebugBreak();`)
+is used at **1,780 call sites across 922 functions** throughout the binary
+-- it's the primary assertion mechanism for the whole debug build, not a
+one-off.
+
+Real Windows treats an `INT3` with no debugger attached as a normal,
+dispatchable `STATUS_BREAKPOINT` (`0x80000003`) structured exception, not
+an automatic crash -- and this game relies on exactly that: it installs a
+real SEH frame, `_CLayer_CatchSEH(&LAB_0040b7c6)` (called right after the
+`_Nfs_DebuggerIsPresent=1` line in `WinMain`), whose filter
+(`0x004d8c84`, hand-decoded since Ghidra hadn't auto-detected it as a
+function -- SEH filter/handler code is only reachable via scope-table
+metadata, not a normal call) checks specifically for
+`ExceptionCode == 0x80000003`, and whose handler logs a source-location
+message and lets execution continue -- no message box, no `CRTAbort`.
+
+tew's `win32_handlers.py` INT3 dispatch (`int_num == 3` in the interrupt
+dispatcher) previously skipped all of that: unconditional
+`c.halted = True; c.fatal_halt = True`, no SEH attempt at all, for every
+one of those 1,780 sites. Fixed to route through the same
+`dispatch_exception()` SEH-chain-walking machinery already used for access
+violations: sets `ExceptionAddress`/`CONTEXT.Eip` to the `INT3`'s own
+address (`c.eip - 1` -- `EIP` has already advanced past the 1-byte opcode
+by the time the interrupt handler runs, but real Windows reports the
+exception at the `INT3` itself), calls `dispatch_exception(c, memory,
+STATUS_BREAKPOINT, fault_eip)`, and only falls back to the same permanent
+`fatal_halt` (still needed -- a plain `halted=True` gets silently cleared
+by the next scheduler thread-switch, same class of gap fixed elsewhere for
+unhandled access-violation faults) if the chain is genuinely exhausted.
+This mirrors the existing pattern in `seh.py`'s own `_raise_exception`
+(`RaiseException`'s real implementation), which already calls
+`dispatch_exception` synchronously from inside a Python interrupt-handler
+callback the same way.
+
+3 new tests in `tests/unit/api/test_int3_seh_dispatch.py`: a handled case
+(`ContinueExecution` handler -- confirms no halt), an unhandled case
+(empty chain -- confirms the fatal_halt fallback still works, via
+`pytest.raises(FatalHaltError)` since `cpu.step()` raises the instant
+`fatal_halt` newly becomes true rather than returning normally), and an
+`ExceptionAddress`-correctness case (a hand-built handler reads
+`EXCEPTION_RECORD->ExceptionAddress` and confirms it points at the `INT3`
+itself, not one past it). Verified the two behavior-changing tests are
+real regressions: stashed the fix, confirmed both fail against the
+pre-fix code, restored. 615/615 tests passing (612 + 3 new).
+
+Confirmed live against the real scenario: re-running the same DAO/Jet
+sequence that previously hit the unexplained `0x00688c69` halt now shows
+`dispatch_exception` genuinely walking `tid=1012`'s real, compiled
+**11-frame SEH chain** (handlers at `0x009f5eb8` (repeated -- a generic
+CRT default handler), `0x00c771b0`, `0x00c93b54`, `0x00c93cc9`, all for
+`code=0x80000003`) -- every one declines (`ContinueSearch`), so it's still
+genuinely unhandled and correctly halts, but now the halt is a proven
+result (`EIP=0x00688c68`, the `INT3`'s own address, correctly one less
+than before) rather than a guess. This also answers the open question
+from earlier investigation: `tid=1012` does **not** share
+`_CLayer_CatchSEH`'s coverage (that frame is main-thread-only), so this
+specific breakpoint really is unhandled at the per-thread level on real
+Windows too. What real Windows would do next -- fall through to a
+process-wide `SetUnhandledExceptionFilter`, if the game installs one --
+is a separate, unexplored question; tew's `dispatch_exception` only walks
+the per-thread FS:[0] chain today.
+
 ## 2026-08-02 (later session, cont'd again) — root cause of the `EIP=0x15035655`
 MSJET35.DLL fault found and fixed: `opMovR32Imm` never honored 0x66
 
