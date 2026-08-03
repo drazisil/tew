@@ -279,17 +279,42 @@ class Win32Handlers:
                 nt_dispatcher.dispatch(c)
                 return
             if int_num == 3:
-                # INT3 debug breakpoint — halt so the run loop dumps state.
-                # Must be a fatal_halt: a plain halted=True gets silently
-                # cleared by the very next scheduler thread-switch or nested
-                # _invoke_emulated_proc call (same class of gap as the
-                # unimplemented-API halts fixed earlier), so execution was
-                # continuing right past this "halt" instead of actually
-                # stopping.
-                from tew.logger import logger
-                logger.warn(
+                # INT3 debug breakpoint. Real Windows raises STATUS_BREAKPOINT
+                # as a normal, dispatchable structured exception, not an
+                # automatic crash -- and this game relies on exactly that:
+                # `_Nfs_DebuggerIsPresent` is hardcoded to 1 in this debug
+                # build (set unconditionally in WinMain, not from an
+                # IsDebuggerPresent() check), so every one of its ~1,780
+                # assertion call sites throughout the binary executes a real
+                # INT3 on purpose. The game installs its own SEH frame
+                # (_CLayer_CatchSEH) specifically to catch STATUS_BREAKPOINT,
+                # log, and continue -- exactly what real Windows does here
+                # with no debugger attached. Route through the same SEH-chain
+                # dispatch already used for access violations instead of
+                # treating every one of those sites as instant-fatal.
+                from tew.kernel.seh import dispatch_exception, STATUS_BREAKPOINT
+                # EIP has already advanced past the 1-byte opcode by the time
+                # this handler runs, but ExceptionAddress/CONTEXT.Eip must
+                # point AT the INT3 itself, matching real Windows.
+                fault_eip = (c.eip - 1) & 0xFFFFFFFF
+                c.eip = fault_eip
+                handled = dispatch_exception(c, stubs._memory, STATUS_BREAKPOINT, fault_eip)
+                if handled:
+                    logger.debug(
+                        "seh",
+                        f"INT3 at EIP=0x{fault_eip:08x} handled by game's own SEH chain -- resuming",
+                    )
+                    return
+                # Genuinely unhandled: same permanent, unclearable halt as
+                # before. A plain halted=True gets silently cleared by the
+                # very next scheduler thread-switch or nested
+                # _invoke_emulated_proc call (same class of gap fixed
+                # elsewhere for unhandled access-violation faults), so this
+                # must still be a fatal_halt -- now reached only after really
+                # giving the game's own SEH chain a chance, not on sight.
+                logger.error(
                     "handlers",
-                    f"INT3 breakpoint at EIP=0x{(c.eip & 0xFFFFFFFF):08x} — halting",
+                    f"INT3 breakpoint at EIP=0x{fault_eip:08x} unhandled by SEH chain -- halting",
                 )
                 c.halted = True
                 c.fatal_halt = True
