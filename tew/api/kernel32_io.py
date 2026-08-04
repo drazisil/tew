@@ -367,8 +367,7 @@ def register_kernel32_io_handlers(
     def _sleep_ex(cpu: "CPU") -> None:
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-        tid = state.tls_current_thread_id()
-        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) tid={tid} ret=0x{return_eip:x}")
+        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) ret=0x{return_eip:x}")
         cpu.regs[ESP] = (cpu.regs[ESP] + 12) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
         state.scheduler.tick(dw_ms, memory)
         _fire_due_timers(cpu, memory, state)
@@ -454,7 +453,7 @@ def register_kernel32_io_handlers(
                         obj.recursion_count = 1
                         obj.locked = True
                     logger.debug("scheduler",
-                        f"WaitForMultipleEx: tid={tid} satisfied h=0x{h:x} idx={i}")
+                        f"WaitForMultipleEx: satisfied h=0x{h:x} idx={i}")
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
@@ -1841,6 +1840,12 @@ def register_kernel32_io_handlers(
     def _get_user_default_lcid(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0x0409
 
+    def _get_user_default_lang_id(cpu: "CPU") -> None:
+        # LANGIDFROMLCID(lcid) == lcid & 0xFFFF; for the en-US LCID above
+        # (0x0409, SORT_DEFAULT already 0 in the high word) that's the same
+        # value, not a coincidence to hardcode separately.
+        cpu.regs[EAX] = 0x0409
+
     def _is_valid_locale(cpu: "CPU") -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = 1 if locale == 0x0409 else 0
@@ -1855,6 +1860,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetStringTypeA",       _halt("GetStringTypeA"))
     stubs.register_handler("kernel32.dll", "GetOEMCP",             _get_oemc_p)
     stubs.register_handler("kernel32.dll", "GetUserDefaultLCID",   _get_user_default_lcid)
+    stubs.register_handler("kernel32.dll", "GetUserDefaultLangID", _get_user_default_lang_id)
     stubs.register_handler("kernel32.dll", "IsValidLocale",        _is_valid_locale)
     stubs.register_handler("kernel32.dll", "EnumSystemLocalesA",   _halt("EnumSystemLocalesA"))
     stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)

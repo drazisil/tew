@@ -11,7 +11,64 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-02)
+## Current status (2026-08-04, cont'd)
+
+The `EIP=0x001fe012` `Nfs_REALabortcallback`/`DebugBreak` halt from earlier
+today is **resolved, and doesn't reproduce at all anymore**. Root cause:
+`expsrv.dll`'s own init probes `oleaut32.dll!DispCallFunc`, `ole32.dll!
+CoCreateInstanceEx`/`CLSIDFromProgIDEx`/`CLSIDFromProgID` via
+`GetProcAddress`, all previously NULL since tew's real (non-stub)
+ole32/oleaut32 COM layer never had them. Implemented `CLSIDFromProgID`,
+`CLSIDFromProgIDEx`, `CoCreateInstanceEx` for real in
+`oleaut32_handlers.py` (registry-driven, same honest-failure pattern as
+the rest of that file). `DispCallFunc` intentionally still not
+implemented -- generic x86 calling-convention/VARIANT marshaling, a
+separate, larger piece of work. Execution now gets substantially further:
+genuinely deep into `expsrv.dll -> vbajet32.dll -> DAO350.DLL -> exe`.
+`kernel32.dll!GetUserDefaultLangID` (hit right after) is also fixed
+(`kernel32_io.py`, same en-US LCID as the existing `GetUserDefaultLCID`).
+Full detail: changelog.md, "2026-08-04 (cont'd)".
+
+**Current blocker**: `[UNIMPLEMENTED] kernel32.dll!GetSystemDefaultLangID`
+-- same shape as the `GetUserDefaultLangID` fix just made (this emulator
+has no real multi-locale concept, so `GetSystemDefaultLangID` and
+`GetUserDefaultLangID` should return the same fixed en-US value, `0x0409`)
+-- not yet implemented.
+
+Also this session: per-thread `[tid=N]` log tagging added everywhere
+(`logger.py`/`run_exe.py`), and two DLL-loader efficiency fixes
+(`dll_loader.py`) -- negative DLL-lookup caching, and `patch_dll_iats`
+made incremental instead of O(N^2) full-rescans across a run's DLL loads.
+Both confirmed live: no repeated "Could not find X" lines anywhere in a
+full run, "Patched X/Y new DLL IAT entries" now reports small per-call
+batches. Full detail: changelog.md, "2026-08-04 (cont'd)".
+
+## Previous status (2026-08-04)
+
+The `RUNAWAY` at ~195.8M steps queued from 2026-08-03 is **resolved, and
+was never a real blocker** -- it was corruption fallout from a genuine
+`VirtualAlloc` bug: `_virtual_alloc` (`tew/api/kernel32_memory.py`)
+rejected `flProtect 0x1` (`PAGE_NOACCESS`, a legitimate reserve-then-commit
+pattern MSJET35.DLL uses) as unimplemented. Fixed by adding it to
+`_KNOWN_PROTECT_FLAGS`; 615/615 tests pass. Confirmed live: neither the
+`VirtualAlloc` halts nor the `RUNAWAY` reproduce, and MSJET35.DLL now
+loads and resolves all ordinal imports cleanly. Full detail: changelog.md,
+"2026-08-04".
+
+**RESOLVED (2026-08-04, cont'd)**: the `cpu.fatal_halt at EIP=0x001fe012`
+blocker described below traced to the four missing ole32/oleaut32 COM
+functions -- see "Current status" above for the fix and the new frontier
+(`GetSystemDefaultLangID`). Original diagnosis kept for the EBP-chain
+reference:
+
+A new, genuine `cpu.fatal_halt at EIP=0x001fe012`, reached right after
+MSJET35.DLL's import resolution. The `EBP` chain matches the
+`Nfs_REALabortcallback`/`DebugBreak()` assertion path fully diagnosed
+2026-08-03 -- this is the correctly-behaving, properly-marked fatal halt
+case (not the soft-halt-that-doesn't-halt bug class, which remains
+deliberately deferred -- see queued issues).
+
+## Previous status (2026-08-02)
 
 The DAO `*ppv`-stays-NULL mystery that this project chased across several
 sessions (2026-07-19 through 2026-07-23) is **resolved**. Root cause: three
@@ -389,19 +446,17 @@ need to reach all the way through the DAO handshake.
   remains true as a fact about the binary but is no longer an active
   blocker -- no further action needed unless a *different* one of those
   1,780 sites is actually hit by a future run.
-- **New top priority**: `RUNAWAY` (EIP in invalid/unmapped memory) at step
-  ~195.8M, the new frontier reached after the DAO/Jet fixes above. Preceded
-  immediately by two `[UNIMPLEMENTED]` `VirtualAlloc` halts that don't
-  actually stop execution (`/tmp/emu.log` lines 382-383: `unsupported
-  flProtect 0x1`, then `MEM_COMMIT on unreserved 0x4000000` -- ~195M more
-  steps ran after these "halts", so this is likely the same "logged as
-  halting but doesn't actually halt" bug class already fixed once this
-  session for unhandled access-violation faults, now recurring for
-  `VirtualAlloc`). Two things to check first: (1) does the `VirtualAlloc`
-  handler actually set `cpu.halted = True` / raise on the unimplemented
-  path, or just log and fall through; (2) is `flProtect 0x1` (PAGE_NOACCESS)
-  and committing 0x4000000 (64MB) unreserved memory actually what the real
-  game does here, or a symptom of bad args from an earlier miscomputation.
+- **RESOLVED (2026-08-04)**: `RUNAWAY` at ~195.8M steps. Root cause was a
+  real `VirtualAlloc` gap (`PAGE_NOACCESS` wrongly rejected) plus its
+  corruption fallout, not a genuinely-missing halt-propagation fix -- see
+  "Current status" above and changelog.md "2026-08-04". **New current
+  blocker**: `cpu.fatal_halt at EIP=0x001fe012` (see "Current status").
+- **Deliberately deferred (per Molly, 2026-08-04)**: the general
+  "`cpu.halted = True` doesn't actually stop the CPU" bug class (the
+  ~85-of-~90-sites gap further down this list) is a known, real issue --
+  it's what let the `VirtualAlloc` halts above silently corrupt the stack
+  and produce the `RUNAWAY` instead of stopping cleanly. Not fixed this
+  session by explicit request; still worth its own dedicated pass.
 - Historical note, kept for context, now incorrect -- do not act on this:
   `0x00688c69` was previously guessed to be the same open item as the
   "Decide/implement a real unwind for seh.py's unhandled-fault path" bullet

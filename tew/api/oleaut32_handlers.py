@@ -15,12 +15,15 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
-from tew.api._state import CRTState
+from tew.api._state import CRTState, read_wide_string
 from tew.logger import logger
 
 S_OK = 0
 E_NOINTERFACE = 0x80004002
+E_INVALIDARG = 0x80070057
 REGDB_E_CLASSNOTREG = 0x80040154
+CO_E_CLASSSTRING = 0x800401F3
+CO_S_NOTALLINTERFACES = 0x00080012
 
 # Real, period-correct COM in-proc servers this emulator can actually load
 # and execute (as opposed to Python-faked). Registry entries whose
@@ -867,7 +870,7 @@ def register_oleaut32_ole32_handlers(
         if perrinfo:
             _errinfo_addref_core((perrinfo - 4) & 0xFFFFFFFF)
         state.error_info_store[tid] = perrinfo
-        logger.info("com", f"SetErrorInfo(perrinfo=0x{perrinfo:08x}) -> S_OK (tid={tid})")
+        logger.info("com", f"SetErrorInfo(perrinfo=0x{perrinfo:08x}) -> S_OK")
         cpu.regs[EAX] = S_OK
         cleanup_stdcall(cpu, memory, 8)
 
@@ -922,10 +925,46 @@ def register_oleaut32_ole32_handlers(
             _iid_iclassfactory_addr_box[0] = addr
         return _iid_iclassfactory_addr_box[0]
 
+    # Scratch IID_IUnknown, needed by CoCreateInstanceEx's initial
+    # DllGetClassObject(..., IID_IClassFactory, ...) -> CreateInstance(...,
+    # IID_IUnknown, ...) step before it QueryInterfaces out each of the
+    # caller's actually-requested interfaces. Same lazy-allocation pattern
+    # as _get_iid_iclassfactory_addr above.
+    _iid_iunknown_addr_box = [0]
+
+    def _get_iid_iunknown_addr() -> int:
+        if _iid_iunknown_addr_box[0] == 0:
+            addr = state.simple_alloc(16)
+            _write_guid(addr, "00000000-0000-0000-C000-000000000046")
+            _iid_iunknown_addr_box[0] = addr
+        return _iid_iunknown_addr_box[0]
+
     def _resolve_com_server(clsid_addr: int) -> "str | None":
         key = f"hkcr\\clsid\\{{{_read_guid_str(clsid_addr)}}}\\inprocserver32"
         entry = state.registry_values.get(key, {}).get("")
         return str(entry.value) if entry is not None else None
+
+    def _resolve_progid_clsid(progid: str) -> "str | None":
+        """ProgID -> CLSID string (no braces), per HKCR\\<ProgID>\\CLSID's
+        default value. Registry-driven, same honest-failure philosophy as
+        _resolve_com_server: an unregistered ProgID returns None rather
+        than fabricating a CLSID, matching a real unmodified install."""
+        key = f"hkcr\\{progid.lower()}\\clsid"
+        entry = state.registry_values.get(key, {}).get("")
+        if entry is None:
+            return None
+        raw = str(entry.value)
+        return raw.strip("{}")
+
+    def _clsid_has_server(clsid_str: str) -> bool:
+        """True if HKCR\\CLSID\\{clsid}\\ has a real in-proc or local
+        server registration -- the extra check CLSIDFromProgIDEx makes
+        beyond CLSIDFromProgID's plain ProgID->CLSID string lookup."""
+        base = f"hkcr\\clsid\\{{{clsid_str}}}\\"
+        return any(
+            key.startswith(base) and key.endswith(("inprocserver32", "localserver32"))
+            for key in state.registry_values
+        )
 
     def _ensure_dll_ready(dll_filename: str, cpu: "CPU") -> "LoadedDLL | None":
         if dll_loader is None:
@@ -935,12 +974,11 @@ def register_oleaut32_ole32_handlers(
         if loaded is None:
             return None
         if not was_loaded:
-            # patch_dll_iats re-scans EVERY DLL's accumulated IAT entries,
-            # not just this one's -- only worth paying for right after a
-            # genuinely new load actually added entries. Calling it again
-            # on every subsequent CoGetClassObject/CoCreateInstance for an
-            # already-loaded DLL was pure repeated waste (confirmed live:
-            # each successive DAO call was measurably slower than the last).
+            # patch_dll_iats is itself incremental now (only processes
+            # entries added since its own last call), but there's still no
+            # reason to call it at all when this particular DLL was already
+            # loaded -- an already-loaded DLL adds no new IAT entries, so
+            # the call would just be a guaranteed-empty no-op every time.
             dll_loader.patch_dll_iats(memory, stubs)
         if not was_loaded and loaded.entry_point != 0:
             sentinel = _get_dialog_sentinel(state, memory)
@@ -1039,6 +1077,89 @@ def register_oleaut32_ole32_handlers(
 
     stubs.register_handler("ole32.dll", "CoCreateInstance", _CoCreateInstance)
 
+    # CoCreateInstanceEx(rclsid, pUnkOuter, dwClsCtx, pServerInfo, dwCount,
+    #                     pResults: MULTI_QI[]) -> HRESULT
+    # MULTI_QI = { const IID *pIID; IUnknown *pItf; HRESULT hr; } (12 bytes).
+    # Creates one instance, then QueryInterfaces it for each of dwCount
+    # requested interfaces -- writes each result directly into its own
+    # MULTI_QI.pItf/hr fields (real COM proxies do the same in-place
+    # marshaling, so no scratch buffer is needed for the [out] pointers).
+    def _CoCreateInstanceEx(cpu: "CPU") -> None:
+        rclsid       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        p_unk_outer  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        dw_count     = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        p_results    = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+
+        clsid_str = _read_guid_str(rclsid)
+
+        def _fail_all(hr: int) -> None:
+            for i in range(dw_count):
+                entry = (p_results + i * 12) & 0xFFFFFFFF
+                memory.write32(entry + 4, 0)
+                memory.write32(entry + 8, hr & 0xFFFFFFFF)
+
+        if dw_count == 0:
+            hr = E_INVALIDARG
+            logger.warn("com", "CoCreateInstanceEx: dwCount=0 — E_INVALIDARG")
+            cpu.regs[EAX] = hr & 0xFFFFFFFF
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        dll_name = _resolve_com_server(rclsid)
+        if dll_name is None:
+            logger.warn("com", f"CoCreateInstanceEx(clsid={{{clsid_str}}}) — not registered, REGDB_E_CLASSNOTREG")
+            hr = REGDB_E_CLASSNOTREG
+            _fail_all(hr)
+        elif dll_name.lower() not in _KNOWN_COM_SERVERS:
+            logger.warn("com", f"CoCreateInstanceEx(clsid={{{clsid_str}}}) — registered to \"{dll_name}\", which this emulator doesn't implement — REGDB_E_CLASSNOTREG")
+            hr = REGDB_E_CLASSNOTREG
+            _fail_all(hr)
+        else:
+            loaded = _ensure_dll_ready(dll_name, cpu)
+            if loaded is None:
+                logger.warn("com", f"CoCreateInstanceEx: \"{dll_name}\" activation failed (see above)")
+                hr = REGDB_E_CLASSNOTREG
+                _fail_all(hr)
+            else:
+                factory_ppv = state.simple_alloc(4)
+                hr = _call_dll_get_class_object(cpu, loaded, rclsid, _get_iid_iclassfactory_addr(), factory_ppv)
+                factory_obj = memory.read32(factory_ppv) if not _hr_failed(hr) else 0
+                if factory_obj:
+                    unk_ppv = state.simple_alloc(4)
+                    hr = _dispatch_com_method(cpu, factory_obj, 3, [p_unk_outer, _get_iid_iunknown_addr(), unk_ppv])  # IClassFactory::CreateInstance
+                    _dispatch_com_method(cpu, factory_obj, 2, [])  # IUnknown::Release (factory)
+                    unk_obj = memory.read32(unk_ppv) if not _hr_failed(hr) else 0
+                    if unk_obj:
+                        any_failed = False
+                        for i in range(dw_count):
+                            entry = (p_results + i * 12) & 0xFFFFFFFF
+                            iid_ptr = memory.read32(entry)
+                            qi_hr = _dispatch_com_method(cpu, unk_obj, 0, [iid_ptr, entry + 4])  # QueryInterface
+                            if _hr_failed(qi_hr):
+                                memory.write32(entry + 4, 0)
+                                any_failed = True
+                            memory.write32(entry + 8, qi_hr & 0xFFFFFFFF)
+                        _dispatch_com_method(cpu, unk_obj, 2, [])  # IUnknown::Release (temp)
+                        hr = CO_S_NOTALLINTERFACES if any_failed else S_OK
+                    elif not _hr_failed(hr):
+                        hr = 0x80004005  # E_FAIL — CreateInstance "succeeded" but returned NULL
+                        _fail_all(hr)
+                    else:
+                        _fail_all(hr)
+                elif not _hr_failed(hr):
+                    hr = 0x80004005  # E_FAIL — DllGetClassObject "succeeded" but returned NULL
+                    _fail_all(hr)
+                else:
+                    _fail_all(hr)
+                logger.info("com",
+                    f"CoCreateInstanceEx(clsid={{{clsid_str}}}, count={dw_count}) "
+                    f"via real {dll_name} -> hr=0x{hr & 0xFFFFFFFF:08x}")
+
+        cpu.regs[EAX] = hr & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("ole32.dll", "CoCreateInstanceEx", _CoCreateInstanceEx)
+
     # CoGetClassObject(rclsid, dwClsContext, pServerInfo, riid, ppv) -> HRESULT
     def _CoGetClassObject(cpu: "CPU") -> None:
         rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -1072,6 +1193,61 @@ def register_oleaut32_ole32_handlers(
         cleanup_stdcall(cpu, memory, 20)
 
     stubs.register_handler("ole32.dll", "CoGetClassObject", _CoGetClassObject)
+
+    # CLSIDFromProgID(lpszProgID, lpclsid) -> HRESULT
+    def _CLSIDFromProgID(cpu: "CPU") -> None:
+        lp_progid = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_clsid  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        progid = read_wide_string(lp_progid, memory)
+        clsid_str = _resolve_progid_clsid(progid)
+        if clsid_str is None:
+            logger.warn("com", f'CLSIDFromProgID("{progid}") — not registered, CO_E_CLASSSTRING')
+            memory.write32(lp_clsid, 0)
+            memory.write32(lp_clsid + 4, 0)
+            memory.write32(lp_clsid + 8, 0)
+            memory.write32(lp_clsid + 12, 0)
+            hr = CO_E_CLASSSTRING
+        else:
+            _write_guid(lp_clsid, clsid_str)
+            logger.info("com", f'CLSIDFromProgID("{progid}") -> {{{clsid_str}}}')
+            hr = S_OK
+        cpu.regs[EAX] = hr & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("ole32.dll", "CLSIDFromProgID", _CLSIDFromProgID)
+
+    # CLSIDFromProgIDEx(lpszProgID, lpclsid) -> HRESULT
+    # Same ProgID->CLSID registry lookup as CLSIDFromProgID, but also
+    # verifies the resolved CLSID actually has a server registration
+    # (InprocServer32/LocalServer32) -- the extra integrity check real
+    # Windows makes that plain CLSIDFromProgID doesn't.
+    def _CLSIDFromProgIDEx(cpu: "CPU") -> None:
+        lp_progid = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_clsid  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        progid = read_wide_string(lp_progid, memory)
+        clsid_str = _resolve_progid_clsid(progid)
+        if clsid_str is not None and not _clsid_has_server(clsid_str):
+            logger.warn("com",
+                f'CLSIDFromProgIDEx("{progid}") -> {{{clsid_str}}} has no server registration — REGDB_E_CLASSNOTREG')
+            clsid_str = None
+            hr_not_found = REGDB_E_CLASSNOTREG
+        else:
+            hr_not_found = CO_E_CLASSSTRING
+        if clsid_str is None:
+            logger.warn("com", f'CLSIDFromProgIDEx("{progid}") — not registered')
+            memory.write32(lp_clsid, 0)
+            memory.write32(lp_clsid + 4, 0)
+            memory.write32(lp_clsid + 8, 0)
+            memory.write32(lp_clsid + 12, 0)
+            hr = hr_not_found
+        else:
+            _write_guid(lp_clsid, clsid_str)
+            logger.info("com", f'CLSIDFromProgIDEx("{progid}") -> {{{clsid_str}}}')
+            hr = S_OK
+        cpu.regs[EAX] = hr & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("ole32.dll", "CLSIDFromProgIDEx", _CLSIDFromProgIDEx)
 
     # OleInitialize(pvReserved) -> HRESULT
     def _OleInitialize(cpu: "CPU") -> None:

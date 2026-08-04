@@ -142,9 +142,8 @@ def register_kernel32_system_handlers(
     def _set_last_error(cpu: "CPU") -> None:
         err = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if err == 6:  # ERROR_INVALID_HANDLE
-            tid = state.tls_current_thread_id()
             ret = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-            logger.debug("handlers", f"SetLastError(INVALID_HANDLE) tid={tid} ret=0x{ret:x}")
+            logger.debug("handlers", f"SetLastError(INVALID_HANDLE) ret=0x{ret:x}")
         memory.write32(TEB_BASE + 0x34, err)
         cleanup_stdcall(cpu, memory, 4)
 

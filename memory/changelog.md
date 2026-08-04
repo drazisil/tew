@@ -4,6 +4,127 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-04 (cont'd) — real ole32/oleaut32 COM gaps fixed, per-thread log
+tagging added, GetUserDefaultLangID fixed, DLL loader stopped doing O(N^2)
+redundant filesystem/IAT-patch work
+
+Chased the `Nfs_REALabortcallback`/`DebugBreak` halt from earlier today one
+level deeper. Root cause of *that* dead end: `expsrv.dll`'s own init
+(ordinal #2000) probes `oleaut32.dll!DispCallFunc`, `ole32.dll!
+CoCreateInstanceEx`, `CLSIDFromProgIDEx`, `CLSIDFromProgID` via
+`GetProcAddress` -- all four came back NULL because tew's real (not
+stubbed) ole32/oleaut32 COM layer in `oleaut32_handlers.py` (the same file
+that already does genuine COM activation for DAO -- `CoGetClassObject`,
+`CoCreateInstance`, `CreateErrorInfo`, `SetErrorInfo`) simply never had
+them added. Implemented `CLSIDFromProgID` and `CLSIDFromProgIDEx` (real
+`HKCR\<ProgID>\CLSID` registry lookup, `_write_guid` into the output,
+honest `CO_E_CLASSSTRING`/`REGDB_E_CLASSNOTREG` on anything unregistered --
+same no-fabrication philosophy as `_resolve_com_server`; `...Ex` adds the
+extra InprocServer32/LocalServer32 registration check that's the real
+spec difference from plain `CLSIDFromProgID`) and `CoCreateInstanceEx`
+(creates one instance via the existing `DllGetClassObject`/
+`IClassFactory::CreateInstance` path, then `QueryInterface`s it once per
+`MULTI_QI` entry, writing straight into each entry's own `pItf`/`hr`
+fields). `DispCallFunc` deliberately **not** implemented -- real generic
+x86 calling-convention/VARIANT-array marshaling is a different scale of
+problem, flagged separately rather than rushed. 615/615 tests still pass.
+
+Confirmed live this was the right area but not why the game got stuck:
+with all three implemented, the earlier `Nfs_REALabortcallback` halt (the
+`exe`-only frame chain from the last few sessions) **doesn't reproduce at
+all anymore** -- execution now gets substantially further, genuinely deep
+into `expsrv.dll -> vbajet32.dll -> DAO350.DLL -> exe`, and hits a new,
+different, honest `[UNIMPLEMENTED]` halt: `kernel32.dll!
+GetUserDefaultLangID`. Fixed (`kernel32_io.py`, next to the existing
+`GetUserDefaultLCID`): `LANGIDFROMLCID(lcid) == lcid & 0xFFFF`, and for
+this emulator's fixed en-US LCID (`0x0409`, `SORT_DEFAULT` already 0 in
+the high word) that's numerically the same value as the LCID itself, not
+a separate thing to compute. Confirmed live: cleared the halt, immediately
+followed one call later by the same-shaped gap, `kernel32.dll!
+GetSystemDefaultLangID` -- not yet fixed, see status.md.
+
+Separately, per Molly's request: every log line now carries `[tid=N]`
+once `crt_state` exists (a `set_thread_id_provider()` callback in
+`logger.py`, wired to `crt_state.tls_current_thread_id` in `run_exe.py`
+right after construction -- avoids a circular import, since `_state.py`
+already imports `logger`). Before `crt_state` exists (early DLL-loading
+output), lines carry no tid, same as always. Cleaned up the handful of
+call sites that were manually embedding a now-redundant `tid=` in their
+own message text (`SetLastError`, `SleepEx`, `WaitForMultipleEx`,
+`SetErrorInfo`, `GetWindowThreadProcessId`'s `current_tid=`) -- left the
+ones referencing a genuinely *different* thread alone (`CreateThread`'s
+newly-spawned tid, `GetWindowThreadProcessId`'s `creator_tid`, every
+`scheduler.py` from/to-thread switch message).
+
+Also per Molly's observation that the DLL loader's repeated "Could not
+find X" spam (basically every real DLL imports `kernel32.dll`/
+`user32.dll`/etc., names this emulator never has on disk since they're
+Python-simulated) meant a full case-insensitive filesystem walk
+(`find_file_ci`, recursive `os.listdir` at every path component) was
+re-running from scratch for the same always-missing name on every single
+DLL load, for the whole run: `DLLLoader.load_dll` (`dll_loader.py`) now
+caches negative lookups per-name (`self._not_found`), invalidated only
+when a genuinely new search path is added (`add_search_path`) since a
+later-added path could contain a name an earlier lookup missed. Separately
+and more significantly, `patch_dll_iats` was rescanning **every**
+accumulated `_dll_iat_entries` entry from **every** previously-loaded DLL
+on every single call (3 call sites, each firing once per new DLL load) --
+O(N^2) total work across a run with N DLL loads. Proved this was always
+safe to fix, not just a suspected optimization: `load_dll`'s own IAT-
+resolution loop already recursively `load_dll`s each entry's target DLL
+*before* appending the entry, and every Win32 handler is registered once
+at startup before any DLL ever loads -- so an entry's correct patch
+outcome is fully determined the moment it's appended and can never change
+on a later call. Made it incremental via a high-water-mark cursor
+(`_iat_patch_cursor`); confirmed live the "Patched X/Y new DLL IAT
+entries" log lines now report small per-call batches instead of ever-
+growing full-list rescans, and no "Could not find X" line repeats anywhere
+in a full run's log. 615/615 tests still pass throughout.
+
+## 2026-08-04 — `VirtualAlloc` PAGE_NOACCESS bug fixed; RUNAWAY at ~195.8M steps
+was corruption fallout, not a real blocker; run now reaches a new, genuine
+`cpu.fatal_halt`
+
+Root cause of the `RUNAWAY DETECTED at step 197100000` blocker queued from
+2026-08-03: `_virtual_alloc` (`tew/api/kernel32_memory.py`) rejected any
+`flProtect` bit outside `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE` as
+unimplemented. `flProtect 0x1` (`PAGE_NOACCESS`) is the standard Win32
+"`MEM_RESERVE` a big range with no access now, `MEM_COMMIT` sub-ranges as
+`PAGE_READWRITE` later" pattern -- a real, spec-legal flag MSJET35.DLL uses
+during its own init, not a genuinely-missing case. Fixed by adding
+`_PAGE_NOACCESS = 0x01` to `_KNOWN_PROTECT_FLAGS`; no other behavior change
+needed since tew's memory model doesn't enforce page protection anywhere
+(confirmed by checking `VirtualProtect` and the rest of the codebase --
+bookkeeping-only, same as the existing `PAGE_READWRITE`/
+`PAGE_EXECUTE_READWRITE` flags). 615/615 tests still pass.
+
+The `MEM_COMMIT on unreserved 0x04000000` halt logged 24ms after the
+`PAGE_NOACCESS` one, and the subsequent `RUNAWAY` at step 197,100,000 with
+`EIP`/`ESP`/`EBP` full of heap-region garbage, were both downstream noise
+from the first bogus halt: `cpu.halted = True; return` in the handler
+doesn't actually stop the CPU (the still-open "~85 of ~90 `cpu.halted`
+call sites lack the `fatal_halt` marker" issue, deliberately deferred this
+session, not fixed here) -- so the trampoline's `RET` executed against an
+uncleaned stdcall stack, corrupting the return address and sending
+execution into garbage that eventually looked like a second (bogus)
+`VirtualAlloc` call and then ran off into unmapped memory. Confirmed live:
+after the one real fix above, neither of those two halts nor the
+`RUNAWAY` reproduce at all -- MSJET35.DLL now loads and resolves all its
+ordinal imports cleanly.
+
+Execution now reaches a **new, different, genuine** halt:
+`cpu.fatal_halt at EIP=0x001fe012`, immediately after a burst of
+`_sehReturnSentinel` activity. The `EBP` chain
+(`0x0068adf2`/`0x00a301a1`/`0x00684de7`/`0x006848ee`/`0x004d8c71`/
+`0x0068a7d5`/`0x009fcaa6`, all in `MCity_d.exe`) is the *same* call chain
+as the `Nfs_REALabortcallback`/`DebugBreak()` assertion path fully
+diagnosed 2026-08-03 ("INT3 now routes through the real SEH chain") --
+this is the correctly-behaving, properly-marked `cpu.fatal_halt` case,
+not the soft-halt bug class above. Not yet investigated further this
+session (deferred by request, see queued issues). Full run log:
+`/tmp/emu.log` (this session, `LOG_LEVEL=debug LOG_CATEGORIES=com,dll,
+loader,exception,handlers`).
+
 ## 2026-08-03 (cont'd) — real SetLastError/GetFileSize bugs found and fixed
 while chasing why DAO/Jet database init fails; execution now reaches
 ~195.8M steps (previous best: a few million)

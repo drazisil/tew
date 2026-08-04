@@ -781,9 +781,8 @@ def register_user32_gdi32_handlers(
             return
         if lpdw_process_id:
             memory.write32(lpdw_process_id & 0xFFFFFFFF, 1)  # our fake PID
-        cur = state.tls_current_thread_id()
         logger.debug("handlers",
-            f"[GetWindowThreadProcessId] hwnd=0x{h_wnd:08x} creator_tid={entry.creator_tid} current_tid={cur}")
+            f"[GetWindowThreadProcessId] hwnd=0x{h_wnd:08x} creator_tid={entry.creator_tid}")
         cpu.regs[EAX] = entry.creator_tid
         cleanup_stdcall(cpu, memory, 8)
 

@@ -31,7 +31,7 @@ from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
-from tew.logger import logger
+from tew.logger import logger, set_thread_id_provider
 
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -169,6 +169,7 @@ crt_state = register_crt_handlers(
     config=_emulator_config, registry_dir=_repo_dir,
 )
 crt_state.exe_path = exe_path   # used by GetModuleFileNameA
+set_thread_id_provider(crt_state.tls_current_thread_id)
 
 # Attach PE resources so dialog templates and bitmap controls can be loaded
 with open(exe_path, "rb") as _f:
