@@ -4,6 +4,59 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-04 (cont'd again x3) — real CreateFile dwCreationDisposition bug
+found and fixed; resolves the whole System.mdb/error-3049/DebugBreak chain
+without needing any external asset
+
+Molly's hunch that `lines 1558-1561` (the `system.mdb` `FindFirstFileA`/
+`CreateFile`/`GetFileInformationByHandle` sequence) were "not a dead end"
+was right, just not for the reason either of us initially assumed (a
+missing real workgroup-database file to source from the game's install
+media). The actual bug: `CreateFile`'s log line showed `CreateFile(...)
+-> 0x503a [write]` succeeding even on a run where `FindFirstFileA` had
+just reported the file as genuinely absent -- meaning `open_file_handle`
+(`tew/api/_state.py`) was creating a file regardless of whether it should
+have been allowed to. Traced to the writable branch unconditionally using
+`os.O_WRONLY | os.O_CREAT | os.O_TRUNC` for *any* write-capable
+`CreateFile` call, with zero regard for the real `dwCreationDisposition`
+argument -- `OPEN_EXISTING` (which must fail if the file is missing, and
+must never truncate an existing one) was being silently treated the same
+as `CREATE_ALWAYS`.
+
+Fixed properly, not just for this one call site: added the five real
+Win32 `dwCreationDisposition` constants (`CREATE_NEW`=1,
+`CREATE_ALWAYS`=2, `OPEN_EXISTING`=3, `OPEN_ALWAYS`=4,
+`TRUNCATE_EXISTING`=5) to `_state.py`, gave `open_file_handle` a real
+`disposition` parameter (default `CREATE_ALWAYS`, preserving the
+`msvcrt.dll` fopen/_open call sites' existing behavior unchanged --
+CRT-level mode-string-to-disposition mapping is a separate, not-yet-done
+piece of work, noted but out of scope here), and switched on it properly:
+`CREATE_NEW` uses `O_CREAT|O_EXCL` and fails if the file already exists;
+`OPEN_EXISTING`/`TRUNCATE_EXISTING` resolve the real path via the same
+case-insensitive `find_file_ci` the read-only branch already used and
+fail honestly (no file created) if genuinely missing; only
+`CREATE_ALWAYS`/`TRUNCATE_EXISTING` still truncate. `_create_file_a`/
+`_create_file_w` (`kernel32_io.py`) now pass the real disposition value
+straight through -- it was already being read off the stack, just
+discarded before.
+
+Confirmed live: `CreateFile("C:\system.mdb")` now correctly fails
+(`disposition=3`=`OPEN_EXISTING`, genuinely not found) instead of
+fabricating an empty file. With that honest failure, Jet's own real
+fallback path (auto-creating a default workgroup database when none
+exists, standard Jet behavior) takes over on its own -- no external
+`system.mdb`/`system.mdw` asset needed after all. Neither the
+`Nfs_REALabortcallback`/`DebugBreak` halt nor error 3049 reproduce
+anywhere in a full run anymore. Execution now progresses well past the
+old blocker, deep into real `DAO350.DLL` code, and reaches a new, clean,
+honest `[UNIMPLEMENTED] user32.dll!GetWindow` halt. 615/615 tests pass.
+
+Also confirmed as a real (if not yet observed live) side effect of the
+same root bug, beyond the `system.mdb` symptom: any real existing file
+opened with `OPEN_EXISTING`+`GENERIC_WRITE` would previously have had its
+contents silently truncated to 0 bytes on open (`O_TRUNC` fired
+unconditionally) -- a genuine data-loss bug, fixed by the same change.
+
 ## 2026-08-04 (cont'd again, x2) — patch_dll_iats now logs a per-DLL
 breakdown, not just an aggregate count
 

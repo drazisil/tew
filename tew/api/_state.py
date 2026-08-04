@@ -22,6 +22,18 @@ if TYPE_CHECKING:
     from tew.api.pe_resources import PEResources
 
 
+# ── Win32 CreateFile dwCreationDisposition values ───────────────────────────────
+# Real, stable OS API constants (kernel32.h) -- open_file_handle's writable
+# branch switches on these directly instead of a collapsed "writable" bool,
+# since "opened with write access" and "allowed to create/truncate" are
+# orthogonal in real Win32 (e.g. OPEN_EXISTING + GENERIC_WRITE must fail on
+# a missing file and must never truncate an existing one).
+CREATE_NEW        = 1
+CREATE_ALWAYS     = 2
+OPEN_EXISTING     = 3
+OPEN_ALWAYS       = 4
+TRUNCATE_EXISTING = 5
+
 # ── File handle types ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -406,7 +418,10 @@ class CRTState:
         # No mapping matched — return as-is with backslashes.
         return linux_path.replace("/", "\\")
 
-    def open_file_handle(self, win_name: str, writable: bool, no_create_prompt: bool = False) -> int:
+    def open_file_handle(
+        self, win_name: str, writable: bool, no_create_prompt: bool = False,
+        disposition: int = CREATE_ALWAYS,
+    ) -> int:
         """Open a file and register it in file_handle_map. Returns the handle."""
         from tew.logger import logger
         # Device namespace paths (\\.\xxx) are kernel driver handles — never a
@@ -443,7 +458,38 @@ class CRTState:
         handle = self.next_file_handle
         self.next_file_handle += 1
         if writable:
-            real_path = self.translate_windows_path(win_name)
+            # "Opened for write access" (writable) and "allowed to create or
+            # truncate" (disposition) are orthogonal in real Win32 -- e.g.
+            # OPEN_EXISTING + GENERIC_WRITE must fail on a missing file and
+            # must never truncate an existing one, even though it's a
+            # perfectly normal "open this existing file for read+write"
+            # request. Previously this branch always did O_CREAT|O_TRUNC
+            # regardless of disposition, silently fabricating an empty file
+            # for a genuinely-missing OPEN_EXISTING target (or worse,
+            # truncating a real existing file's data) instead of the
+            # honest ERROR_FILE_NOT_FOUND failure real Windows gives here.
+            must_exist = disposition in (OPEN_EXISTING, TRUNCATE_EXISTING)
+            existing_path = find_file_ci(self.translate_windows_path(win_name))
+            if must_exist and existing_path is None:
+                logger.warn("fileio",
+                    f'CreateFile("{win_name}") -> INVALID (write open failed: '
+                    f'must exist for disposition={disposition}, not found)')
+                return 0xFFFFFFFF
+            if disposition == CREATE_NEW and existing_path is not None:
+                logger.warn("fileio",
+                    f'CreateFile("{win_name}") -> INVALID (CREATE_NEW: already exists)')
+                return 0xFFFFFFFF
+            real_path = existing_path or self.translate_windows_path(win_name)
+            flags = os.O_WRONLY
+            if disposition == CREATE_NEW:
+                # Already confirmed non-existent above; O_EXCL is still the
+                # correct real flag (atomic fail-if-exists), not O_TRUNC.
+                flags |= os.O_CREAT | os.O_EXCL
+            else:
+                if not must_exist:
+                    flags |= os.O_CREAT
+                if disposition in (CREATE_ALWAYS, TRUNCATE_EXISTING):
+                    flags |= os.O_TRUNC
             # A bare relative filename (e.g. the game writing "trace000.txt"
             # with no path prefix at all) has no directory component --
             # os.path.dirname() returns "", and os.makedirs("",
@@ -460,10 +506,11 @@ class CRTState:
             # user32.dll!IsIconic -- halting". Not a crash, not investigated
             # further here.
             try:
-                dirname = os.path.dirname(real_path)
-                if dirname:
-                    os.makedirs(dirname, exist_ok=True)
-                fd = os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                if flags & os.O_CREAT:
+                    dirname = os.path.dirname(real_path)
+                    if dirname:
+                        os.makedirs(dirname, exist_ok=True)
+                fd = os.open(real_path, flags, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
                 return 0xFFFFFFFF

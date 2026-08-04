@@ -11,7 +11,48 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-04, cont'd again)
+## Current status (2026-08-04, cont'd again x2)
+
+**Major root-cause find.** The `System.mdb`/error-3049/`DebugBreak` saga
+from the last few entries is **fully resolved, and it was never a missing
+asset or a Jet bug** -- it was a real correctness bug in tew's own
+`CreateFile` handling. `open_file_handle`'s writable branch
+(`tew/api/_state.py`) unconditionally did `O_CREAT | O_TRUNC` whenever a
+write-capable handle was requested, completely ignoring the actual
+`dwCreationDisposition` value -- so a normal `OPEN_EXISTING` request
+(which must fail honestly if the file is missing, and must never truncate
+an existing one) instead silently fabricated an empty 0-byte file every
+time. Jet saw that empty file, correctly concluded "not a database I
+recognize" (error 3049), and the game's own debug-build assertion fired
+in response -- all downstream of the one bug. Fixed: `open_file_handle`
+now takes the real `disposition` value and switches on real Win32
+semantics (`CREATE_NEW`/`CREATE_ALWAYS`/`OPEN_EXISTING`/`OPEN_ALWAYS`/
+`TRUNCATE_EXISTING`, matching the actual OS API), threaded through from
+`_create_file_a`/`_create_file_w` (`kernel32_io.py`). Confirmed live:
+`CreateFile("C:\system.mdb")` now honestly fails
+(`disposition=3`=`OPEN_EXISTING`, file genuinely missing) instead of
+faking success -- and Jet's own real fallback (auto-creating a default
+workgroup database when none exists) just works, no external asset ever
+needed. Neither `DebugBreak` nor error 3049 reproduce at all anymore.
+615/615 tests pass.
+
+Also confirmed as a side effect of the investigation: this same bug meant
+ANY `OPEN_EXISTING`+`GENERIC_WRITE` open of a real existing file would
+have silently truncated its contents to 0 bytes (`O_TRUNC` fired
+unconditionally) -- a real, if not yet observed live, data-loss bug fixed
+by the same change, not just the `system.mdb` symptom.
+
+**Current blocker**: clean, honest `[UNIMPLEMENTED] user32.dll!GetWindow`
+-- not yet implemented. Reached deep inside real `DAO350.DLL` code, well
+past the old blocker.
+
+Not yet re-investigated this session (superseded by the above): the
+`LoadStringA(hInst=0x0, ...)` systemic empty-description bug -- may
+still be worth fixing independently for readability of *future* error
+reports, but is no longer on the critical path since the error it was
+garbling no longer occurs.
+
+## Previous status (2026-08-04, cont'd)
 
 `GetUserDefaultLangID`, `GetSystemDefaultLangID` (both `kernel32_io.py`,
 same fixed en-US value as the existing `GetUserDefaultLCID`), and

@@ -627,7 +627,8 @@ def register_kernel32_io_handlers(
             logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
-        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
+        cpu.regs[EAX] = state.open_file_handle(
+            name, writable, no_create_prompt=no_prompt, disposition=disposition)
         cleanup_stdcall(cpu, memory, 28)
 
     def _create_file_w(cpu: "CPU") -> None:
@@ -637,7 +638,8 @@ def register_kernel32_io_handlers(
         name = read_wide_string(name_ptr, memory)
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
-        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
+        cpu.regs[EAX] = state.open_file_handle(
+            name, writable, no_create_prompt=no_prompt, disposition=disposition)
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:

@@ -273,12 +273,7 @@
       "value": "DAO350.DLL"
     }
   },
-  "hklm\\software\\microsoft\\jet\\3.5\\engines": {
-    "systemdb": {
-      "type": 1,
-      "value": "C:\\System.mdb"
-    }
-  },
+  "hklm\\software\\microsoft\\jet\\3.5\\engines": {},
   "hklm\\software\\microsoft\\jet\\3.5\\engines\\odbc": {
     "tryjetauth": {
       "type": 1,
