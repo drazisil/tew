@@ -120,7 +120,11 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = 0xFFFFFFFF
 
     def _get_current_process_id(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1234
+        # Must match GetWindowThreadProcessId's hardcoded fake PID
+        # (user32_handlers.py, "our fake PID") -- this emulator only ever
+        # has one fake process, so both need to agree on its ID or any
+        # code comparing them (e.g. "is this window mine?") never matches.
+        cpu.regs[EAX] = 1
 
     def _get_current_thread_id(cpu: "CPU") -> None:
         cpu.regs[EAX] = state.tls_current_thread_id()

@@ -11,7 +11,57 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-04, cont'd again x2)
+## Current status (2026-08-04, cont'd again x3)
+
+**Real progress on the `GetWindow`-adjacent hang, still not fully resolved.**
+Two genuine bugs found and fixed while chasing it (both confirmed correct
+by decompiling `FUN_0448d1f5`/`FUN_0448a801` in real `DAO350.DLL`):
+
+1. `GetCurrentProcessId()` (`kernel32_system.py`) returned a hardcoded
+   `1234`, while `GetWindowThreadProcessId` (`user32_handlers.py`) always
+   writes a hardcoded fake PID of `1` -- these never agreed, so any code
+   asking "does this window belong to my process" could never succeed.
+   Fixed `GetCurrentProcessId` to return `1`, matching the established
+   "our fake PID" convention.
+2. `GetWindowLongA`/`SetWindowLongA` compared the `nIndex` argument
+   (always unsigned via `memory.read32`) directly against negative Python
+   int constants (`GWL_STYLE=-16` etc.) -- `0xFFFFFFF0 == -16` is always
+   `False` in Python, so every `GWL_*` case silently fell through to the
+   generic default, for the entire life of both handlers. Fixed with a
+   proper unsigned-to-signed conversion (matching the existing idiom
+   already used in `msvcrt_handlers.py`). Also added a real `GWL_HWNDPARENT`
+   case (previously relied on the same broken fallback, which happened to
+   produce the right answer by accident) and human-readable `GWL_*` name
+   logging for both handlers.
+3. Also fixed live-discovered gaps in the same investigation:
+   `_ShowWindow` never updated its tracked `WS_VISIBLE` style bit (only
+   toggled the real SDL window), so `IsWindowVisible` -- newly implemented
+   this session -- would have gone stale after any real show/hide.
+   `WindowManager` gained a public `all_windows()` accessor (previously
+   only single-hwnd lookup existed) needed for `GetWindow`'s Z-order/
+   sibling-walk logic.
+
+**Confirmed via live logpoints** (`cpu.add_logpoint`, temporarily wired
+into `run_exe.py` -- addresses are real, unrelocated `DAO350.DLL`
+addresses since it loads at its preferred base) that neither bug was
+actually the root hang cause: `FUN_0448d1f5` (the "find my own top-level
+window" idiom) now returns correctly and fast; its caller `FUN_0448a801`
+makes one indirect call (`CALL [0x44e5350]`, target `0x150332db` inside
+`MSJET35.DLL`) which also returns cleanly (`EAX=0`); and `FUN_0448a033`
+(`FUN_0448a801`'s own caller) successfully gets control back at `0x448a16a`.
+**But `FUN_0448a033` never reaches either of its own two `RET` sites**
+(`0x448a241`, `0x448a281`) -- the actual hang is somewhere in the stretch
+between `0x448a16a` and those returns, which contains several more direct
+and indirect calls (`0x448a184`, `0x448a19b`, `0x448a1b7`, `0x448a1da`,
+`0x448a20b`, `0x448a21c`, `0x448a234`) not yet individually logpointed.
+
+**Current blocker**: same as above -- narrow down which specific call in
+`FUN_0448a033` (between `0x448a16a` and its returns) is where execution
+actually gets stuck. The temporary diagnostic logpoints are still wired
+into `run_exe.py` (clearly marked "TEMPORARY diagnostic logpoints") for
+the next session to extend rather than starting over.
+
+## Previous status (2026-08-04, cont'd again x2)
 
 **Major root-cause find.** The `System.mdb`/error-3049/`DebugBreak` saga
 from the last few entries is **fully resolved, and it was never a missing

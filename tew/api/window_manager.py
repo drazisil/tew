@@ -628,6 +628,13 @@ class WindowManager:
     def get_window(self, hwnd: int) -> WindowEntry | None:
         return self._windows.get(hwnd)
 
+    def all_windows(self) -> list[WindowEntry]:
+        """All tracked windows, in creation order -- this emulator never
+        reorders/raises windows, so creation order is a real, honest
+        Z-order (not a fabricated one) for callers like GetWindow's
+        GW_HWNDFIRST/NEXT/PREV/LAST and the desktop's GW_CHILD walk."""
+        return list(self._windows.values())
+
     # ── SDL2 event pump ───────────────────────────────────────────────────────
 
     def pump_sdl_events(self) -> bool:

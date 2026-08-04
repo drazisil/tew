@@ -4,6 +4,78 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-04 (cont'd again x3) — GetWindow implemented; two real bugs found
+and fixed chasing an apparent hang (PID mismatch, GWL_* sign-comparison);
+real hang narrowed to inside FUN_0448a033 via live logpoints, not yet
+pinned down
+
+Implemented `GetWindow` (`user32_handlers.py`) for real: `GW_CHILD` on the
+desktop returns the first tracked top-level window; `GW_OWNER` returns
+`entry.parent_hwnd`; `GW_HWNDFIRST`/`LAST`/`NEXT`/`PREV` walk siblings
+sharing the same parent, using creation order as an honest Z-order (this
+emulator never reorders/raises windows). Needed a new public
+`WindowManager.all_windows()` accessor (previously only single-hwnd
+lookup existed). Also implemented `IsWindowVisible` for real (walks the
+full parent chain checking `WS_VISIBLE` at every level, matching real
+Win32 semantics -- a visible window with a hidden ancestor is still not
+visible) and fixed `_ShowWindow`, which only ever toggled the real SDL
+window and never updated its own tracked `WS_VISIBLE` style bit --
+`IsWindowVisible` would have gone stale after any real show/hide.
+
+After clearing that halt, hit what looked like a genuine infinite loop
+inside `DAO350.DLL`'s `FUN_0448d1f5` (a standard "find my own top-level
+window" idiom: walk the desktop's children checking `WS_CHILD`,
+`IsWindowVisible`, and `GetWindowThreadProcessId(...) == GetCurrentProcessId()`).
+Confirmed genuinely hung (100% CPU, zero further output, needed `SIGKILL`
+-- `SIGTERM` didn't work, consistent with being stuck inside a tight
+native CPU-emulation loop that never yields back to Python's signal
+handling). Found two real, confirmed-via-decompile bugs while
+investigating (neither turned out to be the actual hang cause, but both
+were genuine, live bugs worth fixing regardless):
+
+1. `GetCurrentProcessId()` returned a hardcoded `1234`
+   (`kernel32_system.py`) while `GetWindowThreadProcessId` always writes
+   a hardcoded fake PID of `1` (`user32_handlers.py`, "our fake PID") --
+   these never agreed, so DAO's "is this window mine?" check could never
+   succeed for any window this emulator will ever have. The `0x4d2`
+   (=1234) seen in an earlier halt's `EDI` register, previously written
+   off as unrelated leftover data, was this exact value. Fixed
+   `GetCurrentProcessId` to return `1`, matching the established
+   convention.
+2. `GetWindowLongA`/`SetWindowLongA` compared `nIndex` (always unsigned
+   via `memory.read32`) directly against negative Python int constants
+   (`GWL_STYLE=-16` etc.) -- `4294967280 == -16` is always `False` in
+   Python, so every `GWL_*` case had *always* silently fallen through to
+   the generic `0` default, for the entire life of both handlers,
+   regardless of which index was actually requested. Fixed with a proper
+   unsigned-to-signed conversion (same idiom already used repeatedly in
+   `msvcrt_handlers.py`). Also added a real, explicit `GWL_HWNDPARENT`
+   case (previously relied on the same broken fallback, which happened to
+   produce the right answer -- `0`, no owner -- by accident, not by
+   design) and human-readable `GWL_*` constant-name logging for both
+   handlers (`_gwl_name` helper) since raw index numbers like `-8` are
+   meaningless without memorizing the Win32 header.
+
+Neither fix was the actual hang cause -- confirmed live via `cpu.add_logpoint`
+(temporarily wired into `run_exe.py`, clearly marked as temporary
+diagnostic code; addresses are real, unrelocated `DAO350.DLL` addresses
+since it loads at its preferred base with no relocation needed):
+`FUN_0448d1f5` now returns correctly and fast with the fixes in place
+(the outer window-search loop's condition is false on the very first
+check now, since all three OR-terms are legitimately false for the
+game's real top-level window); its caller `FUN_0448a801` makes one
+indirect call (`CALL [0x44e5350]`, resolved live to target `0x150332db`,
+inside `MSJET35.DLL`'s address range) which also returns cleanly
+(`EAX=0`); and `FUN_0448a033` (the next caller up) successfully receives
+control back at `0x448a16a`. But `FUN_0448a033` never reaches either of
+its own two `RET` sites (`0x448a241`, `0x448a281`) -- the real hang is
+somewhere in the stretch of code between `0x448a16a` and those returns,
+which contains several more direct and indirect calls not yet
+individually logpointed. Full detail and exact addresses to logpoint
+next: status.md "Current status".
+
+615/615 tests pass throughout every fix in this entry.
+
 ## 2026-08-04 (cont'd again x3) — real CreateFile dwCreationDisposition bug
 found and fixed; resolves the whole System.mdb/error-3049/DebugBreak chain
 without needing any external asset

@@ -446,7 +446,9 @@ def register_oleaut32_ole32_handlers(
     # Ordinal 149 — SysStringByteLen(bstr) -> UINT
     def _ord149(cpu: "CPU") -> None:
         bstr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = memory.read32(bstr - 4) if bstr else 0
+        length = memory.read32(bstr - 4) if bstr else 0
+        logger.debug("handlers", f"SysStringByteLen(bstr=0x{bstr:x}) -> {length} (0x{length:x})")
+        cpu.regs[EAX] = length
         cleanup_stdcall(cpu, memory, 4)
 
     _ole_ord(149, _ord149)

@@ -27,6 +27,7 @@ from tew.api._state import CRTState
 from tew.api.window_manager import (
     WindowManager,
     WM_INITDIALOG, BM_GETCHECK, BM_SETCHECK,
+    WS_VISIBLE,
     du_to_px_x, du_to_px_y,
 )
 from tew.logger import logger
@@ -443,6 +444,56 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetDesktopWindow", _GetDesktopWindow)
 
+    # GetWindow(hWnd, uCmd) -> HWND
+    _GW_HWNDFIRST = 0
+    _GW_HWNDLAST  = 1
+    _GW_HWNDNEXT  = 2
+    _GW_HWNDPREV  = 3
+    _GW_OWNER     = 4
+    _GW_CHILD     = 5
+    _DESKTOP_HWND = 0x0001  # matches _GetDesktopWindow's fixed fake handle
+
+    def _GetWindow(cpu: "CPU") -> None:
+        h_wnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        u_cmd = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+
+        result = 0
+        if u_cmd == _GW_CHILD:
+            if h_wnd == _DESKTOP_HWND:
+                # The desktop's children are exactly the top-level windows,
+                # in creation order.
+                top_level = [e.hwnd for e in wm.all_windows() if e.parent_hwnd == 0]
+                result = top_level[0] if top_level else 0
+            else:
+                entry = wm.get_window(h_wnd)
+                if entry and entry.children_list:
+                    result = entry.children_list[0][1]
+        elif u_cmd == _GW_OWNER:
+            entry = wm.get_window(h_wnd)
+            if entry:
+                result = entry.parent_hwnd
+        elif u_cmd in (_GW_HWNDFIRST, _GW_HWNDLAST, _GW_HWNDNEXT, _GW_HWNDPREV):
+            if h_wnd != _DESKTOP_HWND:
+                entry = wm.get_window(h_wnd)
+                if entry is not None:
+                    siblings = [e.hwnd for e in wm.all_windows() if e.parent_hwnd == entry.parent_hwnd]
+                    if u_cmd == _GW_HWNDFIRST:
+                        result = siblings[0] if siblings else 0
+                    elif u_cmd == _GW_HWNDLAST:
+                        result = siblings[-1] if siblings else 0
+                    elif h_wnd in siblings:
+                        idx = siblings.index(h_wnd)
+                        if u_cmd == _GW_HWNDNEXT and idx + 1 < len(siblings):
+                            result = siblings[idx + 1]
+                        elif u_cmd == _GW_HWNDPREV and idx > 0:
+                            result = siblings[idx - 1]
+
+        logger.debug("handlers", f"GetWindow(hWnd=0x{h_wnd:x}, uCmd={u_cmd}) -> 0x{result:x}")
+        cpu.regs[EAX] = result & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "GetWindow", _GetWindow)
+
     # GetForegroundWindow() -> HWND
     def _GetForegroundWindow(cpu: "CPU") -> None:
         # Return the first visible top-level window, or NULL.
@@ -749,22 +800,45 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetWindowTextA", _GetWindowTextA)
 
+    # Real Win32 GWL_* names for nIndex, purely for readable logging --
+    # covers the ones this emulator implements plus the other common ones,
+    # so any future occurrence in a log is self-explanatory instead of a
+    # bare number that has to be looked up by hand.
+    _GWL_NAMES = {
+        -4: "GWL_WNDPROC", -6: "GWL_HINSTANCE", -8: "GWL_HWNDPARENT",
+        -12: "GWL_ID", -16: "GWL_STYLE", -20: "GWL_EXSTYLE", -21: "GWL_USERDATA",
+    }
+
+    def _gwl_name(n_index: int) -> str:
+        name = _GWL_NAMES.get(n_index)
+        return f"{name}({n_index})" if name else str(n_index)
+
     # GetWindowLongA(HWND, int) -> LONG
     def _GetWindowLongA(cpu: "CPU") -> None:
         h_wnd  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        n_index = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        n_index_raw = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        # GWL_* indices are negative (-4, -8, -16, ...); memory.read32 always
+        # returns unsigned, so an unconverted comparison against a negative
+        # Python int constant can never match (e.g. 0xFFFFFFF0 == -16 is
+        # False) -- every GWL_* case silently fell through to the generic
+        # 0 default regardless of which index was actually requested.
+        n_index = n_index_raw if n_index_raw < 0x80000000 else n_index_raw - 0x100000000
         entry = wm.get_window(h_wnd)
-        GWL_WNDPROC = -4
-        GWL_STYLE   = -16
+        GWL_HWNDPARENT = -8
+        GWL_WNDPROC    = -4
+        GWL_STYLE      = -16
         if entry is not None:
             if n_index == GWL_WNDPROC:
                 cpu.regs[EAX] = entry.wnd_proc_addr
             elif n_index == GWL_STYLE:
                 cpu.regs[EAX] = entry.style
+            elif n_index == GWL_HWNDPARENT:
+                cpu.regs[EAX] = entry.parent_hwnd  # 0 = no owner/parent, real semantics
             else:
                 cpu.regs[EAX] = 0
         else:
             cpu.regs[EAX] = 0
+        logger.debug("handlers", f"GetWindowLongA(hWnd=0x{h_wnd:x}, nIndex={_gwl_name(n_index)}) -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:x}")
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "GetWindowLongA", _GetWindowLongA)
@@ -790,9 +864,12 @@ def register_user32_gdi32_handlers(
 
     # SetWindowLongA(HWND, int, LONG) -> LONG (previous value)
     def _SetWindowLongA(cpu: "CPU") -> None:
-        h_wnd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
-        n_index  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
-        new_long = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        h_wnd        = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        n_index_raw  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        new_long     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        # Same unsigned/signed fix as GetWindowLongA -- GWL_* indices are
+        # negative, memory.read32 is always unsigned.
+        n_index = n_index_raw if n_index_raw < 0x80000000 else n_index_raw - 0x100000000
         entry = wm.get_window(h_wnd)
         GWL_WNDPROC = -4
         GWL_STYLE   = -16
@@ -804,6 +881,8 @@ def register_user32_gdi32_handlers(
             elif n_index == GWL_STYLE:
                 prev = entry.style
                 entry.style = new_long
+        logger.debug("handlers",
+            f"SetWindowLongA(hWnd=0x{h_wnd:x}, nIndex={_gwl_name(n_index)}, new=0x{new_long:x}) -> 0x{prev:x}")
         cpu.regs[EAX] = prev
         cleanup_stdcall(cpu, memory, 12)
 
@@ -1536,15 +1615,43 @@ def register_user32_gdi32_handlers(
         h_wnd     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_cmd_show = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = wm.get_window(h_wnd)
-        if entry is not None and entry.sdl_window is not None:
+        if entry is not None:
             if n_cmd_show == 0:  # SW_HIDE
-                SDL_HideWindow(entry.sdl_window)
+                entry.style &= ~WS_VISIBLE
+                if entry.sdl_window is not None:
+                    SDL_HideWindow(entry.sdl_window)
             else:
-                SDL_ShowWindow(entry.sdl_window)
+                entry.style |= WS_VISIBLE
+                if entry.sdl_window is not None:
+                    SDL_ShowWindow(entry.sdl_window)
         cpu.regs[EAX] = 0  # was previously hidden
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("user32.dll", "ShowWindow", _ShowWindow)
+
+    # IsWindowVisible(hWnd) -> BOOL -- TRUE only if hWnd and every ancestor
+    # up to the desktop has WS_VISIBLE set (real Win32 semantics: a window
+    # with WS_VISIBLE whose parent is hidden is still not visible).
+    def _IsWindowVisible(cpu: "CPU") -> None:
+        h_wnd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        visible = 1
+        hwnd = h_wnd
+        seen: set[int] = set()
+        while hwnd and hwnd not in seen:
+            seen.add(hwnd)
+            entry = wm.get_window(hwnd)
+            if entry is None:
+                visible = 0
+                break
+            if not (entry.style & WS_VISIBLE):
+                visible = 0
+                break
+            hwnd = entry.parent_hwnd
+        logger.debug("handlers", f"IsWindowVisible(hWnd=0x{h_wnd:x}) -> {visible}")
+        cpu.regs[EAX] = visible
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "IsWindowVisible", _IsWindowVisible)
 
     # IsIconic(HWND hWnd) -> BOOL -- TRUE if the window is minimized.
     # ShowWindow only distinguishes SW_HIDE from "show" (no per-window
