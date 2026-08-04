@@ -4,6 +4,50 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-04 (cont'd again, x2) — patch_dll_iats now logs a per-DLL
+breakdown, not just an aggregate count
+
+`patch_dll_iats`'s "Patched X/Y new DLL IAT entries" summary line doesn't
+say which DLL any given entry belongs to -- and since a single call can
+cover more than one DLL's entries at once (`load_dll` recursively loads
+and IAT-resolves everything a newly-loaded DLL itself imports before
+returning), that ambiguity got worse once the incremental-cursor fix
+(above) started batching multiple DLLs' worth of new entries into one
+call. Added a `logger.debug("loader", ...)` breakdown grouped by (DLL
+being patched, DLL its imports come from) right before the patch loop --
+e.g. `patching msjter35.dll: 2 import(s) from kernel32.dll`. 615/615
+tests pass.
+
+## 2026-08-04 (cont'd again) — GetSystemDefaultLangID/GetShortPathNameA
+fixed; real blocker is now Jet error 3049, "can't open database"
+
+Two more clean `[UNIMPLEMENTED]` halts fixed, same session as the ole32
+COM gaps: `GetSystemDefaultLangID` (`kernel32_io.py`, same fixed en-US
+value as `GetUserDefaultLCID`/`GetUserDefaultLangID` -- this emulator has
+no separate system-vs-user locale concept anywhere else either) and
+`GetShortPathNameA` (real `find_file_ci` path-existence check via
+`state.translate_windows_path`, same pattern as `GetFileAttributesA`;
+returns the long path unchanged on success since this emulator doesn't
+implement real NTFS 8.3 short-name generation -- the same real behavior a
+genuine Windows install has with `fsutil 8dot3name` short-name generation
+disabled, not a fabricated result; `ERROR_FILE_NOT_FOUND` + return 0 on a
+genuinely missing path, matching `DeleteFileA`'s existing error-handling
+style in the same file). 615/615 tests pass.
+
+Confirmed live: both cleared, and execution reaches significantly further
+-- `MSJTER35.DLL`/`MSJINT35.DLL` load, and `CreateErrorInfo`/
+`SetErrorInfo` succeed reporting a real Jet error. Looked up via the same
+offline `msjint35.dll` resource-table method as the earlier `3447`
+diagnosis: error **3049** is *"Can't open database '|'. It may not be a
+database that your application recognizes, or the file may be corrupt."*
+Right after `tid=1012` reports this, `tid=1000` (the main thread this
+time) independently hits the same `Nfs_REALabortcallback`/`DebugBreak`
+chain fixed/confirmed-correct earlier today -- expected, correct
+behavior, not a new bug. Real next step: find out whether the actual
+`.mdb` database file DAO/Jet is trying to open exists at the path being
+used, or whether this is a genuine bug earlier in the Jet open-database
+call chain. Not yet investigated this session.
+
 ## 2026-08-04 (cont'd) — real ole32/oleaut32 COM gaps fixed, per-thread log
 tagging added, GetUserDefaultLangID fixed, DLL loader stopped doing O(N^2)
 redundant filesystem/IAT-patch work

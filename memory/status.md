@@ -11,7 +11,34 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-04, cont'd)
+## Current status (2026-08-04, cont'd again)
+
+`GetUserDefaultLangID`, `GetSystemDefaultLangID` (both `kernel32_io.py`,
+same fixed en-US value as the existing `GetUserDefaultLCID`), and
+`GetShortPathNameA` (real `find_file_ci` existence check; returns the long
+path unchanged since this emulator doesn't implement true NTFS 8.3
+short-name generation -- matches real Windows behavior with 8dot3name
+generation disabled, not a fabrication) are all fixed and confirmed live.
+Execution now reaches significantly further: `MSJTER35.DLL`/
+`MSJINT35.DLL` load, `CreateErrorInfo`/`SetErrorInfo` succeed for a real
+Jet error.
+
+**Current blocker**: that Jet error is **3049**, confirmed from
+`msjint35.dll`'s real resource table: *"Can't open database '|'. It may
+not be a database that your application recognizes, or the file may be
+corrupt."* Right after `tid=1012` (the DAO/Jet worker thread) reports
+this via `SetErrorInfo`, `tid=1000` (the **main** thread this time, not
+1012) independently hits the same `Nfs_REALabortcallback`/`DebugBreak`
+assertion chain seen and fixed earlier today (same EBP frames:
+`0x0068adf2`/`0x00a301a1`/`0x00684de7`/`0x006848ee`/`0x004d8c71`/
+`0x0068a7d5`/`0x009fcaa6`) -- this is expected, correctly-behaving
+`cpu.fatal_halt` (INT3 routed through the real SEH chain, all handlers
+decline, same as always), not a bug in tew. Not yet investigated: whether
+the actual `.mdb` database file DAO/Jet expects even exists at the path
+being used, or whether this is a real bug further up the Jet
+open-database call chain.
+
+## Previous status (2026-08-04)
 
 The `EIP=0x001fe012` `Nfs_REALabortcallback`/`DebugBreak` halt from earlier
 today is **resolved, and doesn't reproduce at all anymore**. Root cause:

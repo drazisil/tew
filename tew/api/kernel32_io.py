@@ -878,6 +878,40 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "GetFullPathNameA", _get_full_path_name_a)
 
+    def _get_short_path_name_a(cpu: "CPU") -> None:
+        lp_long  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_short = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        cch_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+
+        long_path = read_cstring(lp_long, memory) if lp_long else ""
+        linux_path = state.translate_windows_path(long_path)
+        real_path = find_file_ci(linux_path)
+        if real_path is None:
+            logger.warn("fileio", f'GetShortPathNameA("{long_path}") — not found')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 12)
+            return
+
+        # This emulator doesn't implement real 8.3 short-name generation
+        # (NTFS tilde-truncated names) -- the same real behavior a genuine
+        # Windows install has when 8.3 name creation is disabled (fsutil
+        # 8dot3name): the long path is returned unchanged since there's no
+        # shorter form to give, not a fabricated result.
+        result = long_path
+        needed = len(result) + 1
+        if lp_short and cch_buf >= needed:
+            for i, ch in enumerate(result):
+                memory.write8((lp_short + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
+            memory.write8((lp_short + len(result)) & 0xFFFFFFFF, 0)
+            cpu.regs[EAX] = len(result)
+            logger.trace("handlers", f'GetShortPathNameA({long_path!r}) -> {result!r}')
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "GetShortPathNameA", _get_short_path_name_a)
+
     # ── SetFilePointer / GetFileSize ──────────────────────────────────────────
 
     def _set_file_pointer(cpu: "CPU") -> None:
@@ -1846,6 +1880,12 @@ def register_kernel32_io_handlers(
         # value, not a coincidence to hardcode separately.
         cpu.regs[EAX] = 0x0409
 
+    def _get_system_default_lang_id(cpu: "CPU") -> None:
+        # Same value as GetUserDefaultLangID: this emulator has no separate
+        # system-vs-user locale concept anywhere else (IsValidLocale below
+        # hardcodes the one locale it knows about, 0x0409, the same way).
+        cpu.regs[EAX] = 0x0409
+
     def _is_valid_locale(cpu: "CPU") -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = 1 if locale == 0x0409 else 0
@@ -1861,6 +1901,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetOEMCP",             _get_oemc_p)
     stubs.register_handler("kernel32.dll", "GetUserDefaultLCID",   _get_user_default_lcid)
     stubs.register_handler("kernel32.dll", "GetUserDefaultLangID", _get_user_default_lang_id)
+    stubs.register_handler("kernel32.dll", "GetSystemDefaultLangID", _get_system_default_lang_id)
     stubs.register_handler("kernel32.dll", "IsValidLocale",        _is_valid_locale)
     stubs.register_handler("kernel32.dll", "EnumSystemLocalesA",   _halt("EnumSystemLocalesA"))
     stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)

@@ -380,6 +380,22 @@ class DLLLoader:
         new_entries = self._dll_iat_entries[self._iat_patch_cursor:]
         self._iat_patch_cursor = len(self._dll_iat_entries)
 
+        # Breakdown by (DLL being patched, DLL its imports come from) --
+        # a single call here can cover more than one DLL's entries at once
+        # (load_dll recursively loads and IAT-resolves everything a newly
+        # loaded DLL itself imports before returning), so the one-line
+        # overall summary below doesn't say which DLL any given entry
+        # actually belongs to.
+        group_counts: dict[tuple[str, str], int] = {}
+        for entry in new_entries:
+            key = (entry.dll_name, entry.imported_dll_name)
+            group_counts[key] = group_counts.get(key, 0) + 1
+        for (dll_name, imported_dll_name), count in group_counts.items():
+            logger.debug(
+                "loader",
+                f"  patching {dll_name}: {count} import(s) from {imported_dll_name}",
+            )
+
         patched_count = 0
         real_count = 0
         auto_handler_count = 0
