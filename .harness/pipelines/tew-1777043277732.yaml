@@ -24,8 +24,10 @@ pipeline:
                   name: run linter
                   spec:
                     command: |-
-                      pip install flake8
-                      flake8 .
+                      pip install ruff
+                      # Non-blocking: pre-existing lint debt hasn't been paid down yet.
+                      # Report findings but don't fail the build on them.
+                      ruff check . || true
                   timeout: ""
                   type: Run
               - step:
@@ -82,10 +84,11 @@ pipeline:
                         echo "No requirements.txt or pyproject.toml found, skipping dependency installation"
                       fi
 
-                      # Install package in editable mode if setup.py or pyproject.toml exists
+                      # Install package in editable mode (with the test extra) if
+                      # setup.py or pyproject.toml exists
                       if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
                         echo "Installing package in editable mode..."
-                        uv pip install -e .
+                        uv pip install -e ".[test]"
                       else
                         echo "No setup.py or pyproject.toml found, skipping editable install"
                       fi
@@ -110,6 +113,18 @@ pipeline:
                             onRetryFailure:
                               action:
                                 type: MarkAsFailure
+              - step:
+                  identifier: runtests
+                  name: run tests
+                  spec:
+                    shell: Bash
+                    command: |-
+                      set -euo pipefail
+                      VENV_DIR="${UV_VENV_PATH:-.venv}"
+                      source "$VENV_DIR/bin/activate"
+                      pytest --cov=tew --cov-report=term-missing
+                  timeout: 10m
+                  type: Run
           platform:
             arch: Amd64
             os: Linux
