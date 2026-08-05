@@ -148,6 +148,15 @@ timeout 60 env LOG_LEVEL=debug LOG_CATEGORIES=fileio,registry .venv/bin/python r
 
 **Run ONCE per session. All follow-up analysis greps `/tmp/emu.log`. Never re-run to answer a question.**
 
+### Running Tests
+
+```bash
+.venv/bin/pytest                                                      # full suite
+.venv/bin/pytest --cov=tew --cov-report=term-missing:skip-covered     # with coverage report
+```
+
+`--cov` is intentionally not baked into `addopts` — it adds instrumentation overhead that isn't wanted on quick `pytest -k foo` debug runs.
+
 ---
 
 ## Project Structure
