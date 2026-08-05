@@ -19,141 +19,154 @@ pipeline:
           cloneCodebase: true
           execution:
             steps:
-              - step:
-                  identifier: runlinter
-                  name: run linter
-                  spec:
-                    command: |-
-                      pip install ruff
-                      # Non-blocking: pre-existing lint debt hasn't been paid down yet.
-                      # Report findings but don't fail the build on them.
-                      ruff check . || true
-                  timeout: ""
-                  type: Run
-              - step:
-                  identifier: setupvirtualenvironment
-                  name: Setup Virtual Environment
-                  spec:
-                    shell: Bash
-                    command: |-
-                      set -euo pipefail
+              - stepGroup:
+                  identifier: lint
+                  name: Lint
+                  steps:
+                    - step:
+                        identifier: runlinter
+                        name: run linter
+                        spec:
+                          command: |-
+                            pip install ruff
+                            # Non-blocking: pre-existing lint debt hasn't been paid down yet.
+                            # Report findings but don't fail the build on them.
+                            ruff check . || true
+                        timeout: ""
+                        type: Run
+              - stepGroup:
+                  identifier: setup
+                  name: Setup
+                  steps:
+                    - parallel:
+                        - step:
+                            identifier: setupvirtualenvironment
+                            name: Setup Virtual Environment
+                            spec:
+                              shell: Bash
+                              command: |-
+                                set -euo pipefail
 
-                      echo "=== Setting up Python environment with uv ==="
+                                echo "=== Setting up Python environment with uv ==="
 
-                      # Install uv if not present
-                      if ! command -v uv &> /dev/null; then
-                        echo "Installing uv..."
-                        curl -LsSf https://astral.sh/uv/install.sh | sh
-                        
-                        # Add uv to PATH for this session
-                        export PATH="$HOME/.local/bin:$PATH"
-                        
-                        # Verify installation
-                        if ! command -v uv &> /dev/null; then
-                          echo "ERROR: uv installation failed"
-                          exit 1
-                        fi
-                        echo "uv installed successfully: $(uv --version)"
-                      else
-                        echo "uv already installed: $(uv --version)"
-                      fi
+                                # Install uv if not present
+                                if ! command -v uv &> /dev/null; then
+                                  echo "Installing uv..."
+                                  curl -LsSf https://astral.sh/uv/install.sh | sh
 
-                      # Set virtual environment path
-                      VENV_DIR="${UV_VENV_PATH:-.venv}"
-                      echo "Virtual environment directory: $VENV_DIR"
+                                  # Add uv to PATH for this session
+                                  export PATH="$HOME/.local/bin:$PATH"
 
-                      # Create virtual environment using uv
-                      echo "Creating virtual environment..."
-                      uv venv "$VENV_DIR" --seed
+                                  # Verify installation
+                                  if ! command -v uv &> /dev/null; then
+                                    echo "ERROR: uv installation failed"
+                                    exit 1
+                                  fi
+                                  echo "uv installed successfully: $(uv --version)"
+                                else
+                                  echo "uv already installed: $(uv --version)"
+                                fi
 
-                      # Activate virtual environment
-                      source "$VENV_DIR/bin/activate"
+                                # Set virtual environment path
+                                VENV_DIR="${UV_VENV_PATH:-.venv}"
+                                echo "Virtual environment directory: $VENV_DIR"
 
-                      # Verify activation
-                      echo "Python location: $(which python)"
-                      echo "Python version: $(python --version)"
+                                # Create virtual environment using uv
+                                echo "Creating virtual environment..."
+                                uv venv "$VENV_DIR" --seed
 
-                      # Install dependencies if requirements file exists
-                      if [ -f "requirements.txt" ]; then
-                        echo "Installing dependencies from requirements.txt..."
-                        uv pip install -r requirements.txt
-                      elif [ -f "pyproject.toml" ]; then
-                        echo "Installing dependencies from pyproject.toml..."
-                        uv pip install -r pyproject.toml
-                      else
-                        echo "No requirements.txt or pyproject.toml found, skipping dependency installation"
-                      fi
+                                # Activate virtual environment
+                                source "$VENV_DIR/bin/activate"
 
-                      # Install package in editable mode (with the test extra) if
-                      # setup.py or pyproject.toml exists
-                      if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
-                        echo "Installing package in editable mode..."
-                        uv pip install -e ".[test]"
-                      else
-                        echo "No setup.py or pyproject.toml found, skipping editable install"
-                      fi
+                                # Verify activation
+                                echo "Python location: $(which python)"
+                                echo "Python version: $(python --version)"
 
-                      # Export virtual environment path for subsequent steps
-                      export VIRTUAL_ENV_PATH="$(pwd)/$VENV_DIR"
+                                # Install dependencies if requirements file exists
+                                if [ -f "requirements.txt" ]; then
+                                  echo "Installing dependencies from requirements.txt..."
+                                  uv pip install -r requirements.txt
+                                elif [ -f "pyproject.toml" ]; then
+                                  echo "Installing dependencies from pyproject.toml..."
+                                  uv pip install -r pyproject.toml
+                                else
+                                  echo "No requirements.txt or pyproject.toml found, skipping dependency installation"
+                                fi
 
-                      echo "=== Virtual environment setup complete ==="
-                      echo "To activate in subsequent steps, run: source $VENV_DIR/bin/activate"
-                  timeout: 10m
-                  type: Run
-                  failureStrategies:
-                    - onFailure:
-                        errors:
-                          - AllErrors
-                        action:
-                          type: Retry
-                          spec:
-                            retryCount: 2
-                            retryIntervals:
-                              - 5s
-                            onRetryFailure:
-                              action:
-                                type: MarkAsFailure
-              - step:
-                  identifier: buildcpuzig
-                  name: Build Zig CPU core
-                  spec:
-                    shell: Bash
-                    command: |-
-                      set -euo pipefail
-                      ZIG_VERSION="0.15.2"
-                      ZIG_DIR="$HOME/opt/zig-x86_64-linux-${ZIG_VERSION}"
-                      if ! command -v zig &> /dev/null; then
-                        echo "Installing Zig ${ZIG_VERSION}..."
-                        mkdir -p "$HOME/opt"
-                        curl -LsSf "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-                        tar -xf /tmp/zig.tar.xz -C "$HOME/opt"
-                        export PATH="$ZIG_DIR:$PATH"
-                      fi
-                      echo "Zig version: $(zig version)"
+                                # Install package in editable mode (with the test extra) if
+                                # setup.py or pyproject.toml exists
+                                if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+                                  echo "Installing package in editable mode..."
+                                  uv pip install -e ".[test]"
+                                else
+                                  echo "No setup.py or pyproject.toml found, skipping editable install"
+                                fi
 
-                      echo "=== Building libcpu.so ==="
-                      cd cpu
-                      zig build
-                      ls -la zig-out/lib/
-                  timeout: 10m
-                  type: Run
-              - step:
-                  identifier: runtests
-                  name: run tests
-                  spec:
-                    shell: Bash
-                    command: |-
-                      set -euo pipefail
-                      VENV_DIR="${UV_VENV_PATH:-.venv}"
-                      source "$VENV_DIR/bin/activate"
-                      pytest --cov=tew --cov-report=term-missing --junitxml=test-results/junit.xml
-                    reports:
-                      type: JUnit
-                      spec:
-                        paths:
-                          - test-results/junit.xml
-                  timeout: 10m
-                  type: Run
+                                # Export virtual environment path for subsequent steps
+                                export VIRTUAL_ENV_PATH="$(pwd)/$VENV_DIR"
+
+                                echo "=== Virtual environment setup complete ==="
+                                echo "To activate in subsequent steps, run: source $VENV_DIR/bin/activate"
+                            timeout: 10m
+                            type: Run
+                            failureStrategies:
+                              - onFailure:
+                                  errors:
+                                    - AllErrors
+                                  action:
+                                    type: Retry
+                                    spec:
+                                      retryCount: 2
+                                      retryIntervals:
+                                        - 5s
+                                      onRetryFailure:
+                                        action:
+                                          type: MarkAsFailure
+                        - step:
+                            identifier: buildcpuzig
+                            name: Build Zig CPU core
+                            spec:
+                              shell: Bash
+                              command: |-
+                                set -euo pipefail
+                                ZIG_VERSION="0.15.2"
+                                ZIG_DIR="$HOME/opt/zig-x86_64-linux-${ZIG_VERSION}"
+                                if ! command -v zig &> /dev/null; then
+                                  echo "Installing Zig ${ZIG_VERSION}..."
+                                  mkdir -p "$HOME/opt"
+                                  curl -LsSf "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+                                  tar -xf /tmp/zig.tar.xz -C "$HOME/opt"
+                                  export PATH="$ZIG_DIR:$PATH"
+                                fi
+                                echo "Zig version: $(zig version)"
+
+                                echo "=== Building libcpu.so ==="
+                                cd cpu
+                                zig build
+                                ls -la zig-out/lib/
+                            timeout: 10m
+                            type: Run
+              - stepGroup:
+                  identifier: test
+                  name: Test
+                  steps:
+                    - step:
+                        identifier: runtests
+                        name: run tests
+                        spec:
+                          shell: Bash
+                          command: |-
+                            set -euo pipefail
+                            VENV_DIR="${UV_VENV_PATH:-.venv}"
+                            source "$VENV_DIR/bin/activate"
+                            pytest --cov=tew --cov-report=term-missing --junitxml=test-results/junit.xml
+                          reports:
+                            type: JUnit
+                            spec:
+                              paths:
+                                - test-results/junit.xml
+                        timeout: 10m
+                        type: Run
           platform:
             arch: Amd64
             os: Linux
