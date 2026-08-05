@@ -1,0 +1,573 @@
+"""Tests for tew.api.patch_internals — CRT internal function patches.
+
+Unlike the rest of the Win32 handlers cluster, patch_crt_internals writes
+INT 0xFE; RET bytes directly into memory at hardcoded game addresses via
+Win32Handlers.patch_address, so these tests use the REAL Win32Handlers
+class (not the _StubHandlers test fake used elsewhere) to exercise that
+side effect for real.
+"""
+from __future__ import annotations
+
+import pytest
+
+from tew.api._state import CRTState
+from tew.api.patch_internals import patch_crt_internals
+from tew.api.win32_handlers import (
+    Win32Handlers,
+    DIALOG_TRAMPOLINE,
+    DLLMAIN_TRAMPOLINE,
+    DLLMAIN_HANDLE_STORE,
+)
+from tew.hardware.memory import Memory
+from tew.hardware.cpu_zig import EAX, ESP, EBP, ZF_BIT
+from tew import logger as logger_module
+
+MEM_SIZE = 64 * 1024 * 1024  # must cover SNDMEMI_STRUCT_PTR (~33MB)
+STACK    = 0x200000
+
+CHKESP_ADDR       = 0x009F1BC0
+CRT_DBG_REPORT    = 0x009F9300
+CHANNEL_DBG_PRINT = 0x004CC5B0
+FREE_DBG          = 0x009F6E20
+WINMAIN_CHECK1    = 0x0040D1D4
+WINMAIN_CHECK2    = 0x0040159B
+WINMAIN_CHECK3    = 0x008ED560
+SNDMEMI_STRUCT_PTR = 0x020DEF78
+SNDMEMI_INIT_ADDR  = 0x00A5422A
+SNDMEMI_VALIDATE_ADDR = 0x00A54107
+
+
+class _FakeCPU:
+    def __init__(self):
+        self.regs = [0] * 8
+        self.halted = False
+        self.fatal_halt = False
+        self.eflags = 0
+
+    def get_flag(self, bit: int) -> bool:
+        return ((self.eflags >> bit) & 1) == 1
+
+    def set_flag(self, bit: int, val: bool) -> None:
+        if val:
+            self.eflags |= (1 << bit)
+        else:
+            self.eflags &= ~(1 << bit)
+
+
+@pytest.fixture
+def env():
+    mem   = Memory(MEM_SIZE)
+    state = CRTState()
+    stubs = Win32Handlers(mem)
+    patch_crt_internals(stubs, mem, state)
+    cpu = _FakeCPU()
+    return cpu, mem, state, stubs
+
+
+@pytest.fixture
+def captured_logs():
+    lines: list[str] = []
+    logger_module.set_emit_hook(lambda level, line: lines.append(line))
+    yield lines
+    logger_module.set_emit_hook(None)
+
+
+def patched(stubs, addr):
+    return stubs._patched_addrs[addr].handler
+
+
+def write_cstring(mem, addr, s: str) -> None:
+    data = s.encode("ascii") + b"\x00"
+    for i, b in enumerate(data):
+        mem.write8(addr + i, b)
+
+
+# ── Patch side effect ──────────────────────────────────────────────────────────
+
+class TestPatchSideEffect:
+
+    def test_bytes_written_at_patched_address(self, env):
+        cpu, mem, state, stubs = env
+        assert mem.read8(CHKESP_ADDR) == 0xCD
+        assert mem.read8(CHKESP_ADDR + 1) == 0xFE
+        assert mem.read8(CHKESP_ADDR + 2) == 0xC3
+
+    def test_bytes_written_at_second_address(self, env):
+        cpu, mem, state, stubs = env
+        assert mem.read8(CRT_DBG_REPORT) == 0xCD
+        assert mem.read8(CRT_DBG_REPORT + 1) == 0xFE
+        assert mem.read8(CRT_DBG_REPORT + 2) == 0xC3
+
+
+# ── Dialog / DllMain trampolines ────────────────────────────────────────────────
+
+class TestDialogFinishIdok:
+
+    def test_returns_idok(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        patched(stubs, DIALOG_TRAMPOLINE)(cpu)
+        assert cpu.regs[EAX] == 1
+
+    def test_skips_four_stack_args(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        patched(stubs, DIALOG_TRAMPOLINE)(cpu)
+        assert cpu.regs[ESP] == STACK + 16
+
+
+class TestDllMainFinish:
+
+    def test_restores_handle_from_store(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(DLLMAIN_HANDLE_STORE, 0xDEADBEEF)
+        patched(stubs, DLLMAIN_TRAMPOLINE)(cpu)
+        assert cpu.regs[EAX] == 0xDEADBEEF
+
+
+# ── WinMain checks ──────────────────────────────────────────────────────────────
+
+class TestWinmainCheck1:
+
+    def test_returns_nonzero_sentinel(self, env):
+        cpu, mem, state, stubs = env
+        patched(stubs, WINMAIN_CHECK1)(cpu)
+        assert cpu.regs[EAX] == 0x12345678
+
+
+class TestWinmainCheck2:
+
+    def test_writes_parseable_version_string(self, env):
+        cpu, mem, state, stubs = env
+        buf = 0x300000
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, buf)
+        patched(stubs, WINMAIN_CHECK2)(cpu)
+        out = bytearray()
+        while True:
+            b = mem.read8(buf + len(out))
+            if b == 0:
+                break
+            out.append(b)
+        assert out == b"1, 2, 3"
+
+    def test_returns_nonzero(self, env):
+        cpu, mem, state, stubs = env
+        buf = 0x300000
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, buf)
+        patched(stubs, WINMAIN_CHECK2)(cpu)
+        assert cpu.regs[EAX] == 1
+
+
+class TestWinmainCheck3:
+
+    def test_returns_nonzero(self, env):
+        cpu, mem, state, stubs = env
+        patched(stubs, WINMAIN_CHECK3)(cpu)
+        assert cpu.regs[EAX] == 1
+
+
+# ── __chkesp ─────────────────────────────────────────────────────────────────
+
+class TestChkesp:
+
+    def test_zf_set_does_not_halt(self, env):
+        cpu, mem, state, stubs = env
+        cpu.set_flag(ZF_BIT, True)
+        patched(stubs, CHKESP_ADDR)(cpu)
+        assert cpu.halted is False
+
+    def test_zf_clear_halts(self, env):
+        cpu, mem, state, stubs = env
+        cpu.set_flag(ZF_BIT, False)
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK, 0x00401234)  # fake return address
+        cpu.regs[EBP] = STACK
+        patched(stubs, CHKESP_ADDR)(cpu)
+        assert cpu.halted is True
+
+    def test_zf_clear_sets_fatal_halt(self, env):
+        cpu, mem, state, stubs = env
+        cpu.set_flag(ZF_BIT, False)
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK, 0x00401234)
+        cpu.regs[EBP] = STACK
+        patched(stubs, CHKESP_ADDR)(cpu)
+        assert cpu.fatal_halt is True
+
+    def test_zf_clear_diagnostic_read_does_not_crash(self, env):
+        cpu, mem, state, stubs = env
+        cpu.set_flag(ZF_BIT, False)
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK, 0x00401234)
+        cpu.regs[EBP] = STACK + 100
+        patched(stubs, CHKESP_ADDR)(cpu)  # must not raise
+        assert cpu.halted is True
+
+
+# ── _CrtDbgReport ────────────────────────────────────────────────────────────
+
+class TestCrtDbgReport:
+
+    def _set_args(self, mem, sp, report_type, filename_ptr=0, line_number=0,
+                   module_name_ptr=0, format_ptr=0):
+        mem.write32(sp + 4,  report_type)
+        mem.write32(sp + 8,  filename_ptr)
+        mem.write32(sp + 12, line_number)
+        mem.write32(sp + 16, module_name_ptr)
+        mem.write32(sp + 20, format_ptr)
+
+    def test_crt_warn_does_not_halt(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert cpu.halted is False
+
+    def test_crt_warn_returns_zero(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert cpu.regs[EAX] == 0
+
+    def test_crt_error_halts(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=1)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert cpu.halted is True
+        assert cpu.fatal_halt is True
+        assert cpu.regs[EAX] == 1
+
+    def test_crt_assert_halts(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=2)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert cpu.halted is True
+        assert cpu.fatal_halt is True
+
+    def test_null_ish_pointers_do_not_crash(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=1, filename_ptr=0, format_ptr=0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert cpu.halted is True
+
+    def test_percent_s_substitution(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        arg_ptr = 0x300100
+        write_cstring(mem, fmt_ptr, "assert failed: %s")
+        write_cstring(mem, arg_ptr, "pool corrupt")
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, arg_ptr)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert any("pool corrupt" in line for line in captured_logs)
+
+    def test_percent_d_substitution(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "code=%d")
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, 42)
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert any("code=42" in line for line in captured_logs)
+
+    def test_percent_present_but_not_s_or_d_is_passthrough(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "value=%x")  # neither %s nor %d
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, 0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert any("value=%x" in line for line in captured_logs)
+
+    def test_unreadable_filename_pointer_does_not_crash(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=0, filename_ptr=0xFFFFFFF0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert cpu.halted is False
+
+    def test_unreadable_format_pointer_does_not_crash(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        self._set_args(mem, STACK, report_type=0, format_ptr=0xFFFFFFF0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert cpu.halted is False
+
+    def test_unreadable_percent_s_arg_pointer_uses_bad_ptr_fallback(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "bad: %s")
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, 0xFFFFFFF0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert any("<bad ptr" in line for line in captured_logs)
+
+    def test_null_ish_percent_s_arg_pointer_stays_null(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "val: %s")
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, 0)  # arg_ptr <= 0x1000 -- skip the read entirely
+        patched(stubs, CRT_DBG_REPORT)(cpu)
+        assert any("val: (null)" in line for line in captured_logs)
+
+
+# ── Channel_DebugPrint ─────────────────────────────────────────────────────────
+
+class TestChannelDebugPrint:
+
+    def test_multi_vararg_substitution(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        str_ptr = 0x300100
+        write_cstring(mem, fmt_ptr, "Hello %s number %d!")
+        write_cstring(mem, str_ptr, "World")
+        mem.write32(STACK + 4, 1)   # user
+        mem.write32(STACK + 8, 2)   # channel
+        mem.write32(STACK + 12, fmt_ptr)
+        mem.write32(STACK + 16, str_ptr)  # first vararg (%s)
+        mem.write32(STACK + 20, 42)       # second vararg (%d)
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)
+        assert any("Hello World number 42!" in line for line in captured_logs)
+
+    def test_no_percent_is_passthrough(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "plain message")
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, fmt_ptr)
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)
+        assert any("plain message" in line for line in captured_logs)
+
+    def test_unreadable_format_pointer_does_not_crash(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, 0xFFFFFFF0)
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)  # must not raise
+        assert any("(null)" in line for line in captured_logs)
+
+    def test_unreadable_percent_s_arg_pointer_uses_bad_ptr_fallback(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "bad: %s")
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, fmt_ptr)
+        mem.write32(STACK + 16, 0xFFFFFFF0)
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)  # must not raise
+        assert any("<bad ptr" in line for line in captured_logs)
+
+    def test_null_ish_format_pointer_stays_null(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, 0)  # fmt_ptr <= 0x1000 -- skip the read entirely
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)
+        assert any("(null)" in line for line in captured_logs)
+
+    def test_null_ish_percent_s_arg_pointer_stays_null(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "val: %s")
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, fmt_ptr)
+        mem.write32(STACK + 16, 0)  # arg_ptr <= 0x1000
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)
+        assert any("val: (null)" in line for line in captured_logs)
+
+
+# ── __free_dbg ───────────────────────────────────────────────────────────────
+
+class TestFreeDbgNoop:
+
+    def test_no_observable_effect(self, env):
+        cpu, mem, state, stubs = env
+        cpu.regs[EAX] = 0x1234
+        patched(stubs, FREE_DBG)(cpu)  # must not raise
+        assert cpu.regs[EAX] == 0x1234
+        assert cpu.halted is False
+
+
+# ── SNDMEMI_init ─────────────────────────────────────────────────────────────
+
+class TestSndmemiInit:
+
+    def test_alignment_and_field_writes(self, env):
+        cpu, mem, state, stubs = env
+        param_1 = 0x00300002  # deliberately unaligned
+        param_2 = 0x1000
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, param_1)
+        mem.write32(STACK + 8, param_2)
+        patched(stubs, SNDMEMI_INIT_ADDR)(cpu)
+
+        expected_pool_base = ((param_1 + 40) + 3) & ~3
+        assert mem.read32(SNDMEMI_STRUCT_PTR) == param_1
+        assert mem.read32(param_1) == expected_pool_base
+        assert mem.read32(param_1 + 4) == (param_1 + param_2 - 0x18) & 0xFFFFFFFF
+        assert mem.read32(param_1 + 8) == param_2
+        assert mem.read32(param_1 + 12) == (param_2 - 0x43) & 0xFFFFFFFF
+        assert mem.read32(param_1 + 16) == (param_2 - 3) & 0xFFFFFFFF
+        assert mem.read32(param_1 + 20) == 0
+
+
+# ── SNDMEMI_validate ───────────────────────────────────────────────────────────
+
+class TestSndmemiValidate:
+
+    def test_null_pool_early_return(self, env):
+        cpu, mem, state, stubs = env
+        # SNDMEMI_STRUCT_PTR reads 0 on fresh memory -- never initialised.
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)  # must not raise
+
+    def test_zero_entry_count_logs_first_alloc(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        pool_ptr = 0x00300000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, 0x00310000)      # pool_base
+        mem.write32(pool_ptr + 4, 0x00320000)  # blist_ptr
+        mem.write32(pool_ptr + 20, 0)          # entry_count = 0
+        cpu.regs[EBP] = STACK
+        mem.write32(STACK + 8, 0x00330000)  # param1 for the [count=0] log line
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)
+        assert any("[count=0]" in line for line in captured_logs)
+
+    def test_zero_entry_count_unreadable_ebp_falls_back_to_zero(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        pool_ptr = 0x00300000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, 0x00310000)
+        mem.write32(pool_ptr + 4, 0x00320000)
+        mem.write32(pool_ptr + 20, 0)
+        cpu.regs[EBP] = 0xFFFFFFF0  # unreadable -- forces the except -> param1=0 path
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)  # must not raise
+        assert any("param1=0x00000000" in line for line in captured_logs)
+
+    def test_valid_sentinels_no_corruption_reported(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        pool_ptr  = 0x00300000
+        pool_base = 0x00310000
+        blist_ptr = 0x00320000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, pool_base)
+        mem.write32(pool_ptr + 4, blist_ptr)
+        mem.write32(pool_ptr + 20, (-2) & 0xFFFFFFFF)  # entry_count: 2 entries
+
+        # entry 0 at blist_ptr
+        mem.write32(blist_ptr, 0)       # start
+        mem.write32(blist_ptr + 4, 8)   # size
+        mem.write32(pool_base + 0, 0xDEADDEAD)
+        mem.write32(pool_base + 4, 0xDEADDEAD)
+
+        # entry 1 at blist_ptr - 0x18
+        entry1 = blist_ptr - 0x18
+        mem.write32(entry1, 0x100)      # start
+        mem.write32(entry1 + 4, 8)      # size
+        mem.write32(pool_base + 0x100, 0xDEADDEAD)
+        mem.write32(pool_base + 0x104, 0xDEADDEAD)
+
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)
+        assert not any("CORRUPTION" in line for line in captured_logs)
+
+    def test_corrupted_sentinel_reports_corruption(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        pool_ptr  = 0x00300000
+        pool_base = 0x00310000
+        blist_ptr = 0x00320000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, pool_base)
+        mem.write32(pool_ptr + 4, blist_ptr)
+        mem.write32(pool_ptr + 20, (-1) & 0xFFFFFFFF)  # entry_count: 1 entry
+
+        mem.write32(blist_ptr, 0)       # start
+        mem.write32(blist_ptr + 4, 8)   # size
+        mem.write32(pool_base + 0, 0xDEADDEAD)
+        mem.write32(pool_base + 4, 0xBADBADBA)  # corrupted hi sentinel
+
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)
+        assert any("CORRUPTION" in line for line in captured_logs)
+
+    def test_corrupted_sentinel_ebp_walk_does_not_crash_out_of_bounds(self, env, captured_logs):
+        """EBP within the plausible-stack range but unreadable in our test
+        memory must break the walk via the try/except, not raise."""
+        cpu, mem, state, stubs = env
+        pool_ptr  = 0x00300000
+        pool_base = 0x00310000
+        blist_ptr = 0x00320000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, pool_base)
+        mem.write32(pool_ptr + 4, blist_ptr)
+        mem.write32(pool_ptr + 20, (-1) & 0xFFFFFFFF)
+
+        mem.write32(blist_ptr, 0)
+        mem.write32(blist_ptr + 4, 8)
+        mem.write32(pool_base + 0, 0xDEADDEAD)
+        mem.write32(pool_base + 4, 0xBADBADBA)
+
+        cpu.regs[EBP] = 0x07000000  # in-range per the walk's magic bounds, out of our Memory bounds
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)  # must not raise
+        assert any("CORRUPTION" in line for line in captured_logs)
+
+    def test_corrupted_sentinel_ebp_walk_logs_one_valid_frame(self, captured_logs):
+        """A separate, larger Memory instance so a genuinely valid EBP frame
+        (within the walk's hardcoded 0x07000000-0x7FFFFFFF magic range) is
+        actually readable, exercising the walk's successful-log branch
+        rather than only its exception/break paths."""
+        mem   = Memory(0x08000000)  # 128MB, covers ebp=0x07000000
+        state = CRTState()
+        stubs = Win32Handlers(mem)
+        patch_crt_internals(stubs, mem, state)
+        cpu = _FakeCPU()
+
+        pool_ptr  = 0x00300000
+        pool_base = 0x00310000
+        blist_ptr = 0x00320000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, pool_base)
+        mem.write32(pool_ptr + 4, blist_ptr)
+        mem.write32(pool_ptr + 20, (-1) & 0xFFFFFFFF)
+
+        mem.write32(blist_ptr, 0)
+        mem.write32(blist_ptr + 4, 8)
+        mem.write32(pool_base + 0, 0xDEADDEAD)
+        mem.write32(pool_base + 4, 0xBADBADBA)  # corrupted
+
+        ebp = 0x07000000
+        mem.write32(ebp, 0)              # saved_ebp = 0 -> next iteration breaks (out of range)
+        mem.write32(ebp + 4, 0x00401234)  # ret_addr
+        mem.write32(ebp + 8, 0xCAFEBABE)  # arg0
+        cpu.regs[EBP] = ebp
+
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)
+        assert any("EBP=0x07000000" in line and "ret=0x00401234" in line and "arg0=0xcafebabe" in line
+                   for line in captured_logs)
+
+    def test_insane_count_logged_and_skipped(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        pool_ptr = 0x00300000
+        mem.write32(SNDMEMI_STRUCT_PTR, pool_ptr)
+        mem.write32(pool_ptr, 0x00310000)
+        mem.write32(pool_ptr + 4, 0x00320000)
+        mem.write32(pool_ptr + 20, (-2000) & 0xFFFFFFFF)  # n > 1024
+        patched(stubs, SNDMEMI_VALIDATE_ADDR)(cpu)  # must not raise
+        assert any("insane count" in line for line in captured_logs)
