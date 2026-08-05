@@ -64,13 +64,13 @@ def register_crt_handlers(
     # missing trace-log directory in this sandbox, not a MAD/movie issue,
     # and not investigated further here -- out of scope for this change).
     cmd_line_addr = 0x00210024
-    cmd_line_str  = b"MCity_d.exe -nomovie\x00"
+    cmd_line_str  = b"MCity_d.exe -nomovie -dbEnableLog\x00"
     for i, b in enumerate(cmd_line_str):
         memory.write8(cmd_line_addr + i, b)
 
     # Wide (UTF-16LE) command line string at 0x00210070 (128 bytes reserved)
     cmd_line_w_addr = 0x00210070
-    cmd_line_w      = "MCity_d.exe -nomovie"
+    cmd_line_w      = "MCity_d.exe -nomovie -dbEnableLog"
     for i, ch in enumerate(cmd_line_w):
         memory.write16(cmd_line_w_addr + i * 2, ord(ch))
     memory.write16(cmd_line_w_addr + len(cmd_line_w) * 2, 0)  # null terminator

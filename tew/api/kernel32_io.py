@@ -367,8 +367,7 @@ def register_kernel32_io_handlers(
     def _sleep_ex(cpu: "CPU") -> None:
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-        tid = state.tls_current_thread_id()
-        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) tid={tid} ret=0x{return_eip:x}")
+        logger.debug("scheduler", f"SleepEx(ms={dw_ms}) ret=0x{return_eip:x}")
         cpu.regs[ESP] = (cpu.regs[ESP] + 12) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
         state.scheduler.tick(dw_ms, memory)
         _fire_due_timers(cpu, memory, state)
@@ -454,7 +453,7 @@ def register_kernel32_io_handlers(
                         obj.recursion_count = 1
                         obj.locked = True
                     logger.debug("scheduler",
-                        f"WaitForMultipleEx: tid={tid} satisfied h=0x{h:x} idx={i}")
+                        f"WaitForMultipleEx: satisfied h=0x{h:x} idx={i}")
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
@@ -628,7 +627,8 @@ def register_kernel32_io_handlers(
             logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
-        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
+        cpu.regs[EAX] = state.open_file_handle(
+            name, writable, no_create_prompt=no_prompt, disposition=disposition)
         cleanup_stdcall(cpu, memory, 28)
 
     def _create_file_w(cpu: "CPU") -> None:
@@ -638,7 +638,8 @@ def register_kernel32_io_handlers(
         name = read_wide_string(name_ptr, memory)
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
-        cpu.regs[EAX] = state.open_file_handle(name, writable, no_create_prompt=no_prompt)
+        cpu.regs[EAX] = state.open_file_handle(
+            name, writable, no_create_prompt=no_prompt, disposition=disposition)
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:
@@ -677,8 +678,15 @@ def register_kernel32_io_handlers(
         try:
             os.unlink(real_path)
             success = True
+        except FileNotFoundError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        except PermissionError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
         except OSError:
             success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.debug("fileio", f'[Win32] DeleteFileA("{name}") -> {success}')
         cpu.regs[EAX] = 1 if success else 0
         cleanup_stdcall(cpu, memory, 4)
@@ -690,8 +698,15 @@ def register_kernel32_io_handlers(
         try:
             os.unlink(real_path)
             success = True
+        except FileNotFoundError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+        except PermissionError:
+            success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
         except OSError:
             success = False
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
         logger.debug("fileio", f'[Win32] DeleteFileW("{name}") -> {success}')
         cpu.regs[EAX] = 1 if success else 0
         cleanup_stdcall(cpu, memory, 4)
@@ -865,6 +880,40 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "GetFullPathNameA", _get_full_path_name_a)
 
+    def _get_short_path_name_a(cpu: "CPU") -> None:
+        lp_long  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_short = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        cch_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+
+        long_path = read_cstring(lp_long, memory) if lp_long else ""
+        linux_path = state.translate_windows_path(long_path)
+        real_path = find_file_ci(linux_path)
+        if real_path is None:
+            logger.warn("fileio", f'GetShortPathNameA("{long_path}") — not found')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 12)
+            return
+
+        # This emulator doesn't implement real 8.3 short-name generation
+        # (NTFS tilde-truncated names) -- the same real behavior a genuine
+        # Windows install has when 8.3 name creation is disabled (fsutil
+        # 8dot3name): the long path is returned unchanged since there's no
+        # shorter form to give, not a fabricated result.
+        result = long_path
+        needed = len(result) + 1
+        if lp_short and cch_buf >= needed:
+            for i, ch in enumerate(result):
+                memory.write8((lp_short + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
+            memory.write8((lp_short + len(result)) & 0xFFFFFFFF, 0)
+            cpu.regs[EAX] = len(result)
+            logger.trace("handlers", f'GetShortPathNameA({long_path!r}) -> {result!r}')
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "GetShortPathNameA", _get_short_path_name_a)
+
     # ── SetFilePointer / GetFileSize ──────────────────────────────────────────
 
     def _set_file_pointer(cpu: "CPU") -> None:
@@ -905,12 +954,36 @@ def register_kernel32_io_handlers(
         h_file    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_high   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
-        if entry and not entry.writable:
+        size = None
+        if entry is not None:
+            # Query the real host file directly (same approach
+            # GetFileInformationByHandle already uses) instead of
+            # entry.data's cached length -- entry.data is only populated
+            # for read-mode entries (empty bytes for write-only, per its own
+            # field comment in _state.py), which made GetFileSize wrongly
+            # fail on every writable handle -- confirmed live: right after
+            # creating and writing its own scratch temp file, msjet35.dll
+            # calls GetFileSize on that exact handle as a completely normal
+            # operation, and GetFileInformationByHandle succeeds on the same
+            # handle moments earlier in the same log, proving it's valid.
+            try:
+                st = os.fstat(entry.fd) if entry.fd is not None else os.stat(entry.path)
+                size = st.st_size
+            except OSError:
+                size = None
+        if size is not None:
             if lp_high:
                 memory.write32(lp_high, 0)
-            cpu.regs[EAX] = len(entry.data) & 0xFFFFFFFF
+            cpu.regs[EAX] = size & 0xFFFFFFFF
         else:
+            # h_file is genuinely unknown, or the real host file is no
+            # longer accessible. Real GetFileSize always calls SetLastError
+            # on this 0xFFFFFFFF failure return -- callers (confirmed live:
+            # msjet35.dll's own error-code translator) read GetLastError()
+            # right after and need a real value, not whatever was already
+            # there.
             cpu.regs[EAX] = 0xFFFFFFFF
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
         cleanup_stdcall(cpu, memory, 8)
 
     def _get_file_size_ex(cpu: "CPU") -> None:
@@ -1803,6 +1876,18 @@ def register_kernel32_io_handlers(
     def _get_user_default_lcid(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0x0409
 
+    def _get_user_default_lang_id(cpu: "CPU") -> None:
+        # LANGIDFROMLCID(lcid) == lcid & 0xFFFF; for the en-US LCID above
+        # (0x0409, SORT_DEFAULT already 0 in the high word) that's the same
+        # value, not a coincidence to hardcode separately.
+        cpu.regs[EAX] = 0x0409
+
+    def _get_system_default_lang_id(cpu: "CPU") -> None:
+        # Same value as GetUserDefaultLangID: this emulator has no separate
+        # system-vs-user locale concept anywhere else (IsValidLocale below
+        # hardcodes the one locale it knows about, 0x0409, the same way).
+        cpu.regs[EAX] = 0x0409
+
     def _is_valid_locale(cpu: "CPU") -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = 1 if locale == 0x0409 else 0
@@ -1817,6 +1902,8 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetStringTypeA",       _halt("GetStringTypeA"))
     stubs.register_handler("kernel32.dll", "GetOEMCP",             _get_oemc_p)
     stubs.register_handler("kernel32.dll", "GetUserDefaultLCID",   _get_user_default_lcid)
+    stubs.register_handler("kernel32.dll", "GetUserDefaultLangID", _get_user_default_lang_id)
+    stubs.register_handler("kernel32.dll", "GetSystemDefaultLangID", _get_system_default_lang_id)
     stubs.register_handler("kernel32.dll", "IsValidLocale",        _is_valid_locale)
     stubs.register_handler("kernel32.dll", "EnumSystemLocalesA",   _halt("EnumSystemLocalesA"))
     stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)

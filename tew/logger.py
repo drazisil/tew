@@ -60,6 +60,13 @@ _LEVEL_PREFIX: dict[int, str] = {
 EmitHook = Callable[[int, str], None]
 _emit_hook: EmitHook | None = None
 
+# Set once CRTState (and its scheduler) exists -- see set_thread_id_provider.
+# A plain callback, not a direct import of _state.py, since _state.py
+# already imports this module for its own logger.warn/error calls and a
+# back-import would be circular.
+ThreadIdProvider = Callable[[], int]
+_thread_id_provider: ThreadIdProvider | None = None
+
 
 def configure_logger(*, level: str | None = None, categories: str | None = None) -> None:
     global _active_level, _active_categories
@@ -72,6 +79,16 @@ def configure_logger(*, level: str | None = None, categories: str | None = None)
 def set_emit_hook(hook: EmitHook | None) -> None:
     global _emit_hook
     _emit_hook = hook
+
+
+def set_thread_id_provider(provider: ThreadIdProvider | None) -> None:
+    """Called once from run_exe.py right after CRTState is constructed, so
+    every log line from that point on can be attributed to the thread that
+    emitted it. Before this is called (early boot -- DLL loading, memory
+    setup -- happens before CRTState exists), log lines carry no tid, same
+    as they always did."""
+    global _thread_id_provider
+    _thread_id_provider = provider
 
 
 def _emit(level: int, category: str, msg: str) -> None:
@@ -92,7 +109,10 @@ def _emit(level: int, category: str, msg: str) -> None:
 
     elapsed = time.monotonic() - _start_time
     ts = f"{elapsed:8.3f}s"
-    line = f"{ts} {_LEVEL_PREFIX[level]} [{category}] {msg}"
+    tid_field = ""
+    if _thread_id_provider is not None:
+        tid_field = f" [tid={_thread_id_provider()}]"
+    line = f"{ts} {_LEVEL_PREFIX[level]}{tid_field} [{category}] {msg}"
     print(line, flush=True)
     if _emit_hook is not None:
         _emit_hook(level, line)

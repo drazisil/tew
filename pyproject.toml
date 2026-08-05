@@ -16,13 +16,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0", "pytest-cov"]
+test = ["pytest>=8.0", "pytest-cov", "hypothesis"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["tew"]
+branch = true
+omit = ["tew/**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
 
 [tool.ruff.lint]
 ignore = [

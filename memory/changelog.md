@@ -4,6 +4,512 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-04 (cont'd again x3) — GetWindow implemented; two real bugs found
+and fixed chasing an apparent hang (PID mismatch, GWL_* sign-comparison);
+real hang narrowed to inside FUN_0448a033 via live logpoints, not yet
+pinned down
+
+Implemented `GetWindow` (`user32_handlers.py`) for real: `GW_CHILD` on the
+desktop returns the first tracked top-level window; `GW_OWNER` returns
+`entry.parent_hwnd`; `GW_HWNDFIRST`/`LAST`/`NEXT`/`PREV` walk siblings
+sharing the same parent, using creation order as an honest Z-order (this
+emulator never reorders/raises windows). Needed a new public
+`WindowManager.all_windows()` accessor (previously only single-hwnd
+lookup existed). Also implemented `IsWindowVisible` for real (walks the
+full parent chain checking `WS_VISIBLE` at every level, matching real
+Win32 semantics -- a visible window with a hidden ancestor is still not
+visible) and fixed `_ShowWindow`, which only ever toggled the real SDL
+window and never updated its own tracked `WS_VISIBLE` style bit --
+`IsWindowVisible` would have gone stale after any real show/hide.
+
+After clearing that halt, hit what looked like a genuine infinite loop
+inside `DAO350.DLL`'s `FUN_0448d1f5` (a standard "find my own top-level
+window" idiom: walk the desktop's children checking `WS_CHILD`,
+`IsWindowVisible`, and `GetWindowThreadProcessId(...) == GetCurrentProcessId()`).
+Confirmed genuinely hung (100% CPU, zero further output, needed `SIGKILL`
+-- `SIGTERM` didn't work, consistent with being stuck inside a tight
+native CPU-emulation loop that never yields back to Python's signal
+handling). Found two real, confirmed-via-decompile bugs while
+investigating (neither turned out to be the actual hang cause, but both
+were genuine, live bugs worth fixing regardless):
+
+1. `GetCurrentProcessId()` returned a hardcoded `1234`
+   (`kernel32_system.py`) while `GetWindowThreadProcessId` always writes
+   a hardcoded fake PID of `1` (`user32_handlers.py`, "our fake PID") --
+   these never agreed, so DAO's "is this window mine?" check could never
+   succeed for any window this emulator will ever have. The `0x4d2`
+   (=1234) seen in an earlier halt's `EDI` register, previously written
+   off as unrelated leftover data, was this exact value. Fixed
+   `GetCurrentProcessId` to return `1`, matching the established
+   convention.
+2. `GetWindowLongA`/`SetWindowLongA` compared `nIndex` (always unsigned
+   via `memory.read32`) directly against negative Python int constants
+   (`GWL_STYLE=-16` etc.) -- `4294967280 == -16` is always `False` in
+   Python, so every `GWL_*` case had *always* silently fallen through to
+   the generic `0` default, for the entire life of both handlers,
+   regardless of which index was actually requested. Fixed with a proper
+   unsigned-to-signed conversion (same idiom already used repeatedly in
+   `msvcrt_handlers.py`). Also added a real, explicit `GWL_HWNDPARENT`
+   case (previously relied on the same broken fallback, which happened to
+   produce the right answer -- `0`, no owner -- by accident, not by
+   design) and human-readable `GWL_*` constant-name logging for both
+   handlers (`_gwl_name` helper) since raw index numbers like `-8` are
+   meaningless without memorizing the Win32 header.
+
+Neither fix was the actual hang cause -- confirmed live via `cpu.add_logpoint`
+(temporarily wired into `run_exe.py`, clearly marked as temporary
+diagnostic code; addresses are real, unrelocated `DAO350.DLL` addresses
+since it loads at its preferred base with no relocation needed):
+`FUN_0448d1f5` now returns correctly and fast with the fixes in place
+(the outer window-search loop's condition is false on the very first
+check now, since all three OR-terms are legitimately false for the
+game's real top-level window); its caller `FUN_0448a801` makes one
+indirect call (`CALL [0x44e5350]`, resolved live to target `0x150332db`,
+inside `MSJET35.DLL`'s address range) which also returns cleanly
+(`EAX=0`); and `FUN_0448a033` (the next caller up) successfully receives
+control back at `0x448a16a`. But `FUN_0448a033` never reaches either of
+its own two `RET` sites (`0x448a241`, `0x448a281`) -- the real hang is
+somewhere in the stretch of code between `0x448a16a` and those returns,
+which contains several more direct and indirect calls not yet
+individually logpointed. Full detail and exact addresses to logpoint
+next: status.md "Current status".
+
+615/615 tests pass throughout every fix in this entry.
+
+## 2026-08-04 (cont'd again x3) — real CreateFile dwCreationDisposition bug
+found and fixed; resolves the whole System.mdb/error-3049/DebugBreak chain
+without needing any external asset
+
+Molly's hunch that `lines 1558-1561` (the `system.mdb` `FindFirstFileA`/
+`CreateFile`/`GetFileInformationByHandle` sequence) were "not a dead end"
+was right, just not for the reason either of us initially assumed (a
+missing real workgroup-database file to source from the game's install
+media). The actual bug: `CreateFile`'s log line showed `CreateFile(...)
+-> 0x503a [write]` succeeding even on a run where `FindFirstFileA` had
+just reported the file as genuinely absent -- meaning `open_file_handle`
+(`tew/api/_state.py`) was creating a file regardless of whether it should
+have been allowed to. Traced to the writable branch unconditionally using
+`os.O_WRONLY | os.O_CREAT | os.O_TRUNC` for *any* write-capable
+`CreateFile` call, with zero regard for the real `dwCreationDisposition`
+argument -- `OPEN_EXISTING` (which must fail if the file is missing, and
+must never truncate an existing one) was being silently treated the same
+as `CREATE_ALWAYS`.
+
+Fixed properly, not just for this one call site: added the five real
+Win32 `dwCreationDisposition` constants (`CREATE_NEW`=1,
+`CREATE_ALWAYS`=2, `OPEN_EXISTING`=3, `OPEN_ALWAYS`=4,
+`TRUNCATE_EXISTING`=5) to `_state.py`, gave `open_file_handle` a real
+`disposition` parameter (default `CREATE_ALWAYS`, preserving the
+`msvcrt.dll` fopen/_open call sites' existing behavior unchanged --
+CRT-level mode-string-to-disposition mapping is a separate, not-yet-done
+piece of work, noted but out of scope here), and switched on it properly:
+`CREATE_NEW` uses `O_CREAT|O_EXCL` and fails if the file already exists;
+`OPEN_EXISTING`/`TRUNCATE_EXISTING` resolve the real path via the same
+case-insensitive `find_file_ci` the read-only branch already used and
+fail honestly (no file created) if genuinely missing; only
+`CREATE_ALWAYS`/`TRUNCATE_EXISTING` still truncate. `_create_file_a`/
+`_create_file_w` (`kernel32_io.py`) now pass the real disposition value
+straight through -- it was already being read off the stack, just
+discarded before.
+
+Confirmed live: `CreateFile("C:\system.mdb")` now correctly fails
+(`disposition=3`=`OPEN_EXISTING`, genuinely not found) instead of
+fabricating an empty file. With that honest failure, Jet's own real
+fallback path (auto-creating a default workgroup database when none
+exists, standard Jet behavior) takes over on its own -- no external
+`system.mdb`/`system.mdw` asset needed after all. Neither the
+`Nfs_REALabortcallback`/`DebugBreak` halt nor error 3049 reproduce
+anywhere in a full run anymore. Execution now progresses well past the
+old blocker, deep into real `DAO350.DLL` code, and reaches a new, clean,
+honest `[UNIMPLEMENTED] user32.dll!GetWindow` halt. 615/615 tests pass.
+
+Also confirmed as a real (if not yet observed live) side effect of the
+same root bug, beyond the `system.mdb` symptom: any real existing file
+opened with `OPEN_EXISTING`+`GENERIC_WRITE` would previously have had its
+contents silently truncated to 0 bytes on open (`O_TRUNC` fired
+unconditionally) -- a genuine data-loss bug, fixed by the same change.
+
+## 2026-08-04 (cont'd again, x2) — patch_dll_iats now logs a per-DLL
+breakdown, not just an aggregate count
+
+`patch_dll_iats`'s "Patched X/Y new DLL IAT entries" summary line doesn't
+say which DLL any given entry belongs to -- and since a single call can
+cover more than one DLL's entries at once (`load_dll` recursively loads
+and IAT-resolves everything a newly-loaded DLL itself imports before
+returning), that ambiguity got worse once the incremental-cursor fix
+(above) started batching multiple DLLs' worth of new entries into one
+call. Added a `logger.debug("loader", ...)` breakdown grouped by (DLL
+being patched, DLL its imports come from) right before the patch loop --
+e.g. `patching msjter35.dll: 2 import(s) from kernel32.dll`. 615/615
+tests pass.
+
+## 2026-08-04 (cont'd again) — GetSystemDefaultLangID/GetShortPathNameA
+fixed; real blocker is now Jet error 3049, "can't open database"
+
+Two more clean `[UNIMPLEMENTED]` halts fixed, same session as the ole32
+COM gaps: `GetSystemDefaultLangID` (`kernel32_io.py`, same fixed en-US
+value as `GetUserDefaultLCID`/`GetUserDefaultLangID` -- this emulator has
+no separate system-vs-user locale concept anywhere else either) and
+`GetShortPathNameA` (real `find_file_ci` path-existence check via
+`state.translate_windows_path`, same pattern as `GetFileAttributesA`;
+returns the long path unchanged on success since this emulator doesn't
+implement real NTFS 8.3 short-name generation -- the same real behavior a
+genuine Windows install has with `fsutil 8dot3name` short-name generation
+disabled, not a fabricated result; `ERROR_FILE_NOT_FOUND` + return 0 on a
+genuinely missing path, matching `DeleteFileA`'s existing error-handling
+style in the same file). 615/615 tests pass.
+
+Confirmed live: both cleared, and execution reaches significantly further
+-- `MSJTER35.DLL`/`MSJINT35.DLL` load, and `CreateErrorInfo`/
+`SetErrorInfo` succeed reporting a real Jet error. Looked up via the same
+offline `msjint35.dll` resource-table method as the earlier `3447`
+diagnosis: error **3049** is *"Can't open database '|'. It may not be a
+database that your application recognizes, or the file may be corrupt."*
+Right after `tid=1012` reports this, `tid=1000` (the main thread this
+time) independently hits the same `Nfs_REALabortcallback`/`DebugBreak`
+chain fixed/confirmed-correct earlier today -- expected, correct
+behavior, not a new bug. Real next step: find out whether the actual
+`.mdb` database file DAO/Jet is trying to open exists at the path being
+used, or whether this is a genuine bug earlier in the Jet open-database
+call chain. Not yet investigated this session.
+
+## 2026-08-04 (cont'd) — real ole32/oleaut32 COM gaps fixed, per-thread log
+tagging added, GetUserDefaultLangID fixed, DLL loader stopped doing O(N^2)
+redundant filesystem/IAT-patch work
+
+Chased the `Nfs_REALabortcallback`/`DebugBreak` halt from earlier today one
+level deeper. Root cause of *that* dead end: `expsrv.dll`'s own init
+(ordinal #2000) probes `oleaut32.dll!DispCallFunc`, `ole32.dll!
+CoCreateInstanceEx`, `CLSIDFromProgIDEx`, `CLSIDFromProgID` via
+`GetProcAddress` -- all four came back NULL because tew's real (not
+stubbed) ole32/oleaut32 COM layer in `oleaut32_handlers.py` (the same file
+that already does genuine COM activation for DAO -- `CoGetClassObject`,
+`CoCreateInstance`, `CreateErrorInfo`, `SetErrorInfo`) simply never had
+them added. Implemented `CLSIDFromProgID` and `CLSIDFromProgIDEx` (real
+`HKCR\<ProgID>\CLSID` registry lookup, `_write_guid` into the output,
+honest `CO_E_CLASSSTRING`/`REGDB_E_CLASSNOTREG` on anything unregistered --
+same no-fabrication philosophy as `_resolve_com_server`; `...Ex` adds the
+extra InprocServer32/LocalServer32 registration check that's the real
+spec difference from plain `CLSIDFromProgID`) and `CoCreateInstanceEx`
+(creates one instance via the existing `DllGetClassObject`/
+`IClassFactory::CreateInstance` path, then `QueryInterface`s it once per
+`MULTI_QI` entry, writing straight into each entry's own `pItf`/`hr`
+fields). `DispCallFunc` deliberately **not** implemented -- real generic
+x86 calling-convention/VARIANT-array marshaling is a different scale of
+problem, flagged separately rather than rushed. 615/615 tests still pass.
+
+Confirmed live this was the right area but not why the game got stuck:
+with all three implemented, the earlier `Nfs_REALabortcallback` halt (the
+`exe`-only frame chain from the last few sessions) **doesn't reproduce at
+all anymore** -- execution now gets substantially further, genuinely deep
+into `expsrv.dll -> vbajet32.dll -> DAO350.DLL -> exe`, and hits a new,
+different, honest `[UNIMPLEMENTED]` halt: `kernel32.dll!
+GetUserDefaultLangID`. Fixed (`kernel32_io.py`, next to the existing
+`GetUserDefaultLCID`): `LANGIDFROMLCID(lcid) == lcid & 0xFFFF`, and for
+this emulator's fixed en-US LCID (`0x0409`, `SORT_DEFAULT` already 0 in
+the high word) that's numerically the same value as the LCID itself, not
+a separate thing to compute. Confirmed live: cleared the halt, immediately
+followed one call later by the same-shaped gap, `kernel32.dll!
+GetSystemDefaultLangID` -- not yet fixed, see status.md.
+
+Separately, per Molly's request: every log line now carries `[tid=N]`
+once `crt_state` exists (a `set_thread_id_provider()` callback in
+`logger.py`, wired to `crt_state.tls_current_thread_id` in `run_exe.py`
+right after construction -- avoids a circular import, since `_state.py`
+already imports `logger`). Before `crt_state` exists (early DLL-loading
+output), lines carry no tid, same as always. Cleaned up the handful of
+call sites that were manually embedding a now-redundant `tid=` in their
+own message text (`SetLastError`, `SleepEx`, `WaitForMultipleEx`,
+`SetErrorInfo`, `GetWindowThreadProcessId`'s `current_tid=`) -- left the
+ones referencing a genuinely *different* thread alone (`CreateThread`'s
+newly-spawned tid, `GetWindowThreadProcessId`'s `creator_tid`, every
+`scheduler.py` from/to-thread switch message).
+
+Also per Molly's observation that the DLL loader's repeated "Could not
+find X" spam (basically every real DLL imports `kernel32.dll`/
+`user32.dll`/etc., names this emulator never has on disk since they're
+Python-simulated) meant a full case-insensitive filesystem walk
+(`find_file_ci`, recursive `os.listdir` at every path component) was
+re-running from scratch for the same always-missing name on every single
+DLL load, for the whole run: `DLLLoader.load_dll` (`dll_loader.py`) now
+caches negative lookups per-name (`self._not_found`), invalidated only
+when a genuinely new search path is added (`add_search_path`) since a
+later-added path could contain a name an earlier lookup missed. Separately
+and more significantly, `patch_dll_iats` was rescanning **every**
+accumulated `_dll_iat_entries` entry from **every** previously-loaded DLL
+on every single call (3 call sites, each firing once per new DLL load) --
+O(N^2) total work across a run with N DLL loads. Proved this was always
+safe to fix, not just a suspected optimization: `load_dll`'s own IAT-
+resolution loop already recursively `load_dll`s each entry's target DLL
+*before* appending the entry, and every Win32 handler is registered once
+at startup before any DLL ever loads -- so an entry's correct patch
+outcome is fully determined the moment it's appended and can never change
+on a later call. Made it incremental via a high-water-mark cursor
+(`_iat_patch_cursor`); confirmed live the "Patched X/Y new DLL IAT
+entries" log lines now report small per-call batches instead of ever-
+growing full-list rescans, and no "Could not find X" line repeats anywhere
+in a full run's log. 615/615 tests still pass throughout.
+
+## 2026-08-04 — `VirtualAlloc` PAGE_NOACCESS bug fixed; RUNAWAY at ~195.8M steps
+was corruption fallout, not a real blocker; run now reaches a new, genuine
+`cpu.fatal_halt`
+
+Root cause of the `RUNAWAY DETECTED at step 197100000` blocker queued from
+2026-08-03: `_virtual_alloc` (`tew/api/kernel32_memory.py`) rejected any
+`flProtect` bit outside `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE` as
+unimplemented. `flProtect 0x1` (`PAGE_NOACCESS`) is the standard Win32
+"`MEM_RESERVE` a big range with no access now, `MEM_COMMIT` sub-ranges as
+`PAGE_READWRITE` later" pattern -- a real, spec-legal flag MSJET35.DLL uses
+during its own init, not a genuinely-missing case. Fixed by adding
+`_PAGE_NOACCESS = 0x01` to `_KNOWN_PROTECT_FLAGS`; no other behavior change
+needed since tew's memory model doesn't enforce page protection anywhere
+(confirmed by checking `VirtualProtect` and the rest of the codebase --
+bookkeeping-only, same as the existing `PAGE_READWRITE`/
+`PAGE_EXECUTE_READWRITE` flags). 615/615 tests still pass.
+
+The `MEM_COMMIT on unreserved 0x04000000` halt logged 24ms after the
+`PAGE_NOACCESS` one, and the subsequent `RUNAWAY` at step 197,100,000 with
+`EIP`/`ESP`/`EBP` full of heap-region garbage, were both downstream noise
+from the first bogus halt: `cpu.halted = True; return` in the handler
+doesn't actually stop the CPU (the still-open "~85 of ~90 `cpu.halted`
+call sites lack the `fatal_halt` marker" issue, deliberately deferred this
+session, not fixed here) -- so the trampoline's `RET` executed against an
+uncleaned stdcall stack, corrupting the return address and sending
+execution into garbage that eventually looked like a second (bogus)
+`VirtualAlloc` call and then ran off into unmapped memory. Confirmed live:
+after the one real fix above, neither of those two halts nor the
+`RUNAWAY` reproduce at all -- MSJET35.DLL now loads and resolves all its
+ordinal imports cleanly.
+
+Execution now reaches a **new, different, genuine** halt:
+`cpu.fatal_halt at EIP=0x001fe012`, immediately after a burst of
+`_sehReturnSentinel` activity. The `EBP` chain
+(`0x0068adf2`/`0x00a301a1`/`0x00684de7`/`0x006848ee`/`0x004d8c71`/
+`0x0068a7d5`/`0x009fcaa6`, all in `MCity_d.exe`) is the *same* call chain
+as the `Nfs_REALabortcallback`/`DebugBreak()` assertion path fully
+diagnosed 2026-08-03 ("INT3 now routes through the real SEH chain") --
+this is the correctly-behaving, properly-marked `cpu.fatal_halt` case,
+not the soft-halt bug class above. Not yet investigated further this
+session (deferred by request, see queued issues). Full run log:
+`/tmp/emu.log` (this session, `LOG_LEVEL=debug LOG_CATEGORIES=com,dll,
+loader,exception,handlers`).
+
+## 2026-08-03 (cont'd) — real SetLastError/GetFileSize bugs found and fixed
+while chasing why DAO/Jet database init fails; execution now reaches
+~195.8M steps (previous best: a few million)
+
+Continued the "why does `Nfs_REALabortcallback` fire at all" investigation
+from the entry above. Added a real `-dbEnableLog` command-line flag
+(`crt_handlers.py`'s `GetCommandLineA`/`W` strings, `msvcrt_handlers.py`'s
+`__getmainargs` argv array -- both updated to carry
+`"MCity_d.exe -nomovie -dbEnableLog"`) after the game's own debug log
+(`dbcode.c`-sourced, written to `c:\dblog.txt` -> `~/.emu32/dblog.txt`)
+turned out to be exactly the DAO/Jet trace the game already supports,
+rather than something to reconstruct by hand. It showed the DAO COM
+activation succeeding end-to-end (`DAO Engine version: 3.51`, `Workspace
+type is Jet.`) and then `ERROR: get workspaces failed.` -- a real vtable
+call, `DBEngine::get_Workspaces()` (`dao350.dll`, vtable offset `0x3c`),
+returning null.
+
+Traced live (logpoints/breakpoints at addresses found via Ghidra, same
+methodology as the MSJET35.DLL investigation) through `dao350.dll`'s
+`FUN_0448a033` -> `msjet35.dll` ordinal 154 (`FUN_7a876127`) ->
+`FUN_7a8761fa` -> `FUN_7a876425` -> `FUN_7a876e2b`, which returns
+`0xfffffc02` (-1022). Found the real source: `FUN_7a873691`, msjet35.dll's
+own `GetLastError()` -> internal-error-code translation table (found via a
+random Ghidra address the user was independently looking at,
+`7a8caafa`/`7a8caac6`, landing inside this exact function). `-1022` is
+produced either by a cluster of real I/O-fault-class Win32 error codes
+(`ERROR_INVALID_HANDLE`, `ERROR_WRITE_FAULT`/`ERROR_READ_FAULT`,
+`ERROR_UNEXP_NET_ERR`, etc.) or, notably, by *any unrecognized*
+`GetLastError()` value via a generic "Unmapped error code" fallback path.
+
+Live-traced (breakpoint at the translator's entry, reading
+`TEB_BASE+0x34` directly rather than single-stepping the emulated
+`GetLastError()` call) and found `GetLastError()` reading back as `0`
+(success) at both of its two call sites in this exact sequence -- meaning
+some *real* failure was happening, but tew was reporting "no error"
+afterward instead of the actual reason. Traced the immediate callers (the
+return address at `[ESP+0]` is reliable for one level even though full
+EBP-chain walking isn't -- see below) to two genuine bugs in
+`kernel32_io.py`:
+
+- `_delete_file_a`/`_delete_file_w`: correctly returned `FALSE` on
+  failure, but never called `SetLastError` at all, leaving whatever
+  error code happened to already be set. Fixed to map the real Python
+  exception (`FileNotFoundError` -> `ERROR_FILE_NOT_FOUND`,
+  `PermissionError` -> `ERROR_ACCESS_DENIED`, other `OSError` ->
+  `ERROR_FILE_NOT_FOUND`) the same way `CreateFileA`'s existing
+  `SetLastError` calls already do nearby in the same file.
+- `_get_file_size`: same missing-`SetLastError` bug, but also a deeper,
+  separate one -- it only ever supported read-mode handles
+  (`if entry and not entry.writable`), unconditionally failing for any
+  writable-mode handle regardless of whether the handle was valid. Real
+  `GetFileSize` works fine on writable handles. Confirmed live this
+  wasn't hypothetical: right after `msjet35.dll` creates and writes its
+  own scratch temp file (`GetTempFileNameA` -> `JETA000.TMP`, opened for
+  write), it calls `GetFileSize` on that exact handle as a completely
+  normal operation -- and `GetFileInformationByHandle` on the *same*
+  handle, moments earlier in the same log, already proved it was valid.
+  Rewrote `_get_file_size` to query the real host file directly via
+  `os.fstat(entry.fd)` (falling back to `os.stat(entry.path)`), the same
+  approach `_get_file_information_by_handle` already used correctly --
+  works for both read and write mode now, only fails (with
+  `ERROR_INVALID_HANDLE`) when the handle is genuinely unknown or the
+  real host file is inaccessible.
+
+Also seeded two real Jet 3.5 registry values that were previously
+`NOT FOUND` in `registry.json`: `SystemDB` (under
+`HKLM\Software\Microsoft\Jet\3.5\Engines`, value `C:\System.mdb` --
+confirmed via a hardcoded literal string found directly in `msjet35.dll`'s
+own compiled code, `FUN_7a876276`, that the `.mdb` extension is correct,
+not `.mdw` as first guessed) and `TryJetAuth` (under
+`...\Jet\3.5\Engines\ODBC` -- found by direct runtime introspection after
+two wrong guesses at its location, `Debug` and bare `Engines`, both
+disproven by adding a temporary debug print inside `_reg_query_value`
+itself and reading back the exact `key_name` being checked at query time;
+value `"N"`, tried as a "skip workgroup auth" hypothesis -- didn't change
+the failure on its own, but left seeded since it's a real, previously-
+missing value either way).
+
+None of these fixes individually resolved the exact `-1022` propagating
+out of `FUN_7a876e2b` (confirmed still identical, `0xfffffc02`, at the
+same checkpoint even after every fix above) -- the two `GetLastError()`
+call sites turned out to feed a separate error-recording path (likely
+DAO's `Errors` collection), not the function's own direct return value,
+which still traces to a third, not-yet-identified call to `FUN_7a873691`.
+**But the combined effect of all of the above took the run from
+halting after a few million steps to running clean for ~195.8 million
+steps** -- past the entire DAO/Jet database-initialization sequence
+entirely, into real gameplay activity (`dsound.dll` buffer status/lock,
+`winmm.dll!timeSetEvent`, `user32.dll!GetMessageA` -- the actual message
+pump). Whatever was gating progress past DAO/Jet is now effectively
+cleared in practice, even without having pinned the exact `-1022` call
+site with certainty.
+
+New, unrelated blocker found at the new frontier (step ~195.8M): a
+`RUNAWAY` with `EIP` landing in invalid/unmapped memory, preceded by two
+`[UNIMPLEMENTED]`-labeled `VirtualAlloc` halts (`unsupported flProtect
+0x1`, then `MEM_COMMIT on unreserved 0x4000000`) that evidently don't
+actually stop execution (confirmed: ~195 million more steps ran
+afterward) -- very likely the real cause of the eventual runaway, and a
+strong candidate to also be the same "logged as halting but doesn't
+actually halt" bug class already fixed once this session for unhandled
+access-violation faults. Not investigated further this session -- next
+priority.
+
+Along the way, confirmed two things that turned out not to be the
+answer, worth recording so they aren't re-derived: (1) tew has zero
+native NT syscall (`INT 0x2E`) activity anywhere in this entire run
+(`NtSyscallDispatcher` logs at `logger.debug("nt", ...)`, category never
+included in earlier runs this session -- checked with it included,
+found nothing), ruling out a missing-native-syscall explanation. (2) EBP
+frame-based call-stack dumps (`_walk_ebp_chain`, reused from
+`exception_diagnostics.py`) cannot see *into* `dao350.dll`/`msjet35.dll`
+at all -- both are evidently frame-pointer-omitted (optimized/release)
+builds, so unwinding through them just returns stale `EBP` state from
+whatever `MCity_d.exe` frame was last active before the whole DAO/Jet
+excursion began. This retroactively explains why *every* EBP chain dump
+this whole project has ever produced only ever shows `MCity_d.exe`
+addresses. For visibility inside these DLLs, targeted breakpoints/
+logpoints at addresses found via Ghidra remain the only working method --
+confirmed the *immediate* return address at `[ESP+0]` is still reliable
+for one call-depth level even when full chain-walking isn't, since it's
+pushed by `CALL` regardless of whether the callee sets up its own frame.
+
+Also found and flagged, not yet fixed: `LCMapStringA` is a genuine
+unimplemented halt-stub (`kernel32_io.py`), while its Unicode sibling
+`LCMapStringW` is fully implemented. Notable because this entire game is
+ANSI-only throughout (every API call seen this whole session has been the
+`A` suffix, never `W`) -- if anything ever calls it (a real candidate:
+`msjint35.dll`, Jet's own "international"/collation support DLL, already
+loaded in this exact chain), it's an immediate hard halt. Queued for a
+future session.
+
+615/615 tests passing throughout (no new tests this entry -- this was a
+live/runtime debugging session, verification was via the checkpoint-trace
+methodology rather than new unit tests; the `GetFileSize`/`DeleteFileA`
+fixes are exercised indirectly by the existing kernel32_io test coverage
+but don't yet have dedicated regression tests of their own -- worth
+adding later).
+
+## 2026-08-03 — INT3 now routes through the real SEH chain instead of an
+unconditional fatal_halt
+
+Root-caused the `EIP=0x00688c69` halt that surfaced once the MSJET35.DLL
+fault (previous entries) was fixed. Traced the caller chain in Ghidra:
+`Nfs_REALabortcallback` (the game's own DAO/Jet database-init-failure
+handler -- it's what wrote `except.txt`, the "Failed to initialize
+database..." file noticed earlier this session) checks a global,
+`_Nfs_DebuggerIsPresent`, and calls `_Nfs_DebugBreak()` (a thunk at
+`0x0040eaca` jumping to the real body at `0x00688c50`, whose entire "work"
+is a single `INT3` byte at `0x00688c68`) when it's true. That flag is
+**hardcoded to `1` unconditionally** in `WinMain` (`0068a5e1`, right before
+registering `Nfs_exitCallback` via `atexit()`) -- not read from
+`IsDebuggerPresent()` or any environment check -- so this is deliberate,
+by-design debug-build behavior, not something dependent on tew's Win32
+emulation. The same pattern (`if (_Nfs_DebuggerIsPresent) DebugBreak();`)
+is used at **1,780 call sites across 922 functions** throughout the binary
+-- it's the primary assertion mechanism for the whole debug build, not a
+one-off.
+
+Real Windows treats an `INT3` with no debugger attached as a normal,
+dispatchable `STATUS_BREAKPOINT` (`0x80000003`) structured exception, not
+an automatic crash -- and this game relies on exactly that: it installs a
+real SEH frame, `_CLayer_CatchSEH(&LAB_0040b7c6)` (called right after the
+`_Nfs_DebuggerIsPresent=1` line in `WinMain`), whose filter
+(`0x004d8c84`, hand-decoded since Ghidra hadn't auto-detected it as a
+function -- SEH filter/handler code is only reachable via scope-table
+metadata, not a normal call) checks specifically for
+`ExceptionCode == 0x80000003`, and whose handler logs a source-location
+message and lets execution continue -- no message box, no `CRTAbort`.
+
+tew's `win32_handlers.py` INT3 dispatch (`int_num == 3` in the interrupt
+dispatcher) previously skipped all of that: unconditional
+`c.halted = True; c.fatal_halt = True`, no SEH attempt at all, for every
+one of those 1,780 sites. Fixed to route through the same
+`dispatch_exception()` SEH-chain-walking machinery already used for access
+violations: sets `ExceptionAddress`/`CONTEXT.Eip` to the `INT3`'s own
+address (`c.eip - 1` -- `EIP` has already advanced past the 1-byte opcode
+by the time the interrupt handler runs, but real Windows reports the
+exception at the `INT3` itself), calls `dispatch_exception(c, memory,
+STATUS_BREAKPOINT, fault_eip)`, and only falls back to the same permanent
+`fatal_halt` (still needed -- a plain `halted=True` gets silently cleared
+by the next scheduler thread-switch, same class of gap fixed elsewhere for
+unhandled access-violation faults) if the chain is genuinely exhausted.
+This mirrors the existing pattern in `seh.py`'s own `_raise_exception`
+(`RaiseException`'s real implementation), which already calls
+`dispatch_exception` synchronously from inside a Python interrupt-handler
+callback the same way.
+
+3 new tests in `tests/unit/api/test_int3_seh_dispatch.py`: a handled case
+(`ContinueExecution` handler -- confirms no halt), an unhandled case
+(empty chain -- confirms the fatal_halt fallback still works, via
+`pytest.raises(FatalHaltError)` since `cpu.step()` raises the instant
+`fatal_halt` newly becomes true rather than returning normally), and an
+`ExceptionAddress`-correctness case (a hand-built handler reads
+`EXCEPTION_RECORD->ExceptionAddress` and confirms it points at the `INT3`
+itself, not one past it). Verified the two behavior-changing tests are
+real regressions: stashed the fix, confirmed both fail against the
+pre-fix code, restored. 615/615 tests passing (612 + 3 new).
+
+Confirmed live against the real scenario: re-running the same DAO/Jet
+sequence that previously hit the unexplained `0x00688c69` halt now shows
+`dispatch_exception` genuinely walking `tid=1012`'s real, compiled
+**11-frame SEH chain** (handlers at `0x009f5eb8` (repeated -- a generic
+CRT default handler), `0x00c771b0`, `0x00c93b54`, `0x00c93cc9`, all for
+`code=0x80000003`) -- every one declines (`ContinueSearch`), so it's still
+genuinely unhandled and correctly halts, but now the halt is a proven
+result (`EIP=0x00688c68`, the `INT3`'s own address, correctly one less
+than before) rather than a guess. This also answers the open question
+from earlier investigation: `tid=1012` does **not** share
+`_CLayer_CatchSEH`'s coverage (that frame is main-thread-only), so this
+specific breakpoint really is unhandled at the per-thread level on real
+Windows too. What real Windows would do next -- fall through to a
+process-wide `SetUnhandledExceptionFilter`, if the game installs one --
+is a separate, unexplored question; tew's `dispatch_exception` only walks
+the per-thread FS:[0] chain today.
+
 ## 2026-08-02 (later session, cont'd again) — root cause of the `EIP=0x15035655`
 MSJET35.DLL fault found and fixed: `opMovR32Imm` never honored 0x66
 

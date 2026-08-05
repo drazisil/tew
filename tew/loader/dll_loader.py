@@ -172,10 +172,30 @@ class DLLLoader:
         self._loaded_dlls: dict[str, LoadedDLL] = {}
         self._address_mappings: list[AddressMapping] = []
         self._dll_iat_entries: list[_DLLIATEntry] = []
+        # Every real DLL's import table includes kernel32.dll/user32.dll/etc,
+        # names this emulator never has on disk (they're Python-simulated,
+        # not real files) -- without this, find_dll_file's full
+        # case-insensitive directory walk (find_file_ci, os.listdir at every
+        # path component) re-ran from scratch for the same always-missing
+        # name on every single DLL load, for the whole run.
+        self._not_found: set[str] = set()
+        # High-water mark into _dll_iat_entries: an entry's correct patch
+        # (real_addr, handler, or auto-stub) is fully determined the moment
+        # it's appended -- its target DLL was already recursively
+        # load_dll'd first (see the loop that appends these), and every
+        # Win32 handler is registered once at startup before any DLL loads
+        # -- so re-patching an already-patched entry can never produce a
+        # different result. patch_dll_iats only needs to process the slice
+        # added since its last call, not rescan everything from index 0.
+        self._iat_patch_cursor: int = 0
 
     def add_search_path(self, path: str) -> None:
         if path not in self._search_paths:
             self._search_paths.append(path)
+            # A newly-added path could contain a name a prior lookup missed
+            # -- the negative cache is only valid against the search paths
+            # that were in effect when it was populated.
+            self._not_found.clear()
 
     def _is_address_range_available(self, base_address: int, size: int) -> bool:
         end_address = base_address + size - 1
@@ -220,6 +240,8 @@ class DLLLoader:
         key = dll_name.lower()
         if key in self._loaded_dlls:
             return self._loaded_dlls[key]
+        if key in self._not_found:
+            return None
 
         dll_path = self.find_dll_file(dll_name)
         if not dll_path:
@@ -227,6 +249,7 @@ class DLLLoader:
                 logger.debug("dll", f"{dll_name} not found (API forwarding DLL - imports will be resolved at runtime)")
             else:
                 logger.warn("dll", f"Could not find {dll_name}")
+            self._not_found.add(key)
             return None
 
         try:
@@ -335,7 +358,7 @@ class DLLLoader:
             return None
 
     def patch_dll_iats(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
-        """Re-patch all loaded DLLs' IAT entries with Win32 stubs where available.
+        """Patch newly-accumulated DLL IAT entries with Win32 stubs where available.
 
         See patch_iat_entry (module-level) for what happens to an unmatched
         import -- this is the secondary-DLL side of that shared fallback;
@@ -347,11 +370,36 @@ class DLLLoader:
         lacking a matching handler was silently clobbered with the
         unimplemented-stub fallback, even though load_dll had already wired
         up the correct address.
+
+        Only processes entries added since the last call (see
+        _iat_patch_cursor): an entry's target DLL is already recursively
+        load_dll'd, and every Win32 handler is registered before any DLL
+        loads, so an already-patched entry's outcome can never change on a
+        later call -- rescanning it again would be pure repeated work.
         """
+        new_entries = self._dll_iat_entries[self._iat_patch_cursor:]
+        self._iat_patch_cursor = len(self._dll_iat_entries)
+
+        # Breakdown by (DLL being patched, DLL its imports come from) --
+        # a single call here can cover more than one DLL's entries at once
+        # (load_dll recursively loads and IAT-resolves everything a newly
+        # loaded DLL itself imports before returning), so the one-line
+        # overall summary below doesn't say which DLL any given entry
+        # actually belongs to.
+        group_counts: dict[tuple[str, str], int] = {}
+        for entry in new_entries:
+            key = (entry.dll_name, entry.imported_dll_name)
+            group_counts[key] = group_counts.get(key, 0) + 1
+        for (dll_name, imported_dll_name), count in group_counts.items():
+            logger.debug(
+                "loader",
+                f"  patching {dll_name}: {count} import(s) from {imported_dll_name}",
+            )
+
         patched_count = 0
         real_count = 0
         auto_handler_count = 0
-        for entry in self._dll_iat_entries:
+        for entry in new_entries:
             alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
             imported_dll = self._loaded_dlls.get(entry.imported_dll_name)
             real_addr = imported_dll.exports.get(entry.func_name) if imported_dll else None
@@ -368,7 +416,7 @@ class DLLLoader:
 
         logger.info(
             "loader",
-            f"Patched {patched_count}/{len(self._dll_iat_entries)} DLL IAT entries with stubs "
+            f"Patched {patched_count}/{len(new_entries)} new DLL IAT entries with stubs "
             f"({real_count} real DLL exports, {auto_handler_count} auto-stubs for unimplemented imports)",
         )
 

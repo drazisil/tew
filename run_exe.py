@@ -31,7 +31,7 @@ from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
-from tew.logger import logger
+from tew.logger import logger, set_thread_id_provider
 
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -169,6 +169,39 @@ crt_state = register_crt_handlers(
     config=_emulator_config, registry_dir=_repo_dir,
 )
 crt_state.exe_path = exe_path   # used by GetModuleFileNameA
+set_thread_id_provider(crt_state.tls_current_thread_id)
+
+# TEMPORARY diagnostic logpoints -- tracing the indirect call in
+# DAO350.DLL's FUN_0448a801 right after FUN_0448d1f5 (window finder)
+# returns, to see what it actually calls into and whether it returns.
+def _lp_before_indirect_call(eip, regs, memory_ptr, memory_size):
+    esp = regs[4]
+    args = [mem.read32(esp + i * 4) for i in range(5)]
+    target = mem.read32(0x044e5350)
+    logger.error("cpu",
+        f"[LOGPOINT] 0x448a90a: CALL [0x44e5350] -> target=0x{target:08x} "
+        f"args={[hex(a) for a in args]}")
+cpu.add_logpoint(0x0448a90a, _lp_before_indirect_call)
+
+def _lp_after_indirect_call(eip, regs, memory_ptr, memory_size):
+    logger.error("cpu", f"[LOGPOINT] 0x448a910: returned, EAX=0x{regs[0]:08x}")
+cpu.add_logpoint(0x0448a910, _lp_after_indirect_call)
+
+def _lp_fun_0448a033_entry(eip, regs, memory_ptr, memory_size):
+    logger.error("cpu", f"[LOGPOINT] 0x448a033: FUN_0448a033 entered, ECX(this)=0x{regs[1]:08x}")
+cpu.add_logpoint(0x0448a033, _lp_fun_0448a033_entry)
+
+def _lp_fun_0448a033_after_0448a801_call(eip, regs, memory_ptr, memory_size):
+    logger.error("cpu", f"[LOGPOINT] 0x448a16a: returned from FUN_0448a801 call, EAX=0x{regs[0]:08x}")
+cpu.add_logpoint(0x0448a16a, _lp_fun_0448a033_after_0448a801_call)
+
+def _lp_fun_0448a033_ret1(eip, regs, memory_ptr, memory_size):
+    logger.error("cpu", f"[LOGPOINT] 0x448a241: FUN_0448a033 returning (path 1), EAX=0x{regs[0]:08x}")
+cpu.add_logpoint(0x0448a241, _lp_fun_0448a033_ret1)
+
+def _lp_fun_0448a033_ret2(eip, regs, memory_ptr, memory_size):
+    logger.error("cpu", f"[LOGPOINT] 0x448a281: FUN_0448a033 returning (path 2), EAX=0x{regs[0]:08x}")
+cpu.add_logpoint(0x0448a281, _lp_fun_0448a033_ret2)
 
 # Attach PE resources so dialog templates and bitmap controls can be loaded
 with open(exe_path, "rb") as _f:
