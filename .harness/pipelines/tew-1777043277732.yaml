@@ -122,7 +122,12 @@ pipeline:
                       set -euo pipefail
                       VENV_DIR="${UV_VENV_PATH:-.venv}"
                       source "$VENV_DIR/bin/activate"
-                      pytest --cov=tew --cov-report=term-missing
+                      pytest --cov=tew --cov-report=term-missing --junitxml=test-results/junit.xml
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - test-results/junit.xml
                   timeout: 10m
                   type: Run
           platform:
