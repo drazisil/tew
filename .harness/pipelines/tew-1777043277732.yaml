@@ -114,6 +114,30 @@ pipeline:
                               action:
                                 type: MarkAsFailure
               - step:
+                  identifier: buildcpuzig
+                  name: Build Zig CPU core
+                  spec:
+                    shell: Bash
+                    command: |-
+                      set -euo pipefail
+                      ZIG_VERSION="0.15.2"
+                      ZIG_DIR="$HOME/opt/zig-x86_64-linux-${ZIG_VERSION}"
+                      if ! command -v zig &> /dev/null; then
+                        echo "Installing Zig ${ZIG_VERSION}..."
+                        mkdir -p "$HOME/opt"
+                        curl -LsSf "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+                        tar -xf /tmp/zig.tar.xz -C "$HOME/opt"
+                        export PATH="$ZIG_DIR:$PATH"
+                      fi
+                      echo "Zig version: $(zig version)"
+
+                      echo "=== Building libcpu.so ==="
+                      cd cpu
+                      zig build
+                      ls -la zig-out/lib/
+                  timeout: 10m
+                  type: Run
+              - step:
                   identifier: runtests
                   name: run tests
                   spec:
