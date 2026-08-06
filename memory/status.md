@@ -11,7 +11,48 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-06)
+## Current status (2026-08-06, cont'd)
+
+**The `n=0xfffffffc` mystery queued earlier today is RESOLVED, and it was a
+real Zig CPU-core bug, not a DAO/Jet or tew-handler issue.** Traced the
+exact call site to `DAO350.DLL`'s `FUN_044d1f27` (a sorted name-index
+insert routine) and its `FUN_044d1d98` binary-search helper, live, via
+targeted `cpu.add_logpoint`s reading real register/memory state (not
+guessing from the decompile alone). Root cause: `doGroup1`
+(`cpu/src/engine.zig`, the shared handler for opcodes `0x80`/`0x81`/`0x83`
+— ADD/OR/ADC/SBB/AND/SUB/XOR/CMP against an immediate) hardcoded `.w32`
+for its flags computation in every case, never checking `s.op_size_ovr` —
+the exact same `0x66`-prefix flags-width bug class already fixed elsewhere
+in this project (accumulator-immediate opcodes, `doGroup2`), but never
+audited here, matching the open "broader audit" item this queued-issues
+list already flagged. The real guest instruction was `66 83 7C 24 0C 00`
+= `CMP WORD PTR [ESP+0xC], 0`, comparing `local_4=-1` (`0xFFFF`) — wrongly
+read as `SF=False` (positive, as a 32-bit quantity) instead of `SF=True`
+(negative, as the correct 16-bit quantity), so a `JLE` that should have
+skipped an `INC` didn't, incrementing an insertion index one past a valid
+(empty) collection's bounds and producing `memmove`'s `n=-4`. Fixed:
+`doGroup1` now takes a real `width` parameter, computed from
+`op_size_ovr` by both callers (`op81`/`op83`), matching the pattern already
+used by `op39`/`op3B`/`op3D`/`opA9`. New regression tests (written and
+confirmed failing *before* the fix, per Molly's request):
+`TestGroup1_16BitFlags` in `tests/unit/emulator/test_opcodes_arithmetic.py`
+(4 tests, including a byte-for-byte repro of the real guest instruction
+against a memory operand). 1029/1029 tests pass. Confirmed live:
+`FUN_044d1f27` now computes `n=0x00000000` (correct, empty-collection
+first-insert case) — the emulator sails straight through the entire
+DAO/Jet init sequence that blocked every prior session and reaches the
+game's real message loop (`GetMessageA`/`WaitForMultipleObjectsEx` steady
+state), running stably until killed by timeout rather than crashing. Full
+diagnosis: changelog.md, "2026-08-06 (cont'd)".
+
+**Current blocker**: none identified yet — this is the furthest the
+emulator has ever reached (past all of DAO/Jet, into the game's own
+message-pump steady state). Next session should pick up from here: what
+happens if it's allowed to run past the message-pump idle state (does
+real UI/gameplay progress happen, or is there a *different*, not-yet-hit
+blocker further in), not yet investigated.
+
+## Previous status (2026-08-06)
 
 **The `FUN_0448a033` "hang" queued 2026-08-04 is RESOLVED, and it was never a
 hang at all** — a real bug in `_memcpy`/`_memmove`/`_memset`/`_memcmp`
@@ -32,15 +73,13 @@ these four functions have ever had). 1025/1025 tests pass. Full diagnosis
 (gdb-attach live-process investigation, the ClickHouse execution-history
 tooling, ~/pe-walker/history-poc setup): changelog.md, "2026-08-06".
 
-**Current blocker**: with the hang/corruption masking it gone, the *real*
-question is now visible and unanswered: confirmed live, the actual faulting
-call is `memmove(dst=0x06f9e014, src=0x06f9e010, n=0xfffffffc)` —
+**RESOLVED (2026-08-06, cont'd)**: confirmed live, the actual faulting
+call was `memmove(dst=0x06f9e014, src=0x06f9e010, n=0xfffffffc)` —
 `n` is `-4` as a signed value, `dst`/`src` are real adjacent heap addresses
-only 4 bytes apart. This looks like a signed-length computation
+only 4 bytes apart. This looked like a signed-length computation
 (`end - start`-shaped) underflowing somewhere upstream in the DAO/Jet call
-chain, not raw garbage — not yet identified whether that's a genuine guest
-bug (unlikely in well-tested retail DAO/Jet) or a tew emulation gap feeding
-bad input into otherwise-correct guest code. Not yet investigated.
+chain, not raw garbage — confirmed correct guess: it was a tew emulation
+gap, not a guest bug. See "Current status" above.
 
 ## Previous status (2026-08-04, cont'd again x3)
 

@@ -4,6 +4,113 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-06 (cont'd) — Root cause of memmove's n=-4 found: a real Zig
+CPU-core bug (doGroup1 ignores op_size_ovr for flags, same 0x66-prefix
+bug class fixed elsewhere but never audited here) -- fixed, with a
+regression test written and confirmed failing before the fix; emulator
+now reaches the game's real message-pump steady state for the first time
+
+**Picked the `n=0xfffffffc` question back up** (queued at the end of the
+previous entry) by going *up* the call chain instead of down into DAO/Jet's
+own binary-search semantics, per Molly's steer ("pretty sure it's not a
+Windows bug"). `[ESP+0]` at the fault (not the EBP chain, which was
+already confirmed unreliable past frame 2) gave the real immediate return
+address, `0x044d1fcc` — decompiling that landed on `FUN_044d1f27`
+(`dao350.dll`): a sorted name-index insert routine, `memmove(_Src+1,
+_Src, (sVar2 - local_2) * 4)`, where `sVar2` is a count field and
+`local_2` an index from `FUN_044d1d98`'s binary search. For `n` to be
+`-4`, `local_2` had to be `count+1` -- one past valid bounds.
+
+**Identified the real caller with a targeted logpoint** (`cpu.add_logpoint`
+at `FUN_044d1f27`'s entry, reading the real `[ESP]` args and dereferencing
+the key string) rather than guessing between the two static xref callers:
+it's `FUN_044d1e4a` ("add child to parent"), inserting DAO's own
+hardcoded `"#Default Workspace#"` object -- the very first insert into a
+genuinely empty (`count=0`) collection.
+
+**The empty-collection math didn't add up.** By hand: `FUN_044d1d98`'s own
+`count != 0` guard should take the "empty" fast path (`local_2=0,
+local_4=-1`) when `count=0`, and `if (0 < local_4) local_2++` should then
+never fire for `local_4=-1` -- predicting `n=0`, not `-4`. Two more
+logpoints (right at the `CALL memmove` instruction, and right after
+`FUN_044d1d98` returns) confirmed `count=0` on both sides of that call
+*and* the derived `local_2` was still `1` (`local_2 = (src - array_base) /
+4`, using the real `src`/`array_base` values) -- a genuine contradiction
+against the decompiled logic, not an instrumentation bug (caught and fixed
+one of my own logpoints' stack-offset math along the way, by cross-
+checking against the independently-known real `dst`/`src`/`n` from the
+handler's halt message).
+
+**Root cause, in the raw disassembly, not the decompiler's pseudocode**:
+the `if (0 < local_4) local_2++` check is a real 16-bit compare --
+`66 83 7C 24 0C 00` = `CMP WORD PTR [ESP+0xC], 0`, the `66` prefix
+confirming genuine 16-bit width, followed by `JLE` -- so the *guest*
+instruction stream is correct. `cpu/src/engine.zig`'s `doGroup1` (the
+shared handler for opcodes `0x80`/`0x81`/`0x83` -- ADD/OR/ADC/SBB/AND/SUB/
+XOR/CMP against an immediate) hardcoded `.w32` for every case's flags
+computation, never checking `s.op_size_ovr` -- unlike sibling functions in
+the same file (`op39`, `op3B`, `op3D`, `opA9`) which all correctly compute
+`width` from `op_size_ovr` first. This is the exact `0x66`-prefix
+flags-width bug class already found and fixed for the accumulator-
+immediate opcodes and `doGroup2` (see 2026-08-02 entries), and precisely
+matches the "other opcode families using op_size_ovr directly... weren't
+exhaustively re-verified" gap this project's own queued-issues list
+already flagged -- `doGroup1` was simply never covered by that earlier
+pass. Concretely: `local_4=-1` (`0xFFFF`) read from memory correctly
+zero-extends to `0x0000FFFF` (the read/write width handling in
+`readRmvResolved`/`writeRmvResolved` was already correct), but comparing
+that against `0` with flags forced to `.w32` sees `65535` -- positive, so
+`SF=False` -- instead of the correct 16-bit interpretation, `-1`, `SF=True`.
+The `JLE` that should have skipped the `INC` doesn't, `local_2` goes from
+`0` to `1` on a genuinely empty collection, and `memmove` gets called with
+`n=(0-1)*4=-4`.
+
+**Regression test written and confirmed failing before the fix**, per
+Molly's explicit request (test-first, not fix-first): `TestGroup1_16BitFlags`
+in `tests/unit/emulator/test_opcodes_arithmetic.py`, 4 cases -- `CMP CX, 0`
+(register operand, the exact opcode/op_ext from the real bug), `CMP WORD
+PTR [ESP+0xC], 0` (memory operand, byte-for-byte the real guest
+instruction), `SUB CX, 0`, and `AND CX, 0xFFFF` (imm16 form via `0x81`) --
+each asserting `SF_BIT` is set for a `0xFFFF`-shaped 16-bit result. One
+early draft case (`SUB CX, 1` from `CX=0`) was caught and replaced before
+committing: `0 - 1 = -1` reads as negative at *any* width (all-1s
+truncates the same way in 16 or 32 bits), so it couldn't actually
+discriminate the bug -- rewritten to `SUB CX, 0` from `CX=0xFFFF`, the same
+positive-32/negative-16 shape as the real bug. All 4 confirmed failing
+against the unfixed build first, exactly as asked.
+
+**Fix**: `doGroup1` now takes a real `width: Width` parameter instead of
+hardcoding `.w32`; both callers (`op81`, `op83`) compute
+`if (s.op_size_ovr) .w16 else .w32` before calling it, matching the
+established pattern. Rebuilt `libcpu.so`. All 4 new tests pass; full suite
+1029/1029 (was 1025).
+
+**Confirmed live**: re-ran with the same diagnostic logpoints still
+attached -- `FUN_044d1f27` now computes `n=0x00000000` (`local_2=0`,
+correct for a first insert into an empty collection), no fault, no halt.
+The run sailed straight through the entire DAO/Jet init sequence that
+blocked every session in this whole investigation and reached the game's
+own message-pump steady state (`GetMessageA`/`WaitForMultipleObjectsEx`/
+`timeSetEvent` cycling normally) -- ran stably until killed by the test
+timeout, not by crashing. This is the furthest this emulator has ever
+reached. `run_exe.py` stripped of all diagnostic logpoints again, per the
+same discard-when-done convention as the previous entry.
+
+**Session process note**: this whole investigation -- from the original
+"hang" report through the memcpy/memmove fix through this CPU-core bug --
+was one continuous session. Both root causes turned out to be real,
+independent bugs (a Python-handler-level missing bounds check, and a
+Zig-core-level flags-width bug), not one bug wearing two hats; fixing the
+first was necessary to even see the second clearly, since the corrupted-
+trampoline symptom and multi-minute wall-clock cost were masking it
+completely.
+
+**Current blocker**: none identified yet. Next session: let it run further
+past the message-pump idle state and see what happens (real UI/gameplay
+progress vs. a new, not-yet-hit blocker) -- not yet investigated.
+
+---
+
 ## 2026-08-06 — The `FUN_0448a033` "hang" was never a hang: real bug in
 memcpy/memmove/memset/memcmp (zero size validation, unbounded loop
 corrupting tew's own trampoline region); fixed + regression tests added

@@ -285,3 +285,57 @@ class TestAccumImmediate16BitFlags:
         step(cpu, 0x66, 0xA9, 0xFF, 0xFF)  # TEST AX, 0xFFFF -> result 0x8000
         assert cpu.regs[EAX] == 0x00008000  # TEST does not write back
         assert cpu.get_flag(SF_BIT) is True
+
+
+class TestGroup1_16BitFlags:
+    """Regression tests for the same 0x66-prefix flags-width bug in
+    doGroup1 (cpu/src/engine.zig), the shared handler for opcodes 0x80/
+    0x81/0x83 (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP against an immediate).
+    Every case in doGroup1 hardcoded .w32 for the flags helper regardless
+    of op_size_ovr -- unlike op39/op3B/op3D/opA9 and the already-fixed
+    accumulator-immediate opcodes above, which all compute width from
+    op_size_ovr first. Traced live via the FUN_044d1f27 (DAO350.DLL sorted
+    name-index insert) investigation: a real 16-bit `CMP WORD PTR [ESP+
+    0xC], 0` against local_4=-1 (0xFFFF) read SF=False (wrong; 0xFFFF is
+    positive as a 32-bit quantity) instead of SF=True (correct; -1 is
+    negative as a 16-bit quantity), so a JLE that should have skipped an
+    INC didn't -- producing an off-by-one insertion index and, downstream,
+    memcpy/memmove being called with n=-4. See memory/changelog.md,
+    "2026-08-06 (cont'd)".
+
+    Each case below produces a 16-bit result of 0xFFFF (bit 15 set, bit 31
+    clear) or writes 0xFFFF to a 16-bit memory operand, which only reads
+    SF=True once flags are computed at the correct (16-bit) width."""
+
+    def test_cmp_rm16_imm8_reg_sign_flag(self, cpu):
+        """The exact opcode/op_ext from the real bug (0x83 /7, CMP), on a
+        register operand: CMP CX, 0 with CX=0xFFFF (-1) must set SF."""
+        cpu.regs[ECX] = 0x0000FFFF
+        step(cpu, 0x66, 0x83, 0xF9, 0x00)  # CMP CX, 0
+        assert cpu.regs[ECX] == 0x0000FFFF  # CMP does not write back
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_cmp_rm16_imm8_mem_sign_flag(self, cpu):
+        """Same opcode/op_ext, but against a memory operand -- reproduces
+        the real guest instruction byte-for-byte: `66 83 7C 24 0C 00` =
+        CMP WORD PTR [ESP+0xC], 0."""
+        cpu.memory.write16(cpu.regs[ESP] + 0xC, 0xFFFF)
+        step(cpu, 0x66, 0x83, 0x7C, 0x24, 0x0C, 0x00)  # CMP WORD PTR [ESP+0xC], 0
+        assert cpu.memory.read16(cpu.regs[ESP] + 0xC) == 0xFFFF  # unwritten
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_sub_rm16_imm8_sign_flag(self, cpu):
+        """CX=0xFFFF, SUB CX, 0 -> result 0xFFFF: same shape as the CMP
+        case above (op1 is a small positive 32-bit value with bit 15 set,
+        bit 31 clear), not `0 - 1 = -1`, which reads as negative at any
+        width and so can't discriminate this bug."""
+        cpu.regs[ECX] = 0x0000FFFF
+        step(cpu, 0x66, 0x83, 0xE9, 0x00)  # SUB CX, 0
+        assert cpu.regs[ECX] == 0x0000FFFF
+        assert cpu.get_flag(SF_BIT) is True
+
+    def test_and_rm16_imm16_sign_flag(self, cpu):
+        cpu.regs[ECX] = 0x0000FFFF
+        step(cpu, 0x66, 0x81, 0xE1, 0xFF, 0xFF)  # AND CX, 0xFFFF (imm16 form)
+        assert cpu.regs[ECX] == 0x0000FFFF
+        assert cpu.get_flag(SF_BIT) is True
