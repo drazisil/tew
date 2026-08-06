@@ -4,6 +4,131 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-06 — The `FUN_0448a033` "hang" was never a hang: real bug in
+memcpy/memmove/memset/memcmp (zero size validation, unbounded loop
+corrupting tew's own trampoline region); fixed + regression tests added
+
+**Resolved the multi-day `FUN_0448a033` investigation queued 2026-08-04.**
+Picked back up by adding before/after `cpu.add_logpoint`s across every call
+site in the unexplored stretch (`0x448a189`-`0x448a1da`, confirmed via
+Ghidra decompile + raw byte dump of `dao350.dll`, not guessed) — every run
+reached `0x448a189` (`FUN_0448a63d`/`CheckJETVersion` returns cleanly,
+`EAX=0`) and then produced zero further output, matching the original
+"100% CPU, needed `SIGKILL`, `SIGTERM` didn't work" signature exactly.
+Decoded the full straight-line byte range between the last-reached and
+first-unreached logpoints (`0x448a1bf`-`0x448a1d9`): plain
+`LEA`/`MOV`/`MOVSX`/`PUSH`, no jumps, nothing that could loop on its own —
+pointed at either a Zig-core decode bug or a native freeze invisible to
+Python-level instrumentation.
+
+**ClickHouse execution-history capture** (`cpu.enable_history_capture_clickhouse`,
+already wired in `cpu_zig.py` from an earlier session, proven for exactly
+this "what's actually happening at this address" class of question) was
+stood up fresh: `~/pe-walker/history-poc` (`docker compose up`), fixed two
+real environment issues along the way — host port `9000` already in use
+(remapped native-protocol port to `19000` in `docker-compose.yml`, HTTP
+`8123` unaffected) and a stale bind-mounted `data/` directory carrying the
+host's plain `user_home_t` SELinux label, which an Enforcing-mode kernel
+correctly refused the container read access to (fixed with `:z` on the
+volume mount, Docker's built-in relabel, not a manual `chcon`). Learned the
+hard way that enabling capture from process start is catastrophically
+expensive — every single-step EIP change flushed toward ClickHouse for the
+whole ~70s of DLL loading/init produced a 20x wall-clock slowdown and
+never even reached the target region before a 300s timeout; scoping
+`enable_history_capture_clickhouse` to fire inside the `0x448a033` entry
+logpoint instead fixed that, but the run still produced zero flushed rows
+for the scoped capture — turned out to be genuinely informative: nothing
+flushed because the internal batch threshold was never reached before
+`SIGKILL`, consistent with (not contradicting) a hard freeze.
+
+**The actual breakthrough was a live `gdb -p <pid>` attach**, run without
+an aggressive auto-`SIGKILL` timeout (`timeout -k 10 500`, up from the
+usual `300`) so the process could be caught mid-"hang" instead of killed
+first. First attach showed the main thread genuinely blocked inside
+`engine.opCD` (the guest hit a real `INT` — a Win32 API trampoline) →
+`_c_int_dispatch` → a Python handler → `PyCFuncPtr_call`, i.e. actual,
+real execution, not a native freeze. Four more rapid successive attaches
+each landed at a *different* point in normal `ctypes`-call machinery
+(`_PyType_LookupStackRefAndVersion`, `CDataType_from_param_impl`,
+`_stginfo_from_type`, ...) — conclusive proof the process was alive and
+progressing the whole time, just far too slowly for any timeout used so
+far. Re-ran with the same 500s budget and no `SIGKILL` pressure: it
+finished on its own at **354.383s**, hitting a clean, honest halt —
+`[seh] fault at 0x00201fe2 unhandled by SEH chain`, `read8: address
+0xffffffff outside bounds [0, 0x80000000)`. Every previous "hang" across
+this whole investigation was simply killed by `timeout -k 5 300` a few
+seconds before it would have finished on its own.
+
+**Identified what's actually at the fault address.** `0x00201fe2` sits 2
+bytes into the `msvcrt.dll!memmove` trampoline (handler id 257, base
+`0x00201FE0` — confirmed by adding a one-off diagnostic that dumps
+`win32_handlers._handlers_by_id` right after registration and exits before
+any CPU execution, since handler-trampoline addresses are assigned
+deterministically at registration time and don't need a live/slow run to
+inspect). The trampoline's own bytes were corrupted: a clean
+`register_handler` trampoline is `CD FE C3` at its base followed by 29
+bytes of `CC` padding, but the captured fault-site bytes
+(`cc cc cd fe c3 cc cc ...`) show a *second* `CD FE C3` sequence stamped 4
+bytes into what should have been untouched padding.
+
+**Root cause, in `tew/api/msvcrt_handlers.py`**: `_memcpy`, `_memmove`,
+`_memset`, and `_memcmp` all read their size (`n`) straight from guest
+memory with zero validation and looped `for idx in range(n)`
+unconditionally, with no bounds-check on `dst`/`src`/`ptr` either. A
+garbage/underflowed `n` (confirmed live: the actual faulting call is
+`memmove(dst=0x06f9e014, src=0x06f9e010, n=0xfffffffc)` — `n` is `-4` as a
+signed value) turns into thousands of ctypes-heavy real, but effectively
+unbounded, `read8`/`write8` calls — that's the entire 279-second "hang"
+between `0x448a16a` and the fault. Since neither pointer nor size was
+bounds-checked, the sweep eventually walks straight through
+`0x00200000`+ — every trampoline shares the same `CD FE C3` + `CC`-padding
+byte shape, so a wild copy sweeping between two of them produces exactly
+the "extra `CD FE C3` 4 bytes into padding" signature found. The 32-bit
+address space wrapping to `0xFFFFFFFF` is what finally stops it, not any
+check on the copy operation itself.
+
+**Fix**: all four now call the already-existing (but previously unused
+anywhere in `tew/api/`) `memory.is_valid_range(addr, size)` on every
+address+size before touching anything, and halt loudly
+(`logger.error("handlers", ...)` + `cpu.halted = True` +
+`cpu.fatal_halt = True`, matching the established convention e.g.
+`kernel32_io.py`'s `_halt` helper) instead of looping. Confirmed live: a
+fresh run now reaches the same call and halts in **60.3s total**, not
+354s+ — the fix turns a silent multi-minute memory-corruption spree into
+an instant, diagnosable halt with the real `dst`/`src`/`n` values logged.
+
+**New regression tests**: `tests/unit/api/test_msvcrt_memfuncs.py` — 13
+tests, the first coverage these four functions have ever had. Covers
+normal correctness (forward copy, overlapping backward `memmove`, fill,
+compare, first-byte-difference sign) plus one regression case per function
+for this exact bug class (huge `n`; `dst`/`src`/`ptr` + `n` exceeding
+memory bounds) — each asserts an immediate halt rather than relying on a
+wall-clock timeout, so a future regression fails fast in CI instead of
+hanging it. 1025/1025 tests pass (was 1012).
+
+**Session process note**: all diagnostic instrumentation (the 30
+per-instruction `cpu.add_logpoint`s from the address-narrowing phase, the
+ClickHouse capture wiring, the registration-dump-and-`sys.exit(0)`
+diagnostic) was discarded from `run_exe.py` once it had served its
+purpose, per this project's established "TEMP diagnostics get discarded,
+not shipped" convention — including the original 5 logpoints from the
+2026-08-04 session that first raised this investigation, since it's now
+fully closed. The `~/pe-walker/history-poc` ClickHouse stack itself
+(`docker compose up`, port `19000`/`8123`, `:z`-relabeled volume) was left
+running as reusable infrastructure, not torn down — it's genuinely useful
+tooling for the next "what's actually happening at this address" question,
+not a one-off.
+
+**Current blocker**: `n=0xfffffffc` (`-4` signed) looks like a
+signed-length underflow (`end - start`-shaped), not raw garbage — not yet
+identified whether that's upstream in tew's own emulation (e.g. a
+structure field DAO/Jet expects to be populated correctly by this point
+that tew leaves at a wrong/zero value) or a genuine bug already present in
+retail DAO/Jet that real Windows happens not to trigger under whatever
+conditions this emulator's environment differs. Not yet investigated.
+
+---
+
 ## 2026-08-04 (cont'd again x3) — GetWindow implemented; two real bugs found
 and fixed chasing an apparent hang (PID mismatch, GWL_* sign-comparison);
 real hang narrowed to inside FUN_0448a033 via live logpoints, not yet

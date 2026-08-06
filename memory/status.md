@@ -11,7 +11,38 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-04, cont'd again x3)
+## Current status (2026-08-06)
+
+**The `FUN_0448a033` "hang" queued 2026-08-04 is RESOLVED, and it was never a
+hang at all** — a real bug in `_memcpy`/`_memmove`/`_memset`/`_memcmp`
+(`tew/api/msvcrt_handlers.py`) made a *slow but genuinely still-running*
+process look identical to a stuck one. All four looped `for idx in
+range(n)` on a size read straight from guest memory with zero validation;
+a garbage/underflowed `n` turned into hundreds of millions of real
+`read8`/`write8` FFI calls (minutes of true wall-clock work, not a freeze)
+that eventually swept the unbounded `dst`/`src` pointers through tew's own
+`0x00200000+` Win32 trampoline region, corrupting the `memmove` trampoline
+itself before finally faulting on a genuinely out-of-range address. Every
+prior "hung" run was actually just killed by too-short a timeout (`300s`)
+before it reached its own honest halt at `354s`. Fixed: all four now call
+`memory.is_valid_range()` before touching anything and halt loudly
+(`logger.error` + `cpu.fatal_halt`) instead of looping. New regression
+tests: `tests/unit/api/test_msvcrt_memfuncs.py` (13 tests, first coverage
+these four functions have ever had). 1025/1025 tests pass. Full diagnosis
+(gdb-attach live-process investigation, the ClickHouse execution-history
+tooling, ~/pe-walker/history-poc setup): changelog.md, "2026-08-06".
+
+**Current blocker**: with the hang/corruption masking it gone, the *real*
+question is now visible and unanswered: confirmed live, the actual faulting
+call is `memmove(dst=0x06f9e014, src=0x06f9e010, n=0xfffffffc)` —
+`n` is `-4` as a signed value, `dst`/`src` are real adjacent heap addresses
+only 4 bytes apart. This looks like a signed-length computation
+(`end - start`-shaped) underflowing somewhere upstream in the DAO/Jet call
+chain, not raw garbage — not yet identified whether that's a genuine guest
+bug (unlikely in well-tested retail DAO/Jet) or a tew emulation gap feeding
+bad input into otherwise-correct guest code. Not yet investigated.
+
+## Previous status (2026-08-04, cont'd again x3)
 
 **Real progress on the `GetWindow`-adjacent hang, still not fully resolved.**
 Two genuine bugs found and fixed while chasing it (both confirmed correct

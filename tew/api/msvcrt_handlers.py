@@ -1130,11 +1130,25 @@ def register_msvcrt_handlers(
 
     # ── Memory functions ───────────────────────────────────────────────────────
 
+    def _mem_range_halt(cpu: "CPU", func_name: str, **addrs: int) -> None:
+        args = ", ".join(f"{k}=0x{v:08x}" for k, v in addrs.items())
+        logger.error(
+            "handlers",
+            f"{func_name}({args}) -- range out of bounds, halting instead of "
+            f"looping/corrupting memory (n given as an unsigned 32-bit size; "
+            f"a garbage/uninitialized value here reads as huge)",
+        )
+        cpu.halted = True
+        cpu.fatal_halt = True
+
     # memcpy(void* dst, const void* src, size_t n) -> void* [cdecl]
     def _memcpy(cpu: "CPU") -> None:
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if not memory.is_valid_range(dst, n) or not memory.is_valid_range(src, n):
+            _mem_range_halt(cpu, "memcpy", dst=dst, src=src, n=n)
+            return
         for idx in range(n):
             memory.write8(dst + idx, memory.read8(src + idx))
         cpu.regs[EAX] = dst
@@ -1147,6 +1161,9 @@ def register_msvcrt_handlers(
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if not memory.is_valid_range(dst, n) or not memory.is_valid_range(src, n):
+            _mem_range_halt(cpu, "memmove", dst=dst, src=src, n=n)
+            return
         if dst <= src or dst >= src + n:
             # No overlap or dst is before src: copy forward
             for idx in range(n):
@@ -1164,6 +1181,9 @@ def register_msvcrt_handlers(
         ptr = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         val = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF) & 0xFF
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if not memory.is_valid_range(ptr, n):
+            _mem_range_halt(cpu, "memset", ptr=ptr, n=n)
+            return
         for idx in range(n):
             memory.write8(ptr + idx, val)
         cpu.regs[EAX] = ptr
@@ -1175,6 +1195,9 @@ def register_msvcrt_handlers(
         p1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p2 = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if not memory.is_valid_range(p1, n) or not memory.is_valid_range(p2, n):
+            _mem_range_halt(cpu, "memcmp", p1=p1, p2=p2, n=n)
+            return
         for idx in range(n):
             a = memory.read8(p1 + idx)
             b = memory.read8(p2 + idx)
