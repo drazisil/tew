@@ -186,6 +186,7 @@ def register_kernel32_io_handlers(
             if not state.exe_path:
                 logger.error("handlers", "GetModuleFileNameA: exe_path not set in CRTState — halting")
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
             win_path = state.reverse_translate_path(state.exe_path)
         else:
@@ -196,6 +197,7 @@ def register_kernel32_io_handlers(
                     f"GetModuleFileNameA: unknown hModule 0x{h_module:x} — halting",
                 )
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
             # Use the stored full path when available; fall back to the bare DLL name.
             win_path = mod.dll_path if mod.dll_path else mod.dll_name
@@ -247,10 +249,12 @@ def register_kernel32_io_handlers(
         code = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         logger.info("handlers", f"[Win32] TerminateProcess(exitCode={code})")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _fatal_app_exit(cpu: "CPU") -> None:
         logger.error("handlers", "[Win32] FatalAppExitA called")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("kernel32.dll", "TerminateProcess", _terminate_process)
     stubs.register_handler("kernel32.dll", "FatalAppExitA",    _fatal_app_exit)

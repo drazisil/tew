@@ -4,6 +4,87 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-06 (cont'd again) — Resolved the deliberately-deferred "~85 of
+~90 cpu.halted = True sites lack fatal_halt" item: audited and fixed 85
+sites, caught and reverted one genuine false positive via the existing
+test suite, confirmed the native boundary itself needed no changes
+
+**Root of this pass**: picked back up the halt-boundary design discussion
+from earlier today (Molly: "halting the cpu should halt the cpu. python
+should have zero ability to restart it") after a detour to extract `cpu/`
+into its own shared repo. First instinct — collapse `halted`/`fatal_halted`
+into one permanently-one-way native flag — turned out to be wrong: `tew`
+has a real, currently-used, *intentionally* resumable feature built on
+plain `cpu.halted`. `run_exe.py`'s own scripted debugger
+(`register_breakpoint`/`_dispatch_breakpoint`, "Resume is automatic")
+relies on breakpoint-hit halts staying clearable, and `seh.py`'s
+`_sentinel_handler` uses the same flag purely as a nested-step-loop
+completion signal, not an error. Collapsing everything would have broken
+both.
+
+**The actual gap, once that was ruled out**: the native boundary already
+does exactly what was asked — `cpu_set_fatal_halt` is genuinely one-way
+(`s.fatal_halted = true`, no clear function exists), and `cpu_clear_halted`
+already refuses when it's set. The bug was never in that mechanism; it's
+that the vast majority of individual Python handler call sites never opted
+into it, setting bare `cpu.halted = True` for what's clearly an
+unrecoverable condition (the `_ord12`/`VariantChangeType` bug from earlier
+today's session was one instance of this same class, not a one-off).
+
+**Audit**: wrote a script to find every `<var>.halted = True` write whose
+*following* line doesn't mention `fatal_halt` (a same-line grep undercounts
+real coverage -- e.g. `win32_handlers.py`'s already-correct INT3 handler
+sets it on the next line, not the same one). 86 sites found across 20
+files. Classified each:
+- 79 follow the established `logger.error(...) + "halting"/"UNIMPLEMENTED"/
+  "failed"` shape -- unambiguous genuine errors.
+- 3 are clean process-exit calls (`ExitProcess`, `TerminateProcess`,
+  `NtTerminateProcess`) -- logged at INFO not ERROR, but still correctly
+  permanent: nothing should ever resume a CPU after the guest process
+  itself called one of these.
+- 1 (`seh.py`'s SEH-handler-invocation timeout, distinct from the sentinel
+  below) is a genuine unrecoverable error (a stuck/runaway handler).
+- 1 (`seh.py`'s unhandled `RaiseException`) is a genuine error, same shape
+  as the other 79 but didn't match the exact log-message pattern used to
+  spot-check.
+- 1 (`seh.py`'s `_sentinel_handler`) is the legitimate resumable
+  step-loop-completion signal identified above -- left alone.
+- 1 (`scheduler.py`'s `mark_current_dead`, "no runnable threads remain")
+  was *initially* judged a clean process exit by the same reasoning as the
+  three above and marked fatal.
+
+**That last one was wrong, and the existing test suite caught it
+immediately**: marking it fatal broke
+`test_invoke_emulated_proc_thread_death.py::test_invoke_emulated_proc_returns_zero_when_calling_thread_dies_mid_call`,
+which explicitly asserts `cpu.fatal_halt is False` for the scenario it's
+built around -- a *single* thread calling `ExitThread` on itself from
+inside a nested `_invoke_emulated_proc` call (e.g. a DllMain), which the
+scheduler-level bookkeeping legitimately needs to detect and let the
+caller recover from, not treat as a whole-process crash. Reverted that one
+site (`scheduler.py`), left the other 84 in place. Concrete demonstration
+of why this pass needed real per-site judgment and test verification, not
+a blanket property-level flip -- a wrong call here breaks legitimate
+control flow silently, which is worse than the original gap. 1029/1029
+tests pass (85 sites fixed +1 reverted = 84 net).
+
+**Confirmed, tracing `cpu_zig.py`'s `halted` property end to end, that no
+native changes were needed at all for the two seemingly-unguarded clear
+sites in `user32_handlers.py` (177, 220, which clear `cpu.halted` without
+an explicit `if not cpu.fatal_halt` check)**: the getter is
+`self._py_halted or cpu_is_halted(state)`, and the setter's clear path
+calls native `cpu_clear_halted`, which already refuses to flip `s.halted`
+back to false once `s.fatal_halted` is set. So even an unconditional
+Python-side clear attempt can't resume a genuinely fatal halt -- native
+`s.halted` stays true regardless (the enforcement lives at the native
+layer, not the call site), and `cpu_run`'s own execution loop reads that
+native flag directly, never the Python shadow. `cpu.fatal_halt` itself is
+completely untouched by the `halted` setter. The architecture already
+fully enforced "Python has zero ability to restart a fatal halt" once a
+handler correctly opts in -- the real gap was 85 handlers never opting in,
+not a hole in the enforcement mechanism.
+
+---
+
 ## 2026-08-06 (cont'd) — Root cause of memmove's n=-4 found: a real Zig
 CPU-core bug (doGroup1 ignores op_size_ovr for flags, same 0x66-prefix
 bug class fixed elsewhere but never audited here) -- fixed, with a

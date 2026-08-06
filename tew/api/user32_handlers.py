@@ -852,6 +852,7 @@ def register_user32_gdi32_handlers(
         if entry is None:
             logger.error("handlers", f"[GetWindowThreadProcessId] unknown hwnd=0x{h_wnd:08x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         if lpdw_process_id:
             memory.write32(lpdw_process_id & 0xFFFFFFFF, 1)  # our fake PID
@@ -920,6 +921,7 @@ def register_user32_gdi32_handlers(
             # lpBuffer untouched would hand the caller a garbage pointer.
             logger.error("handlers", "[UNIMPLEMENTED] LoadStringA(cchBufferMax=0) — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         resources = _resources_for_module(h_instance)
@@ -1232,6 +1234,7 @@ def register_user32_gdi32_handlers(
         if state.pe_resources is None:
             logger.error("dialog", "[Win32] DialogBoxParamA: pe_resources not available — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         template = state.pe_resources.find_dialog(template_id)
@@ -1240,6 +1243,7 @@ def register_user32_gdi32_handlers(
                 f"[UNIMPLEMENTED] DialogBoxParamA({template_name}): "
                 f"dialog template not found — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.debug("dialog",
@@ -1249,6 +1253,7 @@ def register_user32_gdi32_handlers(
         if not wm.initialize():
             logger.error("dialog", "[Win32] DialogBoxParamA: SDL2 init failed — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # Create the dialog and all its child controls
@@ -1257,6 +1262,7 @@ def register_user32_gdi32_handlers(
         if dlg_hwnd == 0:
             logger.error("dialog", "[Win32] DialogBoxParamA: create_dialog failed — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # Clean up the stdcall arguments.  After this, EAX will be set at the
@@ -1353,6 +1359,7 @@ def register_user32_gdi32_handlers(
         if state.pe_resources is None:
             logger.error("dialog", "[Win32] CreateDialogParamA: pe_resources not available — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         template = state.pe_resources.find_dialog(template_id)
@@ -1361,6 +1368,7 @@ def register_user32_gdi32_handlers(
                 f"[UNIMPLEMENTED] CreateDialogParamA({template_name}): "
                 f"dialog template not found — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.debug("dialog",
@@ -1369,6 +1377,7 @@ def register_user32_gdi32_handlers(
         if not wm.initialize():
             logger.error("dialog", "[Win32] CreateDialogParamA: SDL2 init failed — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         dlg_hwnd = wm.create_dialog(template, h_wnd_parent, lp_dialog_func, dw_init_param,
@@ -1376,6 +1385,7 @@ def register_user32_gdi32_handlers(
         if dlg_hwnd == 0:
             logger.error("dialog", "[Win32] CreateDialogParamA: create_dialog failed — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # Clean up stdcall args before any _invoke_emulated_proc call
@@ -1565,6 +1575,7 @@ def register_user32_gdi32_handlers(
         if not wm.initialize():
             logger.error("window", "[CreateWindowExA] SDL2 init failed — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         hwnd = wm.create_window(
@@ -1577,6 +1588,7 @@ def register_user32_gdi32_handlers(
             logger.error("window",
                 f"[CreateWindowExA] create_window failed for class '{class_name}' — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # Register as child with ctrl_id = low word of hMenu if this is a child window

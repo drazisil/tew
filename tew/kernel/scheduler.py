@@ -435,6 +435,13 @@ class Scheduler:
 
         next_idx = self._pick_next_ready(memory)
         if next_idx is None:
+            # NOT made fatal: this fires whenever the last schedulable thread
+            # dies, which includes a single thread dying mid-nested-call
+            # (e.g. ExitThread from inside _invoke_emulated_proc) -- a
+            # legitimate, recoverable case callers are specifically built to
+            # detect and handle (see test_invoke_emulated_proc_thread_death.py,
+            # which asserts cpu.fatal_halt is False for exactly this
+            # scenario), not just a genuine whole-process exit.
             logger.info("scheduler", "No runnable threads remain — halting CPU")
             cpu.halted = True
             return

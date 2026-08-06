@@ -128,6 +128,7 @@ def register_kernel32_locale_handlers(
             logger.error("handlers",
                 f"GetStringTypeW: unsupported dwInfoType {args.info_type:#010x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 16)
@@ -146,6 +147,7 @@ def register_kernel32_locale_handlers(
             logger.error("handlers",
                 f"LCMapStringW: unsupported dwMapFlags {args.map_flags:#010x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 24)

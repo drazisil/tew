@@ -72,6 +72,7 @@ def _nt_terminate_process(cpu: "CPU", memory: "Memory") -> None:
     logger.info("nt", f"NtTerminateProcess(handle=0x{process_handle:x}, status=0x{exit_status:x})")
     cpu.regs[EAX] = STATUS_SUCCESS
     cpu.halted = True
+    cpu.fatal_halt = True
 
 
 # ── Registration ──────────────────────────────────────────────────────────────

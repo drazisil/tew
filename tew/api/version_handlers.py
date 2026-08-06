@@ -47,10 +47,12 @@ def register_version_handlers(
     def _get_file_version_info_a(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] GetFileVersionInfoA — RT_VERSION parsing not implemented, halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _ver_query_value_a(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VerQueryValueA — RT_VERSION parsing not implemented, halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("version.dll", "GetFileVersionInfoSizeA", _get_file_version_info_size_a)
     stubs.register_handler("version.dll", "GetFileVersionInfoA",     _get_file_version_info_a)

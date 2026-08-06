@@ -51,6 +51,7 @@ def register_kernel32_memory_handlers(
             logger.error("handlers",
                 f"[UNIMPLEMENTED] HeapCreate — unsupported flag(s) 0x{unsupported:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         h = state.next_heap_handle
         state.next_heap_handle += 1
@@ -68,12 +69,14 @@ def register_kernel32_memory_handlers(
         if h_heap not in state.heap_handles:
             logger.error("handlers", f"[HeapAlloc] invalid heap 0x{h_heap:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         unsupported = dw_flags & ~_HEAP_KNOWN_ALLOC_FLAGS
         if unsupported:
             logger.error("handlers",
                 f"[UNIMPLEMENTED] HeapAlloc — unsupported flags 0x{unsupported:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         size = dw_bytes or 1
         addr = state.simple_alloc(size)
@@ -91,12 +94,14 @@ def register_kernel32_memory_handlers(
         if h_heap not in state.heap_handles:
             logger.error("handlers", f"[HeapFree] invalid heap 0x{h_heap:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         unsupported = dw_flags & ~_HEAP_NO_SERIALIZE
         if unsupported:
             logger.error("handlers",
                 f"[UNIMPLEMENTED] HeapFree — unsupported flags 0x{unsupported:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         if lp_mem == 0:
             cpu.regs[EAX] = 1
@@ -105,6 +110,7 @@ def register_kernel32_memory_handlers(
         if lp_mem not in state.heap_alloc_sizes:
             logger.error("handlers", f"[HeapFree] untracked pointer 0x{lp_mem:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         del state.heap_alloc_sizes[lp_mem]
         state.heap_alloc_owner.pop(lp_mem, None)
@@ -119,12 +125,14 @@ def register_kernel32_memory_handlers(
         if h_heap not in state.heap_handles:
             logger.error("handlers", f"[HeapReAlloc] invalid heap 0x{h_heap:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         unsupported = dw_flags & ~_HEAP_KNOWN_REALLOC_FLAGS
         if unsupported:
             logger.error("handlers",
                 f"[UNIMPLEMENTED] HeapReAlloc — unsupported flags 0x{unsupported:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         if dw_flags & _HEAP_REALLOC_IN_PLACE_ONLY:
             cpu.regs[EAX] = 0
@@ -134,6 +142,7 @@ def register_kernel32_memory_handlers(
         if lp_mem != 0 and lp_mem not in state.heap_alloc_sizes:
             logger.error("handlers", f"[HeapReAlloc] untracked pointer 0x{lp_mem:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         new_size = dw_bytes or 1
         new_addr = state.simple_alloc(new_size)
@@ -157,12 +166,14 @@ def register_kernel32_memory_handlers(
         if h_heap not in state.heap_handles:
             logger.error("handlers", f"[HeapSize] invalid heap 0x{h_heap:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         unsupported = dw_flags & ~_HEAP_NO_SERIALIZE
         if unsupported:
             logger.error("handlers",
                 f"[UNIMPLEMENTED] HeapSize — unsupported flags 0x{unsupported:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         sz = state.heap_alloc_sizes.get(lp_mem)
         cpu.regs[EAX] = sz if sz is not None else 0xFFFFFFFF
@@ -175,6 +186,7 @@ def register_kernel32_memory_handlers(
         if h_heap not in state.heap_handles:
             logger.error("handlers", f"[HeapValidate] invalid heap 0x{h_heap:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         cpu.regs[EAX] = 1  # TRUE — heap is always valid
         cleanup_stdcall(cpu, memory, 12)
@@ -199,12 +211,14 @@ def register_kernel32_memory_handlers(
             logger.error("handlers",
                 f"[UNIMPLEMENTED] VirtualAlloc — unsupported flAllocationType 0x{unk_type:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         unk_prot = fl_prot & ~_KNOWN_PROTECT_FLAGS
         if unk_prot:
             logger.error("handlers",
                 f"[UNIMPLEMENTED] VirtualAlloc — unsupported flProtect 0x{unk_prot:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         page_size = ((dw_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)) & 0xFFFFFFFF
         if (fl_type & _MEM_COMMIT) and not (fl_type & _MEM_RESERVE):
@@ -228,6 +242,7 @@ def register_kernel32_memory_handlers(
                 logger.error("handlers",
                     f"[VirtualAlloc] MEM_COMMIT on unreserved 0x{lp_addr:x} — halting")
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
             state.virtual_committed[lp_addr] = page_size
             cpu.regs[EAX] = lp_addr
@@ -260,11 +275,13 @@ def register_kernel32_memory_handlers(
             if dw_size != 0:
                 logger.error("handlers", "[VirtualFree] MEM_RELEASE requires dwSize=0 — halting")
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
             if lp_addr not in state.virtual_reserved:
                 logger.error("handlers",
                     f"[VirtualFree] MEM_RELEASE on unreserved 0x{lp_addr:x} — halting")
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
             del state.virtual_reserved[lp_addr]
             state.virtual_committed.pop(lp_addr, None)
@@ -274,6 +291,7 @@ def register_kernel32_memory_handlers(
             logger.error("handlers",
                 f"[UNIMPLEMENTED] VirtualFree — unsupported type 0x{dw_type:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 12)

@@ -37,6 +37,7 @@ def register_ifc22_handlers(stubs: "Win32Handlers", memory: "Memory") -> None:
         def _h(cpu: "CPU") -> None:
             logger.error("handlers", f"[UNIMPLEMENTED] ifc22 FFB method {name} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
         return _h
 
     # Default constructors — always called by cMouseFFB::cMouseFFB()

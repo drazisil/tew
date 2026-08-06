@@ -366,11 +366,13 @@ def register_wsock32_handlers(
         """bind(s, addr, namelen) -> int."""
         logger.error("handlers", "[UNIMPLEMENTED] bind — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _listen(cpu: "CPU") -> None:
         """listen(s, backlog) -> int."""
         logger.error("handlers", "[UNIMPLEMENTED] listen — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _accept(cpu: "CPU") -> None:
         """accept(s, addr, addrlen) -> SOCKET.  Not supported."""
@@ -753,6 +755,7 @@ def register_wsock32_handlers(
         """gethostbyaddr(addr, len, type) -> HOSTENT*."""
         logger.error("handlers", "[UNIMPLEMENTED] gethostbyaddr — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _gethostname(cpu: "CPU") -> None:
         """gethostname(name, namelen) -> int."""

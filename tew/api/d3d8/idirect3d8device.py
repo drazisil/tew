@@ -346,6 +346,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if _state._vk_device is None:
             logger.error("d3d8", "BeginScene: device not initialised — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8", "BeginScene: ENTER")
@@ -420,6 +421,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             logger.error("d3d8",
                 f"BeginScene failed: {type(exc).__name__}: {exc!r} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # Transition TRANSFER_DST_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL so the
@@ -471,6 +473,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             logger.error("d3d8",
                 f"BeginScene: render pass setup failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8",
@@ -486,6 +489,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if _state._vk_device is None:
             logger.error("d3d8", "EndScene: device not initialised — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         try:
@@ -521,6 +525,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         except Exception as exc:
             logger.error("d3d8", f"EndScene failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8", "EndScene: OK")
@@ -540,6 +545,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if _state._vk_device is None:
             logger.error("d3d8", "Clear: device not initialised — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         flags = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -590,6 +596,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         except Exception as exc:
             logger.error("d3d8", f"Clear failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.debug("d3d8",
@@ -604,6 +611,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if _state._vk_device is None:
             logger.error("d3d8", "Present: device not initialised — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8", "Present: ENTER")
@@ -644,6 +652,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 return
             logger.error("d3d8", f"Present failed: {type(exc).__name__} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8",
@@ -837,6 +846,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if _state._vk_pipeline is None or _state._vk_vertex_mapped_ptr is None:
             logger.error("d3d8", "DrawPrimitive: pipeline not ready — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         D3DPT_TRIANGLELIST = 4

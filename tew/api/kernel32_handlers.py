@@ -297,6 +297,7 @@ def register_kernel32_handlers(
             logger.error("handlers",
                 f"[UNIMPLEMENTED] LoadLibraryExA dwFlags=0x{dw_flags:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         name = read_cstring(name_ptr, memory) if name_ptr else ""
         has_sep = "\\" in name or "/" in name

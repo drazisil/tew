@@ -173,6 +173,7 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
 
     if not cpu.halted:
         cpu.halted = True
+        cpu.fatal_halt = True
         cpu.regs[ESP] = esp_before
         raise SehHandlerTimeout(handler_addr)
 
@@ -337,6 +338,7 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
         if not handled:
             logger.error("seh", f"RaiseException(0x{code:08x}) unhandled -- halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         # A handler resumed execution (ContinueExecution or an unwind
         # escape) -- both already set EIP/ESP correctly; RaiseException

@@ -289,6 +289,7 @@ def register_msvcrt_handlers(
                 f"_call_guest_void: 0x{fn_addr:08x} exceeded {_INITTERM_STEP_LIMIT} steps",
             )
             cpu.halted = True
+            cpu.fatal_halt = True
             return False
 
         # A normal return via sentinel sets EIP = THREAD_SENTINEL + 2
@@ -732,6 +733,7 @@ def register_msvcrt_handlers(
     def _isctype(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] _isctype — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("msvcrt.dll", "_isctype", _isctype)
 
@@ -741,6 +743,7 @@ def register_msvcrt_handlers(
     def _cxx_frame_handler(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] __CxxFrameHandler — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("msvcrt.dll", "__CxxFrameHandler", _cxx_frame_handler)
 

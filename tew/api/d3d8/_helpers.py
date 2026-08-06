@@ -87,6 +87,7 @@ def _com_stub(
                     f"{name}: invalid this=0x{this:08x} (expected 0x{expected_this:08x}) — halting",
                 )
                 cpu.halted = True
+                cpu.fatal_halt = True
                 return
         handler(cpu, memory)
         _cleanup_com(cpu, memory, arg_bytes)

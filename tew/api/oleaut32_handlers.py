@@ -211,6 +211,7 @@ def register_oleaut32_ole32_handlers(
     def _VariantChangeType(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("oleaut32.dll", "VariantChangeType", _VariantChangeType)
 
@@ -308,6 +309,7 @@ def register_oleaut32_ole32_handlers(
     def _SafeArrayRedim(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] SafeArrayRedim — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("oleaut32.dll", "SafeArrayRedim", _SafeArrayRedim)
 
@@ -315,6 +317,7 @@ def register_oleaut32_ole32_handlers(
     def _SafeArrayPutElement(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] SafeArrayPutElement — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     stubs.register_handler("oleaut32.dll", "SafeArrayPutElement", _SafeArrayPutElement)
 
@@ -396,6 +399,7 @@ def register_oleaut32_ole32_handlers(
     def _ord10(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VariantCopy (Ordinal 10) — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     _ole_ord(10, _ord10)
 
@@ -403,6 +407,7 @@ def register_oleaut32_ole32_handlers(
     def _ord12(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType (Ordinal 12) — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     _ole_ord(12, _ord12)
 
@@ -425,6 +430,7 @@ def register_oleaut32_ole32_handlers(
     def _ord82(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VarR8FromCy (Ordinal 82) — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     _ole_ord(82, _ord82)
 
@@ -440,6 +446,7 @@ def register_oleaut32_ole32_handlers(
     def _ord113(cpu: "CPU") -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VarBstrFromCy (Ordinal 113) — halting")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     _ole_ord(113, _ord113)
 
@@ -578,6 +585,7 @@ def register_oleaut32_ole32_handlers(
         if old_size is None:
             logger.error("com", f"IMalloc::Realloc — untracked pointer 0x{pv:08x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         new_addr = state.simple_alloc(cb)
         for i in range(min(old_size, cb)):
@@ -592,6 +600,7 @@ def register_oleaut32_ole32_handlers(
         if pv not in state.heap_alloc_sizes:
             logger.error("com", f"IMalloc::Free — untracked pointer 0x{pv:08x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         del state.heap_alloc_sizes[pv]
 

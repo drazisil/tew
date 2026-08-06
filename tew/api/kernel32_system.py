@@ -217,6 +217,7 @@ def register_kernel32_system_handlers(
         code = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.info("handlers", f"ExitProcess({code})")
         cpu.halted = True
+        cpu.fatal_halt = True
 
     def _is_debugger_present(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0
@@ -287,6 +288,7 @@ def register_kernel32_system_handlers(
             logger.error("handlers",
                 f"[UNIMPLEMENTED] GetFileType: unknown handle 0x{hf:x} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         # FILE_TYPE_CHAR(2) for std handles (have fd), FILE_TYPE_DISK(1) for files
         cpu.regs[EAX] = 2 if entry.fd is not None else 1

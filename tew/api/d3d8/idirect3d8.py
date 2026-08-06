@@ -142,6 +142,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         if entry is None or entry.sdl_window is None:
             logger.error("d3d8", "CreateDevice: no SDL window found — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         sdl_window = entry.sdl_window
@@ -164,6 +165,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: failed to load surface extension functions: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # ── Create VkSurfaceKHR ────────────────────────────────────────────
@@ -222,6 +224,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: VkSurface creation failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8", "CreateDevice: VkSurfaceKHR created")
@@ -238,6 +241,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 "CreateDevice: no GRAPHICS queue family found — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         _state._vk_graphics_queue_family = gfx_family
         _state._vk_present_queue_family  = gfx_family
@@ -265,6 +269,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: vkCreateDevice failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         _state._vk_graphics_queue = vk.vkGetDeviceQueue(
@@ -289,6 +294,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: failed to load swapchain extension functions: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # ── Create swapchain ───────────────────────────────────────────────
@@ -342,6 +348,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: swapchain creation failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8",
@@ -371,6 +378,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: command pool/buffer creation failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # ── Sync primitives ────────────────────────────────────────────────
@@ -391,6 +399,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: sync primitive creation failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         # ── Render pipeline (render pass, framebuffers, graphics pipeline) ───
@@ -416,6 +425,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             logger.error("d3d8",
                 f"CreateDevice: pipeline init failed: {exc} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         if pp_device:
@@ -592,12 +602,14 @@ def make_create8(memory: "Memory") -> Callable:
         except Exception as e:
             logger.error("d3d8", f"[Direct3DCreate8] vkCreateInstance failed: {e} — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         _state._vk_physical_devices = vk.vkEnumeratePhysicalDevices(_state._vk_instance)
         if not _state._vk_physical_devices:
             logger.error("d3d8", "[Direct3DCreate8] No Vulkan physical devices found — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
 
         logger.info("d3d8", f"[Direct3DCreate8] VkInstance created, {len(_state._vk_physical_devices)} physical device(s) found")

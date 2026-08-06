@@ -160,6 +160,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         if not surf:
             _log.error("d3d8", f"Texture::GetSurfaceLevel level={level} out of range — halting")
             cpu.halted = True
+            cpu.fatal_halt = True
             return
         if pp_surf:
             mem.write32(pp_surf, surf)

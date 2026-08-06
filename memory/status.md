@@ -11,7 +11,56 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-06, cont'd)
+## Current status (2026-08-06, cont'd again)
+
+**The `~85 of ~90 cpu.halted = True sites lack fatal_halt` item -- deliberately
+deferred since 2026-08-04 -- is now RESOLVED.** Prompted by tracing why
+`VariantChangeType (Ordinal 12)`'s "halting" log didn't actually stop
+execution (led to a `RUNAWAY` ~100k steps later): confirmed that plain
+`cpu.halted = True` gets silently cleared by any of ~9 scheduler/nested-
+call-bookkeeping sites, while `cpu.fatal_halt = True` is the only thing the
+native layer (`cpu_clear_halted`) actually refuses to undo -- and most
+individual handler halts across the codebase were never using it.
+
+Surveyed every `<var>.halted = True` write site (86 total, via a script
+checking the following line for `fatal_halt` rather than a same-line grep,
+which undercounts -- e.g. `win32_handlers.py`'s INT3 handler already had it
+on the next line). 85 were genuine unrecoverable-error halts (the
+established `logger.error(...) + "halting"/"UNIMPLEMENTED"/"failed"`
+shape, plus three clean process-exit calls -- `ExitProcess`,
+`TerminateProcess`, `NtTerminateProcess` -- correctly permanent even though
+logged at INFO not ERROR) and got `fatal_halt = True` added. One,
+`seh.py`'s `_sentinel_handler`, is a legitimate resumable step-loop
+completion signal (fires when a nested SEH handler call returns
+*normally*) and was correctly left alone.
+
+**One genuine false positive, caught by the existing test suite and
+reverted**: `scheduler.py`'s `mark_current_dead` "no runnable threads
+remain" halt was assumed to always mean a clean process exit and initially
+marked fatal -- broke
+`test_invoke_emulated_proc_thread_death.py::test_invoke_emulated_proc_returns_zero_when_calling_thread_dies_mid_call`,
+which explicitly asserts `cpu.fatal_halt is False` for the case of a
+*single* thread dying mid-nested-call (e.g. `ExitThread` from inside
+`_invoke_emulated_proc`) -- a real, designed-for, recoverable scenario, not
+a whole-process exit. Reverted that one site, left the other 84 in place.
+1029/1029 tests pass.
+
+**Confirmed the native boundary needed no changes at all.** Traced
+`cpu.halted`'s Python property (`cpu_zig.py`) end to end: the getter is
+`self._py_halted or cpu_is_halted(state)` and the setter's clear path calls
+native `cpu_clear_halted`, which already refuses to actually flip
+`s.halted` back to false once `s.fatal_halted` is set -- so even the two
+call sites in `user32_handlers.py` (177, 220) that clear `cpu.halted`
+*without* an explicit `if not cpu.fatal_halt` guard can't actually resume
+a genuinely fatal halt: native `s.halted` stays true regardless (the guard
+lives at the native layer, not the call site), and `cpu_run`'s own
+execution loop reads that native flag directly, never the Python shadow.
+`cpu.fatal_halt` itself is untouched by the `halted` setter entirely. The
+architecture already fully enforced "Python has zero ability to restart a
+fatal halt" -- the actual gap was 85 individual handlers never opting into
+the existing mechanism, not a hole in the mechanism itself.
+
+## Previous status (2026-08-06, cont'd)
 
 **The `n=0xfffffffc` mystery queued earlier today is RESOLVED, and it was a
 real Zig CPU-core bug, not a DAO/Jet or tew-handler issue.** Traced the
@@ -725,10 +774,8 @@ need to reach all the way through the DAO handshake.
 - Fix `_chkesp`'s diagnostic (`patch_internals.py`) hardcoding EBP as the
   snapshot register when it's a compiler register-allocation choice
   (confirmed ESI at one real call site)
-- Dedicated pass on the ~85 of ~90 `cpu.halted = True` call sites that
-  still lack the `cpu.fatal_halt` marker (priority order not yet
-  established) — see [[tew_fake_kernel_gaps]] section 17's closing
-  paragraph.
+- **RESOLVED (2026-08-06, cont'd again)**: the `cpu.halted = True` sites
+  missing `cpu.fatal_halt` — see "Current status" above.
 - SDL window resolution (1536x1248) vs. `GetDeviceCaps` (1024x768) mismatch
 - DrawPrimitive / DrawIndexedPrimitive coverage beyond what's needed to
   reach the DAO abort — not yet assessed how much is implemented
