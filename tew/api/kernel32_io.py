@@ -123,6 +123,14 @@ def register_kernel32_io_handlers(
                 os.close(entry.fd)
             except OSError as e:
                 logger.warn("fileio", f"CloseHandle: os.close(fd={entry.fd}) failed: {e}")
+        if entry is not None:
+            # Real Windows releases every byte-range lock a handle holds the
+            # moment it's closed, whether or not UnlockFile was called first.
+            locks = state.file_locks.get(entry.path)
+            if locks:
+                remaining = [l for l in locks if l[2] != h]
+                if len(remaining) != len(locks):
+                    state.file_locks[entry.path] = remaining
         state.file_handle_map.pop(h, None)
         state.kernel_handle_map.pop(h, None)
         cpu.regs[EAX] = 1
@@ -698,6 +706,65 @@ def register_kernel32_io_handlers(
                 f'offset={pos_before} req={n_to_read} got={to_read} '
                 f'pos_after={entry.position} eof={len(entry.data)}')
         cleanup_stdcall(cpu, memory, 20)
+
+    def _lock_file(cpu: "CPU") -> None:
+        h_file   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        off_low  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        off_high = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        len_low  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        len_high = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        entry = state.file_handle_map.get(h_file)
+        if entry is None:
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 20)
+            return
+        start = off_low | (off_high << 32)
+        end   = start + (len_low | (len_high << 32))
+        locks = state.file_locks.setdefault(entry.path, [])
+        for (l_start, l_end, l_handle) in locks:
+            if l_handle != h_file and start < l_end and l_start < end:
+                logger.warn("fileio",
+                    f'[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE '
+                    f'(conflicts with [{l_start},{l_end}) held by 0x{l_handle:x})')
+                memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_LOCK_VIOLATION))
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 20)
+                return
+        locks.append((start, end, h_file))
+        logger.debug("fileio", f'[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE')
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 20)
+
+    def _unlock_file(cpu: "CPU") -> None:
+        h_file   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        off_low  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        off_high = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        len_low  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        len_high = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        entry = state.file_handle_map.get(h_file)
+        if entry is None:
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 20)
+            return
+        start = off_low | (off_high << 32)
+        end   = start + (len_low | (len_high << 32))
+        locks = state.file_locks.get(entry.path, [])
+        for i, (l_start, l_end, l_handle) in enumerate(locks):
+            if l_handle == h_file and l_start == start and l_end == end:
+                locks.pop(i)
+                logger.debug("fileio", f'[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE')
+                cpu.regs[EAX] = 1
+                cleanup_stdcall(cpu, memory, 20)
+                return
+        logger.warn("fileio", f'[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE (not locked)')
+        memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_NOT_LOCKED))
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("kernel32.dll", "LockFile",   _lock_file)
+    stubs.register_handler("kernel32.dll", "UnlockFile", _unlock_file)
 
     def _delete_file_a(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)

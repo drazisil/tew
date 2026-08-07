@@ -391,6 +391,17 @@ class CRTState:
         # game's own unrendered on-screen "SYSTEM" debug console.
         self.guest_stdout_handle: Optional[int] = None
 
+        # ── Byte-range file locks (LockFile/UnlockFile) ─────────────────────
+        # Keyed by real host path (not handle -- real Win32 byte-range locks
+        # are visible across every handle open on the same file, including
+        # from other threads/processes; this emulator only has "other
+        # threads" to worry about, but real Jet genuinely opens the same
+        # database from more than one handle). Each entry is a list of
+        # (start, end, owning_handle) tuples for currently-held exclusive
+        # ranges -- plain LockFile has no shared-lock concept, only
+        # LockFileEx does, and that's not implemented (not yet needed).
+        self.file_locks: dict[str, list[tuple[int, int, int]]] = {}
+
         # ── Window / dialog system ────────────────────────────────────────
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded

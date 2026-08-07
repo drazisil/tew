@@ -100,15 +100,22 @@ incomplete trace** -- `FUN_7a870cf8` genuinely is in the real call graph
 and `TestGetFileType` additions in `test_kernel32_system_info.py` (real disk
 file &rarr; `FILE_TYPE_DISK`, NUL device still &rarr; `FILE_TYPE_CHAR`).
 
-**New blocker surfaced by this fix**: `[UNIMPLEMENTED] kernel32.dll!LockFile
--- halting`, hit shortly after `Workspace::OpenDatabase` succeeds (real Jet
-trying to lock the database file, real address `EIP=0x002092c2`, inside
-`MSJET35.DLL`+0x5532 per the halt diagnostic's own stack annotations). A
-clean, honest, well-understood gap -- not a mystery -- `LockFile`/`UnlockFile`
-simply aren't implemented yet.
+**`LockFile`/`UnlockFile` are now implemented** (`kernel32_io.py`), tracking
+real Win32 byte-range exclusive locks keyed by host path in a new
+`CRTState.file_locks` registry -- overlap-checked against every other open
+handle to the same file (not the locking handle itself, matching real
+Win32's "same handle may re-lock its own ranges" allowance), released
+automatically on `CloseHandle` as well as explicit `UnlockFile`. 1068/1068
+tests pass; new `test_lock_file.py` covers lock/overlap/unlock/
+CloseHandle-releases-locks/unknown-handle cases. Confirmed live: the
+`LockFile` halt is completely gone.
 
-**Current blocker**: implement `kernel32.dll!LockFile` (and its
-`UnlockFile` counterpart, not yet checked for a matching gap). Not yet
+**New blocker surfaced by this fix**: `[UNIMPLEMENTED]
+kernel32.dll!GetComputerNameA -- halting`, hit almost immediately after.
+Real Jet asking for the local machine's NetBIOS name -- a simple, standard
+API, not another mystery.
+
+**Current blocker**: implement `kernel32.dll!GetComputerNameA`. Not yet
 started.
 
 ## Previous status (2026-08-07, cont'd)

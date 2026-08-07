@@ -21,6 +21,8 @@ class Win32Error(IntEnum):
     ERROR_ACCESS_DENIED        = 5     # Access denied
     ERROR_INVALID_HANDLE       = 6     # The handle is invalid
     ERROR_NOT_ENOUGH_MEMORY    = 8     # Not enough memory
+    ERROR_LOCK_VIOLATION       = 33    # The process cannot access the file because another process has locked a portion of the file
     ERROR_INVALID_PARAMETER    = 87    # The parameter is incorrect
     ERROR_INSUFFICIENT_BUFFER  = 122   # The data area passed to a system call is too small
+    ERROR_NOT_LOCKED           = 158   # The segment is already unlocked
     ERROR_ALREADY_EXISTS       = 183   # Cannot create a file that already exists

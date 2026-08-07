@@ -4,6 +4,28 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 (cont'd again x2) — Implemented `LockFile`/`UnlockFile`
+
+Real Jet locks its database file as a normal part of opening it (byte-range
+locking) -- the very next honest gap surfaced by the `GetFileType` fix.
+Implemented in `kernel32_io.py`: `CRTState.file_locks` tracks currently-held
+exclusive ranges keyed by real host path (not handle -- real Win32
+byte-range locks are visible to every handle open on the same file, and
+real Jet does open the same database from more than one handle). `LockFile`
+rejects a request that overlaps a range held by a *different* handle
+(`ERROR_LOCK_VIOLATION`), matching real Win32's allowance for the same
+handle to re-lock/extend its own ranges; `UnlockFile` requires an exact
+`(offset, length)` match to the original lock (`ERROR_NOT_LOCKED`
+otherwise, matching real behavior); `CloseHandle` now also releases every
+lock a handle still holds, same as real Windows does implicitly.
+
+1068/1068 tests pass. New `test_lock_file.py`: lock succeeds, overlapping
+lock from a different handle fails, non-overlapping succeeds, unlock+relock
+from another handle succeeds, unlocking an unlocked range fails,
+CloseHandle releases locks, unknown handle fails. Confirmed live: the
+`LockFile` halt is gone; execution now reaches
+`[UNIMPLEMENTED] kernel32.dll!GetComputerNameA` instead.
+
 ## 2026-08-07 (cont'd again) — Fixed two real Win32 file-I/O bugs
 (collapsed read/write access, inverted `GetFileType`) that were the actual
 cause of `Workspace::OpenDatabase`'s "unrecognized database format" error
