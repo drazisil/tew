@@ -208,10 +208,83 @@ def register_oleaut32_ole32_handlers(
     stubs.register_handler("oleaut32.dll", "VariantClear", _VariantClear)
 
     # VariantChangeType(pvargDest, pvarSrc, wFlags, vt) -> HRESULT
+    #
+    # VARIANT layout (16 bytes): vt at +0 (2 bytes), 6 bytes reserved, value
+    # union at +8. Real OLE Automation numeric coercion: only the
+    # well-defined integer/bool subset confirmed live so far (VT_I2<->VT_I4
+    # <->VT_BOOL) is implemented with real range-checked semantics; anything
+    # else (VT_BSTR/VT_R4/VT_R8/VT_CY/VT_DATE/...) halts loudly rather than
+    # guess at locale-aware string parsing or float formatting rules never
+    # actually observed. pvargDest/pvarSrc may alias (real callers rely on
+    # in-place conversion) -- the source value is read into a local before
+    # any write to the destination, so aliasing is safe regardless.
+    _VT_I2   = 2
+    _VT_I4   = 3
+    _VT_BOOL = 11
+    _DISP_E_OVERFLOW = 0x8002000A
+
+    def _variant_read_i2(addr: int) -> int:
+        v = memory.read16(addr + 8)
+        return v - 0x10000 if v >= 0x8000 else v
+
+    def _variant_write_i2(addr: int, val: int) -> None:
+        memory.write16(addr, _VT_I2)
+        memory.write16(addr + 8, val & 0xFFFF)
+
+    def _variant_read_i4(addr: int) -> int:
+        return memory.read_signed32(addr + 8)
+
+    def _variant_write_i4(addr: int, val: int) -> None:
+        memory.write16(addr, _VT_I4)
+        memory.write32(addr + 8, val & 0xFFFFFFFF)
+
+    def _variant_write_bool(addr: int, val: bool) -> None:
+        memory.write16(addr, _VT_BOOL)
+        memory.write16(addr + 8, 0xFFFF if val else 0x0000)
+
     def _VariantChangeType(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType — halting")
-        cpu.halted = True
-        cpu.fatal_halt = True
+        pvarg_dest = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pvar_src   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        target_vt  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF) & 0xFFFF
+        src_vt = memory.read16(pvar_src)
+
+        if src_vt == _VT_I2:
+            val = _variant_read_i2(pvar_src)
+        elif src_vt == _VT_I4:
+            val = _variant_read_i4(pvar_src)
+        elif src_vt == _VT_BOOL:
+            # VARIANT_BOOL's storage IS a signed 16-bit field (VARIANT_TRUE
+            # = -1, VARIANT_FALSE = 0) -- read the real signed value
+            # directly rather than remapping to 1/0, matching real
+            # VariantChangeType(VT_BOOL -> numeric) semantics exactly.
+            val = _variant_read_i2(pvar_src)
+        else:
+            logger.error("handlers",
+                f"[UNIMPLEMENTED] VariantChangeType: unhandled source vt={src_vt} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+
+        if target_vt == _VT_I2:
+            if not (-32768 <= val <= 32767):
+                cpu.regs[EAX] = _DISP_E_OVERFLOW
+                cleanup_stdcall(cpu, memory, 16)
+                return
+            _variant_write_i2(pvarg_dest, val)
+        elif target_vt == _VT_I4:
+            _variant_write_i4(pvarg_dest, val)
+        elif target_vt == _VT_BOOL:
+            _variant_write_bool(pvarg_dest, val != 0)
+        else:
+            logger.error("handlers",
+                f"[UNIMPLEMENTED] VariantChangeType: unhandled target vt={target_vt} "
+                f"(src vt={src_vt} val={val}) — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("oleaut32.dll", "VariantChangeType", _VariantChangeType)
 
@@ -403,13 +476,9 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(10, _ord10)
 
-    # Ordinal 12 — VariantChangeType(pvargDest, pvarSrc, wFlags, vt) -> HRESULT
-    def _ord12(cpu: "CPU") -> None:
-        logger.error("handlers", "[UNIMPLEMENTED] VariantChangeType (Ordinal 12) — halting")
-        cpu.halted = True
-        cpu.fatal_halt = True
-
-    _ole_ord(12, _ord12)
+    # Ordinal 12 — same real function as the named export above; DAO350.DLL
+    # imports OLEAUT32 by ordinal, not by name.
+    _ole_ord(12, _VariantChangeType)
 
     # Ordinal 15 — SafeArrayCreate (same handler as the named export above;
     # DAO350.DLL imports OLEAUT32 by ordinal, not by name)

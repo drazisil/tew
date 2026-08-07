@@ -13,8 +13,10 @@ current directory already exists.
 from __future__ import annotations
 
 from tew.api._state import CRTState, EmulatorConfig
+from tew.hardware.memory import Memory
 
 INVALID_HANDLE = 0xFFFFFFFF
+MEM_SIZE = 1 * 1024 * 1024
 
 
 def _state(tmp_path, monkeypatch) -> CRTState:
@@ -25,8 +27,9 @@ def _state(tmp_path, monkeypatch) -> CRTState:
 
 def test_bare_relative_filename_opens_successfully(tmp_path, monkeypatch):
     state = _state(tmp_path, monkeypatch)
+    mem = Memory(MEM_SIZE)
 
-    handle = state.open_file_handle("trace000.txt", writable=True)
+    handle = state.open_file_handle("trace000.txt", writable=True, memory=mem)
 
     assert handle != INVALID_HANDLE
     entry = state.file_handle_map[handle]
@@ -36,7 +39,8 @@ def test_bare_relative_filename_opens_successfully(tmp_path, monkeypatch):
 
 def test_bare_relative_filename_is_actually_writable(tmp_path, monkeypatch):
     state = _state(tmp_path, monkeypatch)
-    handle = state.open_file_handle("trace000.txt", writable=True)
+    mem = Memory(MEM_SIZE)
+    handle = state.open_file_handle("trace000.txt", writable=True, memory=mem)
     entry = state.file_handle_map[handle]
 
     import os
@@ -50,6 +54,7 @@ def test_path_with_directory_component_still_creates_it(tmp_path, monkeypatch):
     """Regression guard: the normal case (a real directory prefix) must
     still work -- this exercises the `if dirname:` branch's True side."""
     state = _state(tmp_path, monkeypatch)
+    mem = Memory(MEM_SIZE)
     # path_mappings keys are forward-slash, lowercase -- matching how
     # load_emulator_config() normalizes them (win.replace("\\","/").lower()).
     config = EmulatorConfig(
@@ -58,7 +63,7 @@ def test_path_with_directory_component_still_creates_it(tmp_path, monkeypatch):
     )
     state.config = config
 
-    handle = state.open_file_handle("C:\\MCity\\Logs\\foo.txt", writable=True)
+    handle = state.open_file_handle("C:\\MCity\\Logs\\foo.txt", writable=True, memory=mem)
 
     assert handle != INVALID_HANDLE
     assert (tmp_path / "MCity" / "Logs" / "foo.txt").exists()

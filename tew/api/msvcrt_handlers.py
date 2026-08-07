@@ -539,7 +539,7 @@ def register_msvcrt_handlers(
         filename = read_cstring(filename_ptr, memory)
         mode     = read_cstring(mode_ptr, memory)
         writable = "w" in mode or "a" in mode
-        handle = state.open_file_handle(filename, writable)
+        handle = state.open_file_handle(filename, writable, memory)
         cpu.regs[EAX] = 0 if handle == 0xFFFFFFFF else handle
 
     stubs.register_handler("msvcrt.dll", "fopen", _fopen)
@@ -551,7 +551,7 @@ def register_msvcrt_handlers(
         filename = read_cstring(filename_ptr, memory)
         mode     = read_cstring(mode_ptr, memory)
         writable = "w" in mode or "a" in mode
-        handle = state.open_file_handle(filename, writable)
+        handle = state.open_file_handle(filename, writable, memory)
         cpu.regs[EAX] = 0 if handle == 0xFFFFFFFF else handle
 
     stubs.register_handler("msvcrt.dll", "_fopen", _fopen_underscore)
@@ -1703,7 +1703,7 @@ def register_msvcrt_handlers(
         path     = read_cstring(path_ptr, memory)
         # O_WRONLY=1, O_RDWR=2; anything with write bit is writable
         writable = bool(oflag & 0x3)
-        handle = state.open_file_handle(path, writable)
+        handle = state.open_file_handle(path, writable, memory)
         cpu.regs[EAX] = 0xFFFFFFFF if handle == 0xFFFFFFFF else handle  # -1 on error
 
     stubs.register_handler("msvcrt.dll", "_open", _open)

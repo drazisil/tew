@@ -245,6 +245,21 @@ def load_emulator_config() -> EmulatorConfig:
 TEB_BASE = 0x00320000   # Thread Environment Block (FS base)
 PEB_BASE = 0x00300000   # Process Environment Block (TEB+0x30 points here)
 
+
+def _win32_error_from_errno(e: OSError):
+    """Maps a real host OSError to the closest real Win32 error code, for
+    setting GetLastError() correctly on a CreateFile failure real guest code
+    may branch on (e.g. ERROR_FILE_NOT_FOUND vs ERROR_ACCESS_DENIED)."""
+    import errno
+    from tew.api.win32_errors import Win32Error
+    if e.errno == errno.ENOENT:
+        return Win32Error.ERROR_PATH_NOT_FOUND
+    if e.errno == errno.EEXIST:
+        return Win32Error.ERROR_ALREADY_EXISTS
+    if e.errno in (errno.EACCES, errno.EPERM, errno.EISDIR):
+        return Win32Error.ERROR_ACCESS_DENIED
+    return Win32Error.ERROR_ACCESS_DENIED
+
 # ── Thread / stack constants ──────────────────────────────────────────────────
 
 THREAD_STACK_BASE = 0x08000000
@@ -419,19 +434,34 @@ class CRTState:
         return linux_path.replace("/", "\\")
 
     def open_file_handle(
-        self, win_name: str, writable: bool, no_create_prompt: bool = False,
+        self, win_name: str, writable: bool, memory: "Memory", no_create_prompt: bool = False,
         disposition: int = CREATE_ALWAYS,
     ) -> int:
-        """Open a file and register it in file_handle_map. Returns the handle."""
+        """Open a file and register it in file_handle_map. Returns the handle.
+
+        Also sets the real Win32 last-error code (TEB+0x34) on every failure
+        path -- previously this function only logged, so GetLastError() after
+        a failed CreateFile always read whatever unrelated call happened to
+        set it last. Real "check if exists via OPEN_EXISTING, fall back to
+        creating it" guest code relies on GetLastError() == ERROR_FILE_NOT_FOUND
+        to know a missing-file failure is expected/recoverable, not fatal --
+        confirmed live this was exactly why DAO/Jet's own CreateDatabase-style
+        logic for 'C:\\SaveData\\DB\\Tmp.MDB' (a file genuinely meant to be
+        created fresh, not pre-provisioned) gave up after one honest
+        OPEN_EXISTING failure instead of retrying with CREATE_ALWAYS/CREATE_NEW.
+        """
         from tew.logger import logger
+        from tew.api.win32_errors import Win32Error
         # Device namespace paths (\\.\xxx) are kernel driver handles — never a
         # real file.  Return INVALID_HANDLE_VALUE without touching the OS.
         normalized = win_name.replace("\\", "/")
         if normalized.startswith("/./") or normalized.startswith("//./"):
             logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (device path, not emulated)')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
             return 0xFFFFFFFF
         if not win_name:
             logger.debug("fileio", 'CreateFile("") -> INVALID_HANDLE_VALUE (empty path)')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
             return 0xFFFFFFFF
         # Win32 reserved device names — case-insensitive, ignore any path prefix.
         _dev_name = normalized.rsplit("/", 1)[-1].upper().split(".")[0]
@@ -454,6 +484,7 @@ class CRTState:
                          "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
                          "LPT6", "LPT7", "LPT8", "LPT9"):
             logger.debug("fileio", f'CreateFile("{win_name}") -> INVALID_HANDLE_VALUE (unsupported device {_dev_name})')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ACCESS_DENIED))
             return 0xFFFFFFFF
         handle = self.next_file_handle
         self.next_file_handle += 1
@@ -474,10 +505,12 @@ class CRTState:
                 logger.warn("fileio",
                     f'CreateFile("{win_name}") -> INVALID (write open failed: '
                     f'must exist for disposition={disposition}, not found)')
+                memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
                 return 0xFFFFFFFF
             if disposition == CREATE_NEW and existing_path is not None:
                 logger.warn("fileio",
                     f'CreateFile("{win_name}") -> INVALID (CREATE_NEW: already exists)')
+                memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ALREADY_EXISTS))
                 return 0xFFFFFFFF
             real_path = existing_path or self.translate_windows_path(win_name)
             flags = os.O_WRONLY
@@ -513,6 +546,7 @@ class CRTState:
                 fd = os.open(real_path, flags, 0o644)
             except OSError as e:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (write open failed: {e})')
+                memory.write32(TEB_BASE + 0x34, int(_win32_error_from_errno(e)))
                 return 0xFFFFFFFF
             self.file_handle_map[handle] = FileHandleEntry(
                 path=real_path, data=b"", position=0, writable=True, fd=fd
@@ -531,11 +565,13 @@ class CRTState:
                     )
                     logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [read, {len(data)} bytes]')
                     return handle
-                except OSError:
+                except OSError as e:
                     logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (read error)')
+                    memory.write32(TEB_BASE + 0x34, int(_win32_error_from_errno(e)))
                     return 0xFFFFFFFF
             if not self.config.interactive_on_missing_file or no_create_prompt:
                 logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (not found: {linux_path})')
+                memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
                 return 0xFFFFFFFF
             print(f"\n[FileIO] File not found: {linux_path}")
             print("  Add the file then press Enter to retry, or type 'c' to continue without it.")
@@ -544,6 +580,7 @@ class CRTState:
                 linux_path = self.translate_windows_path(win_name)
                 continue
             logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (user skipped)')
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
             return 0xFFFFFFFF
 
     # ── TLS helpers ───────────────────────────────────────────────────────────

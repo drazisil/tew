@@ -209,3 +209,8 @@ __marimo__/
 # LSW compiled binaries
 tests/lsw/lsw
 .gitnexus
+
+# Emulator run-time debug output
+except.txt
+memdump.txt
+trace*.txt
