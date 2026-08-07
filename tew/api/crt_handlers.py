@@ -63,14 +63,20 @@ def register_crt_handlers(
     # right after a failed `CreateFile("trace000.txt")` (looks like a
     # missing trace-log directory in this sandbox, not a MAD/movie issue,
     # and not investigated further here -- out of scope for this change).
+    # -CaptureStdout: confirmed via Ghidra against MCity_d.exe's own
+    # NFSArgs_ProcessArgs switch table (DAT_0126e060, row index 13) --
+    # redirects WinMain's stdout (normally sent to the NUL device, see
+    # DAT_0163d834's fopen("stdout.txt" | "NUL", "wt") branch) to a real
+    # STDOUT.TXT file, so real puts()/printf() output the game makes is
+    # observable instead of silently discarded.
     cmd_line_addr = 0x00210024
-    cmd_line_str  = b"MCity_d.exe -nomovie -dbEnableLog\x00"
+    cmd_line_str  = b"MCity_d.exe -nomovie -dbEnableLog -CaptureStdout\x00"
     for i, b in enumerate(cmd_line_str):
         memory.write8(cmd_line_addr + i, b)
 
     # Wide (UTF-16LE) command line string at 0x00210070 (128 bytes reserved)
     cmd_line_w_addr = 0x00210070
-    cmd_line_w      = "MCity_d.exe -nomovie -dbEnableLog"
+    cmd_line_w      = "MCity_d.exe -nomovie -dbEnableLog -CaptureStdout"
     for i, ch in enumerate(cmd_line_w):
         memory.write16(cmd_line_w_addr + i * 2, ord(ch))
     memory.write16(cmd_line_w_addr + len(cmd_line_w) * 2, 0)  # null terminator

@@ -42,6 +42,16 @@ _ARGV_ARRAY_ADDR = 0x0021011C
 _ARGV0_ADDR       = 0x00210140  # "MCity_d.exe\0"
 _NOMOVIE_ARG_ADDR = 0x00210160  # "-nomovie\0"
 _DBENABLELOG_ARG_ADDR = 0x00210170  # "-dbEnableLog\0"
+# -CaptureStdout: confirmed via Ghidra against the real NFSArgs_ProcessArgs
+# switch table (DAT_0126e060 in MCity_d.exe) -- row index 13 (0xd), switch
+# name pointer resolves to the string "CaptureStdout", description "Capture
+# output to stdout in a file (STDOUT.TXT)". Without it, WinMain's startup
+# path (fclose(stdout); fopen(DAT_0163d834 ? "stdout.txt" : "NUL", "wt"))
+# redirects stdout to the NUL device, so real puts()/printf() calls the game
+# makes (e.g. _CLayer_DetectDebugger's "Causing exception to test for
+# debugger...") are silently discarded instead of landing anywhere tew or a
+# human can inspect.
+_CAPTURESTDOUT_ARG_ADDR = 0x00210180  # "-CaptureStdout\0"
 
 # __p__fmode / __p__commode data
 _FMODE_ADDR  = 0x0021001C
@@ -434,27 +444,30 @@ def register_msvcrt_handlers(
         memory.write8(_NOMOVIE_ARG_ADDR + i, b)
     for i, b in enumerate(b"-dbEnableLog\x00"):
         memory.write8(_DBENABLELOG_ARG_ADDR + i, b)
+    for i, b in enumerate(b"-CaptureStdout\x00"):
+        memory.write8(_CAPTURESTDOUT_ARG_ADDR + i, b)
 
     # __getmainargs data: fixed region at 0x210110+
     # argv[0] = "MCity_d.exe\0" at _ARGV0_ADDR, argv[1] = "-nomovie\0" at
     # _NOMOVIE_ARG_ADDR, argv[2] = "-dbEnableLog\0" at _DBENABLELOG_ARG_ADDR,
-    # argv[3] = NULL.
+    # argv[3] = "-CaptureStdout\0" at _CAPTURESTDOUT_ARG_ADDR, argv[4] = NULL.
     memory.write32(_ARGV_ARRAY_ADDR,      _ARGV0_ADDR)          # argv[0] = "MCity_d.exe"
     memory.write32(_ARGV_ARRAY_ADDR + 4,  _NOMOVIE_ARG_ADDR)    # argv[1] = "-nomovie"
     memory.write32(_ARGV_ARRAY_ADDR + 8,  _DBENABLELOG_ARG_ADDR)  # argv[2] = "-dbEnableLog"
-    memory.write32(_ARGV_ARRAY_ADDR + 12, 0)                    # NULL terminator
-    memory.write32(_ARGC_ADDR,  3)
+    memory.write32(_ARGV_ARRAY_ADDR + 12, _CAPTURESTDOUT_ARG_ADDR)  # argv[3] = "-CaptureStdout"
+    memory.write32(_ARGV_ARRAY_ADDR + 16, 0)                    # NULL terminator
+    memory.write32(_ARGC_ADDR,  4)
     memory.write32(_ARGV_ADDR,  _ARGV_ARRAY_ADDR)
     memory.write32(_ENVP_ADDR,  _ENV_STR_A_ADDR)
 
     # __getmainargs(int* argc, char*** argv, char*** envp, int doWildCard, _startupinfo*) -> int [cdecl]
     # CRT writes returned pointers to its own globals; game reads argc/argv to decide
-    # multiplayer vs single-player mode. We supply argc=3, argv=["MCity_d.exe", "-nomovie", "-dbEnableLog"].
+    # multiplayer vs single-player mode. We supply argc=4, argv=["MCity_d.exe", "-nomovie", "-dbEnableLog", "-CaptureStdout"].
     def _getmainargs(cpu: "CPU") -> None:
         p_argc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         p_argv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         p_envp = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        memory.write32(p_argc, 3)
+        memory.write32(p_argc, 4)
         memory.write32(p_argv, _ARGV_ARRAY_ADDR)
         memory.write32(p_envp, _ENV_STR_A_ADDR)
         cpu.regs[EAX] = 0  # success

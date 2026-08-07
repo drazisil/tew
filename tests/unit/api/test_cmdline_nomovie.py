@@ -58,7 +58,7 @@ def test_get_command_line_a_includes_nomovie():
     handler = stubs._handlers["kernel32.dll!GetCommandLineA"].handler
     handler(cpu)
     result_addr = cpu.regs[EAX] & 0xFFFFFFFF
-    assert _read_cstr(mem, result_addr) == "MCity_d.exe -nomovie -dbEnableLog"
+    assert _read_cstr(mem, result_addr) == "MCity_d.exe -nomovie -dbEnableLog -CaptureStdout"
 
 
 def test_get_command_line_w_includes_nomovie():
@@ -66,10 +66,10 @@ def test_get_command_line_w_includes_nomovie():
     handler = stubs._handlers["kernel32.dll!GetCommandLineW"].handler
     handler(cpu)
     result_addr = cpu.regs[EAX] & 0xFFFFFFFF
-    assert _read_wstr(mem, result_addr) == "MCity_d.exe -nomovie -dbEnableLog"
+    assert _read_wstr(mem, result_addr) == "MCity_d.exe -nomovie -dbEnableLog -CaptureStdout"
 
 
-def test_getmainargs_reports_three_args():
+def test_getmainargs_reports_four_args():
     mem, cpu, stubs, state = _env()
 
     p_argc, p_argv, p_envp = 0x00040000, 0x00040004, 0x00040008
@@ -86,14 +86,16 @@ def test_getmainargs_reports_three_args():
 
     argc = mem.read32(p_argc)
     argv_array = mem.read32(p_argv)
-    assert argc == 3
+    assert argc == 4
 
     argv0_ptr = mem.read32(argv_array)
     argv1_ptr = mem.read32(argv_array + 4)
     argv2_ptr = mem.read32(argv_array + 8)
     argv3_ptr = mem.read32(argv_array + 12)
+    argv4_ptr = mem.read32(argv_array + 16)
 
     assert _read_cstr(mem, argv0_ptr) == "MCity_d.exe"
     assert _read_cstr(mem, argv1_ptr) == "-nomovie"
     assert _read_cstr(mem, argv2_ptr) == "-dbEnableLog"
-    assert argv3_ptr == 0
+    assert _read_cstr(mem, argv3_ptr) == "-CaptureStdout"
+    assert argv4_ptr == 0
