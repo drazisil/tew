@@ -11,7 +11,56 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-06, cont'd again)
+## Current status (2026-08-07)
+
+**Correction to the "no blocker identified" claim below (2026-08-06, cont'd
+again): that was wrong, or at best described a run that never actually hit
+this path.** A fresh run today (post the `CreateFile` logging-clarity fix,
+see changelog.md "2026-08-07") halts at ~59s, well before any message-pump
+steady state, on a reproducible `cpu.fatal_halt at EIP=0x001fe012` --
+`INT3 breakpoint at EIP=0x00688c68 unhandled by SEH chain` on `tid=1012`,
+same EBP-chain signature (`0x0068adf2`/`0x00a301a1`/...) as the
+`Nfs_REALabortcallback`/`DebugBreak()` assertion pattern diagnosed
+2026-08-03. `tid=1012` still has no `_CLayer_CatchSEH` coverage (confirmed
+main-thread-only back then), so the halt itself is correctly-behaving, not a
+tew bug in the halt mechanism.
+
+**New evidence this session, added to the standing debug toolkit (see
+emu32 skill v1.9, "Post-Run Checks")**: two guest-written files the
+emulator's own `/tmp/emu.log` never captures, both confirming the exact
+failure independently of register/EBP-chain inference:
+- `/data/Code/tew/except.txt` (the game's own exception dump):
+  `ERROR: open database 'C:\SaveData\DB\Tmp.MDB' failed.`
+- `/home/drazisil/.emu32/dblog.txt` (MSJET35.DLL's `-dbEnableLog` trace, real
+  `dbcode.c` source lines from the shipped Jet 3.5 engine):
+  ```
+  dbcode.c(1691) DB_StartUpDatabase
+  dbcode.c(1698) C:\SaveData\DB\Tmp.MDB
+  dbcode.c(1709) ERROR: open database failed.
+  ```
+
+**Root cause, confirmed reproducible (not flaky)**: `~/.emu32/SaveData/DB/`
+is genuinely empty on disk (verified via `ls`) -- both `C:\system.mdb` and
+`C:\SaveData\DB\Tmp.MDB` are missing, so DAO/Jet's `DB_StartUpDatabase`
+(`FUN_0448c745` in `dao350.dll`, per last session's live logpoints) correctly
+gets an honest `OPEN_EXISTING` failure from `CreateFile` for both -- this is
+tew behaving correctly per the 2026-08-04 `open_file_handle` disposition fix,
+not a regression. What's unconfirmed: `open_file_handle`'s own docstring
+claims real DAO/Jet is supposed to retry `Tmp.MDB` with
+`CREATE_ALWAYS`/`CREATE_NEW` after this miss (it's meant to be created
+fresh, not pre-provisioned) -- but no such retry is observed; `dbcode.c`
+goes straight to `ERROR: open database failed.` and the game asserts.
+Either (a) that retry claim was wrong/inapplicable to this specific
+`DB_StartUpDatabase` call path, or (b) something upstream that would enable
+Jet's real retry logic is still missing from tew.
+
+**Current blocker**: determine which of (a)/(b) above is true. Needs Ghidra
+on `MCity_d.exe`/`0x00688c68`/`0x0068adf2` (the assertion call site) and/or
+`dao350.dll`'s `FUN_0448c745`/`DB_StartUpDatabase` real disassembly to see
+whether a `CREATE_ALWAYS` retry path exists in the real binary and why it
+isn't being taken. Not yet started.
+
+## Previous status (2026-08-06, cont'd again)
 
 **The `~85 of ~90 cpu.halted = True sites lack fatal_halt` item -- deliberately
 deferred since 2026-08-04 -- is now RESOLVED.** Prompted by tracing why
