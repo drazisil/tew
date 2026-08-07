@@ -4,6 +4,32 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 — `CreateFile` failure logging made human-readable (no behavior change)
+
+Prompted by Molly reading `/tmp/emu.log` and finding the `system.mdb`/`Tmp.MDB`
+`CreateFile` failure lines unclear without reading the source: the
+must-exist-but-missing message printed the raw `dwCreationDisposition` integer
+(`disposition=3`) with no indication that `3` means `OPEN_EXISTING` — readable
+only to someone who already has the Win32 header memorized. Separately, that
+message and the plain read-open "not found" message (`options.ini`,
+`tr07.can`, `togglewindowtest.txt`, `tunes.cfg`) looked like the same shape
+with different detail, when they're actually two structurally different
+failures: a write-open whose disposition demands the file already exist, vs.
+a read-open where existence is required regardless of disposition.
+
+Fixed in `tew/api/_state.py`: added `disposition_name()` (maps the five real
+`dwCreationDisposition` constants to their names, e.g. `OPEN_EXISTING(3)`) and
+used it in `open_file_handle`'s must-exist failure log line, which now reads
+`OPEN_EXISTING(3) requires the file to already exist, but it was not found`
+instead of `write open failed: must exist for disposition=3, not found`. The
+read-open miss now reads `read-only open, file not found: ...` instead of a
+bare `not found: ...`, so the two cases are distinguishable without reading
+code. Logging only — no change to `CreateFile`'s actual pass/fail behavior or
+`GetLastError` codes. Confirmed the two tests exercising `open_file_handle`
+(`test_open_file_handle_relative_path.py`,
+`test_open_file_handle_last_error.py`, 7 tests) still pass; full suite not
+re-run for this change (log-message-only diff, no logic touched).
+
 ## 2026-08-06 (cont'd again) — Resolved the deliberately-deferred "~85 of
 ~90 cpu.halted = True sites lack fatal_halt" item: audited and fixed 85
 sites, caught and reverted one genuine false positive via the existing

@@ -34,6 +34,20 @@ OPEN_EXISTING     = 3
 OPEN_ALWAYS       = 4
 TRUNCATE_EXISTING = 5
 
+_DISPOSITION_NAMES = {
+    CREATE_NEW: "CREATE_NEW",
+    CREATE_ALWAYS: "CREATE_ALWAYS",
+    OPEN_EXISTING: "OPEN_EXISTING",
+    OPEN_ALWAYS: "OPEN_ALWAYS",
+    TRUNCATE_EXISTING: "TRUNCATE_EXISTING",
+}
+
+
+def disposition_name(disposition: int) -> str:
+    """Human-readable name for a dwCreationDisposition value, for log messages."""
+    name = _DISPOSITION_NAMES.get(disposition)
+    return f"{name}({disposition})" if name else f"UNKNOWN({disposition})"
+
 # ── File handle types ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -503,8 +517,8 @@ class CRTState:
             existing_path = find_file_ci(self.translate_windows_path(win_name))
             if must_exist and existing_path is None:
                 logger.warn("fileio",
-                    f'CreateFile("{win_name}") -> INVALID (write open failed: '
-                    f'must exist for disposition={disposition}, not found)')
+                    f'CreateFile("{win_name}") -> INVALID ({disposition_name(disposition)} '
+                    f'requires the file to already exist, but it was not found)')
                 memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
                 return 0xFFFFFFFF
             if disposition == CREATE_NEW and existing_path is not None:
@@ -570,7 +584,7 @@ class CRTState:
                     memory.write32(TEB_BASE + 0x34, int(_win32_error_from_errno(e)))
                     return 0xFFFFFFFF
             if not self.config.interactive_on_missing_file or no_create_prompt:
-                logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (not found: {linux_path})')
+                logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (read-only open, file not found: {linux_path})')
                 memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
                 return 0xFFFFFFFF
             print(f"\n[FileIO] File not found: {linux_path}")
