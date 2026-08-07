@@ -13,7 +13,15 @@ if TYPE_CHECKING:
 from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.api._state import CRTState, FileHandleEntry, TEB_BASE
+from tew.api.win32_errors import Win32Error
 from tew.logger import logger
+
+# This emulator only ever has one fake machine -- an arbitrary but stable
+# Windows XP-era NetBIOS name, matching the "fake but plausible" convention
+# already used for the fake PID etc. Real DAO/Jet locking uses the computer
+# name (combined with username) to build the .ldb lock-owner identity, but
+# any consistent, well-formed name works for that purpose.
+_COMPUTER_NAME = "MCITY-PC"
 
 # QPC reports 1 MHz so counter values stay in easy integer range.
 _QPC_FREQ: int = 1_000_000
@@ -132,10 +140,57 @@ def register_kernel32_system_handlers(
     def _get_current_thread(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0xFFFFFFFE
 
+    def _get_computer_name_a(cpu: "CPU") -> None:
+        lp_buffer = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_size   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        buf_capacity = memory.read32(lp_size) if lp_size else 0
+        # Real GetComputerNameA: on success, *lpnSize is set to the char
+        # count copied (NOT including the null terminator); on failure
+        # (buffer too small), it's set to the required size (including it).
+        if lp_buffer and lp_size and buf_capacity >= len(_COMPUTER_NAME) + 1:
+            for i, ch in enumerate(_COMPUTER_NAME):
+                memory.write8(lp_buffer + i, ord(ch))
+            memory.write8(lp_buffer + len(_COMPUTER_NAME), 0)
+            memory.write32(lp_size, len(_COMPUTER_NAME))
+            cpu.regs[EAX] = 1
+            logger.debug("handlers", f'GetComputerNameA() -> "{_COMPUTER_NAME}"')
+        else:
+            if lp_size:
+                memory.write32(lp_size, len(_COMPUTER_NAME) + 1)
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_BUFFER_OVERFLOW))
+            cpu.regs[EAX] = 0
+            logger.warn("handlers",
+                f'GetComputerNameA() -> FALSE (buffer too small: have {buf_capacity}, '
+                f'need {len(_COMPUTER_NAME) + 1})')
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _get_computer_name_w(cpu: "CPU") -> None:
+        lp_buffer = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_size   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        buf_capacity = memory.read32(lp_size) if lp_size else 0
+        if lp_buffer and lp_size and buf_capacity >= len(_COMPUTER_NAME) + 1:
+            for i, ch in enumerate(_COMPUTER_NAME):
+                memory.write16(lp_buffer + i * 2, ord(ch))
+            memory.write16(lp_buffer + len(_COMPUTER_NAME) * 2, 0)
+            memory.write32(lp_size, len(_COMPUTER_NAME))
+            cpu.regs[EAX] = 1
+            logger.debug("handlers", f'GetComputerNameW() -> "{_COMPUTER_NAME}"')
+        else:
+            if lp_size:
+                memory.write32(lp_size, len(_COMPUTER_NAME) + 1)
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_BUFFER_OVERFLOW))
+            cpu.regs[EAX] = 0
+            logger.warn("handlers",
+                f'GetComputerNameW() -> FALSE (buffer too small: have {buf_capacity}, '
+                f'need {len(_COMPUTER_NAME) + 1})')
+        cleanup_stdcall(cpu, memory, 8)
+
     stubs.register_handler("kernel32.dll", "GetCurrentProcess",   _get_current_process)
     stubs.register_handler("kernel32.dll", "GetCurrentProcessId", _get_current_process_id)
     stubs.register_handler("kernel32.dll", "GetCurrentThreadId",  _get_current_thread_id)
     stubs.register_handler("kernel32.dll", "GetCurrentThread",    _get_current_thread)
+    stubs.register_handler("kernel32.dll", "GetComputerNameA",    _get_computer_name_a)
+    stubs.register_handler("kernel32.dll", "GetComputerNameW",    _get_computer_name_w)
 
     # ── Error / tick / time ───────────────────────────────────────────────────
 

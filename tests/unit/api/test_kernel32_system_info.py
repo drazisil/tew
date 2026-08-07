@@ -363,6 +363,33 @@ class TestGetStdHandle:
         assert entry_first is entry_second
 
 
+class TestGetComputerName:
+
+    def test_ansi_returns_name_and_updates_size(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(BUF_A + 0x100, 260)  # nSize in, plenty of room
+        call(stubs, cpu, mem, "GetComputerNameA", [BUF_A, BUF_A + 0x100])
+        assert cpu.regs[EAX] == 1
+        name = read_cstring(mem, BUF_A)
+        assert name == "MCITY-PC"
+        assert mem.read32(BUF_A + 0x100) == len(name)  # excludes null terminator
+
+    def test_wide_returns_name(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(BUF_A + 0x100, 260)
+        call(stubs, cpu, mem, "GetComputerNameW", [BUF_A, BUF_A + 0x100])
+        assert cpu.regs[EAX] == 1
+        assert read_wstring(mem, BUF_A) == "MCITY-PC"
+
+    def test_buffer_too_small_fails_and_reports_required_size(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(BUF_A + 0x100, 2)  # too small for "MCITY-PC\0"
+        call(stubs, cpu, mem, "GetComputerNameA", [BUF_A, BUF_A + 0x100])
+        assert cpu.regs[EAX] == 0
+        assert mem.read32(BUF_A + 0x100) == len("MCITY-PC") + 1
+        assert mem.read32(TEB_BASE + 0x34) == 111  # ERROR_BUFFER_OVERFLOW
+
+
 class TestGetFileType:
 
     def test_known_std_handle_returns_file_type_char(self, env):
