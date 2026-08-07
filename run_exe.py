@@ -347,89 +347,43 @@ def _dispatch_breakpoint() -> None:
         cpu.add_breakpoint(hit_eip)
 
 
-# ── TEMPORARY diagnostic logpoints (2026-08-07, cont'd again) ──────────────────
-# The Tmp.MDB-never-created bug is fixed (see changelog.md). Current blocker:
-# DB_StartUpDatabase still hits the same INT3/fatal_halt even with Tmp.MDB
-# now present, openable, and byte-identical to its real source template
-# (Online.MDB, confirmed genuinely real by Molly). The final HRESULT from
-# DAO350.DLL's Workspace::OpenDatabase wrapper (FUN_0448c745, vtable+0x58
-# call) is now 0x800a0d0f = DAO/Jet error 3343 "Unrecognized database
-# format" -- but Online.MDB's header cleanly matches the real "Standard Jet
-# DB" signature check in msjet35.dll's own validation function
-# (FUN_7a870cf8 in Ghidra's static view of msjet35.dll, which loads at a
-# DIFFERENT runtime base (0x15000000) than its Ghidra-analyzed one
-# (0x7a840000) -- confirmed live via the historical opMovR32Imm fix's
-# known-good landmark instruction (66 B8 01 00 "MOV AX,1" at runtime
-# 0x1503564b / static 0x7a87564b): runtime_addr = static_addr - 0x65840000).
+# ── TEMPORARY: execution-history capture (2026-08-07, cont'd again x5) ─────────
+# The DAO/Jet OpenDatabase chain (GetFileType, LockFile, GetComputerNameA)
+# is fully resolved -- see changelog.md. New blocker: a fatal_halt on
+# tid=1000 (main thread) via nfile.c's FILE_allocateop "FILE SYSTEM NOT
+# INITIALIZED" assertion (real check: `if (DAT_020e2ccc == 0)
+# abortmessage(...)`, confirmed a real fatal path). Molly's read: this is
+# likely a downstream symptom of dbcode.c's own Dbcode_AtExit() (fires
+# right before it, posting an exit request via DBRequestQ_Put), not an
+# independent nfile.c bug -- and Molly correctly caught that a naive
+# Python logpoint on the hot-path FILE_allocateop was adding enough real
+# wall-clock overhead to measurably slow virtual-time progress (the
+# scheduler's timer heartbeat is wall-clock-driven), which cost the run
+# 500M steps' worth of budget before ever reaching the real failure.
 #
-# New hypothesis: that same validation function has a SECOND gate right
-# after the signature check -- real header byte at offset 0x42 is 0x86
-# (non-zero) in our actual Online.MDB, and the decompile treats a non-zero
-# byte there as "this database is password-protected," requiring either a
-# real password match against DB_StartUpDatabase's caller-supplied
-# password (always "" in every DB_StartUpDatabase call traced so far) or
-# a specific param_2 value (==2) to bypass it. Confirming live.
+# Using the real execution-history capture layer instead (native Zig
+# hooks, see cpu/src/history/capture.zig and cpu_zig.py's
+# enable_history_capture_clickhouse) -- exactly the right tool for "what
+# wrote DAT_020e2ccc last, and from where" instead of more hand-rolled
+# logpoints, IF this investigation resumes. ClickHouse already running
+# (history-poc's docker-compose, port 8123, user default/password poc,
+# schema from history-poc/schema.sql).
 #
-# NOTE: the Zig CPU core (cpu/src/core.zig:113, cpu/src/kernel.zig:203-206)
-# only has 8 logpoint slots -- cpu_add_logpoint silently drops registrations
-# past the 8th (no error, no exception). Keep this block at <=8 entries.
-# Remove this whole block once resolved.
-
-def _lp_reached(name: str):
-    def _cb(eip, regs, mem_ptr, mem_size):
-        logger.error("cpu", f"[LOGPOINT] reached {name} @ 0x{eip:08x}")
-    return _cb
-
-def _lp_db_startup(eip, regs, mem_ptr, mem_size):
-    esp = cpu.regs[ESP]
-    path_ptr = mem.read32((esp + 4) & 0xFFFFFFFF)
-    path = read_cstring(path_ptr, mem)
-    logger.error("cpu", f'[LOGPOINT] DB_StartUpDatabase(param_1="{path}") @ 0x{eip:08x}')
-
-def _lp_opendb_postcall(eip, regs, mem_ptr, mem_size):
-    eax = cpu.regs[EAX]
-    isam_open = mem.read32(0x044e52e8)
-    isam_a    = mem.read32(0x044e5288)
-    isam_b    = mem.read32(0x044e52b4)
-    isam_c    = mem.read32(0x044e5218)
-    logger.error(
-        "cpu",
-        f'[LOGPOINT] FUN_0448c745: vtable+0x58 call returned EAX=0x{eax:08x} -- '
-        f'ISAM fn ptrs: DAT_044e52e8=0x{isam_open:08x} DAT_044e5288=0x{isam_a:08x} '
-        f'DAT_044e52b4=0x{isam_b:08x} DAT_044e5218=0x{isam_c:08x}',
-    )
-
-def _lp_delegate_ee9(eip, regs, mem_ptr, mem_size):
-    esp = cpu.regs[ESP]
-    param1 = mem.read32((esp + 4) & 0xFFFFFFFF)
-    inner_obj = mem.read32((param1 + 8) & 0xFFFFFFFF)
-    inner_vtable = mem.read32(inner_obj & 0xFFFFFFFF)
-    target = mem.read32((inner_vtable + 0x70) & 0xFFFFFFFF)
-    logger.error(
-        "cpu",
-        f"[LOGPOINT] FUN_044c5ee9(param_1=0x{param1:08x}) inner_obj=0x{inner_obj:08x} "
-        f"inner_vtable=0x{inner_vtable:08x} target=[vtable+0x70]=0x{target:08x} @ 0x{eip:08x}",
-    )
-
-def _lp_jet_open_entry(eip, regs, mem_ptr, mem_size):
-    esp = cpu.regs[ESP]
-    param2 = mem.read32((esp + 8) & 0xFFFFFFFF)   # path
-    param5 = mem.read32((esp + 0x14) & 0xFFFFFFFF)  # flags
-    path = read_cstring(param2, mem) if param2 > 0x1000 else "(null)"
-    logger.error("cpu", f'[LOGPOINT] msjet35!FUN_7a86fac5(path="{path}", flags=0x{param5:08x}) @ 0x{eip:08x}')
-
-def _lp_resolved_path(eip, regs, mem_ptr, mem_size):
-    this = cpu.regs[ECX]
-    buf_ptr = mem.read32((this + 8) & 0xFFFFFFFF)
-    path = read_cstring(buf_ptr, mem) if buf_ptr > 0x1000 else "(null)"
-    logger.error("cpu", f'[LOGPOINT] msjet35!FUN_7a8707be: resolved path after GetFullPathNameA/FindFirstFileA fixup = "{path}" @ 0x{eip:08x}')
-
-cpu.add_logpoint(0x008f0a60, _lp_db_startup)
-cpu.add_logpoint(0x0448c745, _lp_reached("FUN_0448c745 (Workspace::OpenDatabase wrapper)"))
-cpu.add_logpoint(0x0448c81c, _lp_opendb_postcall)
-cpu.add_logpoint(0x044c5ee9, _lp_delegate_ee9)
-cpu.add_logpoint(0x1502fac5, _lp_jet_open_entry)
-cpu.add_logpoint(0x150307be, _lp_resolved_path)
+# DISABLED for now (2026-08-07): confirmed live that this is NOT
+# lightweight in practice -- it hooks every single memory write and every
+# register/EIP/EFLAGS change for the whole run, and the periodic HTTP
+# flush to ClickHouse can't keep up with that volume (a run stalled at
+# 83s of virtual time after 2+ minutes of real wall-clock time, RSS
+# climbing past 2.3GB as the unflushed buffer piled up in memory). Also:
+# the FILE_allocateop/Dbcode_AtExit blocker this was wired up for turned
+# out to be downstream of a separate, earlier bug (IDirect3D8::Release
+# always reporting refcount 0 -- see idirect3d8.py -- which never even
+# let a run reach dbcode.c's failure point). Flip _HISTORY_CAPTURE_ENABLED
+# back on only if that investigation resumes and is worth the overhead.
+_HISTORY_CAPTURE_ENABLED = False
+if _HISTORY_CAPTURE_ENABLED:
+    cpu.enable_history_capture_clickhouse("http://localhost:8123", "default", "poc")
+    logger.info("startup", "[history] ClickHouse capture enabled, run_id will be queryable after the run")
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
@@ -681,6 +635,19 @@ elif cpu.halted:
     diagnose_halt(cpu, exe.import_resolver)
 
 logger.info("startup", f"Final EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
+
+# Flush the execution-history capture buffer to ClickHouse before shutdown,
+# and log the run_id so it's queryable -- see the capture-enable comment
+# near cpu = CPU(mem) above. Without this flush, any buffered-but-not-yet-
+# flushed events from the tail of the run would be lost on process exit.
+# disable_history_capture() during cpu cleanup is a no-op if never enabled,
+# but skip the flush/run_id logging entirely when capture is off so this
+# doesn't print a misleading "flushed to ClickHouse" line for a run that
+# never captured anything.
+if _HISTORY_CAPTURE_ENABLED:
+    history_run_id = cpu.run_id
+    cpu.flush_history_capture()
+    logger.info("startup", f"[history] run_id={history_run_id} flushed to ClickHouse (history_events table)")
 
 # Tear down SDL2 (and any windows/renderers it owns) before exiting -- an
 # implicit process exit with SDL2 still live left the NVIDIA driver's own

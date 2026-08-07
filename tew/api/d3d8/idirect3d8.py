@@ -47,6 +47,35 @@ _DX8Z_PREFERRED_BASE   = 0x60000000
 _DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
 
 
+# Per-object reference counts: obj_addr -> count (initial = 1 on first
+# access, same convention as idirect3d8resource.py's _ref_counts). In
+# practice there's only ever one IDirect3D8 object (D3D8_OBJ), but keying
+# by `this` rather than using a bare module-level int keeps this file
+# consistent with the resource-object pattern and correct even if that
+# assumption ever changes.
+_ref_counts: dict[int, int] = {}
+
+
+def _add_ref(cpu: "CPU", mem: "Memory") -> None:
+    this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+    count = _ref_counts.get(this, 1) + 1
+    _ref_counts[this] = count
+    logger.info("d3d8", f"IDirect3D8::AddRef -> {count}")
+    cpu.regs[EAX] = count
+
+
+def _release(cpu: "CPU", mem: "Memory") -> None:
+    this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+    count = _ref_counts.get(this, 1) - 1
+    if count > 0:
+        _ref_counts[this] = count
+    else:
+        _ref_counts.pop(this, None)
+    count = max(count, 0)
+    logger.info("d3d8", f"IDirect3D8::Release -> {count}")
+    cpu.regs[EAX] = count
+
+
 def _query_real_desktop_mode() -> tuple[int, int, int]:
     """Report a plausible XP-era desktop resolution/refresh rate.
 
@@ -481,14 +510,19 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         _com_stub(stubs, "d3d8", "IDirect3D8::QueryInterface",
             lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::QueryInterface -> E_NOINTERFACE"),
                               _set_eax(cpu, 0x80004002))[-1], 8, memory),
-        # [1]  AddRef — refcount stub, always 1
-        _com_stub(stubs, "d3d8", "IDirect3D8::AddRef",
-            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::AddRef -> 1"),
-                              _set_eax(cpu, 1))[-1], 0, memory),
-        # [2]  Release — refcount stub, always 0
-        _com_stub(stubs, "d3d8", "IDirect3D8::Release",
-            lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::Release -> 0"),
-                              _set_eax(cpu, 0))[-1], 0, memory),
+        # [1]  AddRef — real per-object refcount (see _add_ref below). Was a
+        # stub that always returned 1; that's fixed at [2].
+        _com_stub(stubs, "d3d8", "IDirect3D8::AddRef", _add_ref, 0, memory),
+        # [2]  Release — real per-object refcount, matching
+        # idirect3d8resource.py's _ref_counts pattern. Was a stub that
+        # unconditionally returned 0 on every call regardless of how many
+        # references were outstanding -- confirmed live 2026-08-07: the
+        # render thread's IDirect3D8::Release (one of >=2 outstanding refs)
+        # told the game it had just hit zero, so the game tore down the
+        # object's internal mutex immediately, which the main thread then
+        # tripped over as "MUTEX_free - FREEING A LOCKED MUTEX" a few
+        # instructions later. Must only report 0 on the true last release.
+        _com_stub(stubs, "d3d8", "IDirect3D8::Release", _release, 0, memory),
         # [3]  RegisterSoftwareDevice — not supported
         _com_stub(stubs, "d3d8", "IDirect3D8::RegisterSoftwareDevice",
             lambda cpu, mem: (logger.info("d3d8", "IDirect3D8::RegisterSoftwareDevice -> D3DERR_NOTAVAIL"),

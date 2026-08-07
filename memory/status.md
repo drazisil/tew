@@ -11,7 +11,82 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-07, cont'd again)
+## Current status (2026-08-07, cont'd again x6)
+
+**The `nfile.c` "FILE SYSTEM NOT INITIALIZED" blocker queued below is
+RESOLVED, and it was never a real bug at all -- it was this session's own
+test-harness `timeout` command killing the process.** Confirmed live:
+`MessageBoxA`'s dialog-appear log line (`user32_handlers.py`'s
+`_show_messagebox`) was correctly added to fix visibility of blocking
+dialogs, but a genuinely unanswered dialog does block the whole process on
+a real `SDL_ShowMessageBox` call -- a run that appeared to reach "1226s of
+virtual time" was actually mostly real wall-clock time spent sitting on an
+unattended `MUTEX_free - FREEING A LOCKED MUTEX (40201e60)` abort dialog,
+not CPU progress (Molly caught this misread live: "Your logpoints dragged
+it long enough that it died right before that message" from an earlier
+round applies here too -- any external stall reads as progress if you
+don't check what's actually blocking).
+
+That mutex-free dialog was itself a **real bug**, and is now fixed: `d3d8
+/idirect3d8.py`'s `IDirect3D8::AddRef`/`Release` were stubs that always
+returned `1`/`0` regardless of how many references were actually
+outstanding -- so *any* `Release` call, even one of several legitimately
+outstanding references (confirmed live: the render thread, `tid=1007`,
+released its own reference while the main thread still held one), told
+the game it had just hit zero. The game's own destructor then tore down
+the object's internal mutex immediately, which a moment later the main
+thread tripped over as "freeing a locked mutex". Fixed with a real
+per-object refcount dict (`_ref_counts`, `this` -> count), mirroring the
+existing correct pattern in `idirect3d8resource.py`'s `_add_ref`/
+`_release`. New regression tests: `test_idirect3d8_refcount.py` (6 tests,
+calling `_add_ref`/`_release` directly rather than through the full
+Vulkan-backed `make_vtable`). 1080/1080 tests pass. Confirmed live: the
+`MUTEX_free` dialog no longer fires.
+
+Once that dialog stopped blocking the run, the `nfile.c` chain queued
+below **did reproduce once**, but only in a run launched with `timeout 90`
+-- and the timing lined up exactly: `SDL_QUIT received` fired at 89.984s,
+~1s before the external `timeout` would fire, meaning the harness's own
+`SIGTERM` was very likely delivered through/interpreted by SDL2 as a real
+window-close event. The game correctly treated that as "user closed the
+window" and walked its own real shutdown path -- `Channel_DebugPrint`
+`dbcode.c(1153)`/`(1172)` `Dbcode_AtExit()` &rarr;
+`Dbcode_AbortCallback_KillThread()` (`dbcode.c(1107)`/`(1130)`) &rarr;
+`nfile.c(200)` `FILE_allocateop - FILE SYSTEM NOT INITIALIZED` (the DB
+thread got killed before/during its own filesystem teardown) &rarr;
+unhandled `INT3` &rarr; fatal halt. This is a real, coherent shutdown-path
+call chain, exactly matching Molly's original read that the nfile.c
+assertion was downstream of a dbcode-level trigger, not an independent
+bug -- but it's **only reachable by killing the process mid-run**, not
+something a real, uninterrupted play session hits. Confirmed by doubling
+the timeout to 180s: the run went the full duration with **no** `SDL_QUIT`,
+no `MUTEX_free`, no `Dbcode_AtExit`/`nfile.c` chain at all, ending cleanly
+via the normal `Execution limit reached (500000000 steps)` step cap at
+145.6s -- the furthest and cleanest this project has ever run.
+
+**Current blocker**: none identified -- this is the furthest clean run
+yet (500M-step cap reached with zero halts). Next session should extend
+`MAX_STEPS`/remove the cap for a longer soak run to see what (if anything)
+is actually next, now that both the mutex refcount bug and the false
+nfile.c trail are cleared.
+
+Also this session: wired up (then disabled) the native ClickHouse
+execution-history capture (`cpu.enable_history_capture_clickhouse`,
+`run_exe.py`, gated behind `_HISTORY_CAPTURE_ENABLED = False`) as the
+purpose-built replacement for ad hoc Python `cpu.add_logpoint`s on
+high-frequency addresses -- per Molly's explicit steer ("this is what we
+have ClickHouse for"). **Confirmed live it is not actually lightweight
+enough to leave on by default**: it hooks every single memory write and
+every register/EIP/EFLAGS change for the entire run, and the periodic HTTP
+flush to ClickHouse couldn't keep up -- a run stalled at 83s of virtual
+time after 2+ minutes of real wall-clock time, RSS climbing past 2.3GB as
+the unflushed buffer piled up in memory, before being killed. Left in
+place but off (flip `_HISTORY_CAPTURE_ENABLED` back on) for a future
+investigation that specifically needs "what wrote address X last" and is
+worth the overhead -- not a general-purpose always-on tool the way the
+docstring originally implied.
+
+## Previous status (2026-08-07, cont'd again)
 
 **The `Workspace::OpenDatabase`/error-3343 blocker below is RESOLVED, and it
 was two real tew bugs in the Win32 file-I/O layer, not a Jet/DAO problem at

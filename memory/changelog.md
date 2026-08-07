@@ -4,6 +4,73 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 (cont'd again x6) — Fixed IDirect3D8::AddRef/Release fake
+refcounting (real MUTEX_free-while-locked cause); nfile.c "FILE SYSTEM NOT
+INITIALIZED" chain traced to a test-harness `timeout`-as-SDL_QUIT
+artifact, not a real bug
+
+`d3d8/idirect3d8.py`'s `IDirect3D8::AddRef`/`Release` COM vtable slots
+were stubs that always returned `1`/`0`, ignoring how many references were
+actually outstanding. Confirmed live: the render thread (`tid=1007`)
+called `Release` on one of >=2 outstanding references; the stub reported
+"refcount is now 0" anyway, so the game's own destructor tore down the
+`IDirect3D8` object's internal mutex immediately -- which the main thread
+then tripped over two log lines later as `"Abort from file
+"cmn\mutex.c", line 429": MUTEX_free - FREEING A LOCKED MUTEX
+(40201e60)."`. Fixed with a real per-`this` refcount dict (`_ref_counts`),
+matching the already-correct pattern in `idirect3d8resource.py`'s
+`_add_ref`/`_release`. `AddRef`/`Release` handlers changed from inline
+lambdas to real `_add_ref`/`_release` functions so they can read `this`
+off the stack and branch. New file `tests/unit/api/
+test_idirect3d8_refcount.py` (6 tests, calling the functions directly
+rather than through the full Vulkan-backed `make_vtable` -- AddRef/Release
+don't touch Vulkan/WindowManager at all). 1080/1080 tests pass.
+
+Also wired up (`run_exe.py`, right after `cpu = CPU(mem)`) the native Zig
+execution-history capture layer (`cpu.enable_history_capture_clickhouse`)
+as a replacement for the ad hoc Python `cpu.add_logpoint`s previously used
+to chase the `nfile.c` "FILE SYSTEM NOT INITIALIZED" blocker queued in the
+last entry -- per Molly's steer that this is exactly the purpose-built
+tool for "what wrote this address last" questions, not more hand-rolled
+logpoints. **Confirmed live this is not lightweight enough to leave on
+unconditionally**: it hooks every memory write and every register/EIP/
+EFLAGS change for the whole run; the periodic HTTP flush to ClickHouse
+couldn't keep up with that volume, and a run stalled at 83s of virtual
+time after 2+ minutes of real time with RSS climbing past 2.3GB before
+being killed. Gated behind `_HISTORY_CAPTURE_ENABLED = False` (currently
+off) rather than removed, for if a future investigation specifically needs
+it and is worth the overhead.
+
+With the capture disabled again, re-running to verify the mutex fix
+surfaced a second, more interesting finding via `user32_handlers.py`'s
+existing "log dialog appearance before the blocking `SDL_ShowMessageBox`
+call" fix (from earlier this session): a run that looked like it made
+"1226s of virtual-time progress" had actually mostly been sitting on an
+unattended `MUTEX_free` dialog in real wall-clock time (Molly caught
+this: "The dialog box was open and I didn't notice, which is why it ran
+so long") -- not a logpoint-overhead Heisenbug like the previous round,
+but the same underlying lesson: check what's actually consuming wall
+time before drawing conclusions from an unexpectedly-long or
+unexpectedly-short run.
+
+After the mutex fix, a run bounded by `timeout 90` reproduced the queued
+`nfile.c` chain exactly once: `SDL_QUIT received` fired at 89.984s, ~1s
+before the external timeout, strongly suggesting the harness's own
+`SIGTERM` was delivered through/interpreted by SDL2 as a real window-close
+event. The game correctly walked its own real shutdown path in response --
+`Channel_DebugPrint` `dbcode.c(1153)`/`(1172)` `Dbcode_AtExit()` ->
+`Dbcode_AbortCallback_KillThread()` (`dbcode.c(1107)`/`(1130)`) ->
+`nfile.c(200)` `FILE_allocateop - FILE SYSTEM NOT INITIALIZED` (the DB
+thread died before/during its own filesystem teardown) -> unhandled
+`INT3` -> fatal halt. A coherent, real call chain (confirms Molly's
+original read that this was dbcode-driven, not an independent nfile.c
+bug) -- but only reachable by killing the process mid-run. Doubling the
+timeout to 180s confirmed this: the run went the full duration with zero
+halts of any kind, ending via the ordinary `Execution limit reached
+(500000000 steps)` step cap at 145.6s -- the furthest and cleanest clean
+run this project has ever produced. Full detail: memory/status.md,
+"Current status (2026-08-07, cont'd again x6)".
+
 ## 2026-08-07 (cont'd again x4) — Fixed real lag in Channel_SystemPrint/
 Channel_DebugPrint; added "channel" to LogCategory
 
