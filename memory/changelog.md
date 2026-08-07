@@ -4,6 +4,87 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 (cont'd again) — Fixed two real Win32 file-I/O bugs
+(collapsed read/write access, inverted `GetFileType`) that were the actual
+cause of `Workspace::OpenDatabase`'s "unrecognized database format" error
+
+Molly's instinct going in: "zero chance this is a Jet bug... if anything,
+it's that we are running windows files under linux encoding" -- exactly
+right, on both counts (not Jet, and squarely tew's OS-emulation layer).
+
+Traced the real DAO350.DLL &rarr; MSJET35.DLL call chain live via Ghidra
+decompile plus `cpu.add_logpoint`s, first working out MSJET35.DLL's real
+runtime-vs-Ghidra-static address delta (`runtime = static - 0x65840000`,
+verified against the `opMovR32Imm` fix's known-good landmark instruction at
+`0x1503564b`/`0x7a87564b`). Full chain, each link confirmed live: DAO350.DLL
+`FUN_0448c745` &rarr; `FUN_044c5ee9` &rarr; `FUN_044c2d8a` &rarr;
+`FUN_044e20c8` &rarr; `FUN_044d896d` &rarr; a dynamically-bound ISAM
+function-pointer table (`DAT_044e52e8` et al, confirmed resolving into real
+MSJET35.DLL addresses at runtime) &rarr; `FUN_7a8701ed` &rarr;
+`FUN_7a85a900` &rarr; `FUN_7a86fac5` &rarr; `FUN_7a86fbed` &rarr;
+`FUN_7a8709b6` &rarr; `FUN_7a870879` &rarr; `FUN_7a8708a1` (real
+`CreateFileA`/`GetFullPathNameA`/`FindFirstFileA` path resolve+open,
+confirmed live resolving to the exact correct path) &rarr; `FUN_7a8706e9`
+(the real `CreateFileA` call, confirmed requesting `GENERIC_READ|
+GENERIC_WRITE`) &rarr; `FUN_7a870b40`, which calls real `GetFileType()`
+(via `FUN_7a8709a5`) before ever reading a byte and aborts immediately
+unless the result is exactly `FILE_TYPE_DISK`.
+
+Two real bugs found and fixed, both in tew's own Win32 file-I/O layer:
+
+1. `kernel32_io.py`'s `_create_file_a`/`_create_file_w` collapsed
+   `dwDesiredAccess` into a single `writable` boolean, losing whether
+   `GENERIC_READ` was *also* requested. `open_file_handle` (`_state.py`)
+   always opened the real fd `os.O_WRONLY` for any writable open, and
+   `ReadFile`/`fread`/`_read` unconditionally rejected any writable-flagged
+   handle regardless of the fd's real capabilities -- so a handle opened
+   `GENERIC_READ|GENERIC_WRITE` (exactly what Jet requests for a live
+   database) could still never actually be read from. Fixed:
+   `FileHandleEntry` gained a `readable` field, `open_file_handle` gained
+   `also_readable` (opens `O_RDWR` when set, threaded from
+   `GENERIC_READ`/fopen's `"+"` mode/`_open`'s `O_RDWR`),
+   `ReadFile`/`fread`/`_read` now do a real `os.pread()` for handles that
+   are both writable and readable. Confirmed live and engaged correctly
+   (`CreateFile(...) -> 0x5041 [write+read]`) -- a real, independent bug fix
+   -- but confirmed NOT the root cause of this specific blocker: `ReadFile`
+   is never even called before the real failure point.
+2. `kernel32_system.py`'s `GetFileType` had its ternary backwards:
+   `cpu.regs[EAX] = 2 if entry.fd is not None else 1`, exactly inverted from
+   its own comment. Every real disk file (read-write or write-only) keeps a
+   live fd, so this returned `FILE_TYPE_CHAR(2)` for every real file and
+   `FILE_TYPE_DISK(1)` only for the read-only-with-cached-`entry.data` case
+   (`entry.fd is None` there). Real `Workspace::OpenDatabase` calls
+   `GetFileType()` immediately after `CreateFileA` and fails with error
+   `-0x404` if the result isn't exactly `FILE_TYPE_DISK` -- fully explaining
+   why `FUN_7a870cf8` (the "Standard Jet DB" signature-check function found
+   earlier this session via a string search) never actually fired despite
+   genuinely being reachable in the call graph: this gate rejects the open
+   one step before ever reaching it. Fixed to key off `entry.path` instead
+   (`'<...>'` sentinel paths and `/dev/null` are the only real
+   `FILE_TYPE_CHAR` cases). **This was the real root cause** -- confirmed
+   live: `0x800a0d0f`/"unrecognized database format" is completely gone,
+   `Workspace::OpenDatabase` proceeds cleanly past everything above.
+
+Also confirmed and worth keeping in mind: `Online.MDB`'s file integrity was
+never in question (byte-identical to a second, independently-sourced copy;
+size is an exact whole number of real Jet-3.x 2048-byte pages; `mdb-tools`,
+an independent non-Microsoft Jet parser, successfully extracted its full
+schema/data back in 2025) -- the earlier "byte-0x42 password-protection
+gate" theory from the previous session is superseded and was based on an
+incomplete trace (`FUN_7a870cf8` genuinely is called from `FUN_7a870b40`,
+just never reached in practice because of bug #2 above).
+
+1061/1061 tests pass. New tests: `test_read_write_file_handle.py` (full
+`CreateFileA`&rarr;`WriteFile`&rarr;`ReadFile` round trip on a
+`GENERIC_READ|GENERIC_WRITE` handle, plus a write-only-still-rejects guard)
+and `TestGetFileType` additions in `test_kernel32_system_info.py`.
+
+**New blocker, surfaced immediately by this fix**: `[UNIMPLEMENTED]
+kernel32.dll!LockFile -- halting`, hit right after `Workspace::OpenDatabase`
+succeeds. A clean, honest, well-understood gap (real Jet locking its
+database file, real `LockFile` just isn't implemented yet) -- not a mystery
+like everything before it. Not yet started.
+
 ## 2026-08-07 (cont'd) — Removed a tew-side patch that faked success on
 `Dbcode_CopyDataBaseToSaveData`, resolving the real `Tmp.MDB`-never-created
 bug; added `-CaptureStdout`
