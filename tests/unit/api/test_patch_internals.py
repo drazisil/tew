@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from tew.api._state import CRTState
+from tew.api._state import CRTState, FileHandleEntry
 from tew.api.patch_internals import patch_crt_internals
 from tew.api.win32_handlers import (
     Win32Handlers,
@@ -28,6 +28,7 @@ STACK    = 0x200000
 CHKESP_ADDR       = 0x009F1BC0
 CRT_DBG_REPORT    = 0x009F9300
 CHANNEL_DBG_PRINT = 0x004CC5B0
+CHANNEL_SYS_PRINT = 0x004CBDE0
 FREE_DBG          = 0x009F6E20
 WINMAIN_CHECK1    = 0x0040D1D4
 WINMAIN_CHECK2    = 0x0040159B
@@ -385,6 +386,65 @@ class TestChannelDebugPrint:
         mem.write32(STACK + 16, 0)  # arg_ptr <= 0x1000
         patched(stubs, CHANNEL_DBG_PRINT)(cpu)
         assert any("val: (null)" in line for line in captured_logs)
+
+
+class TestChannelSystemPrint:
+    """Channel_SystemPrint(const char *format, ...) -- unlike
+    Channel_DebugPrint (user, channel, format, ...), the format string is
+    the *first* arg (at [esp+4]), varargs start at [esp+8]. Molly requested
+    (2026-08-07) this one also write to the guest's real stdout stream when
+    CRTState.guest_stdout_handle is set, not just tew's own log."""
+
+    def test_multi_vararg_substitution_is_logged(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        str_ptr = 0x300100
+        write_cstring(mem, fmt_ptr, "Hello %s number %d!")
+        write_cstring(mem, str_ptr, "World")
+        mem.write32(STACK + 4, fmt_ptr)
+        mem.write32(STACK + 8, str_ptr)   # first vararg (%s)
+        mem.write32(STACK + 12, 42)       # second vararg (%d)
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)
+        assert any("Hello World number 42!" in line for line in captured_logs)
+
+    def test_null_ish_format_pointer_does_not_crash(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, 0)  # fmt_ptr <= 0x1000 -- skip the read entirely
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)  # must not raise
+        assert any("(null)" in line for line in captured_logs)
+
+    def test_no_guest_stdout_handle_set_does_not_crash(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "plain message")
+        mem.write32(STACK + 4, fmt_ptr)
+        assert state.guest_stdout_handle is None
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)  # must not raise
+        assert any("plain message" in line for line in captured_logs)
+
+    def test_writes_to_guest_stdout_handle_when_set(self, env, captured_logs, tmp_path):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "to stdout: %d\n")
+        mem.write32(STACK + 4, fmt_ptr)
+        mem.write32(STACK + 8, 7)
+
+        import os
+        out_path = tmp_path / "stdout.txt"
+        fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT, 0o644)
+        state.file_handle_map[0x5000] = FileHandleEntry(
+            path=str(out_path), data=b"", position=0, writable=True, fd=fd
+        )
+        state.guest_stdout_handle = 0x5000
+
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)
+        os.close(fd)
+
+        assert out_path.read_bytes() == b"to stdout: 7\n"
 
 
 # ── __free_dbg ───────────────────────────────────────────────────────────────

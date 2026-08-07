@@ -370,6 +370,15 @@ class CRTState:
         # ── Current working directory ─────────────────────────────────────
         self.current_directory: str = "C:\\MCity"
 
+        # ── Guest stdout handle ───────────────────────────────────────────
+        # Set by open_file_handle() the moment the guest opens "stdout.txt"
+        # or "NUL" for write (WinMain's fclose(&_iobuf)+fopen("stdout.txt"/
+        # "NUL","wt") stdout-redirect sequence) -- lets Channel_SystemPrint's
+        # patch (patch_internals.py) write real text into the same stream
+        # real puts()/printf() output lands in, instead of only the
+        # game's own unrendered on-screen "SYSTEM" debug console.
+        self.guest_stdout_handle: Optional[int] = None
+
         # ── Window / dialog system ────────────────────────────────────────
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded
@@ -509,6 +518,7 @@ class CRTState:
                 self.file_handle_map[handle] = FileHandleEntry(
                     path="/dev/null", data=b"", position=0, writable=True, fd=fd
                 )
+                self.guest_stdout_handle = handle
             else:
                 self.file_handle_map[handle] = FileHandleEntry(
                     path="/dev/null", data=b"", position=0, writable=False, fd=None
@@ -588,6 +598,9 @@ class CRTState:
                 path=real_path, data=b"", position=0, writable=True, fd=fd
             )
             logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [write]')
+            bare_name = win_name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if bare_name in ("stdout.txt", "nul"):
+                self.guest_stdout_handle = handle
             return handle
         linux_path = self.translate_windows_path(win_name)
         while True:

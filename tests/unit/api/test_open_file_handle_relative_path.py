@@ -94,3 +94,39 @@ def test_path_with_directory_component_still_creates_it(tmp_path, monkeypatch):
 
     assert handle != INVALID_HANDLE
     assert (tmp_path / "MCity" / "Logs" / "foo.txt").exists()
+
+
+def test_opening_stdout_txt_for_write_tags_guest_stdout_handle(tmp_path, monkeypatch):
+    """Lets Channel_SystemPrint's patch (patch_internals.py) find the
+    guest's real stdout stream to write into, alongside real puts()/
+    printf() output -- see CRTState.guest_stdout_handle's own docstring."""
+    state = _state(tmp_path, monkeypatch)
+    mem = Memory(MEM_SIZE)
+    assert state.guest_stdout_handle is None
+
+    handle = state.open_file_handle("stdout.txt", writable=True, memory=mem)
+
+    assert handle != INVALID_HANDLE
+    assert state.guest_stdout_handle == handle
+
+
+def test_opening_nul_for_write_also_tags_guest_stdout_handle(tmp_path, monkeypatch):
+    """Without -CaptureStdout, WinMain opens "NUL" instead of "stdout.txt"
+    for the same redirect -- still worth tagging so Channel_SystemPrint's
+    writes go somewhere real (the NUL device) instead of being dropped."""
+    state = _state(tmp_path, monkeypatch)
+    mem = Memory(MEM_SIZE)
+
+    handle = state.open_file_handle("NUL", writable=True, memory=mem)
+
+    assert handle != INVALID_HANDLE
+    assert state.guest_stdout_handle == handle
+
+
+def test_unrelated_write_does_not_tag_guest_stdout_handle(tmp_path, monkeypatch):
+    state = _state(tmp_path, monkeypatch)
+    mem = Memory(MEM_SIZE)
+
+    state.open_file_handle("C:\\MCity\\Logs\\foo.txt", writable=True, memory=mem)
+
+    assert state.guest_stdout_handle is None

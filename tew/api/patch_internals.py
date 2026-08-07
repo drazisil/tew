@@ -21,6 +21,7 @@ from tew.api.win32_handlers import (
     DLLMAIN_HANDLE_STORE,
 )
 from tew.api._state import CRTState, read_cstring
+from tew.api.msvcrt_handlers import _sprintf_format
 from tew.logger import logger
 
 
@@ -216,6 +217,54 @@ def patch_crt_internals(
         # cdecl variadic -- no stack cleanup by callee
 
     stubs.patch_address(0x004CC5B0, "Channel_DebugPrint", _channel_debug_print)
+
+    # Channel_SystemPrint (0x004cbde0), channel.c: __cdecl
+    # Channel_SystemPrint(const char *format, ...) -- the game's own
+    # printf-style logger for its "SYSTEM" debug channel (assertion text,
+    # DB_StartUpDatabase's "ERROR: open database failed", WinMain's
+    # startup trace lines, etc. -- confirmed live, this is what most of the
+    # game's own diagnostic text actually flows through). Real
+    # implementation is gated on DAT_013e0518 (only true if
+    # Channel_StartChannel ran) and, even then, routes to
+    # Mono_CreateWindowSubDevice's on-screen "SYSTEM" overlay window
+    # (confirmed via Ghidra: Virtual_CreateWindowSubDevice's device-type
+    # dispatch, device type 0/3 -> Mono_OutputMain; the only other type,
+    # 1 -> File_OutputMain, is never bound by Channel_StartChannel) -- this
+    # emulator never renders that window, so nothing reaches tew's log or
+    # -CaptureStdout's stdout.txt today regardless of that gate. Same
+    # "CRT-internal patch, not worth replicating the real plumbing"
+    # rationale as Channel_DebugPrint above, but this one also writes to
+    # the guest's real stdout stream (CRTState.guest_stdout_handle, tagged
+    # by open_file_handle() the moment WinMain's fopen("stdout.txt"/
+    # "NUL","wt") runs) at Molly's request 2026-08-07, so SYSTEM-channel
+    # output lands in stdout.txt alongside real puts()/printf() output
+    # instead of only tew's own /tmp/emu.log.
+    def _channel_system_print(cpu: "CPU") -> None:
+        sp      = cpu.regs[ESP]
+        fmt_ptr = memory.read32((sp + 4) & 0xFFFFFFFF)
+        fmt     = read_cstring(fmt_ptr, memory, 4096) if fmt_ptr > 0x1000 else "(null)"
+
+        arg_off = [8]
+
+        def get_arg() -> int:
+            v = memory.read32((sp + arg_off[0]) & 0xFFFFFFFF)
+            arg_off[0] += 4
+            return v
+
+        msg = _sprintf_format(fmt, get_arg, memory)
+        logger.info("channel", f"Channel_SystemPrint — {msg.rstrip(chr(10) + chr(13))}")
+
+        entry = None
+        if state.guest_stdout_handle is not None:
+            entry = state.file_handle_map.get(state.guest_stdout_handle)
+        if entry is not None and entry.writable and entry.fd >= 0:
+            import os as _os
+            data = msg.encode("latin-1", errors="replace")
+            _os.write(entry.fd, data)
+            entry.position += len(data)
+        # cdecl variadic -- no stack cleanup by callee
+
+    stubs.patch_address(0x004CBDE0, "Channel_SystemPrint", _channel_system_print)
 
     # abortmessage (0x00a30140): the game's own assert/abort handler --
     # deliberately NOT patched. Decompiled and confirmed: it formats the
