@@ -110,13 +110,42 @@ tests pass; new `test_lock_file.py` covers lock/overlap/unlock/
 CloseHandle-releases-locks/unknown-handle cases. Confirmed live: the
 `LockFile` halt is completely gone.
 
-**New blocker surfaced by this fix**: `[UNIMPLEMENTED]
-kernel32.dll!GetComputerNameA -- halting`, hit almost immediately after.
-Real Jet asking for the local machine's NetBIOS name -- a simple, standard
-API, not another mystery.
+**`GetComputerNameA`/`W` are now implemented** (`kernel32_system.py`),
+returning a fixed, plausible NetBIOS name (`"MCITY-PC"`, matching the
+"fake but plausible" convention already used for the fake PID etc.),
+correctly modeling the real too-small-buffer failure path
+(`ERROR_BUFFER_OVERFLOW`, required-size-on-failure vs
+chars-copied-on-success semantics). 1071/1071 tests pass; new
+`TestGetComputerName` cases in `test_kernel32_system_info.py`. Confirmed
+live: that halt is gone, execution reaches **151s of virtual time** (up
+from ~86s) -- well past the DAO/Jet sequence and deep into real gameplay
+territory for the first time this session.
 
-**Current blocker**: implement `kernel32.dll!GetComputerNameA`. Not yet
-started.
+**Performance**: also fixed real, confirmed lag in `Channel_SystemPrint`/
+`Channel_DebugPrint`'s patches (`patch_internals.py`) -- both were doing
+their full vararg-formatting walk (reading guest memory per `%s`/`%d`,
+building the output string) unconditionally on every call, even when
+"channel" wasn't in `LOG_CATEGORIES` and the result would never be shown.
+Confirmed live these fire extremely often once execution reaches real
+gameplay depth (matches the jump to 151s above). Both now check
+`logger.is_active(...)` first (`_channel_system_print` also checks
+`guest_stdout_handle is not None`, since that sink must keep working
+independent of log filtering) and return immediately if neither sink
+needs the work. Also added the long-missing `"channel"` entry to
+`tew/logger.py`'s own `LogCategory` type (it was real and in active use
+but never actually declared). 1074/1074 tests pass; new
+`TestChannelPrintSkipsWorkWhenFiltered` in `test_patch_internals.py`.
+
+**New blocker surfaced after `GetComputerNameA`**: a *different*,
+main-thread (`tid=1000`, not `1012`) `INT3`/`fatal_halt` at the same
+familiar `EIP=0x001fe012` -- but this time from a completely different
+subsystem: `nfile.c(200) FILE_allocateop - FILE SYSTEM NOT INITIALIZED,
+CALL FILESYS_init().`. Not yet investigated -- likely a real, separate
+game-side file-abstraction layer (`nfile.c`, distinct from DAO/Jet) that
+some code path is using before its own init has run.
+
+**Current blocker**: diagnose the `nfile.c` "FILE SYSTEM NOT INITIALIZED"
+assertion. Not yet started.
 
 ## Previous status (2026-08-07, cont'd)
 

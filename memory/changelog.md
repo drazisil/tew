@@ -4,6 +4,45 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 (cont'd again x4) — Fixed real lag in Channel_SystemPrint/
+Channel_DebugPrint; added "channel" to LogCategory
+
+Both patches (`patch_internals.py`) did their full vararg-formatting walk
+unconditionally on every call, even when "channel" wasn't in
+`LOG_CATEGORIES` and the result would never be shown -- real, measurable
+overhead once execution reaches real gameplay depth and these fire very
+often (Molly: "too laggy" once channel logging started actually producing
+output). Both now check `logger.is_active(...)` first and skip entirely if
+nothing needs the result; `_channel_system_print` also checks
+`guest_stdout_handle is not None` first, since the real stdout redirect
+must keep working independent of log-category filtering. Also added the
+long-missing `"channel"` entry to `tew/logger.py`'s `LogCategory` type --
+real, in active use, just never actually declared.
+
+1074/1074 tests pass. New `TestChannelPrintSkipsWorkWhenFiltered` in
+`test_patch_internals.py`: debug-print does no formatting/logging when
+filtered, system-print does no formatting/logging when filtered *and* no
+stdout handle, system-print still writes stdout.txt when filtered *with* a
+stdout handle set (the log itself stays suppressed either way).
+
+## 2026-08-07 (cont'd again x3) — Implemented `GetComputerNameA`/`W`
+
+The next honest gap surfaced right after `LockFile`/`UnlockFile`: real Jet
+asks for the local machine's NetBIOS name, a simple standard API.
+Implemented in `kernel32_system.py`, returning a fixed, plausible name
+(`"MCITY-PC"`, matching the "fake but plausible" convention already used
+for the fake PID etc.), with correct too-small-buffer failure semantics
+(`ERROR_BUFFER_OVERFLOW`, required-size-on-failure vs
+chars-copied-on-success, matching real `GetComputerNameA` exactly). Added
+`ERROR_BUFFER_OVERFLOW` to `win32_errors.py`.
+
+1071/1071 tests pass. New `TestGetComputerName` in
+`test_kernel32_system_info.py`. Confirmed live: that halt is gone, and
+execution now reaches 151s of virtual time (up from ~86s) -- well past
+DAO/Jet and into real gameplay territory for the first time this session,
+before hitting a new, unrelated `nfile.c` "FILE SYSTEM NOT INITIALIZED"
+assertion. See status.md for the new current blocker.
+
 ## 2026-08-07 (cont'd again x2) — Implemented `LockFile`/`UnlockFile`
 
 Real Jet locks its database file as a normal part of opening it (byte-range
