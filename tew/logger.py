@@ -6,7 +6,8 @@ Control via environment variables:
   LOG_CATEGORIES=cpu,dll,loader,...       (default: * = all)
 
 Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
-            graphics, fileio, registry, exception, startup, scheduler, winsock, calls
+            graphics, fileio, registry, exception, startup, scheduler, winsock, calls,
+            window, dialog, channel
 """
 
 import os
@@ -20,7 +21,7 @@ LogCategory = Literal[
     "cpu", "dll", "loader", "handlers", "thread", "wininet",
     "d3d8", "graphics", "fileio", "registry", "exception",
     "startup", "scheduler", "winsock", "calls",
-    "window", "dialog",
+    "window", "dialog", "channel",
 ]
 
 ERROR = 0

@@ -447,6 +447,77 @@ class TestChannelSystemPrint:
         assert out_path.read_bytes() == b"to stdout: 7\n"
 
 
+@pytest.fixture
+def channel_category_filtered_out():
+    """Simulates a real run where "channel" isn't in LOG_CATEGORIES --
+    both patches must skip their vararg-formatting work entirely in this
+    case (2026-08-07, Molly: "too laggy" once channel logging started
+    actually producing output at real gameplay volume)."""
+    saved_level = logger_module._active_level
+    saved_categories = logger_module._active_categories
+    logger_module.configure_logger(level="info", categories="cpu")  # anything without "channel"
+    yield
+    logger_module._active_level = saved_level
+    logger_module._active_categories = saved_categories
+
+
+class TestChannelPrintSkipsWorkWhenFiltered:
+    def test_debug_print_does_not_format_or_log_when_channel_filtered(
+        self, env, captured_logs, channel_category_filtered_out,
+    ):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "should not be formatted")
+        mem.write32(STACK + 4, 0)
+        mem.write32(STACK + 8, 0)
+        mem.write32(STACK + 12, fmt_ptr)
+
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)  # must not raise, must not format
+
+        assert captured_logs == []
+
+    def test_system_print_skips_when_filtered_and_no_stdout_handle(
+        self, env, captured_logs, channel_category_filtered_out,
+    ):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "should not be formatted")
+        mem.write32(STACK + 4, fmt_ptr)
+        assert state.guest_stdout_handle is None
+
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)  # must not raise, must not format
+
+        assert captured_logs == []
+
+    def test_system_print_still_writes_stdout_when_filtered(
+        self, env, captured_logs, channel_category_filtered_out, tmp_path,
+    ):
+        """Even with "channel" logging filtered out, the real stdout
+        redirect must still work -- that's the whole point of
+        guest_stdout_handle, independent of what tew's own log shows."""
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "still reaches stdout.txt\n")
+        mem.write32(STACK + 4, fmt_ptr)
+
+        import os
+        out_path = tmp_path / "stdout.txt"
+        fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT, 0o644)
+        state.file_handle_map[0x5000] = FileHandleEntry(
+            path=str(out_path), data=b"", position=0, writable=True, fd=fd
+        )
+        state.guest_stdout_handle = 0x5000
+
+        patched(stubs, CHANNEL_SYS_PRINT)(cpu)
+        os.close(fd)
+
+        assert out_path.read_bytes() == b"still reaches stdout.txt\n"
+        assert captured_logs == []  # log itself still suppressed
+
+
 # ── __free_dbg ───────────────────────────────────────────────────────────────
 
 class TestFreeDbgNoop:

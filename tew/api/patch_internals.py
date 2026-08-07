@@ -22,7 +22,7 @@ from tew.api.win32_handlers import (
 )
 from tew.api._state import CRTState, read_cstring
 from tew.api.msvcrt_handlers import _sprintf_format
-from tew.logger import logger
+from tew.logger import logger, INFO, WARN
 
 
 def patch_crt_internals(
@@ -176,6 +176,16 @@ def patch_crt_internals(
     # patch, not worth replicating the real plumbing" rationale as
     # _CrtDbgReport above.
     def _channel_debug_print(cpu: "CPU") -> None:
+        # Skip the whole vararg-formatting walk when nothing would use the
+        # result -- this patch's own logging is its only output (no stdout
+        # redirect like Channel_SystemPrint below), so a filtered-out
+        # "channel" category means genuinely wasted work on every single
+        # call. Confirmed live 2026-08-07 this function fires extremely
+        # often once execution gets deep into real gameplay (Molly: "too
+        # laggy" once channel logging started actually producing output).
+        if not logger.is_active(WARN, "channel"):
+            return
+
         sp        = cpu.regs[ESP]
         user      = memory.read32((sp + 4)  & 0xFFFFFFFF)
         channel   = memory.read32((sp + 8)  & 0xFFFFFFFF)
@@ -240,6 +250,13 @@ def patch_crt_internals(
     # output lands in stdout.txt alongside real puts()/printf() output
     # instead of only tew's own /tmp/emu.log.
     def _channel_system_print(cpu: "CPU") -> None:
+        # Skip the vararg-formatting walk entirely when neither sink needs
+        # it -- same rationale as _channel_debug_print above, but this one
+        # also feeds the real stdout redirect (guest_stdout_handle), so
+        # that has to stay live even with "channel" logging filtered out.
+        if not logger.is_active(INFO, "channel") and state.guest_stdout_handle is None:
+            return
+
         sp      = cpu.regs[ESP]
         fmt_ptr = memory.read32((sp + 4) & 0xFFFFFFFF)
         fmt     = read_cstring(fmt_ptr, memory, 4096) if fmt_ptr > 0x1000 else "(null)"
