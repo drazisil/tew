@@ -13,6 +13,16 @@ circuits before SDL_ShowMessageBox is ever called).
 """
 from __future__ import annotations
 
+import os
+
+# Must be set before any SDL call -- lets the real (non-hooked)
+# SDL_ShowMessageBox path run without a real display.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
+import pytest
+
+from tew import logger as logger_module
 from tew.api._state import CRTState
 from tew.api.user32_handlers import register_user32_gdi32_handlers
 from tew.api.win32_handlers import Win32Handlers
@@ -104,3 +114,37 @@ def test_hook_returning_none_falls_through_and_is_not_asserted_here():
 def test_no_hook_registered_leaves_messagebox_hook_none():
     mem, state, cpu, stubs = _env()
     assert state.window_manager._messagebox_hook is None
+
+
+@pytest.fixture
+def captured_logs():
+    lines: list[str] = []
+    logger_module.set_emit_hook(lambda level, line: lines.append(line))
+    yield lines
+    logger_module.set_emit_hook(None)
+
+
+MB_ICONERROR = 0x10
+
+
+def test_unhooked_dialog_is_logged_before_the_blocking_sdl_call(captured_logs):
+    """The 2026-08-07 fix: a dialog with no messagebox_hook registered must
+    be logged the instant it appears, not only after SDL_ShowMessageBox
+    returns -- otherwise a genuinely unanswered dialog (blocked on a real
+    click that never comes) is invisible in every log for as long as it
+    sits there, including an entire automated run that eventually just
+    gets killed by an external timeout with no diagnostic at all."""
+    mem, state, cpu, stubs = _env()
+    assert state.window_manager._messagebox_hook is None
+
+    _call_messagebox_a(
+        stubs, mem, cpu,
+        text="MUTEX_free - FREEING A LOCKED MUTEX (0x06f9dcb0).",
+        caption="Abort from file \"cmn\\mutex.c\", line 429",
+        u_type=MB_ICONERROR,
+    )
+
+    appeared = [line for line in captured_logs if "[MessageBox] appeared" in line]
+    assert len(appeared) == 1
+    assert "MUTEX_free - FREEING A LOCKED MUTEX" in appeared[0]
+    assert "BLOCKING" in appeared[0]  # no hook was registered

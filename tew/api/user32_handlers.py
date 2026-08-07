@@ -343,6 +343,22 @@ def register_user32_gdi32_handlers(
             # ExitProcess can't be mistaken for a clean run.
             state.fatal_dialogs.append((caption, text))
 
+        # Log the dialog's appearance BEFORE the potentially-blocking
+        # SDL_ShowMessageBox call below, not after. Confirmed live
+        # 2026-08-07: an unhooked dialog blocks this whole process on a
+        # real human click on the SDL2 window; the previous single log
+        # line (in _MessageBoxA/_MessageBoxW, written only after
+        # _show_messagebox returns) meant a dialog nobody answered was
+        # completely invisible in every log for as long as it sat there --
+        # including the entire duration of an automated/headless run that
+        # eventually just got killed by an external timeout with no
+        # diagnostic at all.
+        getattr(logger, log_level)(
+            "dialog",
+            f'[MessageBox] appeared: ("{caption}", "{text.replace(chr(10), "\\n")}") type=0x{u_type:x}'
+            + (" -- BLOCKING on a real click, no messagebox_hook registered" if wm._messagebox_hook is None else ""),
+        )
+
         if wm._messagebox_hook is not None:
             answer = wm._messagebox_hook(caption, text, u_type)
             if answer is not None:
