@@ -377,6 +377,47 @@ class TestGetFileType:
         call(stubs, cpu, mem, "GetFileType", [0xDEADBEEF])
         assert cpu.halted is True
 
+    def test_real_disk_file_returns_file_type_disk(self, env, tmp_path):
+        """The actual 2026-08-07 bug: this used to key off `entry.fd is not
+        None`, which every real disk file also satisfies (read-write and
+        write-only entries both keep a live fd open) -- so real files always
+        got FILE_TYPE_CHAR(2) instead of FILE_TYPE_DISK(1). Confirmed live as
+        the true cause of msjet35.dll rejecting a byte-perfect, correctly-
+        signed Tmp.MDB as "unrecognized database format": real Jet calls
+        GetFileType right after CreateFile and aborts immediately if it isn't
+        exactly FILE_TYPE_DISK, before ever reading a single byte."""
+        from tew.api._state import FileHandleEntry
+        cpu, mem, state, stubs = env
+        real_path = tmp_path / "Tmp.MDB"
+        real_path.write_bytes(b"Standard Jet DB")
+        import os
+        fd = os.open(str(real_path), os.O_RDWR)
+        handle = 0x5041
+        state.file_handle_map[handle] = FileHandleEntry(
+            path=str(real_path), data=b"", position=0, writable=True, fd=fd, readable=True)
+
+        call(stubs, cpu, mem, "GetFileType", [handle])
+
+        assert cpu.regs[EAX] == 1  # FILE_TYPE_DISK
+        os.close(fd)
+
+    def test_nul_device_still_returns_file_type_char(self, env):
+        """NUL entries keep a real, live fd too (open_file_handle's NUL
+        branch does os.open("/dev/null", O_WRONLY)) -- must still report
+        FILE_TYPE_CHAR despite having an fd, same as std handles."""
+        from tew.api._state import FileHandleEntry
+        cpu, mem, state, stubs = env
+        import os
+        fd = os.open("/dev/null", os.O_WRONLY)
+        handle = 0x5099
+        state.file_handle_map[handle] = FileHandleEntry(
+            path="/dev/null", data=b"", position=0, writable=True, fd=fd)
+
+        call(stubs, cpu, mem, "GetFileType", [handle])
+
+        assert cpu.regs[EAX] == 2  # FILE_TYPE_CHAR
+        os.close(fd)
+
 
 # ── Pointer encode/decode ──────────────────────────────────────────────────────
 

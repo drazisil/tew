@@ -290,8 +290,22 @@ def register_kernel32_system_handlers(
             cpu.halted = True
             cpu.fatal_halt = True
             return
-        # FILE_TYPE_CHAR(2) for std handles (have fd), FILE_TYPE_DISK(1) for files
-        cpu.regs[EAX] = 2 if entry.fd is not None else 1
+        # FILE_TYPE_CHAR(2) for std handles/NUL device, FILE_TYPE_DISK(1) for
+        # real files. CORRECTED 2026-08-07: this used to key off `entry.fd is
+        # not None` -- exactly backwards, since every real disk file (read-
+        # write, or write-only) also has a live fd, so it always reported
+        # FILE_TYPE_CHAR for real files and FILE_TYPE_DISK only for the
+        # read-only-with-cached-data case (entry.fd is None there). Confirmed
+        # live as the true root cause of msjet35.dll's "unrecognized database
+        # format" on a byte-perfect, correctly-signed Tmp.MDB: real Jet calls
+        # GetFileType(handle) right after CreateFile and fails immediately
+        # with error -0x404 if it isn't exactly FILE_TYPE_DISK -- before ever
+        # calling ReadFile or checking the "Standard Jet DB" signature. Std
+        # handles use sentinel paths ('<stdin>' etc, see _get_std_handle
+        # above); the NUL device uses the real path "/dev/null" -- both are
+        # genuinely FILE_TYPE_CHAR on real Windows too.
+        is_char_device = entry.path.startswith("<") or entry.path == "/dev/null"
+        cpu.regs[EAX] = 2 if is_char_device else 1
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "GetStdHandle", _get_std_handle)

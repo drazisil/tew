@@ -21,7 +21,7 @@ import time
 from os.path import dirname
 
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP, EBP, REG_NAMES, FatalHaltError
+from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, REG_NAMES, FatalHaltError
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
 from tew.pe.exe_file import EXEFile
@@ -347,17 +347,28 @@ def _dispatch_breakpoint() -> None:
         cpu.add_breakpoint(hit_eip)
 
 
-# ── TEMPORARY diagnostic logpoints (2026-08-07, cont'd) ────────────────────────
-# The Tmp.MDB-never-created bug is fixed (see changelog.md). New blocker:
+# ── TEMPORARY diagnostic logpoints (2026-08-07, cont'd again) ──────────────────
+# The Tmp.MDB-never-created bug is fixed (see changelog.md). Current blocker:
 # DB_StartUpDatabase still hits the same INT3/fatal_halt even with Tmp.MDB
-# now present and openable. Tracing DAO350.DLL's real Workspace::OpenDatabase
-# chain (FUN_0448c745 in dao350.dll, Ghidra project debug_clean) to find
-# exactly which internal call produces the failing HRESULT. Prior session
-# (2026-08-06) already traced this chain once and found the final indirect
-# vtable call (at 0448c819, real address -- dao350.dll loads at its
-# preferred base 0x04470000+ so no relocation math needed) returns
-# 0x800a0bd0 = DAO/Jet error 3024 "Couldn't find file" -- but that was
-# BEFORE Tmp.MDB existed. Re-checking now that it does.
+# now present, openable, and byte-identical to its real source template
+# (Online.MDB, confirmed genuinely real by Molly). The final HRESULT from
+# DAO350.DLL's Workspace::OpenDatabase wrapper (FUN_0448c745, vtable+0x58
+# call) is now 0x800a0d0f = DAO/Jet error 3343 "Unrecognized database
+# format" -- but Online.MDB's header cleanly matches the real "Standard Jet
+# DB" signature check in msjet35.dll's own validation function
+# (FUN_7a870cf8 in Ghidra's static view of msjet35.dll, which loads at a
+# DIFFERENT runtime base (0x15000000) than its Ghidra-analyzed one
+# (0x7a840000) -- confirmed live via the historical opMovR32Imm fix's
+# known-good landmark instruction (66 B8 01 00 "MOV AX,1" at runtime
+# 0x1503564b / static 0x7a87564b): runtime_addr = static_addr - 0x65840000).
+#
+# New hypothesis: that same validation function has a SECOND gate right
+# after the signature check -- real header byte at offset 0x42 is 0x86
+# (non-zero) in our actual Online.MDB, and the decompile treats a non-zero
+# byte there as "this database is password-protected," requiring either a
+# real password match against DB_StartUpDatabase's caller-supplied
+# password (always "" in every DB_StartUpDatabase call traced so far) or
+# a specific param_2 value (==2) to bypass it. Confirming live.
 #
 # NOTE: the Zig CPU core (cpu/src/core.zig:113, cpu/src/kernel.zig:203-206)
 # only has 8 logpoint slots -- cpu_add_logpoint silently drops registrations
@@ -375,19 +386,50 @@ def _lp_db_startup(eip, regs, mem_ptr, mem_size):
     path = read_cstring(path_ptr, mem)
     logger.error("cpu", f'[LOGPOINT] DB_StartUpDatabase(param_1="{path}") @ 0x{eip:08x}')
 
-def _lp_opendb_precall(eip, regs, mem_ptr, mem_size):
-    esp = cpu.regs[ESP]
-    words = [mem.read32((esp + i * 4) & 0xFFFFFFFF) for i in range(11)]
-    logger.error("cpu", f'[LOGPOINT] FUN_0448c745: about to CALL [vtable+0x58], stack dwords = {[hex(w) for w in words]}')
-
 def _lp_opendb_postcall(eip, regs, mem_ptr, mem_size):
     eax = cpu.regs[EAX]
-    logger.error("cpu", f'[LOGPOINT] FUN_0448c745: vtable+0x58 call returned EAX=0x{eax:08x}')
+    isam_open = mem.read32(0x044e52e8)
+    isam_a    = mem.read32(0x044e5288)
+    isam_b    = mem.read32(0x044e52b4)
+    isam_c    = mem.read32(0x044e5218)
+    logger.error(
+        "cpu",
+        f'[LOGPOINT] FUN_0448c745: vtable+0x58 call returned EAX=0x{eax:08x} -- '
+        f'ISAM fn ptrs: DAT_044e52e8=0x{isam_open:08x} DAT_044e5288=0x{isam_a:08x} '
+        f'DAT_044e52b4=0x{isam_b:08x} DAT_044e5218=0x{isam_c:08x}',
+    )
+
+def _lp_delegate_ee9(eip, regs, mem_ptr, mem_size):
+    esp = cpu.regs[ESP]
+    param1 = mem.read32((esp + 4) & 0xFFFFFFFF)
+    inner_obj = mem.read32((param1 + 8) & 0xFFFFFFFF)
+    inner_vtable = mem.read32(inner_obj & 0xFFFFFFFF)
+    target = mem.read32((inner_vtable + 0x70) & 0xFFFFFFFF)
+    logger.error(
+        "cpu",
+        f"[LOGPOINT] FUN_044c5ee9(param_1=0x{param1:08x}) inner_obj=0x{inner_obj:08x} "
+        f"inner_vtable=0x{inner_vtable:08x} target=[vtable+0x70]=0x{target:08x} @ 0x{eip:08x}",
+    )
+
+def _lp_jet_open_entry(eip, regs, mem_ptr, mem_size):
+    esp = cpu.regs[ESP]
+    param2 = mem.read32((esp + 8) & 0xFFFFFFFF)   # path
+    param5 = mem.read32((esp + 0x14) & 0xFFFFFFFF)  # flags
+    path = read_cstring(param2, mem) if param2 > 0x1000 else "(null)"
+    logger.error("cpu", f'[LOGPOINT] msjet35!FUN_7a86fac5(path="{path}", flags=0x{param5:08x}) @ 0x{eip:08x}')
+
+def _lp_resolved_path(eip, regs, mem_ptr, mem_size):
+    this = cpu.regs[ECX]
+    buf_ptr = mem.read32((this + 8) & 0xFFFFFFFF)
+    path = read_cstring(buf_ptr, mem) if buf_ptr > 0x1000 else "(null)"
+    logger.error("cpu", f'[LOGPOINT] msjet35!FUN_7a8707be: resolved path after GetFullPathNameA/FindFirstFileA fixup = "{path}" @ 0x{eip:08x}')
 
 cpu.add_logpoint(0x008f0a60, _lp_db_startup)
 cpu.add_logpoint(0x0448c745, _lp_reached("FUN_0448c745 (Workspace::OpenDatabase wrapper)"))
-cpu.add_logpoint(0x0448c819, _lp_opendb_precall)
 cpu.add_logpoint(0x0448c81c, _lp_opendb_postcall)
+cpu.add_logpoint(0x044c5ee9, _lp_delegate_ee9)
+cpu.add_logpoint(0x1502fac5, _lp_jet_open_entry)
+cpu.add_logpoint(0x150307be, _lp_resolved_path)
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
