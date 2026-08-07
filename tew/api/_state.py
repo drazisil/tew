@@ -413,8 +413,21 @@ class CRTState:
         drive/prefix mapping we run find_file_ci to resolve every path component
         to the actual on-disk case.  If no match exists we return the naively-
         translated path so callers can report ENOENT normally.
+
+        A path with no drive letter (e.g. "stdout.txt") is relative to the
+        guest's own current directory, exactly like real CreateFile/fopen --
+        NOT to this host Python process's cwd. Previously this fell straight
+        through to the no-mapping-matched fallback below and got returned
+        untranslated, so a bare relative fopen() landed wherever run_exe.py
+        happened to be launched from instead of under the emulated
+        filesystem root -- confirmed live 2026-08-07 via WinMain's
+        fopen("stdout.txt","wt"), which landed in the tew repo's own working
+        directory instead of ~/.emu32/MCity/stdout.txt alongside every other
+        guest file.
         """
         p = win_path.replace("\\", "/")
+        if len(p) < 2 or p[1] != ":":
+            p = self.current_directory.replace("\\", "/").rstrip("/") + "/" + p
         mappings = sorted(self.config.path_mappings.items(), key=lambda kv: -len(kv[0]))
         for win_prefix, linux_prefix in mappings:
             if p.lower().startswith(win_prefix):
