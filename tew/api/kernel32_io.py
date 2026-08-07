@@ -614,6 +614,7 @@ def register_kernel32_io_handlers(
 
     # ── CreateFile / ReadFile ─────────────────────────────────────────────────
 
+    GENERIC_READ  = 0x80000000
     GENERIC_WRITE = 0x40000000
 
     _CF_CREATE_NEW        = 1
@@ -630,9 +631,11 @@ def register_kernel32_io_handlers(
         if not name:
             logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+        also_readable = bool(access & GENERIC_READ)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
         cpu.regs[EAX] = state.open_file_handle(
-            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition)
+            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition,
+            also_readable=also_readable)
         cleanup_stdcall(cpu, memory, 28)
 
     def _create_file_w(cpu: "CPU") -> None:
@@ -641,9 +644,11 @@ def register_kernel32_io_handlers(
         disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_wide_string(name_ptr, memory)
         writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+        also_readable = bool(access & GENERIC_READ)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
         cpu.regs[EAX] = state.open_file_handle(
-            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition)
+            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition,
+            also_readable=also_readable)
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:
@@ -652,12 +657,31 @@ def register_kernel32_io_handlers(
         n_to_read   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lp_read     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
-        if not entry or entry.writable:
+        if not entry or (entry.writable and not entry.readable):
             logger.warn("fileio",
-                f'[Win32] ReadFile(handle=0x{h_file:x}) -> FALSE')
+                f'[Win32] ReadFile(handle=0x{h_file:x}) -> FALSE'
+                + (' (write-only handle)' if entry else ' (unknown handle)'))
             if lp_read:
                 memory.write32(lp_read, 0)
             cpu.regs[EAX] = 0
+        elif entry.writable and entry.readable:
+            # Opened GENERIC_READ|GENERIC_WRITE (or fopen "r+"/"w+"/"a+") --
+            # real read via the live fd, positioned at entry.position (the
+            # tracked logical offset; see FileHandleEntry.readable's own
+            # docstring for why this path exists at all).
+            pos_before = entry.position
+            data = os.pread(entry.fd, n_to_read, entry.position) if entry.fd is not None else b""
+            for i, b in enumerate(data):
+                memory.write8(lp_buf + i, b)
+            entry.position += len(data)
+            if lp_read:
+                memory.write32(lp_read, len(data))
+            cpu.regs[EAX] = 1
+            name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            logger.debug("fileio",
+                f'ReadFile({name_short} h=0x{h_file:x}) '
+                f'offset={pos_before} req={n_to_read} got={len(data)} '
+                f'pos_after={entry.position} [read+write handle]')
         else:
             pos_before = entry.position
             available = len(entry.data) - entry.position

@@ -57,6 +57,18 @@ class FileHandleEntry:
     position: int        # current read/write position
     writable: bool
     fd: Optional[int]    # host file descriptor (None = no real file backing)
+    # True when the guest's CreateFile/fopen call also requested read access
+    # (GENERIC_READ, or an fopen mode with "+") alongside write access --
+    # distinct from `writable`, which only tracks whether *write* access was
+    # requested. A real Win32 handle opened GENERIC_READ|GENERIC_WRITE
+    # supports both ReadFile and WriteFile; before this field existed, any
+    # writable=True handle always opened the real fd with os.O_WRONLY and
+    # ReadFile unconditionally rejected it regardless of what access was
+    # actually granted -- confirmed live 2026-08-07 as the real cause of
+    # msjet35.dll's "unrecognized database format" on Tmp.MDB: Jet opens it
+    # GENERIC_READ|GENERIC_WRITE (needs to read its own header back), and
+    # got a handle that could only ever write.
+    readable: bool = False
 
 
 # ── Kernel object types ───────────────────────────────────────────────────────
@@ -471,7 +483,7 @@ class CRTState:
 
     def open_file_handle(
         self, win_name: str, writable: bool, memory: "Memory", no_create_prompt: bool = False,
-        disposition: int = CREATE_ALWAYS,
+        disposition: int = CREATE_ALWAYS, also_readable: bool = False,
     ) -> int:
         """Open a file and register it in file_handle_map. Returns the handle.
 
@@ -559,7 +571,7 @@ class CRTState:
                 memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ALREADY_EXISTS))
                 return 0xFFFFFFFF
             real_path = existing_path or self.translate_windows_path(win_name)
-            flags = os.O_WRONLY
+            flags = os.O_RDWR if also_readable else os.O_WRONLY
             if disposition == CREATE_NEW:
                 # Already confirmed non-existent above; O_EXCL is still the
                 # correct real flag (atomic fail-if-exists), not O_TRUNC.
@@ -595,9 +607,12 @@ class CRTState:
                 memory.write32(TEB_BASE + 0x34, int(_win32_error_from_errno(e)))
                 return 0xFFFFFFFF
             self.file_handle_map[handle] = FileHandleEntry(
-                path=real_path, data=b"", position=0, writable=True, fd=fd
+                path=real_path, data=b"", position=0, writable=True, fd=fd, readable=also_readable
             )
-            logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [write]')
+            logger.debug(
+                "fileio",
+                f'CreateFile("{win_name}") -> 0x{handle:x} [write{"+read" if also_readable else ""}]',
+            )
             bare_name = win_name.replace("\\", "/").rsplit("/", 1)[-1].lower()
             if bare_name in ("stdout.txt", "nul"):
                 self.guest_stdout_handle = handle

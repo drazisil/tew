@@ -552,7 +552,8 @@ def register_msvcrt_handlers(
         filename = read_cstring(filename_ptr, memory)
         mode     = read_cstring(mode_ptr, memory)
         writable = "w" in mode or "a" in mode
-        handle = state.open_file_handle(filename, writable, memory)
+        also_readable = "+" in mode
+        handle = state.open_file_handle(filename, writable, memory, also_readable=also_readable)
         cpu.regs[EAX] = 0 if handle == 0xFFFFFFFF else handle
 
     stubs.register_handler("msvcrt.dll", "fopen", _fopen)
@@ -564,7 +565,8 @@ def register_msvcrt_handlers(
         filename = read_cstring(filename_ptr, memory)
         mode     = read_cstring(mode_ptr, memory)
         writable = "w" in mode or "a" in mode
-        handle = state.open_file_handle(filename, writable, memory)
+        also_readable = "+" in mode
+        handle = state.open_file_handle(filename, writable, memory, also_readable=also_readable)
         cpu.regs[EAX] = 0 if handle == 0xFFFFFFFF else handle
 
     stubs.register_handler("msvcrt.dll", "_fopen", _fopen_underscore)
@@ -584,10 +586,20 @@ def register_msvcrt_handlers(
         count  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         stream = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(stream)
-        if entry is None or entry.writable or size == 0:
+        if entry is None or (entry.writable and not entry.readable) or size == 0:
             cpu.regs[EAX] = 0
             return
         total_bytes = size * count
+        if entry.writable and entry.readable:
+            # Opened "r+"/"w+"/"a+" -- real read via the live fd, same
+            # rationale as kernel32_io.py's ReadFile fix (see
+            # FileHandleEntry.readable's docstring).
+            data = os.pread(entry.fd, total_bytes, entry.position) if entry.fd is not None else b""
+            for idx, b in enumerate(data):
+                memory.write8(ptr + idx, b)
+            entry.position += len(data)
+            cpu.regs[EAX] = len(data) // size  # full items read
+            return
         available   = len(entry.data) - entry.position
         to_read     = min(total_bytes, available)
         for idx in range(to_read):
@@ -1716,7 +1728,8 @@ def register_msvcrt_handlers(
         path     = read_cstring(path_ptr, memory)
         # O_WRONLY=1, O_RDWR=2; anything with write bit is writable
         writable = bool(oflag & 0x3)
-        handle = state.open_file_handle(path, writable, memory)
+        also_readable = (oflag & 0x3) == 2  # O_RDWR specifically
+        handle = state.open_file_handle(path, writable, memory, also_readable=also_readable)
         cpu.regs[EAX] = 0xFFFFFFFF if handle == 0xFFFFFFFF else handle  # -1 on error
 
     stubs.register_handler("msvcrt.dll", "_open", _open)
@@ -1735,8 +1748,15 @@ def register_msvcrt_handlers(
         buf   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(fd)
-        if entry is None or entry.writable:
+        if entry is None or (entry.writable and not entry.readable):
             cpu.regs[EAX] = 0xFFFFFFFF  # -1 = error
+            return
+        if entry.writable and entry.readable:
+            data = os.pread(entry.fd, count, entry.position) if entry.fd is not None else b""
+            for idx, b in enumerate(data):
+                memory.write8(buf + idx, b)
+            entry.position += len(data)
+            cpu.regs[EAX] = len(data)
             return
         available = len(entry.data) - entry.position
         to_read   = min(count, available)
