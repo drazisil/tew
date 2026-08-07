@@ -28,7 +28,7 @@ from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.pe_resources import PEResources
-from tew.api._state import EmulatorConfig
+from tew.api._state import EmulatorConfig, read_cstring
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
 from tew.logger import logger, set_thread_id_provider
@@ -345,6 +345,52 @@ def _dispatch_breakpoint() -> None:
     cpu.run(1)
     if keep and hit_eip in _bp_handlers:
         cpu.add_breakpoint(hit_eip)
+
+
+# ── TEMPORARY diagnostic logpoints (2026-08-07) ────────────────────────────────
+# Tracing WinMain's real gate sequence in MCity_d.exe to find why
+# Dbcode_CopyDataBaseToSaveData (the only place in the whole binary that
+# creates Tmp.MDB, via FeTools_CopyFile's fopen(dest,"wb")) never leaves a
+# trace in /tmp/emu.log, even though ~/.emu32/SaveData/DB/ stays empty and
+# DB_StartUpDatabase later fails an honest OPEN_EXISTING open on that exact
+# path. See memory/status.md "Current status (2026-08-07)". Each logpoint
+# fires at a real function's *entry* (args still on the raw stack, before
+# the prologue), so a bare stack read is valid. Remove once resolved.
+
+def _lp_reached(name: str):
+    def _cb(eip, regs, mem_ptr, mem_size):
+        logger.error("cpu", f"[LOGPOINT] reached {name} @ 0x{eip:08x}")
+    return _cb
+
+def _lp_copy_file(eip, regs, mem_ptr, mem_size):
+    esp = cpu.regs[ESP]
+    dest_ptr = mem.read32((esp + 4) & 0xFFFFFFFF)
+    src_ptr = mem.read32((esp + 8) & 0xFFFFFFFF)
+    dest = read_cstring(dest_ptr, mem)
+    src = read_cstring(src_ptr, mem)
+    logger.error("cpu", f'[LOGPOINT] FeTools_CopyFile(dest="{dest}", source="{src}") @ 0x{eip:08x}')
+
+def _lp_db_startup(eip, regs, mem_ptr, mem_size):
+    esp = cpu.regs[ESP]
+    path_ptr = mem.read32((esp + 4) & 0xFFFFFFFF)
+    path = read_cstring(path_ptr, mem)
+    logger.error("cpu", f'[LOGPOINT] DB_StartUpDatabase(param_1="{path}") @ 0x{eip:08x}')
+
+
+# NOTE: the Zig CPU core (cpu/src/core.zig:113, cpu/src/kernel.zig:203-206)
+# only has 8 logpoint slots -- cpu_add_logpoint silently drops registrations
+# past the 8th (no error, no exception). Confirmed live 2026-08-07: an
+# earlier 10-logpoint version of this block dropped the two most important
+# ones (FeTools_CopyFile, DB_StartUpDatabase) without any indication, which
+# looked exactly like "these addresses are never reached" until the Zig
+# source was checked. Keep this block at <=8 entries. Worth a real fix
+# later (grow the array or make registration past 8 raise loudly instead
+# of silently no-op'ing) -- not done here, out of scope for this
+# investigation.
+cpu.add_logpoint(0x008ed560, _lp_reached("Dbcode_CopyDataBaseToSaveData"))
+cpu.add_logpoint(0x0040eb1a, _lp_reached("FeTools_CopyFile thunk"))
+cpu.add_logpoint(0x005524d0, _lp_reached("FeTools_CopyFile real body"))
+cpu.add_logpoint(0x008f0a60, _lp_db_startup)
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────

@@ -214,3 +214,4 @@ tests/lsw/lsw
 except.txt
 memdump.txt
 trace*.txt
+stdout.txt

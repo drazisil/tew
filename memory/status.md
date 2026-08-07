@@ -11,7 +11,59 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-07)
+## Current status (2026-08-07, cont'd)
+
+**The `Tmp.MDB`-never-gets-created mystery below is RESOLVED, and the root
+cause was tew's own code, not a missing dependency or a guest-code
+mystery.** Traced via Ghidra (real `MCity_d.exe` decompile, `debug_clean`
+project) plus live logpoints (`cpu.add_logpoint`, capped at 8 slots --
+`cpu/src/core.zig:113`/`kernel.zig:203-206`, exceeding it silently drops
+registrations with no error, a real gap worth fixing separately, not done
+here): `Tmp.MDB` is created exactly once, early in `WinMain`, by
+`Dbcode_CopyDataBaseToSaveData` (real address `0x008ED560`) via
+`FeTools_CopyFile(dest="...DB\Tmp.MDB", source="...Online.MDB")` -- a real
+`fopen`/`fread`/`fwrite` copy loop, nothing to do with `DB_StartUpDatabase`'s
+later `OPEN_EXISTING` open at all (the "should retry with CREATE_ALWAYS"
+theory in the previous entry below was wrong, see `_state.py`'s corrected
+`open_file_handle` docstring). The actual bug: `tew/api/patch_internals.py`
+had a patch, `_winmain_check3` (dating to when this function was still
+"unnamed" in Ghidra), that unconditionally forced `EAX=1` (success) at
+`Dbcode_CopyDataBaseToSaveData`'s entry -- skipping its real body
+entirely, including the copy, every run, forever. Molly confirmed the real
+source template, `Online.MDB`, has always genuinely existed on disk
+(`~/.emu32/Data/DB/Online.mdb`, 5,883,904 bytes) -- there was never a
+reason for this patch to exist. Removed it. Confirmed live: the real copy
+now runs (`CreateFile("C:\Data\DB\Online.MDB") -> [read, 5883904 bytes]`,
+streamed via real `ReadFile`/`WriteFile`), and `~/.emu32/SaveData/DB/Tmp.MDB`
+now exists on disk, byte-identical in size to `Online.MDB`. 1045/1045 tests
+pass (one test, `TestWinmainCheck3`, removed along with the patch it tested).
+
+Also this session: added the `-CaptureStdout` command-line flag (confirmed
+via Ghidra against the real `NFSArgs_ProcessArgs` switch table, row 13) --
+`WinMain` was redirecting the game's own `stdout` to the NUL device;
+`stdout.txt` (gitignored, not committed) now captures real `puts()`/
+`printf()` output, confirmed live with `_CLayer_DetectDebugger`'s
+`"Causing exception to test for debugger...\nFound Debugger!"` lines
+landing in it exactly as predicted from the decompile.
+
+**New blocker surfaced by this fix**: `DB_StartUpDatabase` still hits the
+identical `INT3`/`cpu.fatal_halt at EIP=0x001fe012` on `tid=1012` (same EBP
+chain) even with `Tmp.MDB` now present and openable
+(`CreateFile("C:\SaveData\DB\Tmp.MDB") -> [write]`,
+`GetFileInformationByHandle` confirms the real 5.6MB size). So the raw
+file-level open now succeeds, but DAO's `Workspace::OpenDatabase` COM call
+(vtable `+0x58` on the Workspace object) still returns a NULL database.
+`except.txt`/`dblog.txt` show only the same generic `ERROR: open database
+'C:\SaveData\DB\Tmp.MDB' failed.` / `dbcode.c(1709) ERROR: open database
+failed.` text -- no more specific reason at this log level. Not yet
+investigated: real Jet-format validation, a missing dependency specific to
+opening a *populated* database (vs. the empty/auto-created `system.mdb`
+case already solved 2026-08-04), or something else entirely.
+
+**Current blocker**: diagnose why `Workspace::OpenDatabase` fails on a
+real, present, correctly-sized `Tmp.MDB`. Not yet started.
+
+## Previous status (2026-08-07)
 
 **Correction to the "no blocker identified" claim below (2026-08-06, cont'd
 again): that was wrong, or at best described a run that never actually hit

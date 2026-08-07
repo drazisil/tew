@@ -31,7 +31,6 @@ CHANNEL_DBG_PRINT = 0x004CC5B0
 FREE_DBG          = 0x009F6E20
 WINMAIN_CHECK1    = 0x0040D1D4
 WINMAIN_CHECK2    = 0x0040159B
-WINMAIN_CHECK3    = 0x008ED560
 SNDMEMI_STRUCT_PTR = 0x020DEF78
 SNDMEMI_INIT_ADDR  = 0x00A5422A
 SNDMEMI_VALIDATE_ADDR = 0x00A54107
@@ -157,14 +156,6 @@ class TestWinmainCheck2:
         cpu.regs[ESP] = STACK
         mem.write32(STACK + 4, buf)
         patched(stubs, WINMAIN_CHECK2)(cpu)
-        assert cpu.regs[EAX] == 1
-
-
-class TestWinmainCheck3:
-
-    def test_returns_nonzero(self, env):
-        cpu, mem, state, stubs = env
-        patched(stubs, WINMAIN_CHECK3)(cpu)
         assert cpu.regs[EAX] == 1
 
 

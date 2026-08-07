@@ -458,11 +458,20 @@ class CRTState:
         a failed CreateFile always read whatever unrelated call happened to
         set it last. Real "check if exists via OPEN_EXISTING, fall back to
         creating it" guest code relies on GetLastError() == ERROR_FILE_NOT_FOUND
-        to know a missing-file failure is expected/recoverable, not fatal --
-        confirmed live this was exactly why DAO/Jet's own CreateDatabase-style
-        logic for 'C:\\SaveData\\DB\\Tmp.MDB' (a file genuinely meant to be
-        created fresh, not pre-provisioned) gave up after one honest
-        OPEN_EXISTING failure instead of retrying with CREATE_ALWAYS/CREATE_NEW.
+        to know a missing-file failure is expected/recoverable, not fatal.
+
+        CORRECTED 2026-08-07: an earlier version of this docstring claimed
+        DAO/Jet was supposed to retry 'C:\\SaveData\\DB\\Tmp.MDB' with
+        CREATE_ALWAYS/CREATE_NEW after an OPEN_EXISTING miss, and that tew
+        was missing something that prevented that retry. That was wrong --
+        confirmed via Ghidra decompile of the real MCity_d.exe, Tmp.MDB is
+        never created by any OPEN_EXISTING-retry logic at all. It's created
+        once, early, by Dbcode_CopyDataBaseToSaveData (WinMain, real copy of
+        a shipped 'C:\\Data\\DB\\Online.MDB' template via FeTools_CopyFile),
+        entirely separate from DB_StartUpDatabase's later OPEN_EXISTING open.
+        The actual bug was a tew-side patch (patch_internals.py's old
+        _winmain_check3) that faked that copy's success without ever running
+        it -- removed; see changelog.md "2026-08-07".
         """
         from tew.logger import logger
         from tew.api.win32_errors import Win32Error

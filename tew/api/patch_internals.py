@@ -78,13 +78,6 @@ def patch_crt_internals(
 
     stubs.patch_address(0x0040159B, "_winmain_check2_GetVersionString", _winmain_check2)
 
-    # WinMain check 3: unnamed init fn at 0x8ed560 (via thunk 0x409cfa, called from 0x68a536).
-    # No args, cdecl, returns 0 = failure. Patch to return 1 so WinMain proceeds.
-    def _winmain_check3(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 1  # non-zero = success; cdecl no-args, caller has no ADD ESP
-
-    stubs.patch_address(0x008ED560, "_winmain_check3_init", _winmain_check3)
-
     # __chkesp (0x009f1bc0): called after every function call in MSVC debug builds to
     # verify ESP was properly restored. If ESP is wrong it calls _CrtDbgReport then INT3.
     # Caller emits: CMP EBP, ESP; CALL __chkesp at end of each function epilog.

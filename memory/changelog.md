@@ -4,6 +4,64 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-07 (cont'd) — Removed a tew-side patch that faked success on
+`Dbcode_CopyDataBaseToSaveData`, resolving the real `Tmp.MDB`-never-created
+bug; added `-CaptureStdout`
+
+**Root cause of the `Tmp.MDB` mystery from earlier today**: not a guest bug,
+not a missing Win32 handler, not a Jet/DAO quirk -- `tew/api/patch_internals.py`
+had `stubs.patch_address(0x008ED560, "_winmain_check3_init", _winmain_check3)`,
+a patch (predating this session, from back when Ghidra hadn't identified the
+function yet -- the comment called it "unnamed init fn at 0x8ed560") that
+unconditionally set `EAX=1` at the function's entry instead of letting it run.
+That address is the real `Dbcode_CopyDataBaseToSaveData` -- the only place in
+the whole binary that creates `Tmp.MDB`, via `FeTools_CopyFile` copying a
+shipped `Online.MDB` template. The patch silently skipped that copy every run,
+forever, while telling `WinMain` it had succeeded.
+
+Traced via Ghidra decompile of the real `MCity_d.exe` (`debug_clean` project)
+plus live `cpu.add_logpoint` tracing. One real wrinkle hit along the way: the
+Zig CPU core caps logpoints at 8 slots (`cpu/src/core.zig:113`,
+`cpu/src/kernel.zig:203-206`'s `cpu_add_logpoint`) and silently drops any
+registration past the 8th with no error -- an initial 10-logpoint attempt
+dropped the two most important ones and looked exactly like "these addresses
+are never reached" until the Zig source was read. Worth a real fix later
+(grow the array, or raise loudly on overflow instead of no-op'ing); not done
+here, out of scope for this investigation.
+
+Molly confirmed `Online.MDB` has always been a real, legitimately-shipped
+asset (`~/.emu32/Data/DB/Online.mdb`, 5,883,904 bytes) -- there was never a
+real reason for the patch to exist. Removed it (and its one test,
+`TestWinmainCheck3` in `test_patch_internals.py`). Confirmed live: the real
+copy now runs end-to-end -- `CreateFile("C:\Data\DB\Online.MDB") -> [read,
+5883904 bytes]`, streamed via real `ReadFile`/`WriteFile` calls -- and
+`~/.emu32/SaveData/DB/Tmp.MDB` now exists on disk, byte-identical in size.
+Corrected `_state.py`'s `open_file_handle` docstring, which had previously
+speculated (wrongly) that DAO/Jet was supposed to retry `Tmp.MDB` with
+`CREATE_ALWAYS` after an `OPEN_EXISTING` miss -- no such retry exists
+anywhere in the real binary; `Tmp.MDB`'s creation and its later `OPEN_EXISTING`
+open are two entirely separate, unrelated code paths. 1045/1045 tests pass.
+
+**This surfaced a new, different blocker**: `DB_StartUpDatabase` still halts
+identically (`INT3`/`cpu.fatal_halt at EIP=0x001fe012`, same EBP chain) even
+with `Tmp.MDB` now present and openable at the raw file level. DAO's
+`Workspace::OpenDatabase` COM call itself still returns a NULL database, for
+an as-yet-undiagnosed reason beyond "the file didn't exist." Not yet
+investigated. See status.md "Current status (2026-08-07, cont'd)".
+
+**Also this session**: added the `-CaptureStdout` command-line switch
+(`tew/api/crt_handlers.py`, `tew/api/msvcrt_handlers.py`'s `__getmainargs`
+argv, `argc` 3->4) -- confirmed via Ghidra against the real
+`NFSArgs_ProcessArgs` switch table (`DAT_0126e060` in `MCity_d.exe`, row
+index 13: `"CaptureStdout"` / `"Capture output to stdout in a file
+(STDOUT.TXT)"`). Without it, `WinMain` redirects the game's own stdout to
+the NUL device, silently discarding real `puts()`/`printf()` output.
+Confirmed live: `stdout.txt` (gitignored, not committed) now captures real
+output, including `_CLayer_DetectDebugger`'s `"Causing exception to test for
+debugger...\nFound Debugger!"` lines exactly as predicted from the decompile
+before ever running it. `tests/unit/api/test_cmdline_nomovie.py` updated for
+the 4-arg command line.
+
 ## 2026-08-07 — `CreateFile` failure logging made human-readable (no behavior change)
 
 Prompted by Molly reading `/tmp/emu.log` and finding the `system.mdb`/`Tmp.MDB`
