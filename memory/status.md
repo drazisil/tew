@@ -88,17 +88,44 @@ explaining the entire stall: a ~4.3-billion-iteration loop from a single
 signed/unsigned confusion, same bug shape as the 2026-08-06 `n=0xfffffffc`
 `memmove` bug.
 
+**Two real CPU-core CF-computation bugs found and fixed while chasing this
+(cpu submodule, `002e2db`), confirmed via new Zig regression tests, but
+each independently confirmed live NOT to be the cause -- ruled out, don't
+re-suspect either:**
+1. `updateFlagsArithW` (`core.zig`) computed CF by re-deriving it from a
+   masked operand that ADC/SBB callers had already folded a carry/borrow
+   into via width-native wrapping arithmetic (`op2 +% c`/`op2 +% b`) --
+   when the real operand was at its width's max value with an incoming
+   carry/borrow, that add silently wrapped to 0, making CF always compute
+   false in that edge case. Fixed: use `result_raw` (already correct,
+   full i64 precision) directly for CF instead.
+2. Every `SHL`/`SHR`/`SAR` call site (`doGroup2`/`doGroup2_8`) computed
+   the correct CF (the bit shifted out) and then immediately called
+   `updateFlagsLogicW`, which unconditionally clears CF -- correct for
+   `AND`/`OR`/`XOR`/`TEST`, wrong for shifts, so CF after any shift
+   instruction was always false regardless of what actually shifted out.
+   Fixed: new `updateFlagsShiftW` (same ZF/SF/PF logic, leaves CF alone).
+
+Both fixes rebuilt `libcpu.so` and passed the full 1086-test Python suite
+and the full Zig suite (including the 5 new tests written failing-first).
+A live rerun after fix #1 alone, and again after fix #2 on top, both
+still hit the exact identical stall (`channel_log.txt` frozen at
+`"fetching vehicle attribute table..."`) -- confirmed these are real but
+unrelated bugs, not this investigation's root cause.
+
 **Current blocker**: find where call #6's `EDX = 0xffffffa7` (-89 signed)
 actually comes from -- trace back through `FUN_7a848399`'s calling
-context (the real caller, confirmed above) to whatever computes this
+context (the real caller, confirmed earlier) to whatever computes this
 value, to determine whether it's a genuine tew emulation bug (most
 likely: wrong page/index metadata fed to real Jet code via `ReadFile`,
 given real Jet code is executing natively here, not a tew stub) or a
 real edge case (key genuinely not found) that real Jet handles specially
-in a way this call site doesn't. Diagnostic logpoint removed from
-`run_exe.py` (its specific question -- call count and argument values --
-is answered; reproducible, same 6 values every run per this emulator's
-determinism). Not yet fixed.
+in a way this call site doesn't. The diagnostic logpoint approach itself
+works well (see the 5-iteration refinement in changelog.md) -- next
+session should set one at `FUN_7a848399`'s own entry (runtime
+`0x15008399`) to see what ECX/EDX/stack args it receives on call #6, one
+level further up the chain from the confirmed-answered question. Not yet
+fixed.
 
 ## Previous status (2026-08-08)
 

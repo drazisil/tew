@@ -4,6 +4,53 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-08 (cont'd again x2) — Two real CPU-core CF bugs found and fixed
+(cpu submodule 002e2db), both independently ruled out as the B-tree stall's cause
+
+Molly's question ("how are we with math involving borrow?") while waiting
+on a verification run prompted auditing `updateFlagsArithW`'s CF
+computation directly, since the stall's root cause (signed/unsigned
+confusion, `EDX=-89` wrapping to ~4.3 billion) is exactly this bug class.
+Found a real bug: ADC/SBB fold their carry/borrow into `op2` via
+width-native wrapping arithmetic (`op2 +% c`/`op2 +% b`) before calling
+`updateFlagsArithW`, which then re-derives CF from that (possibly
+already-wrapped) value instead of using the correctly-computed, full
+i64-precision `result_raw` it's also given. When the real operand is at
+its width's max value with an incoming carry/borrow, the wrap rolls to 0
+and CF comes out false when it should be true. Fixed by using
+`result_raw` directly. Wrote 2 new failing-first Zig tests reproducing
+the exact edge case for both SBB and ADC.
+
+A live rerun with this fix alone still hit the identical stall. Molly's
+next question ("what about SHR? do we handle that correctly?") led to a
+second, independent, more severe bug: every `SHL`/`SHR`/`SAR` call site
+computes the correct CF (the bit shifted out) via `setFlag`, then
+immediately calls `updateFlagsLogicW` -- which unconditionally clears CF,
+correct for `AND`/`OR`/`XOR`/`TEST` but wrong for shifts. This meant CF
+after *any* shift instruction anywhere in this emulator was always false,
+regardless of what bit actually shifted out -- a systemic bug, not an
+edge case. `ROL`/`ROR`/`RCL`/`RCR` were unaffected (they never called
+`updateFlagsLogicW`, correctly, since real rotates don't touch ZF/SF/PF
+either). Fixed with a new `updateFlagsShiftW` helper (same ZF/SF/PF
+logic, leaves CF alone since the caller already set it correctly) and
+switched all 6 shift call sites (`doGroup2` + `doGroup2_8`, covering
+SHL/SHR/SAR at both 8-bit and 16/32-bit widths). 3 more new
+failing-first tests.
+
+Both fixes: full Zig suite passes, `libcpu.so` rebuilt, full 1086-test
+Python suite passes. But a live rerun after fix #2 on top of fix #1
+*also* still hit the exact identical stall (`channel_log.txt` frozen at
+`"fetching vehicle attribute table..."`, same as every prior attempt).
+Both bugs are real, confirmed, and worth having fixed regardless -- but
+neither is this investigation's actual root cause. Ruled out; don't
+re-suspect either. Full detail: memory/status.md, "Current status
+(2026-08-08, cont'd)".
+
+**Current blocker unchanged**: still need to trace where `FUN_7a848399`
+call #6's `EDX=-89` argument actually comes from. Next step: a logpoint
+at `FUN_7a848399`'s own entry (runtime `0x15008399`), one level further
+up the confirmed call chain.
+
 ## 2026-08-08 (cont'd again) — Root-caused the B-tree stall to a specific
 signed/unsigned confusion via live logpoint iteration
 
