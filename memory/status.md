@@ -71,13 +71,34 @@ tight loop signature. Decompiled in Ghidra (project `debug_clean`, program
    `0x66`-operand-size-override ambiguity that caused the 2026-08-06
    `doGroup1` flags bug. Not the cause.
 
-**Current blocker**: `0x7a848399`/`0x7a847f1d` (`msjet35.dll`, project
-`debug_clean`) -- either genuinely slow-but-bounded real Jet B-tree work
-(called repeatedly by one of 7 distinct outer callers -- `FUN_7a84dfd9`,
-`FUN_7a8481a0`, `FUN_7a84e51e`, `FUN_7a87abea`, `FUN_7a8986a0`,
-`FUN_7a8487d9`, `FUN_7a8fdc35`, none traced yet -- via `get_references_to`
-on `7a848399`), or a real emulation bug somewhere else in that call chain
-not yet found. Not yet resolved -- in progress.
+**RESOLVED (identified, root cause not yet fixed): confirmed live via a
+temporary logpoint at `FUN_7a847f1d`'s real entry (runtime `0x15007f1d`)
+that it is called only 6 total times per run** (not hundreds of thousands
+-- an earlier attempt logging its assumed caller, `FUN_7a848399`'s entry,
+got zero hits and was a red herring; the real caller, confirmed via the
+correctly-read return address on this attempt, IS `FUN_7a848399`, just
+called far less often than assumed). The real (fastcall, so ECX/EDX not
+stack) `param_2` argument across those 6 calls: `231, 111, 47, 13, 23,
+-89` -- a sequence that looks like a genuine binary search correctly
+narrowing bounds for 5 steps, then going wrong on the 6th. `-89` as
+`uint` (the decompile's own type for this variable) wraps to
+`4,294,967,207` -- and the scan loop (`FUN_7a847f1d`'s `while (uVar3 !=
+0) { ...; uVar3 -= 1; }`) just decrements toward 0 one at a time,
+explaining the entire stall: a ~4.3-billion-iteration loop from a single
+signed/unsigned confusion, same bug shape as the 2026-08-06 `n=0xfffffffc`
+`memmove` bug.
+
+**Current blocker**: find where call #6's `EDX = 0xffffffa7` (-89 signed)
+actually comes from -- trace back through `FUN_7a848399`'s calling
+context (the real caller, confirmed above) to whatever computes this
+value, to determine whether it's a genuine tew emulation bug (most
+likely: wrong page/index metadata fed to real Jet code via `ReadFile`,
+given real Jet code is executing natively here, not a tew stub) or a
+real edge case (key genuinely not found) that real Jet handles specially
+in a way this call site doesn't. Diagnostic logpoint removed from
+`run_exe.py` (its specific question -- call count and argument values --
+is answered; reproducible, same 6 values every run per this emulator's
+determinism). Not yet fixed.
 
 ## Previous status (2026-08-08)
 

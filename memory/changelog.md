@@ -4,6 +4,53 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-08 (cont'd again) — Root-caused the B-tree stall to a specific
+signed/unsigned confusion via live logpoint iteration
+
+Continued the `FUN_7a848399`/`FUN_7a847f1d` investigation with a series of
+temporary logpoints (removed from `run_exe.py` once resolved), each one
+correcting a wrong assumption from the last:
+
+1. First logged calls through `FUN_7a848399`'s entry (assumed the hot
+   caller) -- got zero hits despite the run reliably reaching the same
+   stuck point. Wrong assumption.
+2. Logged `FUN_7a847f1d`'s own entry instead, sampled every 50,000th call
+   -- also zero hits. Turned out the sampling threshold was just too high
+   relative to the real (much smaller) call count -- a measurement
+   artifact, not evidence of anything.
+3. Logged the exact hot instruction directly (`0x15007f52`, confirmed via
+   the earlier `[alive]` sample) -- 21.35 million hits in one run,
+   confirming a real near-continuous loop. But the "return address" it
+   read was garbage (a heap pointer, constant for the entire run) because
+   that address is mid-function, past the prologue's pushes -- `[ESP]`
+   there is a local variable, not a return address. Also explained #2:
+   the function can be called a small number of times with one call's
+   internal loop running for millions of iterations.
+4. Redid the entry-point log (`0x15007f1d`) with unconditional early
+   logging instead of a fixed sample threshold -- **only 6 total calls
+   per run**, confirming the theory from #3. Return addresses (correctly
+   read at true entry this time) confirmed `FUN_7a848399` genuinely is
+   the caller, just far less often than assumed in step 1.
+5. The decompiled signature is `__fastcall FUN_7a847f1d(int *param_1, int
+   param_2)` -- fastcall passes the first two args in ECX/EDX, not the
+   stack, so step 4's stack-relative "param" reads were reading garbage
+   too. Reading ECX/EDX directly: the real `param_2` across the 6 calls
+   was `231, 111, 47, 13, 23, -89` -- a sequence that looks like a
+   genuine binary search correctly narrowing bounds for 5 steps, then
+   going wrong on the 6th. `-89`, read as the decompile's own `uint` type,
+   wraps to `4,294,967,207` -- and the scan loop just decrements toward 0
+   one at a time. That's the entire stall: a ~4.3-billion-iteration loop
+   from one signed/unsigned confusion, same bug shape as the 2026-08-06
+   `n=0xfffffffc` `memmove` bug.
+
+**Current blocker**: find where call #6's `EDX=-89` actually comes from --
+trace back through `FUN_7a848399`'s calling context to whatever computes
+it. Most likely a genuine tew emulation bug (wrong page/index metadata fed
+to real, natively-executing Jet code via `ReadFile`), since this is real
+DLL code, not a tew stub -- but could also be a real "key not found" edge
+case Jet handles specially in a way this call site doesn't. Not yet fixed.
+Full detail: memory/status.md, "Current status (2026-08-08, cont'd)".
+
 ## 2026-08-08 (cont'd) — Traced the post-DB-init stall to a specific MSJET35.DLL
 B-tree function pair; ruled out sockets, mapped files, CMPSB emulation
 
