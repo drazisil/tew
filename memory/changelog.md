@@ -4,6 +4,52 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-08 (cont'd) — Traced the post-DB-init stall to a specific MSJET35.DLL
+B-tree function pair; ruled out sockets, mapped files, CMPSB emulation
+
+With today's perf/logging fixes in place, ran well past the previous
+500M-step cap (2B steps) to see what happens after `DB_StartUpDatabase`
+succeeds. Found a real stall, not just slowness: `channel_log.txt` and
+`dblog.txt` both go completely silent right after `carClassList::
+carClassList`'s "fetching vehicle attribute table..." print and
+`DB_StartUpDatabase`/`Tmp.MDB` respectively, across ~1.94 billion further
+real x86 instructions. The main thread's `wait_task_executing` polling
+loop (confirmed correctly-behaving, waiting on a `DBRequestQ` request)
+made it look deceptively "alive" the whole time via DSOUND's own
+continued ticking, but a targeted `[alive]` sample of `tid=1012`
+specifically showed it confined to a 12-byte instruction range
+(`0x7a847f4d`-`0x7a847f59` static, inside `msjet35.dll`) across 140M+
+steps -- a real tight-loop signature, not varied forward progress.
+
+Decompiled in Ghidra: `FUN_7a847f1d` is a bounded bitmap-scan helper
+(Jet free-space/page-bitmap navigation), called by `FUN_7a848399`, a real
+binary-search routine over a sorted B-tree index page (midpoint search +
+`REP CMPSB` key comparison). Both are finite by construction -- the
+binary search's `while (uVar7 != uVar8)` can't loop forever unless fed
+wrong data every iteration by something else.
+
+Ruled out three real candidate causes, each independently confirmed and
+each worth NOT re-checking next session: (1) sockets -- zero `[socket]`
+log lines in single-player mode, no networking active at all (but found
+and left unfixed a real, separate bug along the way: `wsock32_handlers.py`'s
+`_recv`/`_recvfrom` both ignore their own `flags` parameter entirely, so
+`MSG_PEEK` silently doesn't peek -- it destructively consumes data like a
+normal recv; both also have the same per-byte `write8` loop fixed
+everywhere else today, just missed since this file wasn't in the original
+sweep); (2) memory-mapped files -- `CreateFileMappingA`/`W` are registered
+as unimplemented halts, and no halt occurred, so they were never called;
+(3) the CPU core's `CMPSB` (opcode `0xA6`) emulation -- read `engine.zig`'s
+`opA6` directly, `REP`/`REPNE` break conditions match real x86 semantics
+exactly, fixed-width so no `0x66`-override ambiguity like the prior
+`doGroup1` bug.
+
+**Current blocker**: `0x7a848399`/`0x7a847f1d` in `msjet35.dll` -- not yet
+resolved. Next step: trace `FUN_7a848399`'s 7 distinct callers (via
+`get_references_to`) to determine whether the outer call volume
+legitimately explains the step count, or whether one of them is doing
+something wrong. Full detail: memory/status.md, "Current status
+(2026-08-08, cont'd)".
+
 ## 2026-08-08 — Fixed per-byte FFI memory-copy loops (real perf bug); new
 channel_log.txt; DSOUND starvation diagnosed as architectural, not a bug
 

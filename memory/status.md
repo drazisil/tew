@@ -11,7 +11,75 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-08)
+## Current status (2026-08-08, cont'd)
+
+**New real blocker found, past everything above: `tid=1012` (DB thread) genuinely
+stalls inside `MSJET35.DLL`'s own B-tree code, well past `DB_StartUpDatabase`.**
+Confirmed via a 2B-step run (up from the normal 500M cap): `channel_log.txt`
+never advances past `carClassList::carClassList`'s (`0055bb026`, real
+`MCity_d.exe` decompile) `"fetching vehicle attribute table..."` print, and
+`dblog.txt` (real Jet `-dbEnableLog` trace) never advances past
+`dbcode.c(1691) DB_StartUpDatabase` / `dbcode.c(1698) C:\SaveData\DB\Tmp.MDB`
+-- zero further lines in either file across ~1.94 billion additional real
+x86 instructions. `Final EIP` after that run: `0x0055cd53`
+(`wait_task_executing`'s own polling loop, `wait_task_executing.c` --
+correctly-behaving, waiting on `DB_GetGameConfigCarTable`'s posted
+`DBRequestQ` request, type `0x2fb`, to complete -- this is NOT the bug, the
+main thread is doing exactly what it should).
+
+A follow-up `[alive]`-heartbeat sample of `tid=1012` specifically (temporarily
+re-enabled via `LOG_LEVEL=debug LOG_CATEGORIES=startup`) confirmed the DB
+thread itself is confined to a **12-byte instruction range**
+(`0x15007f4d`-`0x15007f59` runtime, `= 0x7a847f4d`-`0x7a847f59` static via
+the established `runtime = static - 0x65840000` MSJET35.DLL delta) across
+140+ million steps -- not slow forward progress through varied code, a real
+tight loop signature. Decompiled in Ghidra (project `debug_clean`, program
+`msjet35.dll`):
+- `FUN_7a847f1d` (the address itself) -- a bounded bitmap-scan helper
+  (finds the nearest set bit at or below a given bit position via a
+  byte-mask/index lookup table), used for Jet page/free-space bitmap
+  navigation. Finite by construction (decrements toward 0).
+- `FUN_7a848399` -- calls the above; a real binary-search routine over what
+  looks like a sorted B-tree index page (midpoint search via the bitmap
+  helper, then a `REP CMPSE`/`CMPSB.REPE` byte-string key comparison at
+  `0x7a848516`, narrowing `[uVar8, uVar2]` each iteration). The
+  `do { ... } while (uVar7 != uVar8)` loop is bounded by construction
+  (standard low/high convergence) -- it cannot loop forever unless fed
+  wrong data by something else every iteration.
+
+**Ruled out this session, do not re-investigate from scratch**:
+1. **Sockets/wsock32**: zero `[socket]`-category log lines across a full
+   default-category run -- no networking activity at all in this
+   single-player (`DBT_GO_SINGLERACE`) scenario. (Real, separate bug found
+   and NOT yet fixed along the way: `wsock32_handlers.py`'s `_recv`/
+   `_recvfrom` both declare a `flags` parameter in their own docstrings but
+   never actually read it off the stack -- `MSG_PEEK` is silently ignored,
+   so a real peek-based protocol would have its data destructively
+   consumed instead of left in the socket buffer. Both also have the same
+   per-byte `write8`-loop anti-pattern fixed everywhere else today. Real,
+   scoped, not yet fixed -- queued below, independent of the current
+   blocker.)
+2. **Memory-mapped files**: `CreateFileMappingA`/`W` are registered as
+   `_halt(...)` (unimplemented) in `kernel32_io.py` -- since no fatal halt
+   occurred, they were never called. Jet is reading real page data it
+   already fetched via ordinary `ReadFile` (the same path fixed and
+   verified extensively earlier today), not a memory-mapped view.
+3. **`CMPSB` (opcode `0xA6`) instruction emulation**: read `cpu/src/
+   engine.zig`'s `opA6` -- `REP`/`REPE` correctly breaks on `!ZF`
+   (mismatch), `REPNE` correctly breaks on `ZF` (match), matches real
+   x86 semantics exactly. Fixed-width (`.w8`), so it doesn't have the
+   `0x66`-operand-size-override ambiguity that caused the 2026-08-06
+   `doGroup1` flags bug. Not the cause.
+
+**Current blocker**: `0x7a848399`/`0x7a847f1d` (`msjet35.dll`, project
+`debug_clean`) -- either genuinely slow-but-bounded real Jet B-tree work
+(called repeatedly by one of 7 distinct outer callers -- `FUN_7a84dfd9`,
+`FUN_7a8481a0`, `FUN_7a84e51e`, `FUN_7a87abea`, `FUN_7a8986a0`,
+`FUN_7a8487d9`, `FUN_7a8fdc35`, none traced yet -- via `get_references_to`
+on `7a848399`), or a real emulation bug somewhere else in that call chain
+not yet found. Not yet resolved -- in progress.
+
+## Previous status (2026-08-08)
 
 **Real performance investigation, prompted by Molly noticing the run "used
 to be fast" and the DSOUND serve thread missing its 10ms deadline on
