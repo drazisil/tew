@@ -390,7 +390,23 @@ if _HISTORY_CAPTURE_ENABLED:
 
 logger.info("startup", "=== Starting Emulation ===")
 
-MAX_STEPS = 500_000_000
+# TEMPORARY (2026-08-07): diagnostic-only cProfile hook, gated behind
+# TEW_PROFILE so it's a no-op unless explicitly requested. Molly asked to
+# find out why the run is dragging (DSOUND serve thread missing its 10ms
+# deadline by 30-100x, every single tick). `-m cProfile -o file` doesn't
+# work here: this script deliberately calls os._exit() at the very end
+# (see that line's own comment -- avoids a real NVIDIA-driver atexit
+# segfault), which is a hard C-level exit that skips normal Python
+# shutdown/atexit entirely, so cProfile never gets a chance to dump stats.
+# Dumping explicitly, synchronously, right before that os._exit() call
+# sidesteps the problem. Remove this block once the investigation is done.
+import cProfile as _cProfile
+_TEW_PROFILE = os.environ.get("TEW_PROFILE")
+_profiler = _cProfile.Profile() if _TEW_PROFILE else None
+if _profiler is not None:
+    _profiler.enable()
+
+MAX_STEPS = int(os.environ.get("TEW_MAX_STEPS", "500000000"))
 # Steps per batch (also the virtual-clock tick interval).
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
 # from the normal SleepEx path.  Advancing the clock here lets due callbacks fire.
@@ -544,7 +560,7 @@ try:
             if 0x00200000 <= eip_now < 0x00220000:
                 recent = win32_handlers._call_log[-8:]
                 stub_note = f" calls={recent}"
-            logger.info(
+            logger.debug(
                 "startup",
                 f"[alive] step={step_count:,} EIP=0x{eip_now:08x}{stub_note}"
                 f" vtime={crt_state.virtual_ticks_ms}ms",
@@ -663,4 +679,10 @@ crt_state.window_manager.shutdown()
 # exit()/__run_exit_handlers entirely avoids the whole class of driver-atexit
 # bugs. logger.py flushes every line as it's printed, so no output is lost.
 sys.stdout.flush()
+
+if _profiler is not None:
+    _profiler.disable()
+    _profiler.dump_stats(_TEW_PROFILE)
+    logger.info("startup", f"[profile] cProfile stats dumped to {_TEW_PROFILE}")
+
 os._exit(1 if cpu.faulted else 0)

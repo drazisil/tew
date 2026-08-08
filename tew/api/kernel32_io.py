@@ -160,10 +160,7 @@ def register_kernel32_io_handlers(
                     f'[Win32] WriteFile(handle=0x{h_file:x}, "{entry.path}") -> FALSE (no fd)')
             cpu.regs[EAX] = 0
         else:
-            buf = bytearray(n_bytes)
-            for i in range(n_bytes):
-                buf[i] = memory.read8((lp_buf + i) & 0xFFFFFFFF)
-            os.write(entry.fd, bytes(buf))
+            os.write(entry.fd, memory.read_bytes(lp_buf & 0xFFFFFFFF, n_bytes))
             entry.position += n_bytes
             if lp_written:
                 memory.write32(lp_written, n_bytes)
@@ -679,8 +676,8 @@ def register_kernel32_io_handlers(
             # docstring for why this path exists at all).
             pos_before = entry.position
             data = os.pread(entry.fd, n_to_read, entry.position) if entry.fd is not None else b""
-            for i, b in enumerate(data):
-                memory.write8(lp_buf + i, b)
+            if data:
+                memory.load(lp_buf & 0xFFFFFFFF, data)
             entry.position += len(data)
             if lp_read:
                 memory.write32(lp_read, len(data))
@@ -694,8 +691,8 @@ def register_kernel32_io_handlers(
             pos_before = entry.position
             available = len(entry.data) - entry.position
             to_read = min(n_to_read, available)
-            for i in range(to_read):
-                memory.write8(lp_buf + i, entry.data[entry.position + i])
+            if to_read > 0:
+                memory.load(lp_buf & 0xFFFFFFFF, entry.data[entry.position:entry.position + to_read])
             entry.position += to_read
             if lp_read:
                 memory.write32(lp_read, to_read)
@@ -1733,7 +1730,14 @@ def register_kernel32_io_handlers(
                 if ch == 0:
                     break
                 s.append(chr(ch))
-            logger.info("handlers", f"[OutputDebugString] {''.join(s)}")
+            text = "".join(s)
+            logger.info("handlers", f"[OutputDebugString] {text}")
+            # Also lands in the real stdout.txt stream (guest_stdout_handle,
+            # same sink Channel_SystemPrint uses -- Molly's request
+            # 2026-08-07) rather than only tew's own /tmp/emu.log, since
+            # OutputDebugString is real diagnostic text a debugger would
+            # normally show and is worth having on disk the same way.
+            state.write_guest_stdout(text if text.endswith("\n") else text + "\n")
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "OutputDebugStringA", _output_debug_string_a)

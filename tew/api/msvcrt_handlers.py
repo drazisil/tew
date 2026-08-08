@@ -514,8 +514,8 @@ def register_msvcrt_handlers(
         new_ptr  = state.simple_alloc(size)
         old_size = state.heap_alloc_sizes.get(ptr, 0)
         copy_len = min(old_size, size)
-        for i in range(copy_len):
-            memory.write8((new_ptr + i) & 0xFFFFFFFF, memory.read8((ptr + i) & 0xFFFFFFFF))
+        if copy_len > 0:
+            memory.load(new_ptr & 0xFFFFFFFF, memory.read_bytes(ptr & 0xFFFFFFFF, copy_len))
         cpu.regs[EAX] = new_ptr
 
     stubs.register_handler("msvcrt.dll", "realloc", _realloc)
@@ -595,15 +595,15 @@ def register_msvcrt_handlers(
             # rationale as kernel32_io.py's ReadFile fix (see
             # FileHandleEntry.readable's docstring).
             data = os.pread(entry.fd, total_bytes, entry.position) if entry.fd is not None else b""
-            for idx, b in enumerate(data):
-                memory.write8(ptr + idx, b)
+            if data:
+                memory.load(ptr & 0xFFFFFFFF, data)
             entry.position += len(data)
             cpu.regs[EAX] = len(data) // size  # full items read
             return
         available   = len(entry.data) - entry.position
         to_read     = min(total_bytes, available)
-        for idx in range(to_read):
-            memory.write8(ptr + idx, entry.data[entry.position + idx])
+        if to_read > 0:
+            memory.load(ptr & 0xFFFFFFFF, entry.data[entry.position:entry.position + to_read])
         entry.position += to_read
         cpu.regs[EAX] = to_read // size  # full items read
 
@@ -619,7 +619,7 @@ def register_msvcrt_handlers(
             cpu.regs[EAX] = 0
             return
         total = size * count
-        data  = bytes(memory.read8((lp_ptr + i) & 0xFFFFFFFF) for i in range(total))
+        data  = memory.read_bytes(lp_ptr & 0xFFFFFFFF, total)
         entry = state.file_handle_map.get(stream)
         if entry is not None and entry.writable and entry.fd >= 0:
             import os as _os
@@ -1753,15 +1753,15 @@ def register_msvcrt_handlers(
             return
         if entry.writable and entry.readable:
             data = os.pread(entry.fd, count, entry.position) if entry.fd is not None else b""
-            for idx, b in enumerate(data):
-                memory.write8(buf + idx, b)
+            if data:
+                memory.load(buf & 0xFFFFFFFF, data)
             entry.position += len(data)
             cpu.regs[EAX] = len(data)
             return
         available = len(entry.data) - entry.position
         to_read   = min(count, available)
-        for idx in range(to_read):
-            memory.write8(buf + idx, entry.data[entry.position + idx])
+        if to_read > 0:
+            memory.load(buf & 0xFFFFFFFF, entry.data[entry.position:entry.position + to_read])
         entry.position += to_read
         cpu.regs[EAX] = to_read
 
@@ -1772,7 +1772,7 @@ def register_msvcrt_handlers(
         fd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         buf   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        data  = bytes(memory.read8((buf + i) & 0xFFFFFFFF) for i in range(count))
+        data  = memory.read_bytes(buf & 0xFFFFFFFF, count)
         entry = state.file_handle_map.get(fd)
         if entry is not None and entry.writable and entry.fd is not None:
             n = os.write(entry.fd, data)

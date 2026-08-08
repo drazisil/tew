@@ -8,9 +8,12 @@ side effect for real.
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
-from tew.api._state import CRTState, FileHandleEntry
+from tew.api._state import CRTState, EmulatorConfig, FileHandleEntry
 from tew.api.patch_internals import patch_crt_internals
 from tew.api.win32_handlers import (
     Win32Handlers,
@@ -55,9 +58,17 @@ class _FakeCPU:
 
 
 @pytest.fixture
-def env():
+def env(tmp_path):
+    # Scoped path mapping (not the real ~/.emu32/ tree) -- Channel_DebugPrint's
+    # patch now always writes a real host file (channel_log.txt, see
+    # write_channel_log/_state.py), so this fixture must not resolve to real
+    # user paths as an unintended side effect of running the test suite.
+    config = EmulatorConfig(
+        path_mappings={"c:/": str(tmp_path) + "/"},
+        interactive_on_missing_file=False,
+    )
     mem   = Memory(MEM_SIZE)
-    state = CRTState()
+    state = CRTState(config=config)
     stubs = Win32Handlers(mem)
     patch_crt_internals(stubs, mem, state)
     cpu = _FakeCPU()
@@ -315,6 +326,26 @@ class TestCrtDbgReport:
         assert any("val: (null)" in line for line in captured_logs)
 
 
+@pytest.fixture(autouse=True)
+def _channel_debug_level(request):
+    """Channel_DebugPrint/Channel_SystemPrint log at DEBUG (2026-08-07,
+    demoted from WARN/INFO -- real per-track/per-asset chatter that
+    drowned out run_exe.py's [alive] progress heartbeat under default
+    LOG_LEVEL=info). Autouse, but scoped to just the two classes that
+    exercise these functions' formatting logic (via a marker below) --
+    everything else in this file keeps the module's real default level.
+    """
+    if request.cls is None or request.cls.__name__ not in (
+        "TestChannelDebugPrint", "TestChannelSystemPrint",
+    ):
+        yield
+        return
+    saved_level = logger_module._active_level
+    logger_module.configure_logger(level="debug")
+    yield
+    logger_module._active_level = saved_level
+
+
 # ── Channel_DebugPrint ─────────────────────────────────────────────────────────
 
 class TestChannelDebugPrint:
@@ -462,20 +493,29 @@ def channel_category_filtered_out():
 
 
 class TestChannelPrintSkipsWorkWhenFiltered:
-    def test_debug_print_does_not_format_or_log_when_channel_filtered(
+    def test_debug_print_skips_tew_log_but_still_writes_channel_log_when_filtered(
         self, env, captured_logs, channel_category_filtered_out,
     ):
+        """channel_log.txt (2026-08-08, Molly: "so we can tell it from the
+        other 'normal' stuff") is a real host file Channel_DebugPrint
+        writes to unconditionally -- unlike tew's own /tmp/emu.log, it is
+        NOT subject to LOG_LEVEL/LOG_CATEGORIES filtering, so it must still
+        get the formatted message even while tew's own log stays silent."""
         cpu, mem, state, stubs = env
         cpu.regs[ESP] = STACK
         fmt_ptr = 0x300000
-        write_cstring(mem, fmt_ptr, "should not be formatted")
+        write_cstring(mem, fmt_ptr, "still reaches channel_log.txt")
         mem.write32(STACK + 4, 0)
         mem.write32(STACK + 8, 0)
         mem.write32(STACK + 12, fmt_ptr)
 
-        patched(stubs, CHANNEL_DBG_PRINT)(cpu)  # must not raise, must not format
+        patched(stubs, CHANNEL_DBG_PRINT)(cpu)  # must not raise
 
         assert captured_logs == []
+        assert state.channel_log_fd is not None
+        os.fsync(state.channel_log_fd)
+        host_path = state.translate_windows_path("channel_log.txt")
+        assert "still reaches channel_log.txt" in Path(host_path).read_text()
 
     def test_system_print_skips_when_filtered_and_no_stdout_handle(
         self, env, captured_logs, channel_category_filtered_out,

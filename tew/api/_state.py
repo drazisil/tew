@@ -391,6 +391,18 @@ class CRTState:
         # game's own unrendered on-screen "SYSTEM" debug console.
         self.guest_stdout_handle: Optional[int] = None
 
+        # ── Channel_DebugPrint host-side log file ────────────────────────────
+        # channel_log.txt -- a real host file Channel_DebugPrint's patch
+        # (patch_internals.py) writes to unconditionally, independent of
+        # LOG_LEVEL/LOG_CATEGORIES filtering. Deliberately a *separate* file
+        # from guest_stdout_handle's stream (Molly's request 2026-08-08:
+        # "so we can tell it from the other 'normal' stuff") -- unlike
+        # guest_stdout_handle, there's no guest-visible Win32 handle behind
+        # this at all (the real game routes Channel_DebugPrint to its own
+        # unrendered on-screen debug console, never to real stdout), so this
+        # is opened directly by tew itself, lazily, on first write.
+        self.channel_log_fd: Optional[int] = None
+
         # ── Byte-range file locks (LockFile/UnlockFile) ─────────────────────
         # Keyed by real host path (not handle -- real Win32 byte-range locks
         # are visible across every handle open on the same file, including
@@ -423,6 +435,39 @@ class CRTState:
     @virtual_ticks_ms.setter
     def virtual_ticks_ms(self, val: int) -> None:
         self.scheduler.virtual_ticks_ms = val
+
+    def write_guest_stdout(self, text: str) -> None:
+        """Write real text into whatever real host file guest_stdout_handle
+        currently points at (stdout.txt / NUL, see the field's docstring
+        above) -- a no-op if the guest hasn't opened it yet, or opened it
+        read-only, or already closed it. Shared by every internal patch/
+        handler that wants its output to land in the same real stream real
+        puts()/printf() output does, not just tew's own /tmp/emu.log --
+        Channel_SystemPrint (patch_internals.py) and OutputDebugStringA/W
+        (kernel32_io.py) both use this rather than each reimplementing the
+        same os.write dance."""
+        if self.guest_stdout_handle is None:
+            return
+        entry = self.file_handle_map.get(self.guest_stdout_handle)
+        if entry is None or not entry.writable or entry.fd < 0:
+            return
+        data = text.encode("latin-1", errors="replace")
+        os.write(entry.fd, data)
+
+    def write_channel_log(self, text: str) -> None:
+        """Write real text to channel_log.txt (see channel_log_fd's
+        docstring above) -- opened lazily, on this first call, at the same
+        host directory stdout.txt resolves to (translate_windows_path on
+        "channel_log.txt", a driveless name anchored to current_directory,
+        same as stdout.txt's own resolution) so both land next to each
+        other for easy comparison, but as two genuinely separate files."""
+        if self.channel_log_fd is None:
+            host_path = self.translate_windows_path("channel_log.txt")
+            dirname = os.path.dirname(host_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            self.channel_log_fd = os.open(host_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.write(self.channel_log_fd, text.encode("latin-1", errors="replace"))
 
     # ── Heap allocation ───────────────────────────────────────────────────────
 
@@ -672,24 +717,46 @@ class CRTState:
 # ── String helpers (take memory as arg, no state needed) ─────────────────────
 
 def read_cstring(ptr: int, memory: "Memory", max_len: int = 260) -> str:
-    """Read a null-terminated ANSI string from emulator memory."""
-    s = []
-    for i in range(max_len):
-        ch = memory.read8(ptr + i)
-        if ch == 0:
-            break
-        s.append(chr(ch))
-    return "".join(s)
+    """Read a null-terminated ANSI string from emulator memory.
+
+    Reads the whole (up to max_len) span in one bulk call and scans for
+    the terminator in Python, instead of one memory.read8() FFI call per
+    character -- confirmed via cProfile 2026-08-07 this was among the
+    hottest functions in the entire codebase (called from dozens of sites:
+    every %s vararg substitution, every filename/registry-value read,
+    getenv, etc. -- 210,993 calls / 6.97s cumulative time in one 300M-step
+    profiled run, the top identified drag on real throughput alongside
+    WriteFile/ReadFile's now-fixed per-byte loops). Clamped to the
+    actually-addressable span so a genuinely invalid starting pointer still
+    raises the same bounds error read8() would -- callers rely on that to
+    catch unreadable pointers (see e.g. test_patch_internals.py's
+    "unreadable format pointer" cases).
+    """
+    avail = memory.size - ptr
+    if avail <= 0:
+        memory.read8(ptr)  # raises the real bounds error
+    data = memory.read_bytes(ptr, min(max_len, avail))
+    nul = data.find(b"\x00")
+    if nul != -1:
+        data = data[:nul]
+    return data.decode("latin-1")
 
 
 def read_wide_string(ptr: int, memory: "Memory", max_len: int = 260) -> str:
-    """Read a null-terminated UTF-16LE string from emulator memory."""
-    s = []
-    for i in range(max_len):
-        lo = memory.read8(ptr + i * 2)
-        hi = memory.read8(ptr + i * 2 + 1)
-        code = lo | (hi << 8)
-        if code == 0:
+    """Read a null-terminated UTF-16LE string from emulator memory.
+
+    Same bulk-read rationale as read_cstring above -- one FFI call instead
+    of up to 2*max_len. The null-terminator scan still walks the (already
+    local, no-FFI) bytes in 2-byte steps rather than using bytes.find(),
+    since a lone 00 byte at an odd offset would be a false match otherwise.
+    """
+    avail = memory.size - ptr
+    if avail <= 0:
+        memory.read8(ptr)  # raises the real bounds error
+    n_chars = min(max_len, avail // 2)
+    data = memory.read_bytes(ptr, n_chars * 2)
+    for i in range(0, len(data) - 1, 2):
+        if data[i] == 0 and data[i + 1] == 0:
+            data = data[:i]
             break
-        s.append(chr(code))
-    return "".join(s)
+    return data.decode("utf-16-le")

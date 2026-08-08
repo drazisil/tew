@@ -11,7 +11,102 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-07, cont'd again x6)
+## Current status (2026-08-08)
+
+**Real performance investigation, prompted by Molly noticing the run "used
+to be fast" and the DSOUND serve thread missing its 10ms deadline on
+every single tick.** Used cProfile (new, permanent, opt-in-only tooling --
+`TEW_PROFILE=<path>` env var wraps the whole run, `TEW_MAX_STEPS=<n>`
+overrides the 500M-step cap; both no-ops unless set, see run_exe.py right
+after `cpu = CPU(mem)` and right before the final `os._exit()` -- dumping
+stats explicitly before that call was required since os._exit() skips
+normal Python shutdown/atexit, which `-m cProfile -o file` relies on).
+
+Found and fixed a real, confirmed bug class: several hot Win32/CRT
+handlers copied buffers between guest and host memory **one byte at a
+time via individual `memory.read8()`/`write8()` FFI calls**, instead of
+one bulk call. Confirmed via profile: `WriteFile`/`ReadFile` alone
+accounted for 58% of total runtime in an early profiled window (6.3M
+individual read8/write8 calls from just 2,927 handler calls). Fixed by
+adding `ZigMemory.read_bytes(addr, n) -> bytes` (`memory_zig.py`, reads
+directly from the shared backing bytearray, no FFI-per-byte) alongside the
+existing bulk `load()`, and using both in: `kernel32_io.py`'s
+`WriteFile`/`ReadFile`; `msvcrt_handlers.py`'s `fread`/`fwrite`/`_read`/
+`_write`/`realloc`; `kernel32_memory.py`'s `HeapReAlloc`; and, highest-
+leverage of all, `_state.py`'s `read_cstring`/`read_wide_string` (called
+from dozens of sites project-wide -- every `%s` vararg substitution, every
+filename/registry-value read, `getenv`, etc. -- 210,993 calls / 6.97s
+cumulative in one 300M-step profile, dropped to 0.91s after the fix, a
+7.6x reduction). Confirmed live: a real (unprofiled) 500M-step run dropped
+from 143-145.6s to **124.5s** wall-clock (~14-17% faster), and total
+Python function calls in an equal-sized profiled window dropped 37%
+(36.2M -> 22.6M). 1086/1086 tests pass; new `test_output_debug_string.py`
+plus updated `TestChannelPrintSkipsWorkWhenFiltered` in
+`test_patch_internals.py`.
+
+**The DSOUND serve-thread starvation itself is NOT fixed by any of the
+above, and confirmed NOT a regression from these changes** -- re-profiled
+after the fix, 100% of serve calls (188/188, then 1143/1144 in a longer
+2B-step run) still report a hold-off, same 300-800ms+ magnitude as before.
+Diagnosis: this is architectural, not a bug. The `[DSOUND (serve)]`
+"timer held off" message is the *game's own* real-wall-clock
+(`GetTickCount`-based) check on its audio thread; tew's scheduler is a
+single-core, cooperative round-robin across all emulated guest threads
+(`preempt_slice`, `scheduler.py`) -- real Windows gives the audio thread
+genuine OS-level preemption to wake every 10ms regardless of what other
+threads are doing, but here the audio thread only runs when the
+round-robin cycles back to it, after every other thread's full batch of
+real x86 instructions has executed. Closing this gap would need either
+CPU-emulation throughput far beyond what's realistic for a software x86
+core, or a scheduler rebuilt around real wall-clock deadlines instead of
+batch round-robin -- a real architectural change, not attempted here.
+
+**Two logging changes, both confirmed live and both now have real
+consequences for run legibility -- keep in mind for future sessions**:
+`run_exe.py`'s `[alive]` progress heartbeat and `patch_internals.py`'s
+`Channel_DebugPrint`/`Channel_SystemPrint` were both demoted `INFO/WARN`
+-> `DEBUG` earlier today (real, confirmed lag from unconditional
+formatting-and-logging at real gameplay volume) -- but this means a run
+at default `LOG_LEVEL=info` can now go 400+ seconds of real time with
+**zero** log lines during a long, entirely healthy stretch, which reads
+identically to a genuine hang from the log alone (this happened live
+during today's session: a 2B-step run's log jumped from 56s to 464s with
+nothing in between, and had to be verified as healthy via `ps`/timing
+math rather than the log itself). Not yet decided/fixed: whether `[alive]`
+should move back to INFO (or a coarser interval) by default so long runs
+stay legible without needing `LOG_LEVEL=debug LOG_CATEGORIES=startup` to
+confirm they're not stuck.
+
+**New: `channel_log.txt`** (Molly, 2026-08-08: "so we can tell it from
+the other 'normal' stuff") -- `Channel_DebugPrint`'s formatted output now
+always writes to a real, dedicated host file (`CRTState.channel_log_fd`/
+`write_channel_log`, `_state.py`, resolved next to `stdout.txt` via the
+same `translate_windows_path` anchoring), unconditionally, independent of
+`LOG_LEVEL`/`LOG_CATEGORIES` filtering -- deliberately kept separate from
+`stdout.txt` (which only `Channel_SystemPrint`/`OutputDebugStringA` write
+to, via the pre-existing `write_guest_stdout`). Confirmed live:
+`~/.emu32/MCity/channel_log.txt` created fresh each run with real
+`Track.c`/`dbcode.c` content.
+
+**Also confirmed live, real but unrelated to the above, not yet fixed**:
+`[DSOUND (create)] Resorted to using desktop window handle` (visible in
+`stdout.txt`) is a real gap, not expected real-Windows behavior --
+`user32_handlers.py`'s `GetActiveWindow`/`GetForegroundWindow` both
+unconditionally return NULL regardless of whether a real window was
+created and is active, so the game's own DirectSound-init fallback logic
+(try `GetActiveWindow()`, fall back to `GetDesktopWindow()` if NULL)
+always takes the fallback branch. Harmless (DirectSound still functions
+against the desktop HWND) but not real-hardware-accurate. Not fixed this
+session -- a real, scoped, next-session-sized fix if worth doing.
+
+**Current blocker**: none identified -- the DSOUND starvation is now
+understood as architectural rather than an open bug, and no other
+blocker has surfaced. Candidates for a future session: (a) decide whether
+to restore `[alive]` to INFO for run legibility, (b) fix
+`GetActiveWindow`/`GetForegroundWindow` to track real window state, (c) a
+longer/uncapped soak run now that per-step overhead is meaningfully lower.
+
+## Previous status (2026-08-07, cont'd again x6)
 
 **The `nfile.c` "FILE SYSTEM NOT INITIALIZED" blocker queued below is
 RESOLVED, and it was never a real bug at all -- it was this session's own

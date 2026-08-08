@@ -148,11 +148,10 @@ def register_kernel32_memory_handlers(
         new_addr = state.simple_alloc(new_size)
         state.heap_alloc_owner[new_addr] = h_heap
         copy_len = min(old_size, new_size)
-        for i in range(copy_len):
-            memory.write8(new_addr + i, memory.read8(lp_mem + i))
+        if copy_len > 0:
+            memory.load(new_addr, memory.read_bytes(lp_mem & 0xFFFFFFFF, copy_len))
         if (dw_flags & _HEAP_ZERO_MEMORY) and new_size > old_size:
-            for i in range(old_size, new_size):
-                memory.write8(new_addr + i, 0)
+            memory.load(new_addr + old_size, bytes(new_size - old_size))
         if lp_mem != 0:
             state.heap_alloc_sizes.pop(lp_mem, None)
             state.heap_alloc_owner.pop(lp_mem, None)

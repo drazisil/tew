@@ -22,7 +22,7 @@ from tew.api.win32_handlers import (
 )
 from tew.api._state import CRTState, read_cstring
 from tew.api.msvcrt_handlers import _sprintf_format
-from tew.logger import logger, INFO, WARN
+from tew.logger import logger, DEBUG
 
 
 def patch_crt_internals(
@@ -171,21 +171,16 @@ def patch_crt_internals(
     # listeners (FUN_004ce660) gated on a runtime debug-console-enabled
     # flag (DAT_013e0518/DAT_013e051c) -- those listeners target the game's
     # own (unrendered) debug console, so nothing reaches tew's log today
-    # regardless of that gate. We bypass the real routing entirely and just
-    # always surface the formatted message at WARN -- same "CRT-internal
-    # patch, not worth replicating the real plumbing" rationale as
-    # _CrtDbgReport above.
+    # regardless of that gate. We bypass the real routing entirely: the
+    # formatted message always goes to channel_log.txt (state.
+    # write_channel_log, _state.py) -- a real host file, deliberately
+    # separate from stdout.txt (Molly's request 2026-08-08: "so we can
+    # tell it from the other 'normal' stuff") -- and, independently, at
+    # DEBUG to tew's own log (was WARN; confirmed live 2026-08-07 this is
+    # real per-track/per-asset chatter, e.g. dozens of Track.c(444) lines
+    # per run, not warning-worthy, and drowned out the [alive] progress
+    # signal under default LOG_LEVEL=info).
     def _channel_debug_print(cpu: "CPU") -> None:
-        # Skip the whole vararg-formatting walk when nothing would use the
-        # result -- this patch's own logging is its only output (no stdout
-        # redirect like Channel_SystemPrint below), so a filtered-out
-        # "channel" category means genuinely wasted work on every single
-        # call. Confirmed live 2026-08-07 this function fires extremely
-        # often once execution gets deep into real gameplay (Molly: "too
-        # laggy" once channel logging started actually producing output).
-        if not logger.is_active(WARN, "channel"):
-            return
-
         sp        = cpu.regs[ESP]
         user      = memory.read32((sp + 4)  & 0xFFFFFFFF)
         channel   = memory.read32((sp + 8)  & 0xFFFFFFFF)
@@ -223,7 +218,8 @@ def patch_crt_internals(
                 i += 1
         msg = "".join(out)
 
-        logger.warn("channel", f"Channel_DebugPrint(user={user}, channel={channel}) — {msg}")
+        state.write_channel_log(f"Channel_DebugPrint(user={user}, channel={channel}) — {msg}\n")
+        logger.debug("channel", f"Channel_DebugPrint(user={user}, channel={channel}) — {msg}")
         # cdecl variadic -- no stack cleanup by callee
 
     stubs.patch_address(0x004CC5B0, "Channel_DebugPrint", _channel_debug_print)
@@ -254,7 +250,8 @@ def patch_crt_internals(
         # it -- same rationale as _channel_debug_print above, but this one
         # also feeds the real stdout redirect (guest_stdout_handle), so
         # that has to stay live even with "channel" logging filtered out.
-        if not logger.is_active(INFO, "channel") and state.guest_stdout_handle is None:
+        # Emitted at DEBUG (was INFO), same reasoning as Channel_DebugPrint.
+        if not logger.is_active(DEBUG, "channel") and state.guest_stdout_handle is None:
             return
 
         sp      = cpu.regs[ESP]
@@ -269,16 +266,8 @@ def patch_crt_internals(
             return v
 
         msg = _sprintf_format(fmt, get_arg, memory)
-        logger.info("channel", f"Channel_SystemPrint — {msg.rstrip(chr(10) + chr(13))}")
-
-        entry = None
-        if state.guest_stdout_handle is not None:
-            entry = state.file_handle_map.get(state.guest_stdout_handle)
-        if entry is not None and entry.writable and entry.fd >= 0:
-            import os as _os
-            data = msg.encode("latin-1", errors="replace")
-            _os.write(entry.fd, data)
-            entry.position += len(data)
+        logger.debug("channel", f"Channel_SystemPrint — {msg.rstrip(chr(10) + chr(13))}")
+        state.write_guest_stdout(msg)
         # cdecl variadic -- no stack cleanup by callee
 
     stubs.patch_address(0x004CBDE0, "Channel_SystemPrint", _channel_system_print)

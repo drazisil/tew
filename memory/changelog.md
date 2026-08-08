@@ -4,6 +4,93 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-08 — Fixed per-byte FFI memory-copy loops (real perf bug); new
+channel_log.txt; DSOUND starvation diagnosed as architectural, not a bug
+
+Molly noticed the emulator "used to be fast" and asked to find out why,
+tying it to the DSOUND serve thread missing its 10ms callback deadline on
+every single tick (100% of calls in stdout.txt reporting a 300-800ms+
+hold-off). Added permanent, opt-in-only cProfile tooling to investigate
+(`TEW_PROFILE=<path>` / `TEW_MAX_STEPS=<n>` env vars, run_exe.py -- stats
+are dumped explicitly right before `os._exit()` rather than relying on
+`-m cProfile`'s own exit handling, since `os._exit()` deliberately skips
+normal Python shutdown to dodge a real NVIDIA-driver atexit segfault, and
+that would otherwise swallow the profile dump too).
+
+Found a real, confirmed bug class via the profile: several hot handlers
+copied buffers between guest and host memory one byte at a time, via
+individual `memory.read8()`/`write8()` FFI calls in a Python loop, instead
+of one bulk call. `WriteFile`/`ReadFile` alone were 58% of total runtime
+in an early profiled window (6.3M read8/write8 calls from 2,927 handler
+calls). Added `ZigMemory.read_bytes(addr, n) -> bytes` (`memory_zig.py`,
+reads directly from the shared backing bytearray -- safe because it's the
+exact same buffer libcpu.so's mem_* functions operate on) and used it
+(alongside the pre-existing bulk `load()`) to fix: `kernel32_io.py`'s
+`WriteFile`/`ReadFile`; `msvcrt_handlers.py`'s `fread`/`fwrite`/`_read`/
+`_write`/`realloc`; `kernel32_memory.py`'s `HeapReAlloc`; and `_state.py`'s
+`read_cstring`/`read_wide_string` -- the highest-leverage fix of the
+session, called from dozens of sites project-wide (every `%s` vararg sub,
+every filename/registry-value read, `getenv`, etc.). Confirmed via
+before/after profiling at the same 300M-step size: `read_cstring` dropped
+7.6x (6.97s -> 0.91s cumulative for the same 210,993 calls), `getenv`
+dropped 4.5x, total Python function calls dropped 37% (36.2M -> 22.6M).
+Confirmed live with a real unprofiled run: 500M steps dropped from
+143-145.6s to 124.5s wall-clock (~14-17% faster). 1086/1086 tests pass.
+
+**The DSOUND starvation itself is unaffected by any of this, and that's
+expected, not a miss** -- re-profiled and re-run live after the fix, still
+100% of serve calls report a hold-off. Root cause is architectural: the
+"timer held off" message is the game's own real-wall-clock check on its
+audio thread, and tew's scheduler is a single-core cooperative
+round-robin across every emulated guest thread (`preempt_slice`) -- the
+audio thread can only run when the round-robin reaches it, after every
+other thread's full instruction batch for that slice has executed. Real
+Windows gives it genuine OS-level preemption instead. Not fixable without
+either much higher raw emulation throughput than realistic for a software
+x86 core, or a scheduler rewrite around real wall-clock deadlines --
+correctly out of scope for today.
+
+**Two real logging-legibility regressions from earlier today's `[alive]`/
+`channel`-category DEBUG demotions, discovered live**: a background 2B-step
+run's log jumped from 56s straight to 464s with zero lines in between --
+looked exactly like a hang and had to be verified healthy via `ps`
+elapsed-time/CPU-state instead of the log itself, since both the progress
+heartbeat and Channel_DebugPrint's real gameplay-progress lines
+(`Track.c`, etc.) are now silent by default. Not yet resolved -- flagged
+in status.md as an open question for next session (restore `[alive]` to
+INFO, or accept the tradeoff).
+
+**New: `channel_log.txt`** (Molly: "so we can tell it from the other
+'normal' stuff") -- `Channel_DebugPrint` now always writes its formatted
+output to a real, dedicated host file (`CRTState.write_channel_log`,
+`_state.py`; lazily opened, resolved next to `stdout.txt` via the same
+`translate_windows_path` anchoring, directory auto-created same as
+`open_file_handle` already does), unconditionally, independent of
+`LOG_LEVEL`/`LOG_CATEGORIES` -- deliberately a separate file from
+`stdout.txt` (which stays `Channel_SystemPrint`/`OutputDebugStringA`
+only, via the existing `write_guest_stdout`). `test_patch_internals.py`'s
+shared `env` fixture had to be scoped to a `tmp_path`-based `EmulatorConfig`
+as part of this -- it previously used the real `emulator.json`/`~/.emu32/`
+config by default, which would have made every test in the file that
+exercises `_channel_debug_print` write real files into the real user's
+`~/.emu32/` tree as a side effect. Confirmed live:
+`~/.emu32/MCity/channel_log.txt` created fresh each run with real content.
+
+Also this session: routed `OutputDebugStringA` (`kernel32_io.py`) and
+confirmed `Channel_SystemPrint` (`patch_internals.py`) both write through
+the same real `stdout.txt` stream (`CRTState.write_guest_stdout`, factored
+out as a shared helper); confirmed `-CaptureStdout` has been unconditional
+in every run all session (baked into the fixed guest argv in
+`msvcrt_handlers.py`, not a run_exe.py flag); confirmed `IDirect3D8`'s
+`AddRef`/`Release` refcount fix (previous entry) holds under this
+session's much longer real/profiled runs, with no `MUTEX_free` recurrence.
+Also confirmed real, not a regression: `[DSOUND (create)] Resorted to
+using desktop window handle` in stdout.txt -- `user32_handlers.py`'s
+`GetActiveWindow`/`GetForegroundWindow` both unconditionally return NULL,
+so the game's own DirectSound-init fallback always takes the desktop-HWND
+branch it wouldn't on real Windows. Harmless, not fixed this session, noted
+in status.md as a scoped next-session candidate.
+
 ## 2026-08-07 (cont'd again x6) — Fixed IDirect3D8::AddRef/Release fake
 refcounting (real MUTEX_free-while-locked cause); nfile.c "FILE SYSTEM NOT
 INITIALIZED" chain traced to a test-harness `timeout`-as-SDL_QUIT

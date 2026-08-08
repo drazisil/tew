@@ -129,6 +129,25 @@ class ZigMemory:
 
     # ── Bulk load ──────────────────────────────────────────────────────────
 
+    def read_bytes(self, addr: int, n: int) -> bytes:
+        """Bulk read of `n` bytes starting at `addr`, as real `bytes`.
+
+        Reads directly from the shared backing bytearray instead of n
+        individual read8() ctypes/FFI calls -- confirmed live 2026-08-07
+        via cProfile that WriteFile's per-byte `for i in range(n_bytes):
+        buf[i] = memory.read8(...)` loop (kernel32_io.py) alone accounted
+        for a third of total run time on a real profiled session (6.3M
+        read8 calls just from file I/O), which was the actual cause of
+        the DSOUND serve thread missing its 10ms deadline by 30-100x --
+        not a CPU-core regression. Safe because _buffer IS the same memory
+        libcpu.so's mem_* functions operate on (shared via from_buffer, see
+        __init__), so a plain Python slice sees exactly what read8() would
+        have, byte for byte, just without n round-trips through ctypes.
+        """
+        if addr < 0 or n < 0 or not self.is_valid_range(addr, n):
+            raise self._bounds_error("read_bytes", addr)
+        return bytes(self._buffer[addr:addr + n])
+
     def load(self, addr: int, data: bytes | bytearray) -> None:
         buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
         data_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
