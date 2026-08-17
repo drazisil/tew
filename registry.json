@@ -72,6 +72,10 @@
       "type": 1,
       "value": "English"
     },
+    "disableaudio": {
+      "type": 4,
+      "value": 1
+    },
     "loginname": {
       "type": 1,
       "value": "admin"

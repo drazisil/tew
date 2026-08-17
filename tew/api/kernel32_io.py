@@ -141,10 +141,18 @@ def register_kernel32_io_handlers(
     # ── File I/O ──────────────────────────────────────────────────────────────
 
     def _write_file(cpu: "CPU") -> None:
-        h_file      = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_buf      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_bytes     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_written  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        h_file       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_buf       = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        n_bytes      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_written   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_overlapped = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        # See _read_file's comment: a real positioned write via OVERLAPPED
+        # must not disturb the handle's own sequential cursor either.
+        overlapped_pos = None
+        if lp_overlapped:
+            off_low  = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
+            off_high = memory.read32((lp_overlapped + 0xC) & 0xFFFFFFFF)
+            overlapped_pos = off_low | (off_high << 32)
         entry = state.file_handle_map.get(h_file)
         if not entry or not entry.writable or entry.fd is None:
             if lp_written:
@@ -160,12 +168,17 @@ def register_kernel32_io_handlers(
                     f'[Win32] WriteFile(handle=0x{h_file:x}, "{entry.path}") -> FALSE (no fd)')
             cpu.regs[EAX] = 0
         else:
-            os.write(entry.fd, memory.read_bytes(lp_buf & 0xFFFFFFFF, n_bytes))
-            entry.position += n_bytes
+            data = memory.read_bytes(lp_buf & 0xFFFFFFFF, n_bytes)
+            if overlapped_pos is not None:
+                os.pwrite(entry.fd, data, overlapped_pos)
+            else:
+                os.write(entry.fd, data)
+                entry.position += n_bytes
             if lp_written:
                 memory.write32(lp_written, n_bytes)
             logger.debug("fileio",
-                f'[Win32] WriteFile(handle=0x{h_file:x}, nBytes={n_bytes}) -> TRUE')
+                f'[Win32] WriteFile(handle=0x{h_file:x}, nBytes={n_bytes}) -> TRUE'
+                + (f' [overlapped offset={overlapped_pos}]' if overlapped_pos is not None else ''))
             cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 20)
 
@@ -657,10 +670,22 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:
-        h_file      = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_buf      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_to_read   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_read     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        h_file       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_buf       = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        n_to_read    = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_read      = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_overlapped = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        # OVERLAPPED.Offset/.OffsetHigh sit at +8/+0xC (after Internal/
+        # InternalHigh) -- a real positioned read: use this position instead
+        # of the handle's own sequential cursor, and do NOT advance that
+        # cursor afterward (matches real Win32: a non-NULL lpOverlapped reads
+        # at the given offset without disturbing the file pointer, even on a
+        # handle not opened with FILE_FLAG_OVERLAPPED).
+        overlapped_pos = None
+        if lp_overlapped:
+            off_low  = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
+            off_high = memory.read32((lp_overlapped + 0xC) & 0xFFFFFFFF)
+            overlapped_pos = off_low | (off_high << 32)
         entry = state.file_handle_map.get(h_file)
         if not entry or (entry.writable and not entry.readable):
             logger.warn("fileio",
@@ -673,35 +698,40 @@ def register_kernel32_io_handlers(
             # Opened GENERIC_READ|GENERIC_WRITE (or fopen "r+"/"w+"/"a+") --
             # real read via the live fd, positioned at entry.position (the
             # tracked logical offset; see FileHandleEntry.readable's own
-            # docstring for why this path exists at all).
-            pos_before = entry.position
-            data = os.pread(entry.fd, n_to_read, entry.position) if entry.fd is not None else b""
+            # docstring for why this path exists at all), unless a real
+            # OVERLAPPED offset was given.
+            pos = overlapped_pos if overlapped_pos is not None else entry.position
+            data = os.pread(entry.fd, n_to_read, pos) if entry.fd is not None else b""
             if data:
                 memory.load(lp_buf & 0xFFFFFFFF, data)
-            entry.position += len(data)
+            if overlapped_pos is None:
+                entry.position += len(data)
             if lp_read:
                 memory.write32(lp_read, len(data))
             cpu.regs[EAX] = 1
             name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
             logger.debug("fileio",
                 f'ReadFile({name_short} h=0x{h_file:x}) '
-                f'offset={pos_before} req={n_to_read} got={len(data)} '
-                f'pos_after={entry.position} [read+write handle]')
+                f'offset={pos} req={n_to_read} got={len(data)} '
+                f'pos_after={entry.position} buf=0x{lp_buf:x} [read+write handle]'
+                + (' [overlapped]' if overlapped_pos is not None else ''))
         else:
-            pos_before = entry.position
-            available = len(entry.data) - entry.position
-            to_read = min(n_to_read, available)
+            pos = overlapped_pos if overlapped_pos is not None else entry.position
+            available = len(entry.data) - pos
+            to_read = min(n_to_read, max(available, 0))
             if to_read > 0:
-                memory.load(lp_buf & 0xFFFFFFFF, entry.data[entry.position:entry.position + to_read])
-            entry.position += to_read
+                memory.load(lp_buf & 0xFFFFFFFF, entry.data[pos:pos + to_read])
+            if overlapped_pos is None:
+                entry.position += to_read
             if lp_read:
                 memory.write32(lp_read, to_read)
             cpu.regs[EAX] = 1
             name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
             logger.debug("fileio",
                 f'ReadFile({name_short} h=0x{h_file:x}) '
-                f'offset={pos_before} req={n_to_read} got={to_read} '
-                f'pos_after={entry.position} eof={len(entry.data)}')
+                f'offset={pos} req={n_to_read} got={to_read} '
+                f'pos_after={entry.position} buf=0x{lp_buf:x} eof={len(entry.data)}'
+                + (' [overlapped]' if overlapped_pos is not None else ''))
         cleanup_stdcall(cpu, memory, 20)
 
     def _lock_file(cpu: "CPU") -> None:
@@ -1823,6 +1853,28 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = result & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 8)
 
+    def _lstrcmpi_a(cpu: "CPU") -> None:
+        # Real Windows is locale-aware for case-folding; plain ASCII
+        # upper-casing is correct for every string this game actually
+        # compares (matches the IsCharAlphaA/IsCharAlphaNumericA reasoning).
+        p1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        p2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        result = 0
+        i = 0
+        while True:
+            c1 = memory.read8((p1 + i) & 0xFFFFFFFF) if p1 else 0
+            c2 = memory.read8((p2 + i) & 0xFFFFFFFF) if p2 else 0
+            u1 = c1 - 0x20 if 0x61 <= c1 <= 0x7A else c1
+            u2 = c2 - 0x20 if 0x61 <= c2 <= 0x7A else c2
+            if u1 != u2:
+                result = -1 if u1 < u2 else 1
+                break
+            if c1 == 0:
+                break
+            i += 1
+        cpu.regs[EAX] = result & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 8)
+
     def _local_alloc(cpu: "CPU") -> None:
         flags  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_bytes = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -1879,6 +1931,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "lstrcpynA",    _lstrcpyn_a)
     stubs.register_handler("kernel32.dll", "lstrcatA",     _lstrcat_a)
     stubs.register_handler("kernel32.dll", "lstrcmpW",     _lstrcmp_w)
+    stubs.register_handler("kernel32.dll", "lstrcmpiA",    _lstrcmpi_a)
     stubs.register_handler("kernel32.dll", "LocalAlloc",   _local_alloc)
     stubs.register_handler("kernel32.dll", "LocalFree",    _local_free)
     stubs.register_handler("kernel32.dll", "GlobalAlloc",  _global_alloc)
