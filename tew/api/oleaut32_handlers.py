@@ -458,15 +458,15 @@ def register_oleaut32_ole32_handlers(
     _ole_ord(8, _ord8)
 
     # Ordinal 9 — VariantClear(pvarg) -> HRESULT
-    def _ord9(cpu: "CPU") -> None:
-        pv = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if pv:
-            memory.write16(pv,     0)
-            memory.write16(pv + 2, 0)
-        cpu.regs[EAX] = 0  # S_OK
-        cleanup_stdcall(cpu, memory, 4)
-
-    _ole_ord(9, _ord9)
+    # Real callers (msjet35.dll, dao350.dll) import this by ordinal, not by
+    # name, so it must be kept behaviorally identical to the named
+    # VariantClear handler above rather than reimplemented separately --
+    # delegating directly makes that impossible to drift out of sync again.
+    # The bug this replaces only zeroed the 4-byte vt/reserved header,
+    # leaving the 8-byte value union (e.g. a BSTR pointer) untouched, so a
+    # "cleared" VARIANT still held stale data for anything that read it
+    # without checking vt first.
+    _ole_ord(9, _VariantClear)
 
     # Ordinal 10 — VariantCopy(pvargDest, pvargSrc) -> HRESULT
     def _ord10(cpu: "CPU") -> None:
