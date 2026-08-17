@@ -823,3 +823,255 @@ class TestInitThreadStack:
         s._init_thread_stack(cpu, mem, t)
 
         assert s._thread_stack_next == initial + THREAD_STACK_SIZE
+
+
+# ── Reentrancy guard ─────────────────────────────────────────────────────────
+# Covers Scheduler.enter_reentrant_call/exit_reentrant_call and the
+# _swap_current chokepoint that switch_to, preempt_slice,
+# block_current_on_cs, block_current_on_handles, and sleep_current all now
+# route through. mark_current_dead/terminate_thread are deliberately exempt
+# (a thread dying mid-nested-call must still be able to hand off the CPU) --
+# see TestReentrancyGuardExemptions.
+
+class TestReentrantDepthTracking:
+    def test_starts_at_zero(self):
+        s = make_scheduler()
+        assert s.reentrant_depth == 0
+        assert s.reentrancy_violations == []
+
+    def test_enter_increments(self):
+        s = make_scheduler()
+        s.enter_reentrant_call()
+        assert s.reentrant_depth == 1
+
+    def test_exit_decrements(self):
+        s = make_scheduler()
+        s.enter_reentrant_call()
+        s.exit_reentrant_call()
+        assert s.reentrant_depth == 0
+
+    def test_nested_enter_exit_tracks_depth(self):
+        s = make_scheduler()
+        s.enter_reentrant_call()
+        s.enter_reentrant_call()
+        assert s.reentrant_depth == 2
+        s.exit_reentrant_call()
+        assert s.reentrant_depth == 1
+        s.exit_reentrant_call()
+        assert s.reentrant_depth == 0
+
+    def test_exit_without_enter_raises(self):
+        s = make_scheduler()
+        with pytest.raises(AssertionError):
+            s.exit_reentrant_call()
+
+
+class TestReentrancyGuardRefusesSwaps:
+    """When reentrant_depth > 0, every swap-capable public method must
+    refuse the actual CPU swap: no thread status mutated, no scheduler swap
+    (current_idx unchanged, save_state/restore_state never called), a
+    violation recorded, no exception raised (this fires from inside stub
+    handlers -- see _reentrancy_check). switch_to/preempt_slice leave
+    cpu.eip alone entirely on refusal since nothing commits to a redirect
+    before they're called. block_current_on_cs/on_handles/sleep_current are
+    different: their callers already commit to the scheduler redirecting
+    eip (some skip their own cleanup_stdcall entirely, trusting this), so
+    those three still set cpu.eip (and sleep_current's EAX) on refusal --
+    completing the call as an instant no-op retry/return rather than
+    resuming into a stack the caller never actually returned from."""
+
+    def test_switch_to_refused(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        result = s.switch_to(cpu, mem, 1)
+
+        assert result is False
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+        cpu.restore_state.assert_not_called()
+        assert len(s.reentrancy_violations) == 1
+        assert "switch_to" in s.reentrancy_violations[0]
+
+    def test_preempt_slice_refused(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        result = s.preempt_slice(cpu, mem)
+
+        assert result is False
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+
+    def test_block_current_on_cs_refused(self):
+        # Callers of block_current_on_cs (e.g. _enter_cs) deliberately skip
+        # their own cleanup_stdcall on the blocking path, trusting the
+        # scheduler to redirect eip -- so a refusal must still set
+        # cpu.eip = retry_eip (self-correcting immediate retry) even though
+        # no thread state changes and no swap happens. Leaving eip untouched
+        # was live-verified to corrupt ESP/EBP (caught by __chkesp) since
+        # the caller's stack is already in a state that assumes this
+        # redirect happens unconditionally.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu(eip=0x401002)
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
+
+        assert s.threads[0].status == ThreadStatus.READY
+        assert s.threads[0].waiting_on_cs is None
+        assert cpu.eip == 0x401000          # redirected to retry_eip, not left as-is
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+        assert len(s.reentrancy_violations) == 1
+
+    def test_block_current_on_handles_refused(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu(eip=0x401002)
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.block_current_on_handles(cpu, mem, frozenset([0x700B]), retry_eip=0x401000)
+
+        assert s.threads[0].status == ThreadStatus.READY
+        assert s.threads[0].waiting_on_handles is None
+        assert cpu.eip == 0x401000          # redirected to retry_eip, not left as-is
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+        assert len(s.reentrancy_violations) == 1
+
+    def test_sleep_current_refused(self):
+        # Sleep/SleepEx callers already popped their own stack before
+        # calling sleep_current, expecting cpu.eip = return_eip regardless
+        # of whether the thread actually sleeps -- same rationale as the
+        # block_current_on_* cases above.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu(eip=0x401002)
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.sleep_current(cpu, mem, return_eip=0x401010, eax_val=0, sleep_ms=50)
+
+        assert s.threads[0].status == ThreadStatus.READY
+        assert cpu.eip == 0x401010           # redirected to return_eip, not left as-is
+        assert cpu.regs[0] == 0              # EAX
+        assert s.current_idx == 0
+        cpu.save_state.assert_not_called()
+        assert len(s.reentrancy_violations) == 1
+
+    def test_refusal_does_not_raise(self):
+        # "Fail loudly" here means log + record, not a Python exception --
+        # this fires deep inside a Win32 stub handler called from Zig via
+        # cpu.run(); raising across that boundary is not an option.
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.switch_to(cpu, mem, 1)
+        s.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
+        s.block_current_on_handles(cpu, mem, frozenset([0x700B]), retry_eip=0x401000)
+        s.sleep_current(cpu, mem, return_eip=0x401010, eax_val=0, sleep_ms=50)
+        s.preempt_slice(cpu, mem)
+        # no exception raised getting here
+
+
+class TestReentrancyGuardExemptions:
+    """mark_current_dead and terminate_thread deliberately bypass the guard:
+    a thread dying mid-nested-call must still hand off the CPU, since
+    _invoke_emulated_proc's own thread-death detection depends on the swap
+    actually happening even while reentrant_depth > 0."""
+
+    def test_mark_current_dead_still_swaps_while_reentrant(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.mark_current_dead(cpu, mem)
+
+        assert s.threads[0].status == ThreadStatus.DEAD
+        assert s.current_idx == 1
+        assert s.reentrancy_violations == []
+
+    def test_mark_current_dead_halts_when_none_left_while_reentrant(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        s.mark_current_dead(cpu, mem)
+
+        assert cpu.halted is True
+        assert s.reentrancy_violations == []
+
+    def test_terminate_current_thread_still_swaps_while_reentrant(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        bg = s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        bg.saved_state = MagicMock()
+        cpu = make_cpu()
+        mem = make_memory()
+        s.enter_reentrant_call()
+
+        result = s.terminate_thread(cpu, mem, 0xBEEF)
+
+        assert result is False
+        assert s.threads[0].status == ThreadStatus.DEAD
+        assert s.current_idx == 1
+        assert s.reentrancy_violations == []
+
+
+class TestReentrancyGuardRegression:
+    """Non-reentrant behavior (reentrant_depth == 0, the default/common
+    case) must be byte-for-byte unchanged by the _swap_current refactor."""
+
+    def test_switch_to_still_works_at_depth_zero(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        mem = make_memory()
+
+        result = s.switch_to(cpu, mem, 1)
+
+        assert result is True
+        assert s.current_idx == 1
+        assert s.reentrancy_violations == []
+
+    def test_enter_then_exit_restores_normal_swapping(self):
+        s = make_scheduler()
+        s.create_main_thread(1000, 0xBEEF)
+        s.create_thread(1001, 0xBEF0, 0x9F0000, 0x0)
+        cpu = make_cpu()
+        mem = make_memory()
+
+        s.enter_reentrant_call()
+        refused = s.switch_to(cpu, mem, 1)
+        s.exit_reentrant_call()
+        allowed = s.switch_to(cpu, mem, 1)
+
+        assert refused is False
+        assert allowed is True
+        assert s.current_idx == 1

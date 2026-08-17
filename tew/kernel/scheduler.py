@@ -88,6 +88,10 @@ class Scheduler:
         self._thread_stack_next = thread_stack_next
         self._last_scheduled_idx: int = 0
         self._kernel: Optional[object] = None  # set to Kernel by CRTState after construction
+        # Reentrancy guard (see _swap_current) — depth, not a flag, so a
+        # nested call made from inside another nested call is still safe.
+        self.reentrant_depth: int = 0
+        self.reentrancy_violations: list[str] = []
 
     # ── Thread registration ───────────────────────────────────────────────────
 
@@ -295,14 +299,96 @@ class Scheduler:
 
         return None
 
-    # ── Public: context switch ────────────────────────────────────────────────
+    # ── Reentrancy guard ───────────────────────────────────────────────────────
+    # tew's CPU has exactly one register file (cpu.regs), shared by every
+    # thread; a thread's "state" only exists as a ThreadState.saved_state
+    # snapshot while it isn't the one running. A nested synchronous call
+    # (e.g. _invoke_emulated_proc, used to invoke a DllMain from inside a
+    # stub handler) runs cpu.run() again while the *outer* call is still on
+    # the Python stack, still expecting cpu.regs to belong to the thread
+    # that entered it. If a stub handler reached during that nested run
+    # triggers a scheduler swap, it silently hands the shared registers to
+    # a different thread's state -- the outer call resumes into someone
+    # else's registers with no error, no exception, nothing until state
+    # visibly stops making sense many steps later. enter/exit_reentrant_call
+    # bracket every nested cpu.run(); _swap_current is the single chokepoint
+    # every swap-capable public method routes through, so it's the one place
+    # that has to know about this.
 
-    def switch_to(self, cpu: "CPU", memory: "Memory", idx: int) -> None:
-        """Save current thread and load thread at idx. For external callers."""
+    def enter_reentrant_call(self) -> None:
+        """Mark that a nested synchronous cpu.run() is starting.
+
+        Call before invoking cpu.run() from inside a stub handler (i.e. any
+        call that is not the main step loop). Depth-counted, not a flag, so
+        a nested call made from inside another nested call stays safe.
+        """
+        self.reentrant_depth += 1
+
+    def exit_reentrant_call(self) -> None:
+        """Mark that a nested synchronous cpu.run() has returned.
+
+        Must be paired 1:1 with enter_reentrant_call, normally via
+        try/finally around the nested cpu.run().
+        """
+        assert self.reentrant_depth > 0, (
+            "exit_reentrant_call called with no matching enter_reentrant_call "
+            "(reentrant_depth was already 0)")
+        self.reentrant_depth -= 1
+
+    def _reentrancy_check(self, operation: str) -> bool:
+        """True if `operation` may proceed; False if a nested synchronous call
+        is in progress and swapping the shared CPU registers away from it
+        would corrupt that call's mid-flight state.
+
+        The sole place reentrant_depth is consulted. On refusal: logs (this
+        IS the failure signal -- callers never raise across the stub-handler
+        boundary for this) and records the violation in
+        reentrancy_violations for tests/diagnostics, but never mutates
+        scheduler or thread state.
+        """
+        if self.reentrant_depth <= 0:
+            return True
+        msg = (f"reentrancy violation: {operation} refused "
+               f"(reentrant_depth={self.reentrant_depth}, "
+               f"current_idx={self.current_idx})")
+        logger.error("scheduler", msg)
+        self.reentrancy_violations.append(msg)
+        return False
+
+    def _swap_current(self, cpu: "CPU", memory: "Memory", target_idx: int,
+                       operation: str) -> bool:
+        """Single chokepoint for handing the shared CPU registers to a
+        different thread: save the outgoing thread's state (unless it just
+        died) and load target_idx's. Every public method that can move
+        control to a different thread routes through here -- this is the
+        scheduler's one API border to everything else for that operation.
+
+        mark_current_dead/terminate_thread deliberately do NOT route through
+        here: a thread dying mid-nested-call is a separate, already-tested,
+        already-correct case (see mark_current_dead's docstring) -- the
+        nested call's own thread-death detection depends on that swap still
+        happening even while reentrant_depth > 0.
+
+        Returns True if the swap happened, False if refused by the
+        reentrancy guard (no state mutated).
+        """
+        if not self._reentrancy_check(operation):
+            return False
         if 0 <= self.current_idx < len(self.threads):
             if self.threads[self.current_idx].status != ThreadStatus.DEAD:
                 self._save_current(cpu, memory)
-        self._load_next(idx, cpu, memory)
+        self._load_next(target_idx, cpu, memory)
+        return True
+
+    # ── Public: context switch ────────────────────────────────────────────────
+
+    def switch_to(self, cpu: "CPU", memory: "Memory", idx: int) -> bool:
+        """Save current thread and load thread at idx. For external callers.
+
+        Returns True if the swap happened, False if refused by the
+        reentrancy guard.
+        """
+        return self._swap_current(cpu, memory, idx, "switch_to")
 
     def preempt_slice(self, cpu: "CPU", memory: "Memory") -> bool:
         """Round-robin preemption: yield the current slice to the next READY thread.
@@ -323,8 +409,7 @@ class Scheduler:
             idx = (self.current_idx + i) % n
             t = self.threads[idx]
             if not t.suspended and t.status == ThreadStatus.READY:
-                self.switch_to(cpu, memory, idx)
-                return True
+                return self.switch_to(cpu, memory, idx)
         return False
 
     # ── Public: blocking operations ───────────────────────────────────────────
@@ -338,6 +423,18 @@ class Scheduler:
         """
         if cpu.fatal_halt:
             return  # single core, fatally locked up -- nothing left to block/resume
+        if not self._reentrancy_check("block_current_on_cs"):
+            # Can't actually give up the CPU inside a nested synchronous call
+            # (see enter_reentrant_call's docstring) -- but the caller (e.g.
+            # _enter_cs) already deliberately skipped its own cleanup_stdcall
+            # on this path, trusting *us* to redirect eip. Leaving eip
+            # untouched here would resume execution with a stack the caller
+            # never actually returned from -- live-verified this corrupts
+            # ESP/EBP and trips __chkesp a few instructions later. Retry the
+            # acquisition immediately instead; harmless busy-poll bounded by
+            # the nested call's own step budget, not a real blocking wait.
+            cpu.eip = retry_eip
+            return
         thread = self.threads[self.current_idx]
         thread.waiting_on_cs = cs_ptr
         thread.status = ThreadStatus.BLOCKED_CS
@@ -345,7 +442,6 @@ class Scheduler:
         logger.debug("scheduler",
             f"block_current_on_cs: idx={self.current_idx} tid={thread.thread_id} "
             f"blocking on CS 0x{cs_ptr:08x}, retry_eip=0x{retry_eip:08x}")
-        self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
         if next_idx is None:
@@ -353,9 +449,9 @@ class Scheduler:
             # retries the CS wait from retry_eip; the heartbeat will advance
             # virtual time and may unblock threads between batches.
             thread.status = ThreadStatus.READY
-            self._load_next(self.current_idx, cpu, memory)
+            self._swap_current(cpu, memory, self.current_idx, "block_current_on_cs")
             return
-        self._load_next(next_idx, cpu, memory)
+        self._swap_current(cpu, memory, next_idx, "block_current_on_cs")
 
     def block_current_on_handles(self, cpu: "CPU", memory: "Memory",
                                    handles: frozenset, retry_eip: int,
@@ -367,6 +463,13 @@ class Scheduler:
         """
         if cpu.fatal_halt:
             return  # single core, fatally locked up -- nothing left to block/resume
+        if not self._reentrancy_check("block_current_on_handles"):
+            # See block_current_on_cs's matching comment: the caller (e.g.
+            # _wait_for_single) skipped its own cleanup_stdcall on this path
+            # and trusts us to redirect eip -- retry immediately rather than
+            # resuming with a stack the caller never returned from.
+            cpu.eip = retry_eip
+            return
         thread = self.threads[self.current_idx]
         thread.waiting_on_handles = handles
         thread.wait_deadline_ms = deadline_ms
@@ -377,7 +480,6 @@ class Scheduler:
             f"block_current_on_handles: idx={self.current_idx} tid={thread.thread_id} "
             f"blocking on handles={sorted(hex(h) for h in handles)}, "
             f"deadline={deadline_ms}, retry_eip=0x{retry_eip:08x}")
-        self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
         if next_idx is None:
@@ -387,9 +489,9 @@ class Scheduler:
             thread.status = ThreadStatus.READY
             thread.waiting_on_handles = None
             thread.wait_deadline_ms = None
-            self._load_next(self.current_idx, cpu, memory)
+            self._swap_current(cpu, memory, self.current_idx, "block_current_on_handles")
             return
-        self._load_next(next_idx, cpu, memory)
+        self._swap_current(cpu, memory, next_idx, "block_current_on_handles")
 
     def sleep_current(self, cpu: "CPU", memory: "Memory",
                        return_eip: int, eax_val: int, sleep_ms: int) -> None:
@@ -400,6 +502,21 @@ class Scheduler:
         """
         if cpu.fatal_halt:
             return  # single core, fatally locked up -- nothing left to sleep/resume
+        if not self._reentrancy_check("sleep_current"):
+            # Can't actually give up the CPU inside a nested synchronous call
+            # -- but callers use return_eip two different ways (Sleep/SleepEx
+            # already popped their own stack and expect a genuine "past the
+            # call" resume address; GetMessageA's 1ms poll-retry passes its
+            # own dispatch address and never popped anything, expecting a
+            # retry). Either way the caller needs eip (and, for the Sleep
+            # case, EAX) set before returning -- leaving it untouched
+            # resumes execution against a stack/EAX the caller doesn't
+            # expect. Live-verified this corrupts ESP/EBP and trips
+            # __chkesp a few instructions later. Complete the call as if the
+            # sleep/retry happened instantly instead.
+            cpu.eip = return_eip
+            cpu.regs[EAX] = eax_val
+            return
         thread = self.threads[self.current_idx]
         cpu.eip = return_eip
         cpu.regs[EAX] = eax_val
@@ -408,22 +525,31 @@ class Scheduler:
         logger.debug("scheduler",
             f"sleep_current: idx={self.current_idx} tid={thread.thread_id} "
             f"sleeping {sleep_ms}ms (until vtime={thread.sleep_until_ms}ms)")
-        self._save_current(cpu, memory)
 
         next_idx = self._pick_next_ready(memory)
         if next_idx is None:
             # No other thread ready — wake immediately and stay on this thread.
+            # Routed through _swap_current (target == current_idx) rather than
+            # a bespoke save/restore pair: since saved_state is non-None after
+            # that save, _load_next's "resume a real thread" branch performs
+            # the exact same cpu.restore_state() + halted-clear this used to
+            # do by hand, just via the shared chokepoint.
             thread.status = ThreadStatus.READY
-            cpu.restore_state(thread.saved_state)
-            if not cpu.fatal_halt:
-                cpu.halted = False
+            self._swap_current(cpu, memory, self.current_idx, "sleep_current")
             return
-        self._load_next(next_idx, cpu, memory)
+        self._swap_current(cpu, memory, next_idx, "sleep_current")
 
     def mark_current_dead(self, cpu: "CPU", memory: "Memory") -> None:
         """Mark current thread as dead and switch to the next ready thread.
 
         If no threads remain, sets cpu.halted = True (process exit).
+
+        Deliberately does NOT route through _swap_current / the reentrancy
+        guard -- unlike the other swap-triggering methods, a thread dying
+        (even mid-nested-call, reentrant_depth > 0) must still be able to
+        hand the CPU to the next thread; that's the mechanism
+        _invoke_emulated_proc's own thread-death detection depends on.
+        Calls _load_next directly.
         """
         if cpu.fatal_halt:
             return  # single core, fatally locked up -- no thread state to update

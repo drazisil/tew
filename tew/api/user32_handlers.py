@@ -140,45 +140,61 @@ def _invoke_emulated_proc(
     # immediately followed by a stack-corruption halt that had nothing to
     # do with DAO. Run in bounded chunks and check which thread is actually
     # live after each one to guard against this.
-    started_thread_idx = scheduler.current_idx if scheduler is not None else None
-    _CHUNK = 200_000
-    steps_run = 0
-    started_thread_died = False
-    while steps_run < max_steps:
-        cpu.run(min(_CHUNK, max_steps - steps_run))
-        steps_run += _CHUNK
+    # Bracket the nested cpu.run() with the scheduler's reentrancy guard:
+    # while this is set, block_current_on_cs/on_handles/sleep_current/
+    # switch_to all refuse to swap the shared cpu.regs away from
+    # started_thread_idx (logging a violation instead of silently handing
+    # our registers to an unrelated thread -- see Scheduler._swap_current).
+    # mark_current_dead is deliberately exempt, so the "thread died mid-call"
+    # detection below still works.
+    if scheduler is not None:
+        scheduler.enter_reentrant_call()
+    try:
+        started_thread_idx = scheduler.current_idx if scheduler is not None else None
+        _CHUNK = 200_000
+        steps_run = 0
+        started_thread_died = False
+        while steps_run < max_steps:
+            cpu.run(min(_CHUNK, max_steps - steps_run))
+            steps_run += _CHUNK
 
-        if (scheduler is not None and started_thread_idx is not None
-                and scheduler.threads[started_thread_idx].status == ThreadStatus.DEAD):
-            # The thread that made this nested call is dead -- e.g. its stack
-            # unwound straight past the sentinel we pushed for this call's
-            # return (skipping it entirely) and landed back at its own
-            # THREAD_SENTINEL instead. scheduler.current_idx can never equal
-            # started_thread_idx again (dead threads are permanently excluded
-            # by _pick_next_ready), so "wait for our thread to come back" is
-            # not just unlikely but mathematically impossible from here on --
-            # no max_steps budget, however large, would ever complete this
-            # call. Live-verified this is exactly what made DllMain's call
-            # burn through a 50,000,000-step budget doing nothing useful.
-            logger.error("dialog",
-                f"[_invoke_emulated_proc] thread idx={started_thread_idx} that made this "
-                f"nested call to 0x{proc_addr:08x} has died (skipped past our sentinel "
-                f"0x{sentinel:08x}) -- returning 0 now instead of exhausting max_steps "
-                "waiting for a thread that can never run again")
-            started_thread_died = True
-            break
+            if (scheduler is not None and started_thread_idx is not None
+                    and scheduler.threads[started_thread_idx].status == ThreadStatus.DEAD):
+                # The thread that made this nested call is dead -- e.g. its stack
+                # unwound straight past the sentinel we pushed for this call's
+                # return (skipping it entirely) and landed back at its own
+                # THREAD_SENTINEL instead. scheduler.current_idx can never equal
+                # started_thread_idx again (dead threads are permanently excluded
+                # by _pick_next_ready), so "wait for our thread to come back" is
+                # not just unlikely but mathematically impossible from here on --
+                # no max_steps budget, however large, would ever complete this
+                # call. Live-verified this is exactly what made DllMain's call
+                # burn through a 50,000,000-step budget doing nothing useful.
+                logger.error("dialog",
+                    f"[_invoke_emulated_proc] thread idx={started_thread_idx} that made this "
+                    f"nested call to 0x{proc_addr:08x} has died (skipped past our sentinel "
+                    f"0x{sentinel:08x}) -- returning 0 now instead of exhausting max_steps "
+                    "waiting for a thread that can never run again")
+                started_thread_died = True
+                break
 
-        if scheduler is not None and scheduler.current_idx != started_thread_idx:
-            # Scheduler swapped to a different thread -- whatever just
-            # happened (including any halt) belongs to it, not our nested
-            # call. Clear a non-fatal halt and keep going; our thread will
-            # be rescheduled once the other thread blocks/sleeps/finishes.
+            if scheduler is not None and scheduler.current_idx != started_thread_idx:
+                # Scheduler swapped to a different thread -- whatever just
+                # happened (including any halt) belongs to it, not our nested
+                # call. Clear a non-fatal halt and keep going; our thread will
+                # be rescheduled once the other thread blocks/sleeps/finishes.
+                # With the reentrancy guard active this should no longer
+                # happen except via the thread-death path above (which is
+                # caught first) -- left in place as a defensive fallback.
+                if cpu.halted:
+                    cpu.halted = False
+                continue
+
             if cpu.halted:
-                cpu.halted = False
-            continue
-
-        if cpu.halted:
-            break  # halted while on OUR thread -- sentinel or unexpected; evaluate below
+                break  # halted while on OUR thread -- sentinel or unexpected; evaluate below
+    finally:
+        if scheduler is not None:
+            scheduler.exit_reentrant_call()
 
     # Did this call genuinely complete -- our own thread, halted right at the
     # sentinel? Any other outcome means cpu.regs[EAX] does NOT hold our
