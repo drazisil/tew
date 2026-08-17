@@ -11,7 +11,341 @@ Path: ~/Documents/i386.pdf (421 pages)
 *This file: current blocker, queued issues, run command, architecture. Completed work goes in changelog.md — do not add "what's fixed" sections here. Full investigation history (the DAO `*ppv` NULL saga, `tid=1012`'s death, the `fatal_halt` fix, etc.) lives in changelog.md, newest-first — do not re-derive any of it from scratch, grep changelog.md instead.*
 ---
 
-## Current status (2026-08-08, cont'd)
+## Current status (2026-08-16, cont'd x3)
+
+**Reentrancy guard implemented, tested, and live-verified working exactly as designed.** The dependency-`DllMain` fix (previous entry) exposed a real, pre-existing tew architecture bug: `_invoke_emulated_proc`'s nested `cpu.run()` call shares tew's single `cpu.regs` with the cooperative scheduler; any scheduler swap triggered by a stub handler mid-nested-call used to silently hijack the shared registers to an unrelated thread with zero detection. Fixed at the source: `tew/kernel/scheduler.py` now has `reentrant_depth`/`reentrancy_violations` plus a single chokepoint, `_swap_current()`, that `switch_to`, `preempt_slice`, `block_current_on_cs`, `block_current_on_handles`, and `sleep_current` all route through -- it refuses (logs `[ERROR][scheduler] reentrancy violation: ...`, records the violation, no state mutated) whenever `reentrant_depth > 0`. `mark_current_dead`/`terminate_thread` are deliberately exempt (unchanged, unguarded) -- a thread dying mid-nested-call must still be able to hand off the CPU; that's the mechanism `_invoke_emulated_proc`'s own (already-tested) thread-death detection depends on. `_invoke_emulated_proc` (`user32_handlers.py`) now brackets its `cpu.run()` loop with `scheduler.enter_reentrant_call()`/`exit_reentrant_call()` in try/finally. 25 new tests added (`test_scheduler.py`: depth tracking, guard refusal for all 5 swap-capable methods with explicit no-mutation assertions, the `mark_current_dead`/`terminate_thread` exemption locked in as a test, non-reentrant regression coverage). Full suite: 1146/1146 passing.
+
+**Live-verified real effect, both good and newly-revealed**: re-ran with `LOG_CATEGORIES=scheduler,thread,dialog,handlers`. `MSJINT35.dll`'s `DllMain` now runs to completion via `_invoke_dependency_dllmain` and its thread (`tid=1011`) exits *normally* through `THREAD_SENTINEL` -- no more silent mid-call thread death. Exactly one reentrancy violation fired during the run: at the instant `tid=1011` died and `mark_current_dead` (unguarded, as designed) swapped the live CPU to `tid=1007`, `tid=1007` immediately tried `Sleep()` while the outer nested call (on the now-dead `tid=1011`) hadn't yet noticed the death at its next chunk boundary (`reentrant_depth` still 1) -- `sleep_current` correctly refused instead of silently corrupting state. That refusal left `tid=1007`'s `Sleep` stub with no graceful fallback (cpu.eip/EAX untouched), and a `__chkesp FAILED` / stack-corruption diagnostic fired on `tid=1007` in the same instant.
+
+**Traced further with `LOG_CATEGORIES=dll` added: the apparent "LoadLibraryA can't find an already-loaded DLL" symptom was a red herring -- root cause found and fixed.** `MSJTER35.DLL` and `MSJINT35.dll` both mapped and cached correctly, exactly once, inside a single `load_dll("MSJTER35.DLL", ...)` call made by `tid=1011`'s own guest code; that call's `on_dependency_loaded` hook then invoked `MSJINT35.dll`'s real `DllMain`, which is the same nested `cpu.run()` that was still in flight when `tid=1011` died and `tid=1007`'s `Sleep()` got refused (previous paragraph). The resulting `__chkesp` fatal halt raised `FatalHaltError`, which unwound straight up through `on_dependency_loaded(imported_dll)` (`dll_loader.py:360`, still on the call stack) into `load_dll`'s own broad `except Exception` -- logged as `"Failed to load MSJTER35.DLL: fatal halt..."` and returned `None`, even though both DLLs were already correctly loaded and cached. That `None` then made `_load_dll_by_name` log the misleading `"LoadLibraryA(MSJTER35.DLL) -> NULL (not found)"` -- a fatal, whole-session-stopping condition silently downgraded to an ordinary per-call warning, letting the game limp on in a corrupted state instead of actually stopping.
+
+**Fixed**: `dll_loader.load_dll` (`tew/loader/dll_loader.py`) now has `except FatalHaltError: raise` before its broad `except Exception`, so a fatal halt raised anywhere inside a nested dependency-`DllMain` call (on any thread, not just the DLL's own) propagates to wherever `FatalHaltError` is actually meant to be handled instead of being swallowed as a load failure. 2 new tests (`test_dll_loader.py::TestLoadDllPropagatesFatalHalt`, monkeypatching `EXEFile`/`find_dll_file` to inject the exception without needing a real PE fixture) -- one confirms `FatalHaltError` propagates, one confirms ordinary PE-parsing exceptions still return `None` as before. Full suite: 1148/1148. **Live re-verified**: same run now ends cleanly at 37.155s with a full diagnostic dump and `"Execution stopped."` instead of continuing in a corrupted state to the 60s timeout cutoff -- no more `"Failed to load MSJTER35.DLL"` / `"LoadLibraryA(...) -> NULL"` lines at all.
+
+**Current blocker, next session**: the underlying trigger for the fatal halt itself is still open -- `sleep_current`'s (and the other 4 guarded methods') refusal path has no defined fallback contract for the calling stub handler (cpu.eip/EAX left exactly as found), which is what let `tid=1007`'s `Sleep()` call fall through into the `__chkesp`-caught stack corruption in the first place. Needs actual design thought (retry once `reentrant_depth` drops back to 0? no-op-continue? something else?) before the run can get past this point to finally reach the real DAO-3075 error text.
+
+## Previous status (2026-08-16, cont'd x2)
+
+**Found the real root cause of the empty DAO error description, and it's a genuine tew architecture gap, not a Jet/DAO logic bug.** Traced the actual message-lookup chain live: `msjet35.dll`'s `FUN_7a8ea900` dynamically `LoadLibraryA("MSJTER35.DLL")`s (succeeds, loads at `0x18000000`) and `GetProcAddress`es two real exports (`JetErrFormattedMessage`=Ordinal#5, plus #2/#3) -- all real, confirmed working. `JetErrFormattedMessage` (now decompiled, `msjter35.dll` project has real symbol names already) is a dense error-category dispatcher that delegates further; the real `LoadStringA(id=3075)` call was traced (via a new permanent debug field added to tew's own `_LoadStringA` handler, `user32_handlers.py`, logging the real caller address resolved through `dll_loader.find_dll_for_address`) to **`MSJINT35.dll`** -- a *different* DLL entirely, the real locale-specific Jet error-string resource DLL that `MSJTER35.DLL` delegates to.
+
+**`MSJINT35.dll` exists on disk (`~/.emu32/WINDOWS/System32/msjint35.dll`) and IS loaded by tew -- but only as an implicit PE-import dependency of `MSJTER35.DLL`, never via an explicit guest-code `LoadLibraryA` call.** Confirmed in `tew/loader/dll_loader.py`'s `load_dll()`: it recursively loads import-table dependencies (`imported_dll = self.load_dll(descriptor.dll_name, memory)`, line ~312) as part of mapping the parent DLL, but **never invokes the dependency's own `DllMain`** -- that only happens in the separate, higher-level `LoadLibraryA` Win32 handler (`kernel32_handlers.py`'s `_load_dll_with_dllmain`), which only runs for the top-level DLL the guest explicitly requested. So `MSJINT35.dll`'s own CRT/DllMain startup code -- which would normally stash "my own HINSTANCE" into a global for later use -- never runs. When `MSJINT35.dll`'s own exported code later executes (called indirectly through `MSJTER35.DLL`'s `JetErrFormattedMessage`) and tries to pass its own module handle to `LoadStringA`, it reads the never-initialized global (0), producing exactly the observed `LoadStringA(hInst=0x0, id=3075) -> "" (0 chars)`.
+
+**This is a systemic gap, not specific to `MSJINT35.dll`**: any DLL pulled in only as an implicit dependency of another dynamically-loaded DLL would have the same problem. Real fix needs actual design thought (when should a dependency's `DllMain` run relative to its parent's own `DLL_PROCESS_ATTACH`, avoiding reentrancy/ordering issues if dependencies share dependencies, etc.) -- bigger than tonight's earlier quick handler-implementations. Not yet attempted.
+
+**Temporary/permanent diagnostic added**: `_LoadStringA` (`tew/api/user32_handlers.py`) now always logs its real caller's address AND resolved `dll+offset` (via `dll_loader.find_dll_for_address`) alongside the existing hInst/id/result fields -- kept as a permanent enhancement, real diagnostic value for any future resource-string investigation, not reverted.
+
+**Current blocker**: implement real dependency-DLL `DllMain` invocation in `dll_loader.load_dll()` (or wherever the right architectural seam is), so DLLs like `MSJINT35.dll` get properly initialized even when only pulled in as a dependency. Once that lands, re-run and check whether `LoadStringA(id=3075)` finally returns the real Jet error text -- which would let a future session confirm or refute whether DAO error 3075 really means "syntax error, missing operator" (and if so, revisit whether the SQL text or the `CreateQueryDef` chain traced earlier tonight has a real bug), or means something else entirely.
+
+## Previous status (2026-08-16, cont'd)
+
+**The `CreateQueryDef`/DAO-3075 investigation is fully traced live, end to end, across three DLLs, and the empty error description is now pinned down to a specific, separate root cause.** New reusable tooling added along the way: a generic backtrace-to-file breakpoint helper (`run_exe.py`, reuses `_dump_cpu_state`/`_walk_ebp_chain` from `tew/kernel/exception_diagnostics.py` with a custom file-writing `log_fn` instead of the logger) -- confirmed working, wrote a real EBP chain to `backtrace_008fe67b.txt` on demand.
+
+**Verified tew's CPU-core JGE is correct** (`core.zig:468`'s `evalCond`, case `0xD => sf == of` -- matches real x86 exactly; checked all 16 condition codes while there, all correct). No prior test coverage existed for JGE specifically (or any Jcc) -- added 2 real tests (`cpu/src/engine.zig`, taken/not-taken via `CMP EAX,0`+`JGE`). 77/77 Zig tests passing.
+
+**Traced `Dbcode_CreateTmpQuery`'s QueryDefs-search loop live and it's working correctly** -- `QueryDefs.Count()=136` (a real, plausible number for a working DB), loop correctly scans all 136 existing named queries (indices 0-135, `Count()` constant throughout), finds no match for `"#Temporary QueryDef#"` (expected -- that's a scratch name, not meant to persist), correctly falls through to the create-fresh branch on iteration 137. This rules out the search/comparison logic (and, incidentally, confirms real JGE behavior live, not just in isolated tests) -- the bug is not here.
+
+**Traced the real `CreateQueryDef` implementation chain, live, through all the thunks/vtables, into actual msjet35.dll Jet-engine code**:
+`Dbcode_CreateTmpQuery` (MCity_d.exe, `0x008fe4a0`) -> `FUN_04487388` (dao350.dll thunk, delegates to an internal ISAM object's own vtable`+0xa0`) -> `FUN_0448356f` -> `FUN_044c98fe` (real DAO internals, constructs the QueryDef object, real query name `"#Temporary QueryDef#"`) -> `FUN_044d519b` -> `(*DAT_044e534c)` (a dynamically-bound global ISAM function pointer, same family as the already-known `DAT_044e52e8`, zero in the static image) -> **`FUN_7a8ae64d`** (real msjet35.dll, confirmed via the established `runtime = static - 0x65840000` delta). That last function is a real 3-way decision point:
+```c
+FUN_7a843cfc(DAT_7a936104);              // lock
+iVar1 = FUN_7a848e20(param_1);           // session/context check
+if (iVar1 == 0) { uVar2 = 0xfffffbb0; }  // error path A
+else {
+    uVar2 = FUN_7a858a28(param_1,param_2,&local_8);  // catalog lookup; param_2 = puVar3[0x2a] (a resolved container/context handle, NOT the SQL text)
+    if ((int)uVar2 < 0) { /* propagate */ }
+    else if ((local_8 == &DAT_7a84f9e8) && (param_4 < 0xfde9)) {
+        uVar2 = FUN_7a858a5f(param_1,param_2,local_10,8,2);      // second lookup
+        uVar2 = FUN_7a856c17(param_1,local_10[0],param_2,param_3,param_4,param_5,param_6);  // real compile/create -- NOT YET TRACED
+    } else { uVar2 = 0xfffffae0; }                                // error path C -- type-check mismatch
+}
+FUN_7a843d0a(DAT_7a936104);              // unlock
+```
+Not yet live-captured which of the 3 paths actually fires or what `FUN_7a856c17` does -- next concrete step if this thread gets picked back up.
+
+**Checked the OLE Variant/BSTR construction path for the SQL text itself (`"SELECT Max(PartID) AS Expr1 FROM Part;"`) -- verified CORRECT, not the bug.** `dbVariant::dbVariant(char*)` (MCity_d.exe) -> `OleVariant::OleVariant(...,0xe)` -> `lstrlenA` + `Ordinal_150`/`SysAllocStringByteLen` (OLEAUT32). Read both tew implementations line by line: `lstrlenA` is a correct null-byte scan; `SysAllocStringByteLen` does an exact `length`-byte copy (no premature null-stop, matching real semantics), correct 4-byte length prefix, correct 2-byte trailing null. This specific string's construction is sound.
+
+**Found and fixed a real, separate bug while checking the above: `OLEAUT32.dll` `Ordinal #9` (`VariantClear`) only cleared 4 of the 16 `VARIANT` bytes.** Real callers (msjet35.dll, dao350.dll) import `VariantClear` by ordinal, not by name -- the ordinal-9 handler had its own, independently-written implementation that zeroed only the `vt`/reserved header (`+0`..`+3`), leaving the 8-byte value union (e.g. a `BSTR` pointer at `+8`) untouched, so a "cleared" `VARIANT` still held stale data for anything reading it without checking `vt` first. Fixed by having `Ordinal #9` delegate directly to the (correct) named `VariantClear` handler so the two can't drift apart again. New tests: `tests/unit/api/test_oleaut32_variant_clear.py` (4 tests, including one asserting both entries resolve to the literal same function object). 1125/1125 passing. **Confirmed via live re-run this fix does NOT change the `CreateQueryDef` failure** -- identical `stdout.txt`/halt output before and after. Real bug, worth keeping, but not this symptom's cause -- don't re-suspect it for this specific investigation.
+
+**Live-captured the real `Error.Description` BSTR content via `DumpErrors` (MCity_d.exe, `0x008f8060`) and it changes the shape of the investigation.** `DumpErrors` prints `" DAOERROR: (%d) %s: %s\n"` with (Number, Source, Description) read via three real COM getters on the `DAOError` object (vtable `+0x1c`/`+0x20`/`+0x24`). Our `stdout.txt` capture showed Number=3075 and Source="DAO.QueryDefs" printing fine, but Description came back empty. Hooked right after the `Error.Description` getter's own call+`__chkesp` sequence completes (`0x008f8275`, description BSTR pointer stable at `[EBP-0x20]` by then) and read the real bytes live: `bstr_ptr=0x70aa514 byte_len=0` -- **a real, validly-allocated, genuinely zero-length BSTR**, not a NULL pointer, not garbage, not a formatting bug. This rules out several hypotheses (pointer corruption, BSTR-vs-ANSI `%s` confusion, memory corruption in the variant-passing chain) in one shot.
+
+**Current blocker**: real DAO/Jet error descriptions come from a message lookup by error code, not dynamic construction -- that table lives in `msjter35.dll` (the real Jet error-message resource DLL, confirmed via its own version string `"Microsoft Jet Database Engine Error DLL"`, present on disk at `~/.emu32/WINDOWS/System32/msjter35.dll`). Already confirmed **that DLL's error text is NOT plain-extractable** -- neither Ghidra's string search nor raw `strings -el` found any real message text in it (only 23 total UTF-16 strings, all version-resource metadata) -- it's stored in some non-standard/compressed resource format. Next step: find where/how msjet35.dll or dao350.dll actually loads an error description string (likely a `LoadStringA`-style call, or a custom resource-reading routine, ultimately reading from `msjter35.dll`), and check whether tew implements that mechanism at all. This is a genuinely separate, previously-uninvestigated piece of tew's emulation from the `CreateQueryDef` logic itself -- getting it working would let a future session finally read the REAL descriptive error text (confirming or refuting the "missing operator" 3075-means-syntax-error theory) regardless of whether `CreateQueryDef`'s own logic turns out to be correct-per-Jet or a real tew bug.
+
+## Previous status (2026-08-16)
+
+**The entire B-tree/`Workspace::OpenDatabase` investigation (running since 2026-08-06/07) is RESOLVED.** Re-ran `run_exe.py` with the new `OVERLAPPED.Offset` support live (`LOG_CATEGORIES=cpu,startup,fileio`) and confirmed directly: the impossible `field@iVar6+2=1903` page (the value that started this whole investigation, "exceeds its own page's 1808-byte capacity") **never occurs this run**. Real positioned reads now scatter across the file (`offset=4169728`, `407552`, `4902912`, `2015232`, `5527552`, ...) instead of the old monotonic sequential march. The same buffer (`0x41ab6000`) that used to always land on `field@+2=1903` via the coincidental sequential offset 69632 now gets reached via a real positioned read at offset 4902912 and reads `field@+2=34` -- small, sane, exactly what a healthy page should look like. Every `btree-probe` hit this run shows plausible small `field@+2` values (`1578`, `899`, `34`, `1722`, `719`, `343`, ...), no overflow, no corruption.
+
+**Confirms last session's hypothesis outright**: the `1903`/page-overflow bug was never a real DAO/Jet, `Online.MDB`, or msjet35.dll problem (Molly's original "MCO shipped and worked" instinct was right all along) -- it was tew's own `ReadFile` silently ignoring `OVERLAPPED.Offset` and serving whatever came next sequentially, regardless of what DAO/Jet actually requested. All of the deep msjet35.dll tracing from 2026-08-15 (`FUN_7a8481a0`'s tail-page branch, the `PageCacheEntry` hash-cache chain, `0x071b0748`/`0xD83A4000`, etc.) was real, accurately-decompiled DAO/Jet internals -- just not the actual root cause. Keep that tracing as reference (real, confirmed code paths, genuinely useful if this area needs revisiting for a different reason) but the specific bug it was chasing is closed.
+
+**New result**: the run now progresses well past the entire DB-open/B-tree sequence -- further than any prior session -- and halts cleanly on an ordinary, expected-shape gap: `[UNIMPLEMENTED] user32.dll!IsCharAlphaNumericA`. Not a crash, not corruption, just a routine unstubbed Win32 function. Implementing it now (real ASCII alnum classification -- locale-aware in real Windows, but plain ASCII is correct for every input this US-English title actually passes) to see how much further a run gets.
+
+**Implemented and tested three more small handlers this session, each moving the run further**: `user32.dll!IsCharAlphaNumericA`, `user32.dll!IsCharAlphaA` (both plain ASCII classification, real tests in `tests/unit/api/test_user32_ischaralphanumerica.py`/`test_user32_ischaralphaa.py`), and `kernel32.dll!lstrcmpiA` (case-insensitive compare, `tests/unit/api/test_kernel32_lstrcmpia.py`). 1121/1121 tests passing.
+
+**Current blocker, real this time (not a missing-handler gap)**: after those three, the run hits `fatal_halt at EIP=0x001fe012` on `tid=1011` with no `[UNIMPLEMENTED]` line and no `except.txt` -- the reason is only in `~/.emu32/MCity/stdout.txt` (a guest-written file, checked separately from `/tmp/emu.log`, per the emu32 skill's Post-Run Checks). Real content this run:
+```
+dbcode.c(3376)  The class has not been licensed     (x2)
+dbcode.c(4418) Could not create Query
+dbcode.c(3426)  DAOERROR: (3075) DAO.QueryDefs:
+ASSERT: dbcode.c(4478) pQueryDef
+```
+DAO tries to create a `QueryDef`, gets real DAO error `3075` against `DAO.QueryDefs`, and asserts on the resulting null/invalid `pQueryDef` at `dbcode.c(4478)` -- that assertion is what trips the `DebugBreak()`/INT3 landing at `0x001fe012`.
+
+**Molly's call: `"The class has not been licensed"` (`dbcode.c(3376)`) can be ignored -- it is NOT the cause of the QueryDef failure, don't chase it.** Real target is the `CreateQueryDef`/error-3075/`pQueryDef` null-assert chain at `dbcode.c(4418)`/`dbcode.c(4478)` specifically. Not yet started -- next session should find the real address for this in Ghidra (`dbcode.c` line numbers map to `dao350.dll`'s `Dbcode_...` functions, same convention as every other `dbcode.c(N)` reference this project has traced) and decompile from there.
+
+## Previous status (2026-08-15, cont'd)
+
+**The `FUN_7a8412c3` chain (queued below) is now fully traced end to end, msjet35.dll's own `state`-machine byte confirmed via raw disassembly, and it surfaced a much bigger finding: tew's own `ReadFile`/`WriteFile` never support positioned/`OVERLAPPED` I/O at all.** This supersedes the previous entry's "decompile `FUN_7a8412c3`" blocker -- that's done, don't redo it.
+
+**Chain traced (project `debug_clean`, program `msjet35.dll`), all via decompile + raw disassembly cross-checks, not decompiler C alone**:
+`FUN_7a8412c3` (lock+dispatch) -> `FUN_7a841230` (hash-table lookup keyed on the raw `uVar4`/`0x071b0748` value -- NOT a page number, just a hash key; chain nodes store their key at `+0xc`) -> miss -> `FUN_7a84220d` (pool-slot allocator: existing-slab bitmap scan or fresh `FUN_7a842571`-backed slab, 48 slots/slab, 0x54=84 bytes/slot, no I/O) -> `FUN_7a84239a`+`FUN_7a842468` (base+derived constructor pair building a `PageCacheEntry : HashNode`, full field map below) -> `FUN_7a841344` (state-field dispatch) -> `FUN_7a84271d`/`FUN_7a84274e` (same shared I/O-dispatch code, reached via **two separate real jump tables**, confirmed via raw bytes not decompiler grouping: table1 @`0x7a8427d4` for the state 0-4 first switch, table2 @`0x7a8427e8` for a second re-read-and-redispatch on the same field -- case 3's actual target is `0x7a842780`, confirmed identical to case 0/2's target via the real table bytes, not assumed from the decompile's C grouping).
+
+**`PageCacheEntry`/`HashNode` struct fully mapped** (offsets 0x00-0x53, size 0x54=84 bytes, confirmed via `FUN_7a84220d`'s slot-stride math) -- given to Molly to type into Ghidra by hand, not yet applied in the project. Key fields: `+0xc` = raw hash key (verbatim, set by `FUN_7a842468`), `+0x1c..+0x38` = 8-slot state-word array (`state[0]`=3 at construction confirmed via both hand bit-math AND the exact final-write instruction at `0x7a842435`; `state[1..7]`=5, a deliberate out-of-range sentinel since the valid switch range is 0-4). A freshly-constructed entry **always** starts in state 3, confirmed at the instruction level (`AND EAX,7` at `0x7a84272c`).
+
+**State 3 does reach the real `ReadFile` dispatch** (corrected an earlier wrong claim mid-session that it didn't) -- `FUN_7a841bf0(&DAT_7a93a5b8,...)` allocates a fresh 2048-byte buffer from a `VirtualAlloc` reserve/commit arena (not from disk), stores the result in EBX, then falls through to the same `case 0/2/3` I/O dispatch as the normal path, calling `FUN_7a842abc` (confirmed = the real `ReadFile` wrapper, real `OVERLAPPED.Offset` + fallback `SetFilePointer` path) with offset = `*(this+0xc) << 0xb`.
+
+**Corrected a real arithmetic mistake mid-session**: first said `0x071b0748 << 11` &asymp; 244GB (wrong -- computed the full-precision product, ignoring that `SHL EAX,0xB` is a 32-bit truncating register shift on real x86). Verified via raw bytes at `0x842781`-`0x842784` (`8B 47 0C` / `C1 E0 0B`, a genuine 32-bit `SHL r/m32,imm8`) that the real truncated result is **`0xD83A4000`** (&asymp;3.38GiB) -- still impossible for a 5.6MB file, just a different number. If this ever needs re-quoting, use `0xD83A4000`, not the 244GB figure.
+
+**Verified tew's own CPU-core SHL is NOT the bug**: added `cpu/src/engine.zig` test `"doGroup2 SHL EAX,0xB truncates to 32 bits on a large shift count"` (EAX=`0x071B0748`, shl 0xB -> expects `0xD83A4000`) -- passes, 75/75 total. `doGroup2`'s SHL case (`(val << c5) & mask` on a native `u32`) correctly truncates exactly like real hardware. Prior tests only covered shift-by-1 CF-flag correctness (the 2026-08-06 CF bugs), never a larger shift count or the result *value* -- real, previously-untested gap, now covered.
+
+**`OVERLAPPED.Offset` support is now implemented and tested** (`tew/api/kernel32_io.py`'s `_read_file`/`_write_file`) -- both now read the real 5th stack parameter (`lpOverlapped`), and when it's non-NULL, read `Offset`/`OffsetHigh` from guest memory at `+8`/`+0xC` (real `OVERLAPPED` layout) and use that 64-bit position for the actual `os.pread`/`os.pwrite`/`entry.data` slice, **without** advancing `entry.position` -- matching real Win32 semantics (a positioned read/write via a non-NULL `lpOverlapped` doesn't disturb the handle's own sequential file pointer, even on a handle not opened with `FILE_FLAG_OVERLAPPED`). NULL `lpOverlapped` still falls back to the old purely-sequential behavior, unchanged. New tests in `tests/unit/api/test_read_write_file_handle.py` (`TestOverlappedReadWrite`, 2 tests): a positioned read at a non-sequential offset returns the right bytes and leaves `entry.position` untouched; a positioned write similarly lands at the right offset without moving the cursor, verified by reading the whole file back afterward. Full suite: 1088/1088 passing (up from 1086).
+
+**Current blocker**: re-run the B-tree investigation now that positioned reads are real. The open question from before -- whether `FUN_7a842abc`'s computed offset for the tail-page transition (`0x071b0748 << 0xb` = `0xD83A4000` on the live/buggy path, vs whatever the "normal" `FUN_7a8870a2` path computes) is what actually lands on page 34, or whether page 34 was previously an artifact of tew's old always-sequential `ReadFile` -- can finally be answered for real. Next session: re-run with the existing btree-probe/next-page-probe/tail-page-probe breakpoints still wired in `run_exe.py`, and check the (now-positioned) `ReadFile` log lines' `offset=`/`[overlapped]` markers against what actually gets requested at each of the 3 B-tree levels, especially level 3 (the buggy one). If the overlapped offset now genuinely differs from `69632`/page 34, that confirms the offset-computation chain traced this session (`FUN_7a8481a0` -> tail-page -> `FUN_7a8412c3` -> ... -> `FUN_7a842abc`) really is broken somewhere and page 34 was coincidental; if it still lands on 69632, the bug is elsewhere (or `0x071b0748` genuinely isn't the value used for this transition and needs re-tracing).
+
+## Previous status (2026-08-15)
+
+**Environment blocker below (2026-08-14) is no longer reproducing -- not root-caused why, just confirmed working.** Two separate runs today (`run_exe.py`, no code changes to the SDL/window-manager layer, no reboot performed by this session) both completed cleanly through the entire B-tree window with no X11 hang, no dummy-driver Vulkan failure, and no Wayland/NVIDIA segfault. Whatever was wrong on 2026-08-14 is not currently blocking -- possibly Molly rebooted since then, possibly it was transient compositor/session state as speculated. Not investigated further since it isn't blocking; if it recurs, re-read the 2026-08-14 entry below rather than re-deriving those three driver failure modes from scratch.
+
+**The B-tree page-34 investigation's real mechanism is now fully decompiled, and it's a different shape than assumed.** Decompiled `FUN_7a8481a0` (the cursor-descend loop) in full (project `debug_clean`, program `msjet35.dll`). After each `FUN_7a848399` call, there are three real branches, not one:
+```c
+iVar3 = FUN_7a848399(piVar5,param_1,&local_4);
+if (iVar3 == -2) {                              // "not found"
+    iVar3 = FUN_7a879d3b((int)piVar5);          // = *(int*)(iVar6+0x10), "tail_page" field
+    if (iVar3 == 0) {
+        iVar3 = FUN_7a879da5((int)piVar5);      // bitmap nearest-set-bit scan, threshold 0x70f-field@+2
+        goto LAB_7a848380;                       // -> falls through to FUN_7a8870a2 below
+    }
+    uVar4 = FUN_7a879d3b((int)piVar5);          // tail_page != 0: uVar4 = tail_page directly, NO FUN_7a8870a2 call
+} else {
+LAB_7a848380:
+    uVar4 = FUN_7a8870a2(piVar5,iVar3,piVar6);   // normal "found" path (previously assumed to be the only path)
+}
+```
+`FUN_7a879d3b` (runtime `0x15039d3b`) and `FUN_7a879da5` (runtime `0x15039da5`) are both trivial one-liners, real addresses confirmed via the established `runtime = static - 0x65840000` delta.
+
+**Confirmed live, twice, identical results both runs**: the level-2->3 transition (btree-probe hit #2, `field@+2=1787`, healthy page -> hit #3, `field@+2=1903`, the buggy page at Tmp.MDB file offset 69632) takes the **third branch above** -- zero `FUN_7a8870a2` hits in the window between hit #2 and hit #3 (breakpoint armed the whole time, confirmed via the existing hit-count-gated register/unregister lifecycle), meaning `iVar3==-2` and `tail_page != 0` for this transition. Added a new breakpoint at `FUN_7a879d3b`'s entry (`run_exe.py`, same TEMPORARY/windowed-lifecycle pattern as the existing probes) that fired twice (matching the decompile's two calls on this branch) with **identical raw value both times**: `tail_page@iVar6+0x10 = 0x071b0748` (119,211,848 decimal).
+
+**This value cannot be a raw page number** -- the whole file is only ~2,873 pages, ruling out the theory (implicit in earlier sessions) that `iVar6+0x10` directly holds the next page index. `uVar4` (whichever branch produced it) is stored into `local_8`/threaded state and consumed at the **top of the next loop iteration**, before `FUN_7a848399` runs again: `FUN_7a8412c3(this_vtable[2], param_3, uVar4, 1, param_5, this_vtable)`. That's the real "fetch/pin page given identifier" call -- not yet decompiled -- and it's almost certainly what turns `0x071b0748` (or the normal-path `FUN_7a8870a2` result, for the other two transitions) into the actual `ReadFile` that lands on file offset 69632/page 34.
+
+**Current blocker**: decompile `FUN_7a8412c3` (static `0x7a8412c3`, runtime should be `0x15012c3`-pattern via the same delta -- not yet computed/verified, recompute carefully) to find how it resolves a raw `uVar4` identifier like `0x071b0748` into a real page fetch, then capture it live (same windowed-breakpoint pattern) for all 3 loop iterations to see whether the level-2->3 resolution is correct per real Jet semantics or is where the actual tew bug lives. `FUN_7a8870a2`/`FUN_7a879d3b`/`FUN_7a879da5` are now fully understood -- don't re-decompile them, just reference this entry.
+
+**Unrelated, noted but not investigated**: both runs today ended in a fatal halt at `EIP=0x00200742` on the **main thread** (`tid=1000`, not the DB thread), 30-60s after the B-tree window closes (60.5s and 92.9s respectively across the two runs) -- a different subsystem entirely, out of scope for the B-tree work. Worth a future session's attention but do not conflate with the above.
+
+## Previous status (2026-08-14)
+
+**Not a code blocker -- an environment blocker on this specific machine.**
+The B-tree investigation itself (see "2026-08-09, cont'd" below) is fully
+queued and ready to resume; nothing about it has changed. What's actually
+stopping progress: `run_exe.py` cannot run at all right now, on any of the
+three SDL video drivers tried, each for a different real reason:
+
+- **Default (X11/XWayland)**: hangs forever, confirmed via `gdb -p <pid>
+  thread apply all bt` -- the main thread is parked in `X11_ShowWindow` ->
+  `XIfEvent`/`xcb_wait_for_event`, waiting on a `MapNotify` from the window
+  manager that never arrives. **Not stale process state** -- killing and
+  letting `kwin_wayland_wrapper` respawn a completely fresh `Xwayland`
+  process (safe to do: confirmed via process tree that this session's own
+  `konsole` is a native Wayland client, not an Xwayland client, so this
+  doesn't risk the session) made no difference. Root cause still unknown --
+  possibly a KDE window-management policy (focus-stealing prevention /
+  window rules for unmanaged apps), not yet investigated.
+- **`SDL_VIDEODRIVER=dummy`**: structurally can never work, not a config
+  issue -- the game's main window is created with the `SDL_WINDOW_VULKAN`
+  flag (`window_manager.py`, needed because D3D8 is implemented via real
+  Vulkan), and the dummy driver has no real native surface for Vulkan to
+  attach to. `SDL_CreateWindow` fails outright, `CreateWindowExA`'s handler
+  treats that as fatal, and the whole process halts at ~10.8s virtual time
+  -- well before `DB_StartUpDatabase` (~35s). A real Xvfb install would
+  almost certainly hit the identical wall (no real GPU/Vulkan backing
+  either) -- not worth pursuing for that reason, confirmed via reasoning
+  before spending the sudo/install effort.
+- **`SDL_VIDEODRIVER=wayland`**: gets furthest -- real window created, real
+  `VkDevice` created -- then segfaults. Real backtrace (via `gdb -batch -ex
+  "run run_exe.py" -ex "bt"` on the actual crash, not a post-mortem core):
+  `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` -> NVIDIA's Vulkan ICD
+  (`libnvidia-glcore.so.610.57.04`) -> `libGLX_nvidia.so.0` ->
+  `XGetWindowAttributes()` (libX11) -- NVIDIA's proprietary driver calls an
+  **X11** function on what is a **native Wayland** surface, reads garbage,
+  crashes. Confirmed NOT a missing-package issue (`egl-wayland` and
+  `libnvidia-egl-wayland(2).so` are both installed). This is a real,
+  external NVIDIA driver bug/limitation (driver `610.57.04`, an
+  unfamiliar-to-Claude/likely-very-recent version), not fixable from
+  inside this session.
+
+**Plan (Molly's call, 2026-08-14): wait until she's physically home and can
+reboot the machine**, rather than keep chasing driver/compositor fixes
+remotely -- a clean reboot is expected to reset whatever stuck
+window-manager/X11/Wayland session state is causing the X11 hang at
+minimum. Do not re-litigate the three driver attempts above without new
+evidence; they're each root-caused, not guesses.
+
+**State preserved, ready to resume immediately after reboot**: `run_exe.py`
+and `tew/api/kernel32_io.py` still carry the uncommitted `TEMPORARY
+(2026-08-09)` probes (confirmed via `git status` on 2026-08-14 -- not lost,
+not committed either). The very next step, once a run actually completes,
+is to let the existing `_fun_7a8870a2_entry` breakpoint (already wired to
+arm/disarm itself around the `btree-probe` hits, no code changes needed)
+capture real (`param_1`, raw bytes at `iVar6+0xf4`) data for the page
+33->34 transition, then hand-check that against the decompiled formula in
+the entry below to find out whether `FUN_7a8870a2`'s computation itself is
+wrong, or whether it's being fed a bad entry index from `FUN_7a848399`'s
+search on page 33.
+
+## Previous status (2026-08-09, cont'd)
+
+**The B-tree page-overflow blocker's Online.MDB-vs-tew-bug question is
+answered: the `1903` value is real, pre-existing data in `Online.MDB`
+itself, not a tew write-path bug.** Added a temporary breakpoint at
+`FUN_7a848399`'s real entry (runtime `0x15008399`, still wired into
+`run_exe.py`, clearly marked `TEMPORARY (2026-08-09)`) logging
+`(this, iVar6, field@iVar6+2)` on each hit, plus a `buf=0x...` field to
+`kernel32_io.py`'s `ReadFile` debug logging (kept permanently -- same style
+as the existing `offset=`/`req=`/`got=`/`pos_after=` fields, real value,
+no downside). Confirmed live all 3 invocations match prior findings
+exactly (`1578`/`1787`/`1903`), and cross-referencing `iVar6` against the
+new `buf=` field pinned hit #3's page to **Tmp.MDB file offset 69632**
+(`ReadFile(Tmp.MDB ... offset=69632 buf=0x41ab6000)`, exact match).
+Confirmed **zero `WriteFile` calls touched the read+write handle (`h=0x5044`)
+before this read** -- the only prior activity on `Tmp.MDB` was the initial
+`FeTools_CopyFile` copy (a separate write-only handle, `h=0x5003`, plain
+sequential 4096-byte `ReadFile(Online.mdb)`/`WriteFile` pairs, no
+transformation). Direct byte comparison at file offset 69632 in both
+`~/.emu32/Data/DB/Online.mdb` and `~/.emu32/SaveData/DB/Tmp.MDB` (both
+5,883,904 bytes) confirmed **byte-for-byte identical**, `field@+2=1903` in
+both. This rules out option (b) from the previous entry (a tew-side
+write-path bug) -- the value is genuinely on disk in the shipped
+`Online.MDB`, not something tew's copy/write path corrupted or introduced.
+
+**Field semantics confirmed via direct Ghidra decompile of `FUN_7a848399`
+(project `debug_clean`, program `msjet35.dll`) -- `iVar6+2` is NOT
+misread.** No pre-existing Ghidra struct for this Jet page format
+(`list_structs` filter "page" → empty). Real decompiled body:
+```c
+iVar6 = *(int *)((int)this + 4);                          // page buffer ptr
+local_18 = 0xe2 - (uint)(*(ushort *)(iVar6 + 2) >> 3);     // capacity - (used/8)
+local_1c = iVar6 + 0x16;                                   // bitmap base (→ FUN_7a847f1d)
+local_10 = iVar6 + 0xf8;                                   // key-data region start (248-byte header)
+uVar1    = (uint)*(byte *)(iVar6 + 0x14);                  // initial search-bound byte
+```
+`0xe2` is a hardcoded immediate in the function itself (compile-time
+constant, not per-page data); `0xf8`=248 as the header size before the
+key-data region lines up with the earlier "2048-byte page minus ~240-byte
+header" guess. `iVar6+2` genuinely is consumed as "bytes used," exactly as
+prior sessions inferred -- this specific misread-field theory is now
+ruled out. Also checked the caller, `FUN_7a8481a0` (B-tree cursor-descend
+loop): no visible bounds/sanity check on this field before calling
+`FUN_7a848399` at each level -- nothing at this layer would stop a page
+like this from being visited.
+
+**Cross-referenced page 34 against `mdbtools`' documented Jet3 page-type
+enum (independent C# parser added, `/data/Code/csharp/MdbLib` --
+`IndexPageHeader`/`ReadIndexPageHeader`, plus a synthetic unit test and a
+temporary real-file cross-check both confirming `free_space=1903` via a
+second, independent code path). Result: page 34's own type byte is
+**`0x01` -- a Data Page, not an index page (`0x03`/`0x04`)**. Its other
+"index header" fields are nonsense under that interpretation
+(`prev_page=125501441` -- impossible, file only has ~2,873 pages total;
+`pref_len=4435` -- impossible, exceeds the whole page size). This isn't a
+page with one anomalous field; it's an ordinary data page being
+misinterpreted as an index page.
+
+**Molly's real-world argument (decisive, don't relitigate this):** MCO
+shipped and ran successfully for real players against this exact
+`Online.MDB`. If this were a genuine Jet 3.5 engine bug or real data
+corruption, real installs would have hit it too, and the game wouldn't
+have worked. It worked. So neither Jet 3.5 nor `Online.MDB`'s data is the
+culprit -- **tew itself must be resolving to the wrong page number for
+this B-tree descent step**, landing on page 34 (an ordinary data page)
+instead of whatever real Windows would correctly fetch here. All prior
+theories in this section (real-Jet-edge-case, misread-field,
+write-path-bug) are superseded by this framing -- don't re-open them
+without new evidence pointing back that way.
+
+**Current blocker**: find where page number 34 itself gets computed/
+selected as "next page to fetch" during the cursor-descend from page 33
+(hit #2, `field=1787`, healthy) to page 34 (hit #3). In `FUN_7a8481a0`
+(the cursor-descend loop), the call immediately after `FUN_7a848399`
+returns is `FUN_7a8870a2(piVar5,iVar3,piVar6)` (or, on the `iVar3==-2`
+path, `FUN_7a879d3b`/`FUN_7a879da5`) -- one of these almost certainly
+resolves the found entry index into the next child page number/pointer.
+Not yet decompiled or traced live. Next step: decompile `FUN_7a8870a2`
+(and `FUN_7a879d3b`/`FUN_7a879da5` if the `iVar3==-2` path is the one
+actually taken) to find the real mechanism, then capture it live
+(extend the existing `run_exe.py` breakpoint or add a new one) to see
+the actual runtime computation that produces "34" and check it against
+what the entry data on page 33 should really resolve to -- this is
+where the real tew bug almost certainly lives, not in page 34 itself.
+
+## Previous status (2026-08-09)
+
+**DSOUND serve-thread spam eliminated** (Molly: "set line 292's key in the
+log to 1"). The game's own real code checks a registry value,
+`HKLM\Software\Electronic Arts\Motor City\DisableAudio`
+(`RegQueryValueExA` at what was `/tmp/emu.log` line 292), which
+`registry.json` never had seeded, so it always came back `NOT FOUND`.
+Added `"disableaudio": {"type": 4, "value": 1}` under
+`hklm\\software\\electronic arts\\motor city` in `registry.json` (real
+`type: 4` = `REG_DWORD`, matching the existing `instlev` entry's
+convention). Confirmed live: `RegQueryValueExA(..., "DisableAudio") -> 1`,
+and `stdout.txt` now has zero `[DSOUND (serve)]`/`"timer held off"` lines
+at all (previously thousands per run) -- `DirectSoundCreate` itself still
+runs, but the game skips whatever downstream init/serve-loop path was
+producing the spam. This is a real, game-supported config toggle, not an
+emulator workaround.
+
+**The `FUN_7a848399`/`FUN_7a847f1d` B-tree stall is now FULLY root-caused
+down to the exact byte, via a chain of logpoints (see changelog.md for
+the full derivation)**: `FUN_7a848399` is invoked 3 times per run
+(matching a 3-level B-tree traversal via `FUN_7a8481a0`), and on each
+invocation computes `local_18 = 0xe2 - (*(ushort*)(iVar6+2) >> 3)` where
+`iVar6 = *(this+4)` is real Jet page metadata already read via
+`ReadFile`. Confirmed live for all 3 invocations:
+- Invocation 1: `field@iVar6+2 = 1578` -> `local_18=29` -> passes `231` to
+  `FUN_7a847f1d`. Fine.
+- Invocation 2: `field@iVar6+2 = 1787` -> `local_18=3` -> passes `23`.
+  Fine, but very close to the edge.
+- Invocation 3: `field@iVar6+2 = 1903` -> **exceeds `0xe2*8=1808`** ->
+  `local_18` underflows to `-11` -> passes `-89`, which
+  `FUN_7a847f1d` (correctly, per real x86/C `uint` semantics -- verified
+  this part of the CPU core is NOT at fault) reinterprets as unsigned and
+  right-shifts, producing a ~537-million-iteration scan that's the
+  entire stall.
+
+`0xe2*8=1808` looks like this page structure's real usable-byte capacity
+(plausibly a `2048`-byte Jet page minus a `~240`-byte header). `field@
+iVar6+2` reads as a real "bytes used" counter for that page, and on the
+3rd traversal level it reads `1903` -- genuinely *over* its own page's
+stated capacity. The values across all 3 invocations are small, plausible,
+and steadily increasing (not garbage/corrupted-looking), so this reads as
+real but *internally inconsistent* page metadata, not a CPU-emulation bug
+at this call site. Two independently-confirmed CPU-core CF bugs were
+found and fixed while chasing this (see below) but ruled out as the
+cause -- the actual `-89` production is entirely explained by this one
+page's own metadata field.
+
+**Current blocker**: find why this specific page's "bytes used" field
+reads `1903` when its own capacity is `1808` -- i.e., trace back to
+whatever wrote this page during `Tmp.MDB`'s creation/growth (the
+`FeTools_CopyFile` from `Online.MDB` at startup, followed by Jet's own
+write operations during `DB_StartUpDatabase`) to determine whether this
+is a real, pre-existing Online.MDB data-integrity quirk (in which case
+real Jet on real Windows would hit the same page-overflow and this call
+site's lack of a bounds check might be a genuine, narrow real-Jet bug
+that real installs just never trigger) or a tew-side write-path bug that
+wrote too much data into this page. Not yet fixed. Given how precisely
+this is now nailed down, a fresh session can go straight to comparing
+this exact page's bytes between `Online.MDB` and the freshly-copied
+`Tmp.MDB`, and/or checking real Jet source/documentation for what this
+field and the `0xe2` capacity constant actually represent.
+
+## Previous status (2026-08-08, cont'd)
 
 **New real blocker found, past everything above: `tid=1012` (DB thread) genuinely
 stalls inside `MSJET35.DLL`'s own B-tree code, well past `DB_StartUpDatabase`.**
