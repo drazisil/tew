@@ -164,14 +164,18 @@ def patch_crt_internals(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-# TEMP diagnostic, tid=1012 investigation (see memory/status.md): DAO's
+# TEMP diagnostic, tid=1012/1011 investigation (see memory/status.md): a
 # DllMain-calling worker thread reaches THREAD_SENTINEL ("returns normally")
 # without ever hitting the nested-call sentinel _invoke_emulated_proc pushed
 # for its call into DllMain -- i.e. it skips past that pushed return address
-# entirely. tid numbering is deterministic run-to-run, so hardcoding the tid
-# here is enough to isolate this thread's dump from the many other threads
-# that complete normally every run. Discard once root-caused.
-_THREAD_END_STACK_DUMP_TIDS: set[int] = {1012}
+# entirely. First seen 2026-xx-xx calling dao350.dll's real DllMain (tid
+# 1012, never root-caused, left as an open TEMP diagnostic); the identical
+# symptom resurfaced 2026-08-16 calling msjint35.dll's real DllMain (tid
+# 1011) via the new dependency-DllMain fix -- same underlying tew bug, not
+# DLL-specific. tid numbering is deterministic run-to-run, so hardcoding the
+# tid here is enough to isolate this thread's dump from the many other
+# threads that complete normally every run. Discard once root-caused.
+_THREAD_END_STACK_DUMP_TIDS: set[int] = {1011, 1012}
 
 
 def _make_thread_return_handler(state: CRTState, memory: "Memory"):

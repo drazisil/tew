@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
 from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
+from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
 from tew.logger import logger
 
 
@@ -42,6 +43,41 @@ def _load_dll_with_dllmain(
     else:
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, arg_bytes)
+
+
+def _invoke_dependency_dllmain(
+    cpu: "CPU", memory: "Memory", state: CRTState, loaded,
+) -> None:
+    """Synchronously run a dependency DLL's own DllMain(DLL_PROCESS_ATTACH).
+
+    dll_loader.load_dll() recursively loads a DLL's own PE-import
+    dependencies but never runs their DllMain -- only the top-level
+    LoadLibraryA path does that (via _load_dll_with_dllmain above, an async
+    stack-trampoline trick appropriate for redirecting the *current*
+    thread's own next instruction). A dependency loaded mid-recursion has
+    no such "current thread about to resume" hook to detour through, so
+    this uses the existing synchronous nested-call mechanism instead
+    (_invoke_emulated_proc, already battle-tested for calling a real loaded
+    DLL's real DllMain -- see its own docstring/comments for the
+    thread-scheduler pitfalls already worked out there).
+
+    Real, confirmed bug this fixes: msjint35.dll (pulled in only as
+    msjter35.dll's own PE-import dependency) never ran its CRT startup, so
+    its "my own HINSTANCE" global stayed at its zero default, and its own
+    exported code later handed that NULL to LoadStringA, silently failing
+    every Jet error-message resource lookup.
+    """
+    handle = loaded.base_address & 0xFFFFFFFF
+    sentinel = _get_dialog_sentinel(state, memory)
+    logger.debug("handlers",
+        f"[dependency-dllmain] invoking DllMain @ 0x{loaded.entry_point:x} for {loaded.name}")
+    result = _invoke_emulated_proc(
+        cpu, memory, loaded.entry_point,
+        [handle, 1, 0],  # hinstDLL, DLL_PROCESS_ATTACH, lpvReserved
+        sentinel, scheduler=state.scheduler,
+    )
+    logger.debug("handlers",
+        f"[dependency-dllmain] {loaded.name}'s DllMain returned {result}")
 
 
 def register_kernel32_handlers(
@@ -180,7 +216,9 @@ def register_kernel32_handlers(
                     basename = os.path.basename(real_path)
                     dll_loader.add_search_path(os.path.dirname(real_path))
                     was_loaded = dll_loader.get_dll(basename) is not None
-                    loaded = dll_loader.load_dll(basename, memory)
+                    loaded = dll_loader.load_dll(
+                        basename, memory,
+                        lambda dep: _invoke_dependency_dllmain(cpu, memory, state, dep))
                     if loaded:
                         dll_loader.patch_dll_iats(memory, stubs)
                         handle = loaded.base_address & 0xFFFFFFFF
@@ -250,7 +288,9 @@ def register_kernel32_handlers(
         """Try to load a name-only DLL (no path separator)."""
         if dll_loader:
             was_loaded = dll_loader.get_dll(name) is not None
-            loaded = dll_loader.load_dll(name, memory)
+            loaded = dll_loader.load_dll(
+                name, memory,
+                lambda dep: _invoke_dependency_dllmain(cpu, memory, state, dep))
             if loaded:
                 dll_loader.patch_dll_iats(memory, stubs)
                 handle = loaded.base_address & 0xFFFFFFFF

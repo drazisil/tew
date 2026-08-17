@@ -3,14 +3,42 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from tew.logger import logger
 from tew.api._state import find_file_ci
+from tew.hardware.cpu_zig import FatalHaltError
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+
+
+def should_invoke_dependency_dllmain(
+    dep_was_loaded: bool,
+    imported_dll: "LoadedDLL | None",
+    on_dependency_loaded: "Callable[[LoadedDLL], None] | None",
+) -> bool:
+    """Decides whether a just-resolved PE-import dependency needs its own
+    DllMain invoked. Pulled out as a standalone, easily unit-testable
+    predicate since it's the part of the dependency-DllMain fix most likely
+    to grow a subtle off-by-one (double-invoking a shared dependency's
+    DllMain, or missing a freshly-loaded one) as this code changes.
+
+    True only when: the dependency was NOT already loaded before this
+    resolution (a second DLL importing an already-loaded dependency must
+    not re-run its DllMain), the load actually succeeded, it has a real
+    entry point (some DLLs are pure resource/data containers with none),
+    and a callback was actually supplied (callers that never pass one --
+    e.g. startup-time static-import loading -- get the pre-fix behavior
+    completely unchanged).
+    """
+    return (
+        not dep_was_loaded
+        and imported_dll is not None
+        and imported_dll.entry_point != 0
+        and on_dependency_loaded is not None
+    )
 
 
 def apply_base_relocations(
@@ -234,7 +262,10 @@ class DLLLoader:
                 return candidates
         return ["kernel32", "ntdll"]
 
-    def load_dll(self, dll_name: str, memory: "Memory") -> LoadedDLL | None:
+    def load_dll(
+        self, dll_name: str, memory: "Memory",
+        on_dependency_loaded: "Callable[[LoadedDLL], None] | None" = None,
+    ) -> LoadedDLL | None:
         from tew.pe.exe_file import EXEFile
 
         key = dll_name.lower()
@@ -309,7 +340,25 @@ class DLLLoader:
             if exe.import_table:
                 logger.debug("loader", f"  [IAT Resolution] Resolving {len(exe.import_table.descriptors)} import descriptors for {dll_name}")
                 for descriptor in exe.import_table.descriptors:
-                    imported_dll = self.load_dll(descriptor.dll_name, memory)
+                    dep_was_loaded = descriptor.dll_name.lower() in self._loaded_dlls
+                    imported_dll = self.load_dll(descriptor.dll_name, memory, on_dependency_loaded)
+                    # A DLL loaded only as another DLL's PE-import dependency
+                    # (never via an explicit guest LoadLibraryA call) never
+                    # ran its own DllMain before this -- its CRT startup
+                    # (which stashes e.g. "my own HINSTANCE" into a global)
+                    # never executed. Real-world hit: msjter35.dll pulls in
+                    # msjint35.dll this way; msjint35.dll's own exported code
+                    # later reads that never-set global as 0 and hands NULL
+                    # to LoadStringA, silently failing every resource lookup.
+                    # on_dependency_loaded (wired up only at the runtime
+                    # LoadLibraryA call sites, where a cpu exists) fixes this
+                    # by invoking the dependency's real DllMain synchronously,
+                    # the moment it's first loaded -- correctly ordered before
+                    # the *caller's* own DllMain runs, since that only
+                    # happens after this whole import-resolution loop (and
+                    # thus every transitively-loaded dependency) completes.
+                    if should_invoke_dependency_dllmain(dep_was_loaded, imported_dll, on_dependency_loaded):
+                        on_dependency_loaded(imported_dll)
 
                     for entry in descriptor.entries:
                         import_addr: int | None = None
@@ -349,6 +398,20 @@ class DLLLoader:
                         )
 
             return dll
+
+        except FatalHaltError:
+            # A dependency's DllMain (invoked synchronously above, via
+            # on_dependency_loaded) can run arbitrary guest code through a
+            # nested cpu.run() -- if *anything* live in the emulator hits an
+            # unimplemented API or corruption check during that window, this
+            # is where cpu.run() surfaces it, even though it has nothing to
+            # do with this DLL failing to load. fatal_halt means the whole
+            # emulator session must stop; swallowing it here as "DLL not
+            # found" (the broad except below) would silently downgrade a
+            # fatal condition to a per-call warning and let the caller limp
+            # on. Let it propagate to wherever it's actually meant to be
+            # handled (see FatalHaltError's docstring, cpu_zig.py).
+            raise
 
         except Exception as err:
             logger.warn("dll", f"Failed to load {dll_name}: {err}")
