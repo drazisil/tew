@@ -750,6 +750,27 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "MapVirtualKeyA", _MapVirtualKeyA)
 
+    # IsCharAlphaNumericA(CHAR ch) -> BOOL
+    # Real Windows is locale-aware (GetStringTypeA under the hood); plain
+    # ASCII alnum classification is correct for every input a US-English
+    # title like this actually passes.
+    def _IsCharAlphaNumericA(cpu: "CPU") -> None:
+        ch = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
+        is_alnum = (0x30 <= ch <= 0x39) or (0x41 <= ch <= 0x5A) or (0x61 <= ch <= 0x7A)
+        cpu.regs[EAX] = 1 if is_alnum else 0
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "IsCharAlphaNumericA", _IsCharAlphaNumericA)
+
+    # IsCharAlphaA(CHAR ch) -> BOOL — same as IsCharAlphaNumericA but no digits
+    def _IsCharAlphaA(cpu: "CPU") -> None:
+        ch = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
+        is_alpha = (0x41 <= ch <= 0x5A) or (0x61 <= ch <= 0x7A)
+        cpu.regs[EAX] = 1 if is_alpha else 0
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "IsCharAlphaA", _IsCharAlphaA)
+
     # UpdateWindow(HWND hWnd) -> BOOL
     # Triggers WM_PAINT; we re-render via SDL on every DispatchMessageA call,
     # so no additional action is needed here.
@@ -954,7 +975,10 @@ def register_user32_gdi32_handlers(
         else:
             copied = len(text)
 
-        logger.debug("handlers", f'LoadStringA(hInst=0x{h_instance:x}, id={u_id}) -> "{text}" ({copied} chars)')
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        caller_dll = dll_loader.find_dll_for_address(caller) if dll_loader else None
+        caller_info = f"{caller_dll.name}+0x{caller - caller_dll.base_address:x}" if caller_dll else "unknown"
+        logger.debug("handlers", f'LoadStringA(hInst=0x{h_instance:x}, id={u_id}) -> "{text}" ({copied} chars) caller=0x{caller:x} [{caller_info}]')
         cpu.regs[EAX] = copied
         cleanup_stdcall(cpu, memory, 16)
 
