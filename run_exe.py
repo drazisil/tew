@@ -23,7 +23,7 @@ from os.path import dirname
 from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, REG_NAMES, FatalHaltError
 from tew.kernel.kernel_structures import KernelStructures
-from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
+from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt, _dump_cpu_state
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
@@ -313,6 +313,14 @@ def is_valid_eip(eip: int) -> str | None:
 # Breakpoints halt execution before the target instruction and call a Python
 # handler(cpu, mem).  Resume is automatic.
 #
+# CAUTION -- cpu.add_breakpoint (cpu/src/kernel.zig) backs this with a FIXED
+# 8-slot table (bp_table: [8]u32) and silently no-ops once full -- no error,
+# no log, the breakpoint just never fires. Live-verified 2026-08-16: 3 new
+# probes added past the 8th registration never fired at all, no diagnostic
+# anywhere. Keep total register_breakpoint() calls in this file at <= 8, or
+# unregister_breakpoint() something first -- there is currently no code-level
+# guard against silently exceeding this.
+#
 # Logpoints fire a C callback inline from the Zig hot loop (no halt, near-zero
 # overhead).  The callback signature is:
 #   fn(eip: u32, regs: ptr[u32 x8], memory: ptr[u8], memory_size: usize)
@@ -384,6 +392,32 @@ _HISTORY_CAPTURE_ENABLED = False
 if _HISTORY_CAPTURE_ENABLED:
     cpu.enable_history_capture_clickhouse("http://localhost:8123", "default", "poc")
     logger.info("startup", "[history] ClickHouse capture enabled, run_id will be queryable after the run")
+
+
+# B-tree page-metadata/next-page-resolution/tail-page investigation
+# (TEMPORARY 2026-08-09/2026-08-15) removed 2026-08-16: fully RESOLVED, see
+# status_archive.md "2026-08-16" -- the page-34/field=1903 symptom was
+# tew's ReadFile ignoring OVERLAPPED.Offset (fixed, see kernel32_io.py),
+# not a real B-tree/page-resolution bug. FUN_7a8870a2/FUN_7a879d3b/
+# FUN_7a848399 were all real, accurately-decompiled, but not the actual
+# cause -- their probes (_fun_7a8870a2_entry, _fun_7a879d3b_entry,
+# _fun_7a848399_entry, and the 3 breakpoint slots they occupied) are gone;
+# re-derive from status_archive.md if this area needs revisiting.
+
+
+# DAO-3075/CreateQueryDef investigation (expsrv.dll / VBAGetExprSrv /
+# query-rewrite probes) removed 2026-08-17: concluded for now, see
+# status.md/changelog.md "2026-08-17" for the full trace. Not resumed
+# tonight -- pivoting to the scheduler-to-Zig port (see
+# ~/.claude/plans/vast-drifting-pike.md) instead, motivated by the
+# starvation incident found while tracing this. All 8 breakpoint slots
+# freed back to baseline.
+
+# Scheduler-to-Zig port Stage 0 baseline-capture probes (2026-08-17) removed
+# 2026-08-17: the port completed all 6 stages, each verified against this
+# baseline's checkpoints (see changelog.md's "2026-08-17 (cont'd)"-through-
+# "(cont'd x7)" entries); the port is done and `tew/kernel/scheduler.py` has
+# been deleted. All breakpoint slots freed back to baseline.
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────

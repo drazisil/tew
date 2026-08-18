@@ -27,7 +27,6 @@ from tew.api.ini_file import (
 )
 from tew.api._state import (
     CRTState, MutexHandle, EventHandle,
-    PendingThreadInfo,
     find_file_ci, read_cstring, read_wide_string,
     TEB_BASE,
 )
@@ -298,8 +297,8 @@ def register_kernel32_io_handlers(
         logger.info("thread",
             f"CreateThread(start=0x{lp_start:x}, param=0x{lp_param:x}, "
             f"flags=0x{dw_flags:x}) -> handle=0x{handle:x}, tid={tid}")
-        idx = len(state.scheduler.threads)
-        thread = state.scheduler.create_thread(
+        idx = state.scheduler.thread_count
+        state.scheduler.create_thread(
             thread_id=tid,
             handle=handle,
             start_address=lp_start,
@@ -307,7 +306,7 @@ def register_kernel32_io_handlers(
             suspended=is_susp,
         )
         logger.debug("thread", f"  tid={tid} assigned scheduler idx={idx}")
-        state.pending_threads.append(thread)
+        state.pending_threads.append(handle)
         if lp_tid:
             memory.write32(lp_tid, tid)
         cpu.regs[EAX] = handle
@@ -315,12 +314,10 @@ def register_kernel32_io_handlers(
 
     def _resume_thread(cpu: "CPU") -> None:
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        for t in state.pending_threads:
-            if t.handle == h and t.suspended:
-                logger.debug("thread",
-                    f"ResumeThread(0x{h:x}) - unsuspending thread {t.thread_id}")
-                t.suspended = False
-                break
+        if h in state.pending_threads and state.scheduler.get_suspended(h):
+            logger.debug("thread",
+                f"ResumeThread(0x{h:x}) - unsuspending thread {state.scheduler.get_thread_id(h)}")
+            state.scheduler.set_suspended(h, False)
         cpu.regs[EAX] = 1  # previous suspend count
         cleanup_stdcall(cpu, memory, 4)
 
@@ -346,20 +343,18 @@ def register_kernel32_io_handlers(
     def _get_exit_code_thread(cpu: "CPU") -> None:
         h         = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_code   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        thread = next((t for t in state.pending_threads if t.handle == h), None)
+        is_pending = h in state.pending_threads
         if lp_code:
-            memory.write32(lp_code, 0 if (thread and thread.completed) else 259)
+            memory.write32(lp_code, 0 if (is_pending and state.scheduler.get_completed(h)) else 259)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
     def _suspend_thread(cpu: "CPU") -> None:
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        for t in state.pending_threads:
-            if t.handle == h:
-                logger.debug("thread",
-                    f"SuspendThread(0x{h:x}) - suspending thread {t.thread_id}")
-                t.suspended = True
-                break
+        if h in state.pending_threads:
+            logger.debug("thread",
+                f"SuspendThread(0x{h:x}) - suspending thread {state.scheduler.get_thread_id(h)}")
+            state.scheduler.set_suspended(h, True)
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 

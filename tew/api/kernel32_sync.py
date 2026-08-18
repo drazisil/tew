@@ -127,13 +127,13 @@ def register_kernel32_sync_handlers(
             return
         slot = state.next_tls_slot
         state.next_tls_slot += 1
-        state.tls_slots.add(slot)
+        state.scheduler.tls_alloc_slot(slot)
         cpu.regs[EAX] = slot
 
     def _tls_set_value(cpu: "CPU") -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         val = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        if idx not in state.tls_slots:
+        if not state.scheduler.tls_slot_allocated(idx):
             # Win32: returns FALSE for an invalid index; never halts.
             logger.warn("handlers", f"[TlsSetValue] invalid slot {idx} — returning FALSE")
             cpu.regs[EAX] = 0
@@ -146,7 +146,7 @@ def register_kernel32_sync_handlers(
 
     def _tls_get_value(cpu: "CPU") -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if idx not in state.tls_slots:
+        if not state.scheduler.tls_slot_allocated(idx):
             # Win32: returns 0 (NULL) for an invalid index; never halts.
             logger.warn("handlers", f"[TlsGetValue] invalid slot {idx} — returning 0")
             cpu.regs[EAX] = 0
@@ -157,13 +157,13 @@ def register_kernel32_sync_handlers(
 
     def _tls_free(cpu: "CPU") -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        if idx not in state.tls_slots:
+        if not state.scheduler.tls_slot_allocated(idx):
             # Win32: returns FALSE for an unallocated index; never halts.
             logger.warn("handlers", f"[TlsFree] invalid slot {idx} — returning FALSE")
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 4)
             return
-        state.tls_slots.discard(idx)
+        state.scheduler.tls_free_slot(idx)
         for store in state.tls_store.values():
             store.pop(idx, None)
         memory.write32(TEB_BASE + 0xE0 + idx * 4, 0)

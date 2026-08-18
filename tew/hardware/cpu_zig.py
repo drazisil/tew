@@ -322,8 +322,20 @@ class ZigCPU:
         self._step_handler:     Callable | None  = None
         self._kernel_structures: "KernelStructures | None" = None
         self._last_fs_base:     int = 0
-        # Override flags for handle_exception() called from Python (not from Zig)
-        self._py_halted:        bool = False
+        # Override flag for handle_exception() called from Python (not from Zig).
+        # `halted` deliberately has no equivalent -- see its property below:
+        # it used to cache a Python-side override the same way, but the
+        # scheduler-to-Zig port (Stage 4, see
+        # ~/.claude/plans/vast-drifting-pike.md) made that a real bug. Once
+        # the scheduler's swap/load logic moved into Zig, it clears
+        # CpuState.halted directly on the native struct -- a Python-side
+        # cache has no way to learn about that, and a `cpu.halted = True`
+        # set from Python earlier (e.g. an unhandled SEH fault check) would
+        # stay stuck True forever afterward even once a real thread swap
+        # legitimately un-halts the CPU, since only this class's own setter
+        # could ever clear the cache. `_lib.cpu_is_halted` is always the
+        # live, correct answer; caching it independently was never needed
+        # (every setter call already updates the native flag directly too).
         self._py_faulted:       bool = False
         # `fatal_halt` itself is a property (see below) backed by native
         # CpuState.fatal_halted — not a plain Python attribute. It has no
@@ -450,6 +462,13 @@ class ZigCPU:
     # ── Register/state properties ─────────────────────────────────────────────
 
     @property
+    def native_handle(self) -> int:
+        """Raw *CpuState handle, for other Zig-backed subsystems (e.g.
+        ZigScheduler) that need to pass this CPU into their own FFI calls.
+        Explicit accessor rather than callers reaching into ._state directly."""
+        return self._state
+
+    @property
     def eip(self) -> int:
         return _lib.cpu_get_eip(self._state)
 
@@ -467,15 +486,13 @@ class ZigCPU:
 
     @property
     def halted(self) -> bool:
-        return self._py_halted or _lib.cpu_is_halted(self._state)
+        return bool(_lib.cpu_is_halted(self._state))
 
     @halted.setter
     def halted(self, val: bool) -> None:
         if not val:
-            self._py_halted = False
             _lib.cpu_clear_halted(self._state)
         else:
-            self._py_halted = True
             _lib.cpu_set_halted(self._state)
 
     @property
@@ -690,7 +707,6 @@ class ZigCPU:
     def handle_exception(self, error: Exception) -> None:
         self.last_error = error
         self._py_faulted = True
-        self._py_halted  = True
         _lib.cpu_set_halted(self._state)
 
     # ── Save / restore ────────────────────────────────────────────────────────

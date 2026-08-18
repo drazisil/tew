@@ -36,7 +36,7 @@ from tew.api.user32_handlers import _invoke_emulated_proc
 from tew.api.win32_handlers import Win32Handlers
 from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
-from tew.kernel.scheduler import ThreadStatus
+from tew.hardware.scheduler_zig import ThreadStatus
 
 MEM_SIZE   = 8 * 1024 * 1024
 STACK      = 0x200000
@@ -90,7 +90,7 @@ def test_invoke_emulated_proc_returns_zero_when_calling_thread_dies_mid_call():
 
     # The thread that made the call must actually be dead -- otherwise this
     # test isn't exercising the scenario it claims to.
-    assert state.scheduler.threads[started_thread_idx].status == ThreadStatus.DEAD
+    assert state.scheduler.status_at_idx(started_thread_idx) == ThreadStatus.DEAD
 
     # Must NOT be the garbage EAX the dying code set right before it died --
     # that's exactly the misattribution bug this detection prevents.

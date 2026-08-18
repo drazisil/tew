@@ -4,6 +4,421 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-17 (cont'd x7) — Scheduler-to-Zig port COMPLETE (Stage 6, final sweep)
+
+Final sweep: grepped for every remaining `tew.kernel.scheduler`/`ThreadState(`/
+`Scheduler(` reference across the whole codebase -- found only the old
+`tests/unit/kernel/test_scheduler.py` (now fully superseded by Stage 5's
+`tests/unit/hardware/test_scheduler_zig.py`) and harmless doc-comment
+mentions in `scheduler_zig.py`. Deleted `tew/kernel/scheduler.py` (673
+lines, the original pure-Python scheduler this whole port replaced) and
+`tests/unit/kernel/test_scheduler.py` (1077 lines, its test suite) together
+-- keeping one without the other made no sense once nothing imports either.
+Also removed `run_exe.py`'s Stage-0 baseline-capture breakpoint probes,
+whose own comment said to remove them once Stage 6 finished its final diff
+-- that's now.
+
+`zig build test`: 154/154 (unchanged -- pure deletion, no new Zig code).
+`pytest -q`: **1112/1112** (was 1191; -79 from the deleted old test file,
+zero regressions from the deletion itself or the probe removal).
+
+**Final live-run verification, all 4 checks from the plan's Verification
+section:**
+- (a) Stage 0 baseline match: checkpoint delta 169,791 steps, confirmed
+  identical across every single stage's live-run check this entire port
+  (Stages 1 through 6) -- the one number that never moved.
+- (b) ordinary multi-thread scheduling: a full production-mode run created
+  14 real threads (tid 1001-1014), including 3 threads spawned *from
+  inside* a nested `expsrv.dll` DllMain call (tid 1011 creating 1012/1013/
+  1014) -- exactly the nested-thread-creation-under-reentrancy scenario
+  this port was built to handle correctly.
+- (c) the nested-DllMain/expsrv.dll starvation scenario: **0 reentrancy
+  violations**, confirmed again in the final clean run (was 160,433
+  violations / 3.7s wall-clock before this port started; was already 0 as
+  of Stage 4, unchanged through Stage 6).
+- (d) `cpu.fatal_halt` still correctly halts the whole emulator: confirmed
+  live -- the final run hits `Fatal halt: fatal halt at EIP=0x001fe012`,
+  logs `Steps executed: 117185511`, and the process exits cleanly with no
+  further execution afterward. No scheduler path silently clears it.
+
+**The scheduler-to-Zig port is done.** `tew/kernel/scheduler.py` no longer
+exists; `tew/hardware/scheduler_zig.py` (`ZigScheduler`) is the only
+scheduler, backed by `cpu/src/scheduler.zig` (154 colocated tests) +
+`tests/unit/hardware/test_scheduler_zig.py` (43 tests covering the Python
+orchestration layer). Motivating problem (FFI-hop-cost reentrancy-guard
+starvation during heavy nested DllMain calls) is fixed and measured: 0
+violations where there used to be 160,433. One real bug (`ZigCPU.
+_py_halted` staleness) was found and fixed along the way, not anticipated
+by the plan. See `~/.claude/plans/vast-drifting-pike.md` for the full
+design record and `status.md`'s current entry for a one-paragraph summary.
+
+## 2026-08-17 (cont'd x6) — Scheduler-to-Zig port, Stage 5 complete
+
+New `tests/unit/hardware/test_scheduler_zig.py` (43 tests, real `ZigCPU`/
+`ZigMemory` throughout, no `MagicMock`): the point of this file isn't to
+re-prove `cpu/src/scheduler.zig`'s own logic (already 154 colocated Zig
+tests deep) -- it's to cover what only the Python layer can: the two-call
+kernel-tick retry protocol in `scheduler_zig.py` itself
+(`test_calls_kernel_tick_once_when_nothing_ready`, a stub `_kernel` that
+counts `.tick()` calls -- this exact orchestration had zero coverage before
+this stage), the `fatal_halt`/`reentrant_depth` pre-checks that decide
+whether `scheduler_pick_next_ready` gets called at all, `terminate_thread`'s
+tri-state `Optional[bool]` mapping, the `_CurrentThreadProxy`, and
+`status_at_idx`. One old test (`TestAnyRunnable.test_false_with_only_
+sleeping`) directly poked `s.threads[0].status = SLEEPING` -- no raw field
+access exists anymore, so it's rewritten to reach the same real state via
+`sleep_current` (two threads, so the single-thread self-reload branch
+doesn't reset status back to READY) plus `set_suspended` on the second
+thread, rather than dropping the guarantee.
+
+Added the "public C ABI" test the plan explicitly called for this stage:
+create 2 threads, preempt, block on a CS via the real two-call protocol,
+unblock, verify the swap -- `cpu/src/kernel.zig`'s only C-ABI-level CS
+coverage (the earlier stages' ABI tests covered handles/TLS/thread-count,
+not CS blocking specifically).
+
+`get_thread_tls` confirmed NOT ported (zero call sites, zero tests in the
+old suite -- see Stage 4's note); `TestInitThreadStack` (the old suite's
+tests for the private `_init_thread_stack` method) not ported either --
+there's no Python-facing method for it anymore, it collapsed into
+`loadNext`'s internal Zig logic, already covered by Stage 1's own
+"switch_to saves current and loads fresh next thread" test.
+
+`zig build test`: 154/154 (was 153; +1 public C ABI test).
+`pytest -q`: **1191/1191** (was 1148; +43 new).
+
+Stage 5 live-run check: checkpoint delta matched exactly (169,791 steps),
+final halt EIP matched (`0x001fe012`), reentrancy violations: 0 (consistent
+with Stage 4's fix, not a new finding). No regression.
+
+Next: Stage 6 (final sweep -- grep for any remaining `tew.kernel.scheduler`
+references, full verification, live re-check of the original nested-
+DllMain/expsrv.dll starvation scenario specifically, delete
+`tew/kernel/scheduler.py`). Pending review.
+
+## 2026-08-17 (cont'd x5) — Scheduler-to-Zig port, Stage 4 complete: emulator now runs on the Zig-backed scheduler
+
+New `tew/hardware/scheduler_zig.py`: `ZigScheduler` class mirroring
+`cpu_zig.py`'s wrapper pattern exactly, `ThreadStatus` as a Python `IntEnum`
+matching the Zig `enum(u8)` values, `_CurrentThreadProxy` exposing only
+`.thread_id`/`.wait_timed_out` (the 3 real external readers). Implements
+the two-call kernel-tick protocol (Design Decision 2) in Python:
+`block_current_on_cs`/`block_current_on_handles`/`sleep_current` check
+`cpu.fatal_halt`/`reentrant_depth` *before* calling `scheduler_pick_next_
+ready` (that scan has real wake side effects the original Python never
+triggers on a refused call); `mark_current_dead` skips only the
+`fatal_halt` check, never the reentrancy one, matching the old guard
+-exempt behavior. `terminate_thread` only resolves `next_idx` (the pick
+-next-ready dance) when the target handle actually is the current thread's
+-- the common "kill some other thread" path never touches it, same as the
+original.
+
+`_state.py`: `Scheduler(tls_slots=...)` → `ZigScheduler()`; `tls_slots`
+set removed entirely (TLS bitset now lives in the Zig `SchedulerState`);
+`pending_threads: list[ThreadState]` → `list[int]` (handles) -- moved here
+from Stage 3, see that stage's reordering note. `kernel32_sync.py`'s 4 TLS
+handlers (`TlsAlloc`/`TlsSetValue`/`TlsGetValue`/`TlsFree`) migrated to
+`scheduler.tls_alloc_slot`/`tls_free_slot`/`tls_slot_allocated`.
+`kernel32_io.py`'s `_create_thread`/`_resume_thread`/`_suspend_thread`/
+`_get_exit_code_thread` migrated to the handle-keyed accessors
+(`get_suspended`/`set_suspended`/`get_completed`, plus a new
+`get_thread_id` added for a debug log that needed it).
+`user32_handlers.py`'s `scheduler.threads[idx].status` (the sharpest
+direct-field-poke finding from the plan's call-site inventory) became
+`scheduler.status_at_idx(idx)`. All `from tew.kernel.scheduler import`
+sites repointed to `tew.hardware.scheduler_zig`.
+
+**Real bug found and fixed, not part of the plan**: `ZigCPU.halted`
+(`cpu_zig.py`) cached a Python-side `_py_halted` override flag alongside
+the native `CpuState.halted` field. Every *write* site kept both in sync,
+but nothing ever re-synced `_py_halted` when something else changed the
+*native* flag without going through this class's own setter -- which the
+old pure-Python scheduler never did (it always called `cpu.halted = False`,
+a real Python attribute set), but the new Zig-backed scheduler does
+routinely (`loadThread`/`loadNext` write `CpuState.halted` directly as a
+native struct field, with no way to notify Python). Net effect: once
+`cpu.halted = True` was set anywhere, it could get permanently stuck
+`True` even after a real thread swap correctly cleared the underlying
+native flag -- caught by `test_kernel32_sleep.py::test_single_thread_
+clears_halted` going red. Fix: removed `_py_halted` entirely; `halted` is
+now a pure passthrough to `cpu_is_halted`/`cpu_set_halted`/
+`cpu_clear_halted` -- every prior write site already updated the native
+flag directly too, so nothing depended on the cache. `_py_faulted` (a
+separate, not-currently-broken flag) was deliberately left alone -- out of
+scope for this stage, no evidence of a live bug there.
+
+Added a `ZigCPU.native_handle` property (`cpu_zig.py`) rather than having
+`scheduler_zig.py` reach into `cpu._state` directly -- keeps the
+cross-module FFI-handle-sharing point explicit, no other module poked that
+attribute before.
+
+Two existing unit tests needed real fixture changes, not just import
+updates: `test_kernel32_sleep.py` used a bare `MagicMock` for `cpu` (fine
+under the old pure-Python scheduler, which never touched it over ctypes);
+now that `ZigScheduler.sleep_current` genuinely calls native code through
+`cpu.native_handle`, it needed a real `ZigCPU` instance. Both that file and
+`test_invoke_emulated_proc_thread_death.py` also had their own
+`scheduler.threads[idx].status` pokes fixed to `status_at_idx(idx)` --
+call-site instances the plan's inventory only tracked for production code,
+not tests.
+
+`zig build test`: 153/153 (unchanged this stage -- pure Python wiring, no
+new Zig code beyond the 3 small gap-fill exports below). Added
+`scheduler_thread_count`/`scheduler_get_virtual_ticks_ms`/`scheduler_set_
+virtual_ticks_ms` to `kernel.zig` (trivial inline field accessors, same
+style as `scheduler_current_idx`) -- needed for `_state.py`'s
+`virtual_ticks_ms` property and a `kernel32_io.py` debug log, not
+anticipated by the plan's non-exhaustive function list.
+
+`pytest -q`: **1148/1148 passing** (was 1148/1148 before this stage --
+net zero regression once the two fixture fixes and the `_py_halted` fix
+landed).
+
+**Stage 4 live-run check -- the first one that exercises real behavior,
+not just build health.** Checkpoint delta matched exactly again (169,791
+steps), final halt EIP matched (`0x001fe012`), same dead-thread-mid
+-nested-call recovery message. **Reentrancy violations: 0** (down from
+4,332 in the Stage 2 check under the old Python scheduler, and the
+160,433/3.7s that motivated this entire port in the first place) --
+concrete confirmation the FFI-hop-cost starvation this port set out to
+fix is actually fixed. The final halt fired on a different thread ID
+(tid=1007 vs the usual tid=1000) than prior runs; consistent with zero
+reentrancy-guard stalling changing exactly *when* threads get scheduled,
+not a regression -- same halt address, same register/stack dump shape.
+No guest assertion (`except.txt` absent), same known DAO-3075 failure
+point in `dblog.txt` as always (unrelated, paused investigation,
+unaffected by this port).
+
+Next: Stage 5 (port `tests/unit/kernel/test_scheduler.py`'s remaining
+Python-facing-contract tests to `tests/unit/hardware/test_scheduler_
+zig.py`, against real `ZigCPU`/`ZigMemory`). `get_thread_tls` intentionally
+NOT ported (zero call sites, zero existing tests) -- `any_runnable` WAS
+ported (has tests, composes the handle-keyed accessors rather than a
+dedicated native export since it's never on a hot path). Pending review.
+
+## 2026-08-17 (cont'd x4) — Scheduler-to-Zig port, Stage 3 complete (Zig side)
+
+`cpu/src/scheduler.zig` gained the TLS bitset exports (`tlsAllocSlot`/
+`tlsFreeSlot`/`tlsSlotAllocated`, backed by the `tls_allocated: u64` bitset
+already declared and consumed by Stage 1's `saveTls`/`loadTls`) and
+handle-keyed accessors for every direct `ThreadState` field poke found in
+the plan's call-site inventory: `getSuspended`/`setSuspended`,
+`getCompleted`, `getWaitTimedOut`/`setWaitTimedOut`, `getStatus` (0xFF
+sentinel for unknown handle), `getThreadId` (-1 sentinel), `handleAtIdx`
+(translates `user32_handlers.py:162`'s index-based access to a handle),
+`currentHandle`. 20 new colocated tests + 1 new "public C ABI" test.
+`zig build test`: 153/153 passing (was 140 after Stage 2).
+
+**Plan correction, made before starting this stage**: the original Stage 3
+text also called for redesigning `state.pending_threads` from
+`list[ThreadState]` to `list[int]` and migrating `kernel32_io.py`/
+`crt_handlers.py` call sites to the new accessors -- but that's Python-side
+wiring against `scheduler_zig.py`, which doesn't exist until Stage 4 (by
+its own title). Moved that piece into Stage 4 where the wrapper it wires to
+will actually exist; amended `~/.claude/plans/vast-drifting-pike.md`
+in place with a reordering note rather than silently doing it differently
+from what was written. Stage 3 stays Zig-only, same as Stages 1-2.
+
+Stage 3 live-run check: checkpoint delta matched exactly (169,791 steps),
+final halt EIP matched (`0x001fe012`). No regression. No Python code
+touched -- `tew/kernel/scheduler.py` is still the live scheduler.
+
+Next: Stage 4 (`tew/hardware/scheduler_zig.py` wrapper + `_state.py`
+wiring + the `pending_threads`/`kernel32_io.py`/`crt_handlers.py`
+migration moved here from Stage 3) -- the first stage that actually
+switches the running emulator over to the new backend. Pending review.
+
+## 2026-08-17 (cont'd x3) — Scheduler-to-Zig port, Stage 2 complete
+
+`cpu/src/scheduler.zig` gained the blocking/wake/tick operations:
+`completeBlockOnCs`, `completeBlockOnHandles`, `completeSleepCurrent`,
+`completeMarkCurrentDead`, `terminateThread` (tri-state `i8`: -1 not found,
+1 different thread terminated, 0 current thread terminated itself),
+`unblockCs`, `unblockHandle`, `tick`. Per Design Decision 2 in the plan,
+these `complete_*` functions take an already-resolved `next_idx` rather
+than scanning themselves -- `pickNextReady` (Stage 1) stops short of the
+kernel-tick fallback, which stays a Python-driven two-call retry (not
+wired until Stage 4). Documented explicitly in `scheduler.zig`: callers
+must check `cpu.fatal_halt`/`reentrant_depth==0` *before* calling
+`scheduler_pick_next_ready` at all, since that scan has real side effects
+(waking a due sleeper) that the original Python never triggers on a
+refused/fatally-halted call.
+
+33 new colocated Zig tests, including 4 explicit `fatal_halted`-preservation
+tests (one per `complete_*` function, per the plan's requirement not to
+just rely on Stage 1's shared-path coverage) and the reentrancy-refusal/
+exemption tests carried over from `TestReentrancyGuardRefusesSwaps`/
+`TestReentrancyGuardExemptions`. 8 new exported wrappers in `kernel.zig`
+(`scheduler_complete_block_on_cs`/`_on_handles`/`_sleep_current`/
+`_mark_current_dead`, `scheduler_terminate_thread`, `scheduler_unblock_cs`/
+`_handle`, `scheduler_tick`) plus one new "public C ABI" test exercising
+the handles-array FFI marshaling specifically (the trickiest new
+parameter shape). `zig build test`: 140/140 passing (was 107 after Stage 1).
+
+**New process, adopted after Stage 1**: a regression-only live run now
+happens after every stage. This one: `main-thread-creation` matched (0),
+the `db-startup-database`→`first-createquerydef` checkpoint delta matched
+exactly (169,791 steps, same as Stage 0 and Stage 1), final halt EIP
+matched (`0x001fe012`). No regression. Absolute step counts at the early
+checkpoints again shifted from the Stage 0/1 baselines by a differing
+amount -- consistent with the wall-clock-timing noise already documented
+after Stage 1, not a new finding.
+
+No Python code touched -- `tew/kernel/scheduler.py` is still the live
+scheduler. Next: Stage 3 (TLS bitset exports + direct-field accessors +
+`pending_threads` redesign), pending review.
+
+## 2026-08-17 (cont'd x2) — Scheduler-to-Zig port, Stage 1 complete
+
+`cpu/src/scheduler.zig` (new): `SchedulerState`/`ThreadEntry`/`ThreadStatus`,
+context switch (`saveCurrent`/`loadThread`/`initThreadStack`/`loadNext`/
+`switchTo`/`preemptSlice`), `pickNextReady`'s scan A + scan B (kernel-tick
+fallback stays a Python-driven two-call retry, per the plan's Design
+Decision 2 -- not ported), and the reentrancy guard
+(`enterReentrantCall`/`exitReentrantCall`/the `swapCurrent` chokepoint).
+33 colocated Zig tests, including the two `fatal_halted`-preservation
+regressions ported verbatim from
+`test_does_not_clear_fatal_halt_on_saved_thread_load`/
+`test_does_not_clear_fatal_halt_on_fresh_thread_start`
+(`test_scheduler.py`). `cpu/src/kernel.zig` gained 11 new exported wrappers
+(`scheduler_create`/`_destroy`/`_create_main_thread`/`_create_thread`/
+`_switch_to`/`_preempt_slice`/`_pick_next_ready`/`_enter_reentrant_call`/
+`_exit_reentrant_call`/`_reentrant_depth`/`_current_idx`) plus one new
+"public C ABI" test exercising the full create -> thread -> preempt_slice ->
+reentrancy-refusal -> destroy path. `zig build test`: 107/107 passing
+(was 74 before this stage). `reentrancy_violations` (Python's list of
+message strings) deliberately NOT ported to Zig -- building/logging those
+strings stays a Python-side concern for the Stage 4 wrapper, which
+constructs the message from the bool a native swap call returns rather than
+crossing strings over the FFI boundary for every refusal.
+
+No Python code touched yet -- `tew/kernel/scheduler.py` is still the live
+scheduler; this is pure new, unwired Zig code. Next: Stage 2 (blocking/
+wake/tick operations), pending review.
+
+## 2026-08-17 (cont'd) — Case-sensitivity in aggregate function-name
+resolution ruled out too
+
+One more targeted test on the DAO-3075 aggregate-function failure: every
+keyword in the real query (SELECT/AS/FROM) was already written uppercase,
+so the earlier tokenizer-probe result ("AS returns keyword code 0x105, not
+misread as identifier") only proved keyword lookup is case-insensitive for
+already-uppercase input -- Max (mixed-case, as literally written in the
+query) was never actually tested for case-sensitivity in its own
+resolution as an aggregate function name (it tokenizes as a plain
+identifier, 0x100, via a different path than the keyword hash table).
+Re-added the query-rewrite/message-report probe pair, rewrote to
+`"SELECT MAX(BrandID) FROM Brand;"` (all-uppercase) -- failed identically
+to the mixed-case version (same retry pattern, same FUN_7a854cd0 call,
+same position numbers). Rules out a case-folding bug, whether in tew's own
+handling of the query text or in Jet's real function-name lookup. Probes
+removed again immediately after; run_exe.py back to 0 registered
+breakpoints.
+
+**Ruled out so far, cumulative**: query bytes/encoding, tokenizer
+misclassification, the AS alias, aggregating an empty table, and now
+function-name case-sensitivity. The aggregate function itself is what
+fails, unconditionally, regardless of case or target-table row count --
+still needs real Jet 3.5 SQL-engine research to explain why.
+
+## 2026-08-17 — Empty-table theory disproven; confirmed Jet 4 predates this
+build; checked a real game archive for a newer Jet, found none
+
+Follow-up to last night's DAO-3075 root-cause work. Re-added two of the
+removed probes (FUN_7a856c17 query-rewrite, FUN_7a854cd0 message-report) for
+one targeted test: is `Max()` failing because it's aggregating the empty
+`Part` table specifically, or aggregates in general? Rewrote a live query to
+`"SELECT Max(BrandID) FROM Brand;"` (Brand confirmed non-empty from last
+session's plain-SELECT test) -- it failed identically to Max(PartID) FROM
+Part, same retry pattern, same FUN_7a854cd0 call. Rules out row-count as a
+factor; the aggregate function itself is what this Jet 3.5 build rejects,
+unconditionally. Probes removed again immediately after -- run_exe.py back
+to 0 registered breakpoints.
+
+Checked real PE build timestamps: MCity_d.exe 2002-05-03, msjet35.dll
+1999-04-23, dao350.dll 1998-04-08, msjter35.dll 1997-06-23. Jet 4.0 shipped
+June 1999 (Access 2000/Office 2000) -- already ~3 years old by the time this
+exe was compiled, and older than msjet35.dll's own build. Confirms Jet 3.5
+was a deliberate compatibility choice by the original dev team (broader
+Win95/98-era redistributability), not "Jet 4 wasn't available yet."
+
+Downloaded and checked a real Motor City Online client-distribution archive
+(a password-protected 7z, ~336MB, 1832 files -- "Motor City Online" install
+tree + Castanet update staging, from a Google Drive link Molly provided;
+needed the resourcekey query param to get past Drive's login-wall for
+pre-2021-shared links) for a bundled newer DAO/Jet. Found zero
+msjet*/dao*/msjter*/msjint* DLLs and no DAO/MDAC redistributable installer
+anywhere in it -- the archive is purely the game's own application files;
+DAO/Jet would have been a separately-installed shared system component.
+Nothing further to find there.
+
+**Current state**: Jet 3.5 aggregate-function failure is real, reproducible,
+independent of table row count, and predates any external "wrong Jet
+version" explanation. Needs real Jet 3.5 SQL-engine research next (documented
+limitations, MS KB articles, mdbtools source) -- out of scope for more live
+emulator tracing.
+
+## 2026-08-16 (cont'd x5) — DAO-3075 root-caused: aggregate function
+Max(PartID) fails to compile in this Jet 3.5 build; alias theory disproven
+
+Live-traced the real `CreateQueryDef` compile chain in msjet35.dll (project
+`debug_clean`) past the reentrancy-guard fix from earlier tonight, all the
+way to the actual failure: `FUN_7a8ae64d` (confirmed success path fires) ->
+`FUN_7a856c17` (real create/compile, never traced before) -> returns -3100
+(0xfffff3e4) -> `FUN_7a866d2b` recognizes -3100 by name, extracts the query
+substring at the failure point -> `FUN_7a854cd0` (message report, gated on
+an internal 0x41f flag) -> `FUN_7a85662f`, which turned out to be `setjmp`
+(real "VC20" jump-buffer signature), not a parser -- the real parser calls
+`longjmp(buf, -3100)` on a genuine syntax error.
+
+Checked three independent layers, all clean -- ruled out corruption,
+encoding, and tew-handler involvement:
+- Raw query bytes (new probe at FUN_7a856c17 entry): exactly the correct 38
+  bytes of "SELECT Max(PartID) AS Expr1 FROM Part;", correct terminator.
+- Tokenizer (new probe at FUN_7a85683d's single shared epilogue): every
+  token classified exactly right, including AS -> real keyword code 0x105,
+  not misread as an identifier. Entirely self-contained (byte-classification
+  bitmap + static keyword hash table) -- zero calls into any Win32 API tew
+  implements anywhere in this whole chain.
+- Confirmed this is Jet 3, not Jet 4: MDB header version byte @0x14 == 0x00
+  in Online.mdb, matching msjet35.dll and this session's established
+  2048-byte page size.
+
+Ran two live query-rewrite experiments (patched the query in memory at
+FUN_7a856c17's entry before tokenizing, updating the length param to
+match): dropping just `AS Expr1` still failed identically (same retry
+pattern, same position numbers despite a 9-byte-shorter string -- disproves
+the alias theory); dropping the aggregate entirely
+("SELECT PartID FROM Part;") compiled with zero errors, confirmed against a
+second real non-aggregate query encountered the same run
+("SELECT BrandID, Brand, PicName FROM Brand;", also clean). stdout.txt's
+"Could not create Query"/DAOERROR(3075)/ASSERT pQueryDef lines vanish
+entirely; the run gets ~15x further (160K log lines vs ~10-13K every prior
+run) before an unrelated RUNAWAY much later, in a different part of the game.
+
+Also corrected a same-session mistake: earlier tonight I re-presented
+"The class has not been licensed" as a new lead/candidate root cause --
+Molly had already flagged this exact message as expected/ignorable in an
+earlier session (see status_archive.md, "2026-08-16"). Noted and corrected
+in status_archive.md so it doesn't get re-chased again.
+
+**Conclusion**: Max(PartID) (the aggregate function call) is specifically
+what this compiled Jet 3.5 engine can't compile -- not the alias, not the
+query text, not tew. Needs real Jet 3.5 SQL internals research next
+session (is a bare aggregate with no GROUP BY a real, documented Jet 3.5
+restriction, a missing-index requirement, or something else) -- out of
+scope for more live emulator tracing.
+
+**Left in run_exe.py, uncommitted**: all 8 breakpoint slots are consumed by
+this investigation's probes; a new caution comment at register_breakpoint's
+definition documents the hard 8-slot cap (Zig core's bp_table, silently
+drops anything past it -- live-verified 3 new probes silently never fired
+before this was found and fixed by pruning 3 confirmed-resolved probes from
+earlier investigations). FUN_7a856c17_entry's query-rewrite experiment
+(_QUERY_REWRITE) is left ACTIVE -- it rewrites every compiled query to
+"SELECT PartID FROM Part;" -- must be removed/disabled before any run not
+specifically testing this.
+
 ## 2026-08-16 (cont'd x4) — dll_loader no longer swallows FatalHaltError as
 a load failure
 

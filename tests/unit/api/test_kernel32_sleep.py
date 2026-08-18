@@ -1,11 +1,12 @@
 """Tests for kernel32.dll's Sleep handler (the Scheduler-driven half of
-kernel32_system.py). Uses a MagicMock CPU for save_state/restore_state,
-matching the convention in tests/unit/kernel/test_scheduler.py, plus a
-real Memory/CRTState so the handler's own stack-argument reads are real.
+kernel32_system.py). Uses a real ZigCPU, not a MagicMock -- since the
+scheduler-to-Zig port (see ~/.claude/plans/vast-drifting-pike.md, Stage 4),
+ZigScheduler.sleep_current genuinely reads/writes CPU register state
+through a real *CpuState handle (cpu.native_handle) over ctypes, which a
+MagicMock cannot stand in for. Memory is already Zig-backed (tew.hardware.
+memory.Memory is a ZigMemory alias), so only the CPU side needed to change.
 """
 from __future__ import annotations
-
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,22 +14,13 @@ from tew.api._state import CRTState
 from tew.api.kernel32_system import register_kernel32_system_handlers
 from tew.api.win32_handlers import pending_timers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.kernel.scheduler import ThreadStatus
+from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.hardware.scheduler_zig import ThreadStatus
 
 
 MEM_SIZE = 4 * 1024 * 1024
 STACK    = 0x200000
 RET_ADDR = 0x401234
-
-
-def make_cpu() -> MagicMock:
-    cpu = MagicMock()
-    cpu.regs = [0] * 8
-    cpu.halted = False
-    cpu.fatal_halt = False
-    cpu.save_state.return_value = MagicMock(name="saved_state")
-    return cpu
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +47,7 @@ def env():
 
     stubs = _StubHandlers()
     register_kernel32_system_handlers(stubs, mem, state)
-    cpu = make_cpu()
+    cpu = CPU(mem)
     return cpu, mem, state, stubs
 
 
@@ -82,8 +74,7 @@ class TestSleep:
     def test_single_thread_wakes_up_immediately(self, env):
         cpu, mem, state, stubs = env
         call_sleep(stubs, cpu, mem, 10)
-        thread = state.scheduler.threads[state.scheduler.current_idx]
-        assert thread.status == ThreadStatus.READY
+        assert state.scheduler.status_at_idx(state.scheduler.current_idx) == ThreadStatus.READY
 
     def test_single_thread_clears_halted(self, env):
         cpu, mem, state, stubs = env
@@ -96,8 +87,7 @@ class TestSleep:
         before = state.virtual_ticks_ms
         call_sleep(stubs, cpu, mem, 0)
         assert state.virtual_ticks_ms == before
-        thread = state.scheduler.threads[state.scheduler.current_idx]
-        assert thread.status == ThreadStatus.READY
+        assert state.scheduler.status_at_idx(state.scheduler.current_idx) == ThreadStatus.READY
 
     def test_pops_stack_args(self, env):
         cpu, mem, state, stubs = env

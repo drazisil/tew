@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Optional
 
 from tew.api.window_manager import WindowManager
 from tew.hardware.alloc_zig import bump_alloc_next
+from tew.hardware.scheduler_zig import ZigScheduler
 from tew.kernel.kernel import Kernel
-from tew.kernel.scheduler import Scheduler, ThreadState
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -99,12 +99,6 @@ class DynamicModule:
     dll_name: str
     base_address: int
     dll_path: str = ""   # full Windows-style path when known; empty if unknown
-
-
-# ── Cooperative thread state ─────────────────────────────────────────────────
-
-# ThreadState is the canonical thread descriptor; PendingThreadInfo is a legacy alias.
-PendingThreadInfo = ThreadState
 
 
 # ── Registry types ────────────────────────────────────────────────────────────
@@ -345,12 +339,19 @@ class CRTState:
         self.dynamic_modules: dict[int, DynamicModule] = {}   # handle → module
 
         # ── Cooperative threads ───────────────────────────────────────────
-        self.pending_threads: list[PendingThreadInfo] = []
+        # Handles (int), not ThreadState objects -- there is no Python object
+        # to hold a reference to once thread state lives in Zig. Callers that
+        # need a thread's fields go through self.scheduler's handle-keyed
+        # accessors (get_suspended/set_suspended/get_completed/etc.).
+        self.pending_threads: list[int] = []
         self.next_thread_id: int = 1001
         self.next_thread_handle: int = 0x0000BEEF
 
         # ── TLS ───────────────────────────────────────────────────────────
-        self.tls_slots: set[int] = set()
+        # Which slots are allocated now lives in self.scheduler's native TLS
+        # bitset (tls_alloc_slot/tls_free_slot/tls_slot_allocated) -- see
+        # kernel32_sync.py's Tls* handlers. next_tls_slot/tls_max_slots stay
+        # here: pure "next index to try" bookkeeping, not part of the port.
         self.next_tls_slot: int = 0
         self.tls_store: dict[int, dict[int, int]] = {}   # tid → (slot → value)
         TLS_MAX_SLOTS = 64
@@ -361,9 +362,8 @@ class CRTState:
         self.error_info_store: dict[int, int] = {}   # tid → IErrorInfo ptr (0 = none)
 
         # ── Kernel scheduler ──────────────────────────────────────────────
-        # tls_slots is passed by reference so TlsAlloc additions are visible.
         # Main thread TID 1000 matches the tls_current_thread_id() fallback.
-        self.scheduler: Scheduler = Scheduler(tls_slots=self.tls_slots)
+        self.scheduler: ZigScheduler = ZigScheduler()
         self.scheduler.create_main_thread(thread_id=1000, handle=0xFFFFFFFF)
         # Kernel owns async I/O completions; wired into the scheduler so
         # tick() fires from _pick_next_ready() when no thread is READY.
