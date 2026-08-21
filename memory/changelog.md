@@ -4,6 +4,18 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-21 (cont'd) — Fixed a real cross-thread SEH-chain contamination bug (shared TEB, ExceptionList never saved/restored per-thread); runaway detector now routes through real SEH dispatch instead of an ad-hoc dump
+
+Molly's suggestion: since the runaway detector's "EIP left every valid region" condition is exactly what real Windows would raise STATUS_ACCESS_VIOLATION for on the instruction fetch, and `run_exe.py` already has a real SEH-dispatch pipeline wired up for genuine `cpu.faulted` events, route the runaway branch through the same `dispatch_exception(...)` call instead of its own bespoke diagnostic dump. Handled exceptions resume normally; unhandled ones get the same richer `diagnose_halt()` EBP-chain-walk report every other halt already gets.
+
+Live-testing that change against the open expsrv.dll blocker surfaced a real, separate bug: debug-level SEH logging showed the "unhandled" dispatch walking 15 real frames across **at least 6 different threads' stacks** (each frame exactly `THREAD_STACK_SIZE` = `0x40000` apart) before giving up. Root cause: `cpu/src/scheduler.zig`'s `TEB_BASE` is one fixed address shared by every thread -- no real per-thread TEB. The scheduler already saves/restores `last_error` (TEB+0x34) per-thread on every context switch (an earlier fix for the identical bug class), but `ExceptionList` (TEB+0x00, the real `fs:[0]` SEH chain head) was never included, so each thread's own pushed frames spliced onto whatever the previously-scheduled thread had left there.
+
+**Fix**: added `exception_list: u32 = 0xFFFFFFFF` to `ThreadEntry`, threaded through `saveCurrent`/`loadThread`/`initThreadStack` exactly like `last_error`. 3 new tests, red before (compile error) green after. `zig build test` + `pytest -q` (1140/1140) both green.
+
+**Live-verified**: the same crash's SEH walk is now cleanly bounded to 5 frames, all within the faulting thread's own stack -- still genuinely unhandled, but now a trustworthy result instead of a cross-thread-corrupted one. A durable, general-purpose fix independent of the original expsrv.dll crash's still-open root cause (Ghidra's MCP connection dropped mid-session before static analysis of the one real return frame, `expsrv.dll+0x1cbd7`, could happen). Full detail in `status.md`.
+
+---
+
 ## 2026-08-21 — Three straightforward Win32 handler gaps fixed in sequence, each exposed by the previous one's fix (VariantChangeType VT_INT, VirtualQuery, GetModuleFileNameW); 4th halt (expsrv.dll indirect jump to invalid address) now the open blocker
 
 Continuation of DAO-3075's resolution the night before. Re-running the same real scenario surfaced a chain of halts, each cleared with tests-first + live re-run before moving to the next:
