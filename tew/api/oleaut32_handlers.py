@@ -6,6 +6,9 @@ stubs, and the ordinal-aliased exports from WinXP OLEAUT32.dll.
 
 from __future__ import annotations
 
+import math
+import re
+import struct
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -552,6 +555,83 @@ def register_oleaut32_ole32_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     _ole_ord(150, _ord150)
+
+    # Ordinal 64 — VarI4FromStr(LPCOLESTR strIn, LCID lcid, ULONG dwFlags,
+    # LONG *plOut) -> HRESULT. Live-confirmed call: MSJET35.DLL's expression
+    # parser (FUN_7a86756b) converting a plain decimal numeric literal
+    # (e.g. "251658241") inside a WHERE-clause expression to VT_I4. Only
+    # the well-defined case -- optional sign, ASCII digits, optional
+    # surrounding whitespace, no locale-specific thousands/decimal
+    # separators -- is implemented with real range-checked semantics
+    # (matching this file's own stated philosophy elsewhere); a string
+    # that doesn't match that shape returns the real HRESULT
+    # (DISP_E_TYPEMISMATCH) real Windows would also give for genuinely
+    # non-numeric input -- that's the real contract, not a guess.
+    _INT_STR_RE = re.compile(r"^\s*[+-]?[0-9]+\s*$")
+    _DISP_E_TYPEMISMATCH = 0x80020005
+
+    def _VarI4FromStr(cpu: "CPU") -> None:
+        str_in  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pl_out  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        s = read_wide_string(str_in, memory) if str_in else ""
+        if not _INT_STR_RE.match(s):
+            cpu.regs[EAX] = _DISP_E_TYPEMISMATCH
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        val = int(s, 10)
+        if not (-2147483648 <= val <= 2147483647):
+            cpu.regs[EAX] = _DISP_E_OVERFLOW
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        memory.write32(pl_out, val & 0xFFFFFFFF)
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 16)
+
+    _ole_ord(64, _VarI4FromStr)
+    stubs.register_handler("oleaut32.dll", "VarI4FromStr", _VarI4FromStr)
+
+    # Ordinal 84 — VarR8FromStr(LPCOLESTR strIn, LCID lcid, ULONG dwFlags,
+    # double *pdblOut) -> HRESULT. Same live call chain as VarI4FromStr
+    # above (MSJET35.DLL's expression parser evaluating a numeric literal
+    # -- Jet's expression evaluator tries the integer conversion first and
+    # falls back to a real-number conversion). Same scope discipline: only
+    # the well-defined, non-locale-specific case -- standard invariant-
+    # culture decimal/scientific float literal, period as decimal point --
+    # is implemented; anything else returns the real DISP_E_TYPEMISMATCH
+    # HRESULT rather than guessing at locale-specific formats never
+    # observed live. Python's float() accepts things like "inf"/"nan"
+    # that aren't valid numeric string literals in this sense, so
+    # validate the shape with a regex first rather than trust float()
+    # directly.
+    _FLOAT_STR_RE = re.compile(r"^\s*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\s*$")
+
+    def _write_f64(addr: int, val: float) -> None:
+        # No 64-bit memory primitive exists (Memory only has 8/16/32-bit
+        # read/write) -- pack as real IEEE-754 little-endian bytes and
+        # write as two 32-bit words rather than guess at a wider API.
+        raw = struct.pack("<d", val)
+        memory.write32(addr, int.from_bytes(raw[0:4], "little"))
+        memory.write32((addr + 4) & 0xFFFFFFFF, int.from_bytes(raw[4:8], "little"))
+
+    def _VarR8FromStr(cpu: "CPU") -> None:
+        str_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pdbl_out = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        s = read_wide_string(str_in, memory) if str_in else ""
+        if not _FLOAT_STR_RE.match(s):
+            cpu.regs[EAX] = _DISP_E_TYPEMISMATCH
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        val = float(s)
+        if math.isinf(val):
+            cpu.regs[EAX] = _DISP_E_OVERFLOW
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        _write_f64(pdbl_out, val)
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 16)
+
+    _ole_ord(84, _VarR8FromStr)
+    stubs.register_handler("oleaut32.dll", "VarR8FromStr", _VarR8FromStr)
 
     # Ordinal 154 — LoadTypeLibEx(...) -> HRESULT
     #

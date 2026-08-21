@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-21 (cont'd x3) — Two more oleaut32 ordinal-only gaps fixed (VarI4FromStr, VarR8FromStr), found by reading the real DLL's export table directly
+
+Continuation of the expsrv.dll fix below. Molly asked how many total exports oleaut32.dll has -- checked the real `/data/Downloads/i386-binaries/oleaut32.dll`'s PE export directory directly via `objdump`: 442 total, 398 by name, 44 ordinal-only. Used the same technique to identify each new halt by real name instead of guessing: `Ordinal #64` = `VarI4FromStr`, `Ordinal #84` = `VarR8FromStr`.
+
+Both live-confirmed as the same call chain: MSJET35.DLL's expression parser evaluating a numeric literal inside a real WHERE-clause expression (`"ParentId = 251658241 and Type = 6 and Connect Is Null"`), first trying an integer conversion then falling back to a real-number one. Implemented the well-defined case for each -- a real, shape-validated (regex, not Python's more permissive `int()`/`float()`) decimal/scientific numeric literal, with correct overflow handling -- returning the real `DISP_E_TYPEMISMATCH` HRESULT for anything else rather than guessing at locale-specific formats never observed live. `VarR8FromStr` needed a new `_write_f64` helper (no 64-bit memory primitive existed) packing real IEEE-754 bytes via `struct.pack`. Both registered under their ordinal *and* real name, per the `LoadTypeLibEx` lesson. 18 + 19 new tests. `pytest -q`: 1149 → 1167 → 1186, green throughout. Live-verified: each fix cleared its halt and the run progressed further before hitting the next one.
+
+**New blocker: `Ordinal #94` = `VarDateFromStr`** -- a real scope jump from the last two (locale-aware date-format parsing, not a single well-defined numeric shape). Not started. Full detail in `status.md`.
+
+---
+
 ## 2026-08-21 (cont'd x2) — RESOLVED the expsrv.dll near-null-jump crash: LoadTypeLibEx/RegisterTypeLib registered under the wrong GetProcAddress key, UnRegisterTypeLib/CreateTypeLib2 missing entirely
 
 Found via an unusual but effective technique: this session's own Ghidra MCP connection was stuck disconnected (the underlying `ghidra-mcp.service` had been OOM-killed twice per `journalctl` -- real memory pressure from a loaded desktop, not a server bug; killing Firefox fixed the server's stability but not this session's already-stale client connection). Spawned a fresh, independent `claude -p "<self-contained prompt>" --permission-mode acceptEdits` process, which gets its own clean MCP handshake since it's a genuinely separate process. (First attempt without the permission flag landed in plan mode and couldn't call any tool at all -- worth remembering for next time.)
