@@ -76,6 +76,18 @@ def _invoke_dependency_dllmain(
         [handle, 1, 0],  # hinstDLL, DLL_PROCESS_ATTACH, lpvReserved
         sentinel, scheduler=state.scheduler,
     )
+    # TEMPORARY (2026-08-18): expression-service-init hypothesis probe --
+    # bumped to error level, scoped to expsrv.dll only, to check whether its
+    # DllMain now actually completes (result=1) with the reentrancy
+    # starvation fixed (was 160,433 violations/3.7s before the scheduler-
+    # to-Zig port; 0 as of that port's completion). See status.md/
+    # changelog.md "2026-08-17"/"(cont'd)" for the DAO-3075 thread this
+    # continues. Revert to plain logger.debug once this investigation
+    # concludes.
+    if loaded.name.lower() == "expsrv.dll":
+        logger.error("handlers",
+            f"[expr-svc-probe] expsrv.dll DllMain returned {result} "
+            f"(1=success, 0=failure)")
     logger.debug("handlers",
         f"[dependency-dllmain] {loaded.name}'s DllMain returned {result}")
 

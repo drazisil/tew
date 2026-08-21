@@ -419,6 +419,403 @@ if _HISTORY_CAPTURE_ENABLED:
 # "(cont'd x7)" entries); the port is done and `tew/kernel/scheduler.py` has
 # been deleted. All breakpoint slots freed back to baseline.
 
+# TEMPORARY (2026-08-18): DAO-3075 thread. Full real call chain confirmed
+# live, dao350.dll's Dbcode_CreateTmpQuery -> ... -> msjet35.dll's real
+# parser (FUN_7a86756b, static addr, receives the SQL text directly). See
+# status.md/changelog.md "2026-08-18 (cont'd)" for the full traced chain --
+# earlier probes for each intermediate hop (vtable resolution, name vs SQL
+# text disambiguation, the dao350->msjet35 bridge) have served their
+# purpose and are removed; keeping only what's still useful going forward.
+#
+# msjet35.dll -- CONFIRMED: runtime = static - 0x65840000 for THIS DLL
+# specifically (dao350.dll and the EXE are static==runtime, unaffected).
+# Any new msjet35.dll breakpoint must add this delta.
+
+def _try_read_str(mem, addr):
+    if addr == 0 or addr > 0xFFFFFFFF:
+        return None
+    try:
+        s = read_cstring(addr, mem)
+        if s and all(32 <= ord(c) < 127 for c in s):
+            return s
+    except Exception:
+        pass
+    return None
+
+# CORRECTED REWRITE POINT (2026-08-18): the deep-parser rewrite above (at
+# FUN_7a86756b's own entry, patching just param_4/param_5) was INVALID --
+# control test proved it: rewriting to "PartID FROM Part;" (a query already
+# confirmed to compile cleanly by the original investigation, with NO
+# rewrite at all) ALSO hit 0x271e through this path. That means something
+# upstream of FUN_7a86756b (dao350.dll's own processing, or state set up
+# earlier in the call chain) already depends on the ORIGINAL query's exact
+# content by the time we reach this deep -- patching only the substring
+# here produces a mismatched, invalid state, not a fair test. Molly's
+# objection was right: "no function call ever recognized" cannot be true of
+# real Jet 3.5, and it wasn't -- it was a broken test harness.
+#
+# Fixed: patch the STRING LITERAL ITSELF, in MCity_d.exe's own data section
+# (0x011e0de4, confirmed via search_strings; EXE is static==runtime, no
+# delta needed), at Dbcode_CreateTmpQuery's own entry (0x008fe4a0) -- the
+# earliest point, before dao350.dll ever sees the text at all. This is the
+# same rewrite point the original (pre-scheduler-detour) investigation used
+# successfully.
+_QUERY_LITERAL_ADDR = 0x011e0de4
+_REWRITE_QUERY = False  # disabled by default -- set True + edit _NEW_QUERY to re-enable
+_NEW_QUERY = b"SELECT Len(PartID) FROM Part;\x00"
+
+def _source_rewrite_probe(cpu, mem):
+    if not _REWRITE_QUERY:
+        return
+    for i, b in enumerate(_NEW_QUERY):
+        mem.write8((_QUERY_LITERAL_ADDR + i) & 0xFFFFFFFF, b)
+    logger.error("cpu",
+        f"[source-rewrite-probe] rewrote query literal at 0x{_QUERY_LITERAL_ADDR:08x} "
+        f"to {_NEW_QUERY[:-1]!r}")
+register_breakpoint(0x008fe4a0, _source_rewrite_probe)
+
+# The real parser entry (static 0x7a86756b, runtime 0x1502756b) -- gets the
+# SQL text directly, confirmed live. Also stashes param_6's real address
+# (the out error-code param, slot[5]) for the shared-exit probe below.
+_param_6_addr = [0]  # mutable cell, set on entry
+def _parser_probe(cpu, mem):
+    args = [mem.read32((cpu.regs[ESP] + 4 + i * 4) & 0xFFFFFFFF) for i in range(6)]
+    _param_6_addr[0] = args[5]
+    ret_addr = mem.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+    logger.error("cpu", f"[parser-probe] FUN_7a86756b entered from ret=0x{ret_addr:08x}, raw args={[hex(a) for a in args]}")
+    for i, w in enumerate(args):
+        s = _try_read_str(mem, w)
+        if s:
+            logger.error("cpu", f"[parser-probe]   slot[{i}]=0x{w:08x} -> string: {s!r}")
+    # Molly's question: is the byte right after ')' *really* a plain space
+    # (0x20), or something else that only LOOKS like one in an ASCII
+    # preview? Dump the raw hex of every byte in the text+length param_4
+    # gives, no ASCII rendering to hide behind.
+    text_ptr = args[3]
+    length   = args[4]
+    raw = bytes(mem.read8((text_ptr + i) & 0xFFFFFFFF) for i in range(length))
+    logger.error("cpu", f"[parser-probe] raw hex ({length} bytes) = {raw.hex()}")
+register_breakpoint(0x1502756b, _parser_probe)
+
+# The parser sets one of ~15 distinct specific error codes (0x271b-0x2731)
+# into *param_6 before jumping/calling to a SHARED exit point at static
+# 0x7a8683bb (runtime 0x150283bb) -- catching that instead of every
+# individual branch tells us exactly which specific error code fired.
+def _exit_probe(cpu, mem):
+    addr = _param_6_addr[0]
+    code = mem.read32(addr & 0xFFFFFFFF) if addr else 0
+    logger.error("cpu", f"[exit-probe] shared exit 0x150283bb hit, *param_6(0x{addr:08x})=0x{code:04x}")
+    # Sanity check: does live memory at runtime 0x15029880 (FUN_7a869880's
+    # supposed entry) match Ghidra's static bytes (83 ec 04 53 56 57 55 8b
+    # 6c 24 1c)? If not, the loaded msjet35.dll build differs from the one
+    # Ghidra analyzed and the whole address-mapping approach is unsound.
+    live_bytes = bytes(mem.read8((0x15029880 + i) & 0xFFFFFFFF) for i in range(11))
+    logger.error("cpu", f"[sanity-check] live bytes at 0x15029880 = {live_bytes.hex()} (expect 83ec04535657558b6c241c)")
+register_breakpoint(0x150283bb, _exit_probe)
+
+# 2026-08-19: DAO-3075 continued -- DispCallFunc did not fix it (see
+# status.md, "cont'd x5"). Tracing one level deeper: FUN_7a8699a2 (runtime
+# 0x150299a2) is what the identifier-token handler in the main parser calls
+# to resolve "Max" once it's peeked a following '(' -- it internally calls
+# FUN_7a87a1e4 (runtime 0x1503a1e4), which looks like the real
+# "is this a known function name" lookup (-1 = not found -> falls through
+# to plain column/identifier resolution, which is consistent with the
+# observed 0x271e: the parser would then treat "Max" as a bare identifier
+# operand, immediately followed by the '(' token as a SEPARATE operand --
+# exactly "two operands in a row"). This probe reads EAX right after that
+# call returns (0x15029a96, the instruction after CALL FUN_7a87a1e4 in
+# FUN_7a8699a2) to confirm empirically whether the lookup is failing.
+# NOTE: "caseD_1" (Ghidra's synthetic name for a jump-table fragment) does
+# NOT correspond to switch-case *value* 0x1 -- get_function_calls on it
+# showed calls matching case 0x9's logic instead (FUN_887ac4/FUN_8a5934/
+# FUN_8c59b4), not case 0x1's identifier-handling calls. Ghidra names these
+# fragments by position in the jump table, not by the C-level case label --
+# unreliable for targeting a specific case body. Breaking on the real,
+# non-split helper functions the decompile shows case 0x1 calling instead:
+# FUN_7a869880 (allocates an identifier node, called unconditionally for
+# any identifier token) and FUN_7a8699a2 (resolves it, called only when the
+# '(' peek succeeds, isFuncCall=1). If FUN_7a869880 never fires either, the
+# tokenizer isn't even classifying "Max" as token type 0x1 to begin with.
+# Neither FUN_7a869880 nor FUN_7a8699a2 fired even once for the whole run
+# -- "Max" isn't reaching case 0x1's identifier handling at all. Going
+# fully empirical instead of guessing more case addresses: log the actual
+# token-type value the tokenizer (FUN_7a8685de) returns at each of its
+# three call sites Ghidra couldn't attribute to a named function
+# (get_references_to showed these as the "(none)" entries -- almost
+# certainly the real main-loop/lookahead call sites, since the ones Ghidra
+# DID attribute turned out to belong to specific case bodies like case
+# 0x9's lookahead loop). Return address = call site + 5 (near CALL rel32).
+# Confirmed via the entry probe above: every real main-loop call to
+# FUN_7a8685de returns to the SAME address (0x1502777e, static 0x7a86777e)
+# -- this is the actual `pbStack_17c = FUN_8685de(...)` call site right
+# after LAB_7a86773e. Breaking there reads EAX = the real token type value
+# the switch(pbStack_17c) dispatches on, for every token in the query.
+# (token-type-probe fully mined earlier this session -- removed to free a
+# slot for the paren-close-read verification below.)
+# Hand-disasm of the paren-skip sub-loop's close predicted a specific call
+# (0x7a866d05, return 0x7a866d0a) reads one more token ("AS", 0x105) right
+# after ')' closes and jumps straight to LAB_7a866c87. Breakpointed 0x15026d0a
+# to test directly: NEVER FIRED -- second consecutive wrong prediction from
+# hand-disassembly this session (see status.md). Superseded below by a real
+# single-instruction-step trace through the whole function instead of more
+# hand-decoded predictions -- slot freed.
+
+# Jump table at static 0x7a8684f0 (dumped live) confirms token type 1
+# ("Max") really does dispatch to 0x7a8676fb (runtime 0x150276fb) -- same
+# address as the case1-probe below, which already fired 3x for Max/PartID/
+# AS with pcVar10={0,0} on the first hit (doesn't match the '\x03' bang
+# check, so it should take the normal cVar3=='(' peek path). The character
+# right after "Max" is genuinely '(' (confirmed via tokenizer-probe's
+# preview). So FUN_7a869880 should fire -- re-testing fresh now that the
+# address mapping confusion from caseD_1/case-0x9 is resolved.
+# New hypothesis: ")" (case 0xa) sets DAT_7a93ab04=2 (not 0) at its own
+# LAB_7a867b77 tail -- meaning the very next operand-group token (here,
+# "AS", type 0x1) hits the SHARED "if(DAT_7a93ab04!=0) error 0x271e" check
+# at the top of 0x7a8676fb BEFORE ever reaching case-1's own inner body
+# (the peek/FUN_7a869880 path traced above) -- which would fully explain
+# why those breakpoints never fire for the 3rd identifier ("AS") while
+# still firing... except they ALSO never fired for "Max" itself (1st
+# identifier, DAT_7a93ab04 confirmed 0 at entry). Reading DAT_7a93ab04
+# directly (runtime 0x150fab04) at case1-probe's own entry point settles
+# this for all 3 identifier hits in one shot.
+def _dat_ab04_probe(cpu, mem):
+    val = mem.read32(0x150fab04)
+    # local_178 (the "if(local_178==0){...real resolution...} else
+    # {piVar8=NULL;}" mode flag) lives at [ESP+0x20] at this exact point
+    # in the prologue (confirmed via hand-disasm: "CMP [ESP+0x20],0" at
+    # 0x7a867712, no push/pop between there and here) -- never actually
+    # verified directly until now. If this is nonzero, "Max" takes the
+    # TRIVIAL fall-through path (XOR EDI,EDI; push NULL operand) instead
+    # of ever reaching real identifier resolution -- which would explain
+    # every dead breakpoint downstream in one shot.
+    local_178 = mem.read32((cpu.regs[ESP] + 0x20) & 0xFFFFFFFF)
+    logger.error("cpu", f"[dat-ab04-probe] DAT_7a93ab04 = {val}, local_178 = {local_178} at case-0x1-group entry")
+register_breakpoint(0x150276fb, _dat_ab04_probe)
+
+# FUN_7a86756b's real caller for our query is FUN_7a855d02 (static
+# 0x7a855d02, runtime 0x13015d02) -- looks like ODBC-style per-column
+# metadata validation (types/precision/driver-info flags), calling the
+# expression parser inside a `local_10 & 0x88`-gated block, seemingly to
+# validate a column's default-value/validation-rule expression syntax --
+# yet it's handed the ENTIRE remaining SELECT-list text in this run, not a
+# per-column default expression. Two real callers of FUN_7a855d02 exist
+# (FUN_7a855cc3 at 7a855cd1, FUN_7a90e276 at 7a90e2f7) -- reading the
+# return address here identifies which one is actually live for this query.
+# Neither FUN_7a858cef nor FUN_7a863500 fired, nor does FUN_7a8549b6 --
+# that whole "SELECT keyword classifier" chain is confirmed NOT part of
+# CreateQueryDef's real path (probably used by OpenRecordset/Execute
+# instead, which genuinely need to disambiguate "saved query name vs
+# literal SQL" -- CreateQueryDef always treats its argument as SQL, no
+# disambiguation needed).
+#
+# Pivoting to a different, already-confirmed lead: dao350.dll's
+# FUN_044d5e64 calls `(*DAT_044e5238)(param_2,param_3,param_4)` -- a
+# function pointer stored in dao350.dll's own data section, called
+# directly with the raw SQL text. This is very likely msjet35.dll's real
+# "compile this SQL into a query" entry point. dao350.dll is confirmed
+# static==runtime (no delta) -- read DAT_044e5238's live value (a raw
+# memory read, doesn't need EIP to be there) to find exactly which
+# msjet35.dll address it targets, then breakpoint the tokenizer/parser
+# entry again to confirm reachability from there.
+# Confirmed chain: DAT_044e5238 (ordinal 302, FUN_7a89de86) only threads
+# the query NAME ("tmp") through -- catalog bookkeeping, not SQL. The real
+# SQL-text path is dao350.dll's FUN_044d519b -> DAT_044e534c (ordinal 319,
+# FUN_7a8ae64d, confirmed live with param_4 = 'SELECT Max(PartID) AS
+# Expr1 FROM Part;') -> FUN_7a856c17, msjet35.dll's real top-level SQL
+# statement compiler (flagged back in the pre-compaction investigation as
+# "makes zero external calls"). FUN_7a856c17 tokenizes the FIRST token via
+# FUN_7a85683d (a STATEMENT-level tokenizer, distinct from FUN_7a8685de,
+# the EXPRESSION-level one this whole session has focused on) and
+# dispatches to one of three named handlers by token code, or a generic
+# fallback:
+#   local_1c == 0x104 -> FUN_7a924264
+#   local_1c == 0x10a -> FUN_7a86e301
+#   local_1c == 0x10f -> FUN_7a92447e
+#   else               -> FUN_7a866d2b (generic fallback)
+# Check live which one actually fires for our real "SELECT ..." query --
+# this is very likely THE function that's supposed to split the SELECT
+# list into per-column expressions.
+# None of the 3 named handlers fired -- and parser-probe still shows the
+# SAME return address (0x15015f7d, FUN_7a855d02's call site) as every
+# earlier run. Two live possibilities: (a) FUN_7a856c17 itself isn't
+# actually reached (chain-tracing error, same pattern as before), or
+# (b) it IS reached but "SELECT"'s token code isn't 0x104/0x10a/0x10f,
+# meaning it goes through the generic fallback FUN_7a866d2b instead.
+# Check both directly.
+# DAT_7a86a940's table genuinely contains 0x105 (AS) as a real entry
+# (confirmed via dump_bytes: 0x2c, 0x105, 0x118, 0x11c, 0x111, 0x132,
+# 0x3b, 0x16, then 0-terminator) -- yet the lookahead scan overshoots to
+# the terminator, meaning the live tokenizer isn't producing 0x105 when it
+# reads "AS". FUN_7a866c6d's inner scan loop calls FUN_7a866b7c
+# repeatedly (call site 0x7a866cec, inside the do-while) -- log every
+# token this scan sees, with the read position, to find what "AS" really
+# tokenizes to at the statement level.
+# The captured token sequence (0x100, 0x29, 0x105, 0x100, 0x111, 0x100,
+# 0x3b, 0x16) DOES include 0x105 (AS) and 0x111 (FROM) -- contradicting
+# the "AS doesn't tokenize correctly at this level" hypothesis. But this
+# breakpoint fires for every call through this one address regardless of
+# which of possibly-multiple FUN_7a866c6d invocations it belongs to, so
+# the sequence could be multiple calls interleaved. Check the ACTUAL
+# RETURN VALUE FUN_7a866c6d hands back to its caller (FUN_7a86a5a7, call
+# site 0x7a86a62a) for the "Max(PartID)" column specifically -- if it's
+# 0x101 (success/rewound), its own matching logic worked and the bug is
+# downstream in how the rewound position gets used.
+# FUN_7a85683d (the real tokenizer) reads its cursor from param+0x10
+# ("piVar1 = param_1+0x10; pbVar13 = *piVar1;"), NOT param+0x18. But
+# FUN_7a866c6d's rewind only does "*(int*)(param_1+0x18) = iVar1" --
+# resets the boundary-bookmark field the caller reads for param_2+0x80,
+# but NOT the +0x10 cursor field the tokenizer actually reads from next.
+# msjet35.dll uses stdcall (callee cleans up) -- by the return point the
+# stack is already restored to pre-call state, so param_3 isn't at
+# [ESP+0] there. Capture it at the CALL SITE instead (args still pushed,
+# stashed for the return-point probe to use).
+# 2026-08-20 (cont'd x3): get_function_instructions (real Ghidra listing,
+# not hand-decoding) caught a whole loop my own byte-by-byte disassembly of
+# FUN_7a866c6d had missed entirely (the JNZ at 0x7a866cc8 feeding back into
+# the whitespace-trim call) -- and it still doesn't show jump targets, so it
+# can't settle the real question either. Two hand-traced predictions had
+# already been contradicted by live data this session. Molly asked directly
+# whether the stack could be dropping/misaligning values across the scan's
+# repeated FUN_7a866b7c calls -- test it for real instead of predicting:
+# single-step cpu.step() one real instruction at a time from this CALL site
+# to the confirmed return address (0x1502a62f), logging EIP/ESP/EAX/EBX/ECX
+# every step. This is the actual control-flow graph as executed, and ESP's
+# trajectory across every call/ret in the loop directly answers the stack
+# question -- no prediction, no hand-decoding, no ambiguity about which
+# branch was taken. LAB_7a866c87 (0x15026c87) sits inside the range being
+# stepped through and is still a live breakpoint; Zig's bp_table halts
+# BEFORE executing an instruction at an armed address, so leaving it armed
+# would freeze the trace there without executing anything. Pull it for the
+# duration and restore it after, regardless of how the loop exits.
+_lookahead_param3 = [0]
+_in_lookahead_scan = [False]
+_lookahead_call_count = [0]
+_LOOKAHEAD_RETURN_EIP = 0x1502a62f
+_LOOKAHEAD_MATCHCHECK_EIP = 0x15026c87
+def _lookahead_call_probe(cpu, mem):
+    _lookahead_param3[0] = mem.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+    _in_lookahead_scan[0] = True
+    call_idx = _lookahead_call_count[0]
+    _lookahead_call_count[0] += 1
+
+    entry_esp = cpu.regs[ESP] & 0xFFFFFFFF
+    cpu.remove_breakpoint(_LOOKAHEAD_MATCHCHECK_EIP)
+    # _dispatch_breakpoint only removes THIS bp (0x1502a62a) from Zig's
+    # bp_table AFTER this handler returns -- while we're in here it's still
+    # armed, so cpu.step() would just re-halt on it forever without
+    # executing anything (caught live: EIP frozen at 0x1502a62a for the
+    # entire 800-step budget on the first real run of this tracer). Pull it
+    # too; _dispatch_breakpoint's own post-handler cleanup re-arms it since
+    # `keep` stays True by default.
+    cpu.remove_breakpoint(0x1502a62a)
+    trace = []
+    try:
+        for i in range(100_000):
+            cpu.step()
+            eip = cpu.eip & 0xFFFFFFFF
+            esp = cpu.regs[ESP] & 0xFFFFFFFF
+            trace.append((i, eip, esp,
+                          cpu.regs[EAX] & 0xFFFFFFFF,
+                          cpu.regs[EBX] & 0xFFFFFFFF,
+                          cpu.regs[ECX] & 0xFFFFFFFF))
+            if eip == _LOOKAHEAD_RETURN_EIP:
+                break
+    finally:
+        cpu.add_breakpoint(_LOOKAHEAD_MATCHCHECK_EIP)
+
+    if not trace:
+        logger.error("cpu", f"[singlestep-trace #{call_idx}] EMPTY -- cpu.step() produced no instructions")
+        return
+    reached_return = trace[-1][1] == _LOOKAHEAD_RETURN_EIP
+    final_delta = trace[-1][2] - entry_esp
+    logger.error("cpu", f"[singlestep-trace #{call_idx}] {len(trace)} instrs, entry_esp=0x{entry_esp:08x}, "
+                         f"reached_return={reached_return}, final_eip=0x{trace[-1][1]:08x}, "
+                         f"final_esp=0x{trace[-1][2]:08x} (delta_vs_entry={final_delta:+d})")
+    # Full per-instruction body only for the first few calls and any call
+    # whose stack didn't balance back to entry_esp exactly -- 1000+ calls at
+    # up to 800 lines each would be unreadable otherwise, and an ESP
+    # mismatch is exactly the signal this trace exists to catch.
+    if call_idx < 5 or final_delta != 0:
+        lines = [f"[singlestep-trace #{call_idx} detail]"]
+        for i, eip, esp, eax, ebx, ecx in trace:
+            lines.append(f"  #{i:3d} eip=0x{eip:08x} esp=0x{esp:08x} (d={esp - entry_esp:+d}) "
+                         f"eax=0x{eax:08x} ebx=0x{ebx:08x} ecx=0x{ecx:08x}")
+        logger.error("cpu", "\n".join(lines))
+register_breakpoint(0x1502a62a, _lookahead_call_probe)  # static 0x7a86a62a (the CALL itself)
+
+def _lookahead_result_probe(cpu, mem):
+    from tew.hardware.cpu_zig import EAX
+    _in_lookahead_scan[0] = False
+    param3 = _lookahead_param3[0]
+    cursor_10 = mem.read32((param3 + 0x10) & 0xFFFFFFFF)
+    bookmark_18 = mem.read32((param3 + 0x18) & 0xFFFFFFFF)
+    cursor_preview = bytes(mem.read8((cursor_10 + i) & 0xFFFFFFFF) for i in range(8))
+    bookmark_preview = bytes(mem.read8((bookmark_18 + i) & 0xFFFFFFFF) for i in range(8))
+    logger.error("cpu", f"[lookahead-result-probe] FUN_7a866c6d returned 0x{cpu.regs[EAX]:x}, param3=0x{param3:08x}, "
+                         f"param+0x10(cursor)=0x{cursor_10:08x} {cursor_preview!r}, "
+                         f"param+0x18(bookmark)=0x{bookmark_18:08x} {bookmark_preview!r}, "
+                         f"diff={cursor_10 - bookmark_18}")
+register_breakpoint(0x1502a62f, _lookahead_result_probe)  # static 0x7a86a62f (0x7a86a62a + 5)
+
+# CORRECTED after hand-disassembly: 0x7a866cec+5 (the previous breakpoint)
+# turned out to be inside the PAREN-SKIP section (reached via the
+# `JZ 0x7a866ce7` branch at 0x7a866c85), NOT the main match-check loop's
+# own token-read. The real "read next candidate token to compare against
+# the table" call is at 0x7a866ca4 (CALL FUN_7a866b7c), return address
+# 0x7a866ca9, immediately followed by `CMP EAX,0x16` -- THIS is what the
+# match-check loop (LAB_7a866c87, 0x7a866c8d-0x7a866ca1: walks the table,
+# CMP [ECX],EAX, JZ on match) actually compares against on each iteration.
+# That confirmed the 0x7a866ca4 main-loop read only fires once (for the
+# opening '('), meaning the rest of the sequence flows through the
+# paren-skip sub-loop's shared fallthrough into LAB_7a866c87 instead.
+# Rather than keep reconstructing control flow by hand, read the ACTUAL
+# matched table entry directly: 0x7a866cae is the confirmed jump target
+# for "real match found" (from the JNZ at 0x7a866ca1). ECX points at the
+# matched table slot there -- *ECX tells us definitively which value
+# (0x105/AS, or something else entirely) the match-check actually fired on.
+# Confirmed: the match only ever fires on 0x16 (the terminator, table
+# index 7), never on 0x105. Narrowing further -- trace EVERY entry into
+# the shared match-check label LAB_7a866c87 (0x7a866c87 itself, reached
+# either by direct fallthrough from the '(' check, or from the paren-skip
+# sub-loop's fallthrough) with the real EAX value at that exact instant.
+def _gated_scan_token_probe(cpu, mem):
+    if not _in_lookahead_scan[0]:
+        return
+    from tew.hardware.cpu_zig import EAX
+    logger.error("cpu", f"[matchcheck-entry-probe] LAB_7a866c87 entered, EAX=0x{cpu.regs[EAX]:x}")
+register_breakpoint(0x15026c87, _gated_scan_token_probe)  # static 0x7a866c87 (LAB_7a866c87 itself)
+
+# Three more hops of static-only reasoning (FUN_7a867064's comma-loop ->
+# FUN_7a86713b per-column parse -> FUN_7a86727e -> FUN_7a856e4d) without
+# any live confirmation -- stop and verify before going deeper, given the
+# proven pattern this session of static assumptions turning out wrong.
+# get_function_calls on FUN_7a866d2b precisely located the FUN_7a85683d
+# call right after the rewind (call site 0x7a866e17, right after
+# FUN_7a866f98 at 0x7a866dff) -- read EAX at the return address (+5) for
+# the REAL token value, rather than continuing to guess at decompiled
+# branch targets.
+# get_function_calls on FUN_7a86a5a7 precisely located the FUN_7a85683d
+# call right after the column boundary gets recorded (param_2+0x80/0x98 =
+# param_3[6]/[8]) -- call site 0x7a86a684, checked against 0x105 in the
+# decompile. Read the REAL token value here to see what actually comes
+# after "Max(PartID)" at this parsing level, and whether it matches 0x105.
+# (post-column-probe already confirmed: token here = 0x16, terminator --
+# folded into the cursor/bookmark comparison above, probe removed to stay
+# within the 8-slot budget.)
+
+# Jump table at 0x7a8669ec, entry for token 0x167 (SELECT, confirmed the
+# rewind re-reads SELECT itself) resolves to 0x7a86a5a7 -- read directly
+# from live memory, not guessed. This decompiles as a real select-list
+# comma-loop (handles "SELECT *", "table.*", records column boundaries at
+# param_2+0x80/0x98, calls FUN_7a856e4d for one branch). Verify it's
+# actually reached before trusting any more of its internal structure.
+# (table-check already confirmed: live DAT_7a86a940 matches expected
+# static bytes exactly -- relocation is NOT corrupting this table. Probe
+# simplified back to entry-only to stay within the 8-slot budget.)
+def _fun_86a5a7_probe(cpu, mem):
+    logger.error("cpu", "[selectlist-probe] FUN_7a86a5a7 (real SELECT-list handler) entered")
+register_breakpoint(0x1502a5a7, _fun_86a5a7_probe)  # static 0x7a86a5a7
+
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
 
