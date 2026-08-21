@@ -554,12 +554,28 @@ def register_oleaut32_ole32_handlers(
     _ole_ord(150, _ord150)
 
     # Ordinal 154 — LoadTypeLibEx(...) -> HRESULT
+    #
+    # Live-confirmed root cause of a real crash: expsrv.dll's own init
+    # resolves LoadTypeLibEx via GetProcAddress-by-NAME (as every real
+    # caller does -- it's a documented export, not an ordinal-only one)
+    # and caches the result unconditionally, never NULL-checking it
+    # before calling through it later (real Windows guarantees this
+    # export always resolves, so real code has no reason to check).
+    # GetProcAddress does a strict string lookup against whatever key(s)
+    # a handler was registered under -- this only had the ordinal key,
+    # so the by-name lookup returned NULL, and the later unconditional
+    # call through that cached NULL/garbage pointer jumped to invalid
+    # memory. Same bug class as VariantClear's Ordinal #9 (see
+    # test_oleaut32_variant_clear.py), just the opposite direction: fix
+    # is to register the SAME handler under both keys, never duplicate
+    # logic so the two can't drift apart again.
     def _ord154(cpu: "CPU") -> None:
         logger.warn("com", "LoadTypeLibEx (Ordinal 154) called — returning E_NOTIMPL (type library loading not implemented)")
         cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
         cleanup_stdcall(cpu, memory, 12)
 
     _ole_ord(154, _ord154)
+    stubs.register_handler("oleaut32.dll", "LoadTypeLibEx", _ord154)
 
     # Ordinal 155 — RegisterTypeLib(...) -> HRESULT
     def _ord155(cpu: "CPU") -> None:
@@ -568,6 +584,30 @@ def register_oleaut32_ole32_handlers(
         cleanup_stdcall(cpu, memory, 12)
 
     _ole_ord(155, _ord155)
+    stubs.register_handler("oleaut32.dll", "RegisterTypeLib", _ord155)
+
+    # UnRegisterTypeLib(REFGUID libID, WORD wVerMajor, WORD wVerMinor,
+    # LCID lcid, SYSKIND syskind) -> HRESULT. Part of the same
+    # GetProcAddress-by-name probe chain as LoadTypeLibEx above
+    # (expsrv.dll's init resolves DispCallFunc/LoadTypeLibEx/
+    # UnRegisterTypeLib/CreateTypeLib2 in sequence, bailing the whole
+    # chain if any single lookup fails) -- didn't exist under any key at
+    # all before this.
+    def _UnRegisterTypeLib(cpu: "CPU") -> None:
+        logger.warn("com", "UnRegisterTypeLib called — returning E_NOTIMPL (type library registration not implemented)")
+        cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("oleaut32.dll", "UnRegisterTypeLib", _UnRegisterTypeLib)
+
+    # CreateTypeLib2(SYSKIND syskind, LPCOLESTR szFile,
+    # ICreateTypeLib2** ppctlib) -> HRESULT. Same probe chain as above.
+    def _CreateTypeLib2(cpu: "CPU") -> None:
+        logger.warn("com", "CreateTypeLib2 called — returning E_NOTIMPL (type library creation not implemented)")
+        cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("oleaut32.dll", "CreateTypeLib2", _CreateTypeLib2)
 
     # ── ole32.dll — COM initialisation ────────────────────────────────────────
 
