@@ -4,6 +4,220 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-20, cont'd x4) — DAO-3075: RESOLVED (tew CPU-engine 0x66-prefix bug). Downstream chain of 3 straightforward missing-handler halts cleared same session (VariantChangeType VT_INT, VirtualQuery, GetModuleFileNameW)
+
+Superseded by the current `status.md` entry, which covers a 4th, harder-looking halt (expsrv.dll, jump to an invalid near-null address) now exposed after these three. Preserved here for the DAO-3075 root-cause detail (single-step trace found a real `0x66`-prefix operand-size bug in `opIncR32`/`opDecR32`) and the fix-verify-live-rerun cycle used for each of the three follow-on halts — all four followed the same shape: real single-step/live evidence pinned the exact cause, a red test was written before the fix, `zig build test`/`pytest -q` stayed green, then a live re-run confirmed forward progress before moving to the next halt. See `changelog.md` for full per-fix detail (all four are separate dated entries there).
+
+---
+
+## Previous status (2026-08-20, cont'd x3) — DAO-3075: "AS" confirmed to never reach the match-check comparison; exact instruction-level path not yet resolved
+
+Superseded same-day: a single-instruction-step live trace (see current `status.md`) found the exact mechanism this entry couldn't pin down, and it was a real tew CPU-engine bug, not the game or the stack. Preserved for the intermediate findings, still valid:
+
+**What was solid at this point:** `AS` genuinely tokenizes to `0x105`; `0x105` is a genuine, uncorrupted entry in the comparison table; the match-check comparison itself only ever saw `0x100` then `0x16`, never `0x105`; the "real match found" path always matched the terminator (`0x16`), never `0x105`.
+
+**What wasn't resolved:** the exact instruction-level path. Two hand-disassembly predictions about `FUN_7a866c6d`'s paren-skip depth-counter logic (`MOV BP,1` at `0x7a866ce7`) had already been directly contradicted by live data this session, and manual byte-by-byte decoding of this specific function was assessed as unreliable going forward. Relocation corruption had already been directly tested and ruled out (see the entry below this one for that detail).
+
+---
+
+## Previous status (2026-08-20, cont'd) — DAO-3075: root cause narrowed to a single comparison in msjet35.dll's own SELECT-list lookahead scanner; relocation ruled out
+
+Superseded same-day by hand-disassembling the exact match-check loop and confirming `AS`'s token code never even reaches the comparison (see live `status.md`). Full content preserved here for the call-chain detail and the relocation-hypothesis test, both still valid and load-bearing:
+
+**The full, live-confirmed call chain from the real SQL text down into the actual SELECT-list column-boundary logic** (every hop verified via a live breakpoint reading real arguments/return values):
+
+```
+dao350.dll FUN_044d519b -> (*DAT_044e534c) -> msjet35.dll ordinal 319 (FUN_7a8ae64d)
+  -> FUN_7a856c17 (real top-level SQL statement compiler)
+    -> FUN_7a85683d (STATEMENT-level tokenizer) -- first token 0x167 = SELECT
+    -> FUN_7a866d2b(0x167) (generic statement dispatcher)
+      -> FUN_7a866f98(0x167,...) -- scans to statement terminator, rewinds to
+                                     right after SELECT, returns 0
+      -> [rewind re-reads SELECT itself, 0x167 again -- confirmed live] jump
+         table at 0x7a8669ec[0x167] -> 0x7a86a5a7 (confirmed via live memory
+         read of the table entry, not guessed)
+        -> FUN_7a86a5a7 -- the REAL SELECT-list handler (confirmed live,
+                            2ms before the parser failure). Per-column loop:
+          -> FUN_7a866c6d(param_3, &DAT_7a86a940) -- lookahead scanner:
+             skips balanced parens (correctly handles "Max(PartID)"), scans
+             for a token matching a lookup table of valid "column ends here"
+             markers, then rewinds and reports success/length.
+          -> FUN_7a86756b (expression parser) -- HANDED THE FULL REMAINING
+             TEXT "Max(PartID) AS Expr1 FROM Part;" (31 chars) instead of
+             just "Max(PartID)" (12 chars). Fails on AS, error 0x271e.
+```
+
+`FUN_7a86756b` confirmed NOT the bug: its only clean-success path requires consuming its entire input buffer, no early-stop mechanism, expects an already-correctly-bounded substring from its caller.
+
+**First hypothesis at the time (later refined -- see live status.md): a cursor/bookmark field mismatch.** `FUN_7a85683d` reads its active scan cursor from `param+0x10`. `FUN_7a866c6d`'s "found a match, rewind" branch only writes `param+0x18` (the boundary bookmark), never `param+0x10`. Live data for the `Max(PartID)` column: `FUN_7a866c6d` returns `0x101` (success); `param+0x18` correctly reads `'Max(Part'`; `param+0x10` sits 31 bytes further on (the length of the entire remaining statement) in unwritten zero memory. The next tokenizer call reads from that stale cursor and gets the buffer-end sentinel instead of `AS`.
+
+**Molly asked directly whether this is a relocation problem** (msjet35.dll is the one DLL in the whole system actually relocated away from its preferred base, meaning any relocation-application bug in tew would be invisible everywhere except here). **Checked and ruled out with real data:**
+- Live memory at `DAT_7a86a940` (the lookup table: `0x2c`,`0x105`(AS),`0x118`,`0x11c`,`0x111`(FROM),`0x132`,`0x3b`,`0x16`, then 0-terminator) matches expected static bytes exactly, byte for byte. Not corrupted.
+- Execution correctly reached `FUN_7a86a5a7` via an indirect jump-table call at its properly-relocated runtime address -- direct proof code-pointer relocation works too.
+- Verdict: tew's relocation handling (`tew/pe/base_relocation_table.py` parsing + `dll_loader.py`'s `apply_base_relocations`) is correct for this DLL, confirmed on two independent data points.
+
+**Disambiguated the exact token sequence inside one invocation** of `FUN_7a866c6d` (gated strictly between call and return). Confirmed: the scan reads `0x100`(PartID) `0x29`(`)`) `0x105`(AS) `0x100`(Expr1) `0x111`(FROM) `0x100`(Part) `0x3b` `0x16` -- `AS` genuinely tokenized correctly and present, yet the scan doesn't stop there. (This breakpoint was later found, via hand-disassembly, to be on the paren-skip sub-loop's own read, not the main match-check loop's feed -- the *sequence* observed here is real, but see the live status.md entry for the corrected understanding of exactly which comparisons see which values.)
+
+---
+
+## Previous status (2026-08-20) — DAO-3075: full real SQL-compile call chain traced end-to-end; FUN_7a86756b's real design confirmed; three speculative hops from FUN_7a866d2b all live-disproven
+
+Superseded same-day once the real chain past `FUN_7a866d2b`'s rewind point was found (see live `status.md`: `FUN_7a866d2b` re-reads SELECT itself via the rewind, dispatches through the SAME jump table again, landing on `FUN_7a86a5a7`, the real SELECT-list handler). Key points from this entry, most still valid and incorporated into the current entry:
+
+- `FUN_7a86756b` confirmed NOT the bug -- its only clean-success path requires consuming the entire input buffer, no early-stop mechanism. By design it expects an already-correctly-bounded substring from its caller.
+- Ruled out (confirmed dead via live breakpoints that never fired): the `FUN_7a8e7cca` "SELECT keyword classifier" chain and its sole caller `FUN_7a8549b6` (real code, used by `OpenRecordset`/`Execute` instead, not `CreateQueryDef`); a separate speculative chain `FUN_7a862215`/`FUN_7a862942`/`FUN_7a862cd4`/`FUN_7a858c87`; `DAT_044e5238`/ordinal 302's chain (confirmed live but only threads the query's catalog name "tmp" through a collision check, never touches SQL text).
+- Also ruled out at the time (later confirmed to be the WRONG next hop, per the live status.md entry): `FUN_7a867064`/`FUN_7a86713b`, guessed as a "comma-loop select-list splitter" -- both confirmed dead via live breakpoints that never fired. The correct next hop (found afterward) was via `FUN_7a866d2b`'s SELECT-rewind-and-redispatch mechanism into `FUN_7a86a5a7`, not this guess.
+- **Methodology lesson, reinforced hard this session:** positional parameter names Ghidra assigns (`param_3`, etc.) do NOT reliably correspond to the same real value across different functions in a call chain, even when names match syntactically at each call site. Caught concretely twice: two different functions' "param_3" both turned out to be the query name "tmp", not the SQL text, despite matching the naming pattern of earlier functions where "param_3" genuinely was the SQL text. Fix: wide-scan live registers + a broad stack range at each hop, match by actual content, never trust name continuity alone.
+
+---
+
+## Previous status (2026-08-19, cont'd) — DAO-3075: "AS not recognized as keyword" root cause found, then confirmed to be part of a much larger architectural picture
+
+Superseded same-week by tracing the FULL call chain from the real SQL-text entry point down to the failure (see live `status.md`). The "AS isn't recognized as a keyword, DAT_7a93ab04 state machine doesn't distinguish complete-vs-mid-expression" finding from this entry is still accurate and is now understood as ONE PIECE of a much bigger picture: `FUN_7a86756b` (the expression parser) is working exactly as designed -- it's a bounded-buffer, consume-to-end-or-error parser with NO graceful-early-stop mechanism, and the REAL question became "why is it being handed a buffer that includes ' AS Expr1 FROM Part;' at all, instead of just 'Max(PartID)'" -- which led to tracing the entire real SQL-compile call chain from dao350.dll down (see live status.md for the full, confirmed chain).
+
+Full content of the superseded entry preserved here since the `local_178`/`DAT_7a93ab04` mechanics are still load-bearing detail not fully re-derived in the new entry:
+
+**Resolved the breakpoint-firing mystery from the previous entry and found the actual root cause in the same pass.** The missing piece was `local_178` (the "if(local_178==0){...real FUN_7a869880/FUN_7a8699a2 identifier resolution...} else {piVar8=NULL;}" mode flag at the very top of the shared operand-group prologue, `0x7a867712`/`0x7a867717`) -- never directly read from live memory before then, only inferred (wrongly) from unrelated evidence. Reading `[ESP+0x20]` directly at the group-entry breakpoint (`0x150276fb`) showed `local_178 = 1` for all three identifier tokens (`Max`, `PartID`, `AS`) in this specific parse call -- meaning this entire parse call runs in a mode that skips real identifier/function resolution outright (a pure grammar/syntax validation pass). The earlier "universal function-call recognition failure" conclusion (Max/Count/Len all hit `0x271e`) was tested exclusively in this mode too -- meaning `DispCallFunc`/VBA/function-name-table theories were never actually being exercised.
+
+**The bug, traced to the instruction level:** the grammar state machine (`DAT_7a93ab04`: 0=nothing pending, 1=operand just pushed, 2=a complete parenthesized/bracketed expression just closed) runs identically regardless of `local_178`. Case `0xa` (`')'`) sets `DAT_7a93ab04=2` after closing `(PartID)`. The next token, `AS`, is tokenized as plain-identifier type `0x01` (confirmed live) -- NOT recognized as the `AS` keyword. Every operand-group case starts with `if (DAT_7a93ab04 != 0) { error 0x271e }` at the shared entry (`0x7a8676fb`) -- confirmed live: `DAT_7a93ab04 = 2` exactly when `AS` is dispatched, immediately before the error fires.
+
+**Methodology note, still valid:** Ghidra's decompile of `FUN_7a86756b` is misleading for control flow (jump-table-heavy switch, decompiled case grouping and `get_function_calls`/`get_references_to` function-boundary attribution do NOT correspond to real C-level switch-case values). Trust hand-disassembly (`dump_bytes` + manual decode) over the decompile for anything in this function. **Always directly verify flag/mode variables via live memory reads before trusting inferred values.**
+
+---
+
+## Previous status (2026-08-19) — DAO-3075 option 2 in progress: real token types confirmed, but a genuine breakpoint-firing mystery is blocking further tracing
+
+Superseded same-day by the "AS not recognized as keyword" root-cause finding (see live `status.md`) -- the mystery this entry describes turned out to be `local_178` (see the current entry for the resolution). Preserved here for the hand-disassembly methodology detail, which remains valid and useful.
+
+Continuing from the DispCallFunc-ruled-out entry below per Molly's "proceed with option 2" (trace one level deeper into what msjet35.dll's parser consults to recognize a function call).
+
+**Real progress, solidly confirmed via live tracing:**
+- The actual token stream for `Max(PartID) AS Expr1 FROM Part;` (as tokenized by `FUN_7a8685de`, runtime `0x150285de`) is: `Max`=type `0x01`, `(`=type `0x09`, `PartID`=type `0x01`, `)`=type `0x0a`, ` `=type `0x11`, `AS`=type `0x01`. Confirmed by breaking at the real main-loop call-return site (`0x1502777e`, found empirically by reading the return address off the stack at tokenizer entry -- NOT by trusting Ghidra's per-case function-boundary attribution, see below).
+- **Ghidra's decompile of `FUN_7a86756b` is structurally misleading for this specific function.** The switch is compiled as TWO chained jump tables (outer: token_type-1 -> either a case-group entry point like `0x7a8676fb` or a dedicated case address; inner, only for the `{1,2,4,5,7,0x13,0x14}` group: a byte-indexed second jump table at `0x7a868570`/`0x7a868590`). Ghidra's synthetic function names for jump-table fragments (`caseD_1`, `caseD_d`, etc.) do NOT correspond to C-level switch-case *values* -- `get_function_calls` on a fragment returns calls from MULTIPLE unrelated case bodies that happen to be laid out contiguously/fall-through in memory. Wasted real time trusting this before catching it. **Lesson: for this function, trust hand-disassembly (`dump_bytes` + manual decode) over decompiled case grouping or `get_function_calls`/`get_references_to` function-boundary attribution.**
+- Hand-disassembled the REAL case-0x1 (identifier) body: shared group entry `0x7a8676fb` (`if(DAT_7a93ab04!=0) error 0x271e; DAT_7a93ab04=1; if(local_178==0)` prologue) -> inner byte-table dispatch at `0x7a86803d`/`0x7a868570` -> case-1's real body at `0x7a86805a`. For "Max" specifically: `pcVar10={0x00,0x00}` fails both the `\x03` bang-check (`0x7a868096`) and the `\x01` check (`0x7a86809e`), falls through to `CALL FUN_7a869865` (peek, at `0x7a8680af`) then `CMP AL,0x28` (`'('`, at `0x7a8680b4`) then (if equal) `CALL FUN_7a869880` at `0x7a8681ef` (else-branch call is at `0x7a8680cf`, same target). **Live memory at runtime `0x15029880` (`FUN_7a869880`'s entry) matches Ghidra's static bytes byte-for-byte** (`83ec04535657558b6c241c`) -- ruled out a loaded-DLL-version mismatch.
+
+**Open blocker at the time (now resolved, see live status.md):** breakpoints placed at `0x150280b4` and `0x15029880` never fired despite the hand-verified straight-line control flow above. Root cause: `local_178` (never directly verified until the next pass) is actually `1`, not `0` as assumed -- meaning this entire code region is genuinely unreachable in this parse call.
+
+---
+
+## Previous status (2026-08-18, cont'd x5) — DAO-3075: DispCallFunc implemented + live-verified, does NOT fix it -- root cause still open
+
+**Superseded same night** -- DispCallFunc turned out to be untestable by the very tests used to justify it (see the "AS not recognized" entry in live `status.md`: `local_178=1` means this whole parse call skips real identifier/function resolution, so DispCallFunc/VBA theories were never actually exercised). DispCallFunc itself remains real/implemented/tested, just not relevant to DAO-3075.
+
+Prior entry (root cause re-validated: universal function-call-recognition
+failure, `0x271e`, confirmed with a trustworthy methodology) archived
+below, "Previous status (2026-08-18, cont'd x4)" -- full detail there, not
+repeated here.
+
+**This session's work: closed out decision option 1** (implement
+`DispCallFunc` and see if it fixes function-call recognition wholesale --
+see the archived entry's "Decision point" list). Implemented the real
+`oleaut32.dll!DispCallFunc` (was a hard-halt stub since 2026-08-04): generic
+late-bound invocation, VARIANT-array arg marshaling (incl. `VT_BYREF`
+pointer pass-through, 2-word types), vtable dispatch (`pvInstance != 0`) vs.
+direct call, `CC_CDECL`/`CC_STDCALL` only, routed through the existing
+`_invoke_emulated_proc`. 7 new tests (`tests/unit/api/test_oleaut32_dispcallfunc.py`).
+Full suite green: `zig build test` 154/154, `pytest -q` 1119/1119. Full
+detail in `changelog.md`, "2026-08-18 (cont'd x5)".
+
+**Live-verified against the real, unmodified query** (probe's
+`_REWRITE_QUERY` left `False` -- no rewrite, the game's own real
+`CreateQueryDef` call): `parser-probe` confirmed the real SQL text is still
+`Max(PartID) AS Expr1 FROM Part;`, and `exit-probe` still fires
+`*param_6 = 0x271e` -- identical to before `DispCallFunc` existed. Final
+halt point unchanged too (`EIP=0x001fe012`).
+
+---
+
+## Previous status (2026-08-18, cont'd x4) — DAO-3075: root cause re-validated after catching a real test-harness bug -- universal function-call recognition failure, confirmed with a trustworthy methodology
+
+Superseded by the DispCallFunc negative result, see live `status.md`. Full
+content preserved here since it's the source of truth for how the `0x271e`
+finding itself was validated (the test-harness-bug catch/fix is not
+duplicated in `changelog.md`'s entries at the same level of detail):
+
+Scheduler-to-Zig port is DONE (see this file, "Previous status (2026-08-17,
+cont'd x4)"). Resumed the paused DAO-3075/aggregate-function thread same
+night, live-traced the entire real `CreateQueryDef` call chain down into
+msjet35.dll's real parser (full blow-by-blow below, "Previous status
+(2026-08-18, cont'd)" -- two theories ruled out first: missing
+`oleaut32.dll!DispCallFunc` and a null `VBAGetExprSrv` interface, neither
+directly connected). Read `changelog.md`'s "2026-08-17"/"2026-08-17 (cont'd)"
+entries for the original pre-scheduler-detour findings (bytes/tokenizer
+clean; plain `SELECT`s compile fine, something with a function call
+specifically doesn't).
+
+**IMPORTANT CORRECTION, caught by Molly's objection ("that would mean jet
+3.5 has no concept of functions" -- correctly could not be true):** the
+first round of testing tonight (rewriting the SQL text *deep* inside the
+parser, right at `FUN_7a86756b`'s own entry, patching only its
+`param_4`/`param_5`) was invalid. Control test: rewrote to
+`"PartID FROM Part;"` -- a query the original investigation had already
+confirmed compiles cleanly with zero rewrite -- via that same deep path,
+and it also hit `0x271e`. That proves something upstream of the deep parser
+(dao350.dll's own processing, before ever reaching msjet35.dll) already
+depends on the original query's real content by the time execution reaches
+that point; patching only the substring there produces a mismatched,
+invalid state, not a fair test of the parser itself. All three "Max/Count/
+Len all fail" results from that first round were retracted -- not because
+they were necessarily wrong, but because the test that produced them
+wasn't trustworthy.
+
+Re-tested properly, patching the SQL text at its real source instead -- the
+string literal in `MCity_d.exe`'s own data section (`0x011e0de4`, confirmed
+via `search_strings`; the EXE is static==runtime, no delta needed), applied
+at `Dbcode_CreateTmpQuery`'s own entry (`0x008fe4a0`), before dao350.dll
+ever sees the text at all. This is the same rewrite point the original
+(pre-scheduler-detour) investigation used successfully.
+
+Control test passed: `"SELECT PartID FROM Part;"` (no function call)
+compiled cleanly through this corrected path -- `exit-probe` never fired,
+the run reached a much-later halt point (`EIP=0x002039c2`, not the usual
+DAO-3075-adjacent `0x001fe012`).
+
+Re-ran the real tests with the validated mechanism -- same conclusion held:
+`SELECT PartID FROM Part;` (control) compiled cleanly; `Max(PartID)`,
+`Count(PartID)`, and `Len(PartID)` (a non-aggregate string function, to
+rule out "aggregate-specific") all hit `0x271e`. Universal function-call-
+recognition failure, not `Max`-specific.
+
+Working theory at the time (now closed with a negative result -- see live
+`status.md`): the VBA Expression Service architecture (`vbajet32.dll`/
+`expsrv.dll`) is how Jet resolves function calls generally. `VBAGetExprSrv`
+itself succeeds (real, non-null interface, confirmed live) -- but obtaining
+the interface isn't the same as its function table being populated/
+consulted by the parser. `oleaut32.dll!DispCallFunc` (unimplemented at the
+time) was the leading candidate for the missing piece.
+
+---
+
+## Previous status (2026-08-18, cont'd) — DAO-3075: full live trace of the real CreateQueryDef call chain (superseded by the concrete root-cause finding, see live status.md)
+
+Full blow-by-blow of live-tracing `Dbcode_CreateTmpQuery` (`0x008fe4a0`, exe) down to msjet35.dll's real parser, address by address, with the msjet35.dll relocation-delta discovery (**`runtime = static - 0x65840000`** for msjet35.dll specifically -- dao350.dll and the EXE are static==runtime, confirmed separately). Two theories ruled out first, both by direct live evidence: missing `DispCallFunc` (real gap, not connected -- `FUN_7a856c17` makes zero external calls) and `VBAGetExprSrv` returning null (disproven -- it succeeds, confirmed via `dao350.dll`'s `FUN_0448a429` real branch at `0x0448a558`).
+
+Full call chain traced, every address/value read from real memory:
+```
+Dbcode_CreateTmpQuery (exe) -> vtable+0x80 on DAODatabase* -> dao350.dll FUN_04487388 (COM thunk)
+  -> vtable+0xa0 on "inner" -> dao350.dll FUN_0448356f (Ghidra under-counts params;
+       live stack read found query name "tmp" at arg slot 3, real SQL text at slot 7)
+  -> dao350.dll FUN_044c98fe -> FUN_044ca3a7
+  -> dao350.dll FUN_044d5e64: (*DAT_044e5238)(...) -- name-registration step
+  -> dao350.dll FUN_044d519b: (*DAT_044e534c)(...) -- THE bridge call, resolves
+       LIVE to MSJET35.DLL+0x6e64d with the real SQL text as argument
+  -> msjet35.dll FUN_7a8a65f8 (static) -- where -3100 is generated via
+       FUN_7a86756b (real parser entry) and FUN_7a87f62d (2nd pass, never reached)
+```
+
+This is all still accurate and was the path to the actual finding -- see the live `status.md` "Current status" entry for the concrete root cause (error code `0x271e`, "Max" tokenized as plain identifier not function-keyword) that this tracing led to.
+
+## Previous status (2026-08-17, cont'd x4) — Scheduler-to-Zig port done, DAO-3075 thread resumed same night
+
+**Scheduler-to-Zig port is DONE (all 7 stages, 0-6).** `tew/kernel/scheduler.py` (the original pure-Python scheduler) and its test suite are deleted; `tew/hardware/scheduler_zig.py` (`ZigScheduler`, backed by `cpu/src/scheduler.zig`) is the only scheduler now. Full design record: `~/.claude/plans/vast-drifting-pike.md` (artifact: https://claude.ai/code/artifact/b3751eed-4723-4010-8724-011c27f456e1). Full per-stage history: `changelog.md`, "2026-08-17 (cont'd)" through "(cont'd x7)"; a fuller wrap-up summary is archived above, "Previous status (2026-08-17, cont'd x3)".
+
+**Outcome, confirmed and measured**: the motivating problem (160,433 reentrancy-guard refusals / 3.7s starvation during a heavy nested `expsrv.dll` DllMain call, caused by ~44 FFI hops per context switch under the old scheduler) is fixed -- a final live run spawning 14 real threads (including 3 created from inside that same nested DllMain call) shows **0 reentrancy violations**. `zig build test`: 154/154. `pytest -q`: 1112/1112. One real bug found and fixed along the way (not anticipated by the plan): `ZigCPU._py_halted`, a Python-side cache that went stale once the scheduler's halt-clearing moved into Zig.
+
+Same night, resumed the DAO-3075 thread (see live "Current status" for where this picked up and where it's headed) -- see it for the freshest state.
+
 ## Previous status (2026-08-17, cont'd x3) — Scheduler-to-Zig port, complete
 
 **All 7 stages (0-6) of the scheduler-to-Zig port are done.** Motivating problem: a heavy nested `DllMain` call (`expsrv.dll`) caused 160,433 reentrancy-guard refusals across 3.7s of real wall-clock starvation, because every context switch under the old pure-Python `Scheduler` paid ~44 individual Python↔Zig FFI round trips. Plan: `~/.claude/plans/vast-drifting-pike.md` (artifact: https://claude.ai/code/artifact/b3751eed-4723-4010-8724-011c27f456e1). Full per-stage detail lives in `changelog.md`'s dated entries, "2026-08-17 (cont'd)" through "(cont'd x7)" -- grep there, not here, for exact test counts/code changes per stage.
