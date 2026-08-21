@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-21 (cont'd x6) — New runaway crash traced to a strong, EBP-verified candidate in msjet35.dll (unchecked collation-interface vtable call); not yet fully closed
+
+Continuation of the logger fix below. Spawned a 3rd headless `claude -p` child to investigate the new runaway -- it correctly refused to fabricate results when every `mcp__ghidra__*` call was denied (`list_projects`/`list_programs` weren't in the project's `.claude/settings.local.json` allow-list of 5 tools, unlike the earlier successful child which never needed them). Added the missing read-only investigation tools to that allow-list directly (`list_projects`, `list_programs`, `switch_active_project`, `import_and_analyze`, `get_function_calls`, `get_function_instructions`, `search_strings`) rather than keep hoping a permission-mode flag would cover it.
+
+A 4th spawn with the fixed allow-list found real, EBP-anchored evidence: `FUN_7a87ba0a` in msjet35.dll (already Ghidra-analyzed, decompiled normally) -- a general variant-comparison routine whose indirect call at `0x7a87bc01` returns to exactly `0x7a87bc04`, the one confirmed-real EBP-chain frame. It reads a per-session cached collation-interface pointer (`DAT_7a9362c0[session]+0x2c0`) and calls through its vtable slot 6 with no NULL check -- if that slot was never populated, the call target becomes `0x18`, matching the crash's near-zero jump exactly. Same shape as the already-fixed `LoadTypeLibEx` bug, different object (a Jet collation cache, not an OLEAUT32 import cache). `expsrv.dll` couldn't be fully re-analyzed (`FileInUseException`, likely this parent session's own stuck connection holding a Ghidra-side lock), so two candidate call sites there are hand-disassembled only, one plausible and one explicitly ruled out. Full write-up: `memory/expsrv_crash2_msjet_collation_analysis.md`.
+
+**Not yet resolved**: what's supposed to write the `0x2c0` collation-object cache field, and whether tew is missing a real Jet API call that would populate it. Full detail in `status.md`.
+
+---
+
 ## 2026-08-21 (cont'd x5) — Crash-diagnostic log lines can no longer be silently dropped by LOG_LEVEL/LOG_CATEGORIES
 
 Investigating the new runaway crash exposed after VarDateFromStr, the "last valid EIP before this jump went bad" diagnostic line was missing from the log twice in a row. Root cause: `tew/logger.py`'s `_emit()` already exempted ERROR-level messages from both the level and category filters (deliberately, so halt diagnostics are never silently dropped), but the runaway-detector's own "RUNAWAY at step..., last valid EIP..." line -- and its sibling in the cpu.faulted branch -- were logged at WARN, which got no such exemption from either filter.
