@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+from datetime import date
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -632,6 +633,56 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(84, _VarR8FromStr)
     stubs.register_handler("oleaut32.dll", "VarR8FromStr", _VarR8FromStr)
+
+    # Ordinal 94 — VarDateFromStr(LPCOLESTR strIn, LCID lcid, ULONG
+    # dwFlags, DATE *pdateOut) -> HRESULT. Live-confirmed call: MSJET35.DLL's
+    # expression parser evaluating a WHERE-clause date-literal comparison
+    # ("(BrandedPart.MfgDate)<>#1/1/2010#") -- Jet's own tokenizer strips
+    # the '#' delimiters before this call, confirmed via a temporary
+    # diagnostic probe (real strIn = '1/1/2010' exactly, no time component,
+    # no 2-digit year). Only that well-defined M/D/YYYY numeric shape is
+    # implemented (4-digit year, '/' separator, real calendar validation
+    # via datetime.date rather than hand-rolled day-per-month tables);
+    # anything else returns the real DISP_E_TYPEMISMATCH HRESULT rather
+    # than guessing at locale-specific date formats never observed live.
+    #
+    # An OLE Automation DATE is a double: whole part = days since
+    # 1899-12-30 (day 0), fractional part = time-of-day (always 0.0 here).
+    # Real OLE dates carry a documented Lotus-1-2-3-compatibility quirk:
+    # 1900 is (incorrectly) treated as a leap year, so a real Gregorian
+    # day-count is off by one for any date on/after 1900-03-01 -- corrected
+    # by adding 1 in that case. This isn't a guess, it's documented
+    # Microsoft behavior, and it matters here since the query does a real
+    # <> comparison against a stored database date value.
+    _DATE_STR_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
+    _OLE_DATE_EPOCH = date(1899, 12, 30)
+    _OLE_DATE_LOTUS_QUIRK_CUTOFF = date(1900, 3, 1)
+
+    def _VarDateFromStr(cpu: "CPU") -> None:
+        str_in    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pdate_out = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        s = read_wide_string(str_in, memory) if str_in else ""
+        m = _DATE_STR_RE.match(s)
+        if not m:
+            cpu.regs[EAX] = _DISP_E_TYPEMISMATCH
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            cpu.regs[EAX] = _DISP_E_TYPEMISMATCH
+            cleanup_stdcall(cpu, memory, 16)
+            return
+        days = (parsed - _OLE_DATE_EPOCH).days
+        if parsed >= _OLE_DATE_LOTUS_QUIRK_CUTOFF:
+            days += 1
+        _write_f64(pdate_out, float(days))
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 16)
+
+    _ole_ord(94, _VarDateFromStr)
+    stubs.register_handler("oleaut32.dll", "VarDateFromStr", _VarDateFromStr)
 
     # Ordinal 154 — LoadTypeLibEx(...) -> HRESULT
     #

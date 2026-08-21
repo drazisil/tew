@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-21 (cont'd x4) — Implemented VarDateFromStr (Ordinal #94), planned first via EnterPlanMode; new, harder runaway crash now exposed
+
+Continuation of the two ordinal fixes below. `VarDateFromStr` needed real planning (date parsing implies locale-aware formats in general) rather than the obviously-correct pattern of the last two fixes, so used `EnterPlanMode` per Molly's request. Added a temporary diagnostic-only stub first to capture the exact real input rather than guess: `'1/1/2010'`, confirmed no `#` delimiters (Jet's tokenizer strips them), no time component, no 2-digit year.
+
+Implemented only that exact `M/D/YYYY` shape (4-digit year required), with real calendar validation via `datetime.date` and the documented OLE Automation/Lotus-1-2-3 epoch quirk (1900 miscounted as a leap year, +1 correction for dates >= 1900-03-01) -- correctness here matters since the query does a real `<>` comparison against a stored database date. Caught and fixed one hand-computed test value that was wrong before trusting it (verified via direct Python computation instead). 26 new tests. `pytest -q`: 1212/1212.
+
+**Live-verified**: the halt is gone. But the run now hits a genuinely different, harder problem -- a new runaway crash (`0x00056159`), confirmed truly unhandled by the (already-fixed, trustworthy) SEH chain, not another quick missing-handler gap. Full detail in `status.md`.
+
+---
+
 ## 2026-08-21 (cont'd x3) — Two more oleaut32 ordinal-only gaps fixed (VarI4FromStr, VarR8FromStr), found by reading the real DLL's export table directly
 
 Continuation of the expsrv.dll fix below. Molly asked how many total exports oleaut32.dll has -- checked the real `/data/Downloads/i386-binaries/oleaut32.dll`'s PE export directory directly via `objdump`: 442 total, 398 by name, 44 ordinal-only. Used the same technique to identify each new halt by real name instead of guessing: `Ordinal #64` = `VarI4FromStr`, `Ordinal #84` = `VarR8FromStr`.
