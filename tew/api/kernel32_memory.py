@@ -28,6 +28,7 @@ _HEAP_KNOWN_CREATE_FLAGS    = _HEAP_NO_SERIALIZE
 _PAGE_SIZE              = 4096
 _MEM_COMMIT             = 0x00001000
 _MEM_RESERVE            = 0x00002000
+_MEM_PRIVATE            = 0x00020000
 _PAGE_NOACCESS          = 0x01
 _PAGE_READWRITE         = 0x04
 _PAGE_EXECUTE_READWRITE = 0x40
@@ -229,6 +230,7 @@ def register_kernel32_memory_handlers(
                 ) & 0xFFFFFFFF
                 state.virtual_reserved[addr] = page_size
                 state.virtual_committed[addr] = page_size
+                state.virtual_protect[addr] = fl_prot
                 logger.debug("handlers", f"[VirtualAlloc] MEM_COMMIT(NULL) -> 0x{addr:08x} size=0x{page_size:x}")
                 cpu.regs[EAX] = addr
                 cleanup_stdcall(cpu, memory, 16)
@@ -244,6 +246,7 @@ def register_kernel32_memory_handlers(
                 cpu.fatal_halt = True
                 return
             state.virtual_committed[lp_addr] = page_size
+            state.virtual_protect[lp_addr] = fl_prot
             cpu.regs[EAX] = lp_addr
             cleanup_stdcall(cpu, memory, 16)
             return
@@ -261,8 +264,60 @@ def register_kernel32_memory_handlers(
             state.virtual_reserved[addr] = page_size
         if fl_type & _MEM_COMMIT:
             state.virtual_committed[addr] = page_size
+        if fl_type & (_MEM_RESERVE | _MEM_COMMIT):
+            state.virtual_protect[addr] = fl_prot
         cpu.regs[EAX] = addr
         cleanup_stdcall(cpu, memory, 16)
+
+    def _virtual_query(cpu: "CPU") -> None:
+        # VirtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer,
+        # SIZE_T dwLength) -> SIZE_T (bytes written, 0 on failure). Live-
+        # confirmed call: MSJET35.DLL's own memory manager probing a page it
+        # previously got from VirtualAlloc; dwLength always observed as
+        # exactly sizeof(MEMORY_BASIC_INFORMATION)=28 live -- anything
+        # smaller, or an address never handed out via VirtualAlloc, halts
+        # loudly rather than guess at real free-region-size reporting we've
+        # never actually observed a caller need.
+        lp_address = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        lp_buffer  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        dw_length  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        _MBI_SIZE = 28
+        if dw_length < _MBI_SIZE:
+            logger.error("handlers",
+                f"[UNIMPLEMENTED] VirtualQuery — buffer too small (dwLength=0x{dw_length:x}, "
+                f"need {_MBI_SIZE}) — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        region_base = None
+        for base, size in state.virtual_reserved.items():
+            if base <= lp_address < base + size:
+                region_base = base
+                region_size = size
+                break
+        if region_base is None:
+            logger.error("handlers",
+                f"[UNIMPLEMENTED] VirtualQuery — 0x{lp_address:x} not in any tracked "
+                f"VirtualAlloc region — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        protect = state.virtual_protect.get(region_base, _PAGE_READWRITE)
+        if region_base in state.virtual_committed:
+            mem_state = _MEM_COMMIT
+            mem_protect = protect
+        else:
+            mem_state = _MEM_RESERVE
+            mem_protect = _PAGE_NOACCESS  # not committed -> not accessible yet
+        memory.write32(lp_buffer + 0,  region_base)          # BaseAddress
+        memory.write32(lp_buffer + 4,  region_base)          # AllocationBase
+        memory.write32(lp_buffer + 8,  protect)               # AllocationProtect
+        memory.write32(lp_buffer + 12, region_size)           # RegionSize
+        memory.write32(lp_buffer + 16, mem_state)             # State
+        memory.write32(lp_buffer + 20, mem_protect)           # Protect
+        memory.write32(lp_buffer + 24, _MEM_PRIVATE)          # Type
+        cpu.regs[EAX] = _MBI_SIZE
+        cleanup_stdcall(cpu, memory, 12)
 
     def _virtual_free(cpu: "CPU") -> None:
         lp_addr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
@@ -297,3 +352,4 @@ def register_kernel32_memory_handlers(
 
     stubs.register_handler("kernel32.dll", "VirtualAlloc", _virtual_alloc)
     stubs.register_handler("kernel32.dll", "VirtualFree",  _virtual_free)
+    stubs.register_handler("kernel32.dll", "VirtualQuery",  _virtual_query)

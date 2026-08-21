@@ -212,7 +212,8 @@ def register_oleaut32_ole32_handlers(
     # VARIANT layout (16 bytes): vt at +0 (2 bytes), 6 bytes reserved, value
     # union at +8. Real OLE Automation numeric coercion: only the
     # well-defined integer/bool subset confirmed live so far (VT_I2<->VT_I4
-    # <->VT_BOOL) is implemented with real range-checked semantics; anything
+    # <->VT_BOOL, plus VT_INT treated as storage-identical to VT_I4 per
+    # MSDN VARENUM) is implemented with real range-checked semantics; anything
     # else (VT_BSTR/VT_R4/VT_R8/VT_CY/VT_DATE/...) halts loudly rather than
     # guess at locale-aware string parsing or float formatting rules never
     # actually observed. pvargDest/pvarSrc may alias (real callers rely on
@@ -221,6 +222,7 @@ def register_oleaut32_ole32_handlers(
     _VT_I2   = 2
     _VT_I4   = 3
     _VT_BOOL = 11
+    _VT_INT  = 22  # MSDN VARENUM: storage-identical to VT_I4 (4-byte signed int at +8)
     _DISP_E_OVERFLOW = 0x8002000A
 
     def _variant_read_i2(addr: int) -> int:
@@ -238,6 +240,10 @@ def register_oleaut32_ole32_handlers(
         memory.write16(addr, _VT_I4)
         memory.write32(addr + 8, val & 0xFFFFFFFF)
 
+    def _variant_write_int(addr: int, val: int) -> None:
+        memory.write16(addr, _VT_INT)
+        memory.write32(addr + 8, val & 0xFFFFFFFF)
+
     def _variant_write_bool(addr: int, val: bool) -> None:
         memory.write16(addr, _VT_BOOL)
         memory.write16(addr + 8, 0xFFFF if val else 0x0000)
@@ -250,7 +256,7 @@ def register_oleaut32_ole32_handlers(
 
         if src_vt == _VT_I2:
             val = _variant_read_i2(pvar_src)
-        elif src_vt == _VT_I4:
+        elif src_vt == _VT_I4 or src_vt == _VT_INT:
             val = _variant_read_i4(pvar_src)
         elif src_vt == _VT_BOOL:
             # VARIANT_BOOL's storage IS a signed 16-bit field (VARIANT_TRUE
@@ -273,6 +279,8 @@ def register_oleaut32_ole32_handlers(
             _variant_write_i2(pvarg_dest, val)
         elif target_vt == _VT_I4:
             _variant_write_i4(pvarg_dest, val)
+        elif target_vt == _VT_INT:
+            _variant_write_int(pvarg_dest, val)
         elif target_vt == _VT_BOOL:
             _variant_write_bool(pvarg_dest, val != 0)
         else:
@@ -1114,6 +1122,172 @@ def register_oleaut32_ole32_handlers(
         return _invoke_emulated_proc(
             cpu, memory, method_addr, [obj_addr] + args, sentinel,
             scheduler=state.scheduler) & 0xFFFFFFFF
+
+    # DispCallFunc(pvInstance, oVft, cc, vtReturn, cActuals, prgvt, prgpvarg,
+    #              pvargResult) -> HRESULT
+    #
+    # Real, generic late-bound function invocation used throughout OLE
+    # Automation/VBA -- expsrv.dll's own init (ordinal #2000) probes for
+    # this via GetProcAddress before doing anything else (see the DAO-3075
+    # investigation, status.md "2026-08-18"). Was unimplemented; expsrv.dll
+    # walked away holding a NULL pointer for it. Marshals a VARIANT
+    # argument array into a real guest stack frame, then invokes the
+    # resolved target through the same _invoke_emulated_proc nested-call
+    # mechanism already used for DllMain/DllGetClassObject calls above.
+    #
+    # Target resolution (real DispCallFunc semantics): if pvInstance != 0,
+    # the target is *(int*)(*(int*)pvInstance + oVft) -- a vtable dispatch,
+    # oVft a BYTE offset (same pattern as _dispatch_com_method above, just
+    # without the *4 index scaling -- oVft is already byte-granular). If
+    # pvInstance == 0, oVft IS the function address directly.
+    #
+    # Calling convention: only CC_CDECL(1) and CC_STDCALL(4) supported --
+    # the only two realistic on x86 Win32 COM/automation, and the only two
+    # _invoke_emulated_proc's push-args-right-to-left mechanism can express
+    # (stdcall/cdecl differ only in who cleans the stack afterward, which
+    # doesn't matter here since the full CPU state is restored after every
+    # call regardless). Anything else halts loudly rather than guess at a
+    # different argument order.
+    _CC_CDECL = 1
+    _CC_STDCALL = 4
+
+    _VT_UI1 = 17
+    _VT_UI2 = 18
+    _VT_UI4 = 19
+    _VT_I1  = 16
+    _VT_INT  = 22
+    _VT_UINT = 23
+    _VT_ERROR = 10
+    _VT_R4 = 4
+    _VT_R8 = 5
+    _VT_I8  = 20
+    _VT_UI8 = 21
+    _VT_CY  = 6
+    _VT_DATE = 7
+    _VT_BSTR = 8
+    _VT_DISPATCH = 9
+    _VT_UNKNOWN = 13
+    _VT_VOID = 24
+    _VT_BYREF_FLAG = 0x4000
+    _VT_TYPEMASK = 0x0FFF
+
+    # Argument marshaling: for each of cActuals arguments, reads prgvt[i]
+    # (VARTYPE, a packed 2-byte array -- real Win32 header type) and
+    # *prgpvarg[i] (a VARIANTARG, 16-byte layout: vt at +0, value union at
+    # +8 -- same layout _VariantChangeType above already relies on),
+    # extracts the raw value per VARTYPE, and produces the flat list of
+    # 32-bit words _invoke_emulated_proc expects (its own docstring: "args
+    # is the argument list in left-to-right (C) order"). Multi-word types
+    # (VT_R8/VT_CY/VT_DATE/VT_I8/VT_UI8, all 8 bytes) contribute two words,
+    # low dword first -- matching how _invoke_emulated_proc's own
+    # right-to-left push reversal lays a real 8-byte argument out on the
+    # stack (low dword ends up at the lower address, [ESP+4], as x86
+    # requires). VT_BYREF pushes the VARIANT's stored pointer directly,
+    # regardless of base type, since the callee expects a pointer parameter
+    # either way -- no need to dereference or know the pointee's real type.
+    def _dispcallfunc_arg_words(pvarg: int, vt: int) -> "list[int] | None":
+        if vt & _VT_BYREF_FLAG:
+            return [memory.read32((pvarg + 8) & 0xFFFFFFFF)]
+        base = vt & _VT_TYPEMASK
+        if base in (_VT_I2, _VT_UI2, _VT_BOOL):
+            return [memory.read16((pvarg + 8) & 0xFFFFFFFF)]
+        if base in (_VT_I1, _VT_UI1):
+            return [memory.read8((pvarg + 8) & 0xFFFFFFFF)]
+        if base in (_VT_I4, _VT_UI4, _VT_INT, _VT_UINT, _VT_ERROR,
+                    _VT_BSTR, _VT_DISPATCH, _VT_UNKNOWN, _VT_R4):
+            # VT_R4 passed as its raw 4-byte bit pattern -- correct for a
+            # real, explicitly-`float`-typed C parameter on x86 cdecl/
+            # stdcall (no register/FPU involvement, unlike varargs'
+            # float->double promotion, which doesn't apply to a fixed
+            # non-vararg signature like this).
+            return [memory.read32((pvarg + 8) & 0xFFFFFFFF)]
+        if base in (_VT_R8, _VT_I8, _VT_UI8, _VT_CY, _VT_DATE):
+            return [memory.read32((pvarg + 8) & 0xFFFFFFFF),
+                    memory.read32((pvarg + 12) & 0xFFFFFFFF)]
+        return None
+
+    # Return marshaling: only integer/pointer/BSTR-shaped return types are
+    # supported -- all come back in EAX, matching real x86 cdecl/stdcall.
+    # Float returns (VT_R4/VT_R8: real ABI puts these in ST(0), not EAX)
+    # are NOT supported and halt loudly rather than silently return
+    # garbage -- no confirmed live need for them yet; extend if one shows
+    # up (would need _invoke_emulated_proc to also expose the FPU top-of-
+    # stack value before its own cpu.restore_state() call discards it).
+    _DISPCALLFUNC_INT_RETURN_VTS = {
+        0,   # VT_EMPTY
+        _VT_I2, _VT_I4, _VT_BSTR, _VT_DISPATCH, _VT_ERROR, _VT_BOOL,
+        _VT_UNKNOWN, _VT_I1, _VT_UI1, _VT_UI2, _VT_UI4, _VT_INT, _VT_UINT,
+        _VT_VOID,
+    }
+
+    def _write_dispcallfunc_result(pvarg_result: int, vt_return: int, eax_val: int) -> bool:
+        if vt_return not in _DISPCALLFUNC_INT_RETURN_VTS:
+            return False
+        # Same minimal-write convention as _variant_write_i2/_i4/_bool
+        # above -- vt at +0, value at +8, reserved bytes untouched.
+        memory.write16(pvarg_result & 0xFFFFFFFF, vt_return)
+        memory.write32((pvarg_result + 8) & 0xFFFFFFFF, eax_val & 0xFFFFFFFF)
+        return True
+
+    def _DispCallFunc(cpu: "CPU") -> None:
+        esp0 = cpu.regs[ESP]
+        pv_instance  = memory.read32((esp0 + 4)  & 0xFFFFFFFF)
+        o_vft        = memory.read32((esp0 + 8)  & 0xFFFFFFFF)
+        cc           = memory.read32((esp0 + 12) & 0xFFFFFFFF)
+        vt_return    = memory.read32((esp0 + 16) & 0xFFFFFFFF) & 0xFFFF
+        c_actuals    = memory.read32((esp0 + 20) & 0xFFFFFFFF)
+        prgvt        = memory.read32((esp0 + 24) & 0xFFFFFFFF)
+        prgpvarg     = memory.read32((esp0 + 28) & 0xFFFFFFFF)
+        pvarg_result = memory.read32((esp0 + 32) & 0xFFFFFFFF)
+
+        if cc not in (_CC_CDECL, _CC_STDCALL):
+            logger.error("handlers",
+                f"[UNIMPLEMENTED] DispCallFunc: calling convention {cc} not "
+                "supported (only CC_CDECL/CC_STDCALL) — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+
+        if pv_instance != 0:
+            vtable = memory.read32(pv_instance)
+            target = memory.read32((vtable + o_vft) & 0xFFFFFFFF)
+        else:
+            target = o_vft & 0xFFFFFFFF
+
+        words: list[int] = []
+        for i in range(c_actuals):
+            vt = memory.read16((prgvt + i * 2) & 0xFFFFFFFF)
+            pvarg = memory.read32((prgpvarg + i * 4) & 0xFFFFFFFF)
+            arg_words = _dispcallfunc_arg_words(pvarg, vt)
+            if arg_words is None:
+                logger.error("handlers",
+                    f"[UNIMPLEMENTED] DispCallFunc: unsupported argument VARTYPE "
+                    f"0x{vt:04x} (arg {i} of {c_actuals}) — halting")
+                cpu.halted = True
+                cpu.fatal_halt = True
+                return
+            words.extend(arg_words)
+
+        logger.debug("handlers",
+            f"[DispCallFunc] target=0x{target:08x} cc={cc} vtReturn=0x{vt_return:04x} "
+            f"cActuals={c_actuals} words={[hex(w) for w in words]}")
+        sentinel = _get_dialog_sentinel(state, memory)
+        result = _invoke_emulated_proc(
+            cpu, memory, target, words, sentinel, scheduler=state.scheduler)
+
+        if pvarg_result != 0:
+            if not _write_dispcallfunc_result(pvarg_result, vt_return, result):
+                logger.error("handlers",
+                    f"[UNIMPLEMENTED] DispCallFunc: unsupported return VARTYPE "
+                    f"0x{vt_return:04x} — halting")
+                cpu.halted = True
+                cpu.fatal_halt = True
+                return
+
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 32)
+
+    stubs.register_handler("oleaut32.dll", "DispCallFunc", _DispCallFunc)
 
     # CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv) -> HRESULT
     def _CoCreateInstance(cpu: "CPU") -> None:

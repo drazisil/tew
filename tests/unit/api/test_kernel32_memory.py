@@ -40,9 +40,12 @@ MEM_COMMIT      = 0x00001000
 MEM_RESERVE     = 0x00002000
 MEM_DECOMMIT    = 0x00004000
 MEM_RELEASE     = 0x00008000
+MEM_FREE        = 0x00010000
+MEM_PRIVATE     = 0x00020000
 PAGE_NOACCESS   = 0x01
 PAGE_READWRITE  = 0x04
 PAGE_SIZE       = 4096
+MBI_SIZE        = 28
 
 
 @pytest.fixture
@@ -479,3 +482,83 @@ class TestVirtualFree:
         call(stubs, cpu, mem, "VirtualFree", [addr, 0, MEM_RELEASE])
         assert cpu.regs[EAX] == 1
         assert cpu.regs[ESP] == STACK + 12
+
+
+# ── VirtualQuery ───────────────────────────────────────────────────────────────
+# Live-confirmed crash: MSJET35.DLL's memory manager queries a page it
+# previously got from VirtualAlloc (no handler existed at all -- unlike
+# every other Virtual*/Heap* API here). Args: VirtualQuery(lpAddress,
+# lpBuffer, dwLength), dwLength always observed as exactly
+# sizeof(MEMORY_BASIC_INFORMATION)=28 live.
+
+def read_mbi(mem, buf):
+    return {
+        "BaseAddress":       mem.read32(buf + 0),
+        "AllocationBase":    mem.read32(buf + 4),
+        "AllocationProtect": mem.read32(buf + 8),
+        "RegionSize":        mem.read32(buf + 12),
+        "State":             mem.read32(buf + 16),
+        "Protect":           mem.read32(buf + 20),
+        "Type":              mem.read32(buf + 24),
+    }
+
+
+class TestVirtualQuery:
+
+    def test_committed_region_reports_mem_commit(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE])
+        addr = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [addr, BUF, MBI_SIZE])
+        mbi = read_mbi(mem, BUF)
+        assert mbi["State"] == MEM_COMMIT
+        assert mbi["BaseAddress"] == addr
+        assert mbi["AllocationBase"] == addr
+        assert mbi["RegionSize"] == PAGE_SIZE
+        assert mbi["Protect"] == PAGE_READWRITE
+        assert mbi["AllocationProtect"] == PAGE_READWRITE
+        assert mbi["Type"] == MEM_PRIVATE
+
+    def test_reserved_only_region_reports_mem_reserve(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 4096, MEM_RESERVE, PAGE_READWRITE])
+        addr = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [addr, BUF, MBI_SIZE])
+        mbi = read_mbi(mem, BUF)
+        assert mbi["State"] == MEM_RESERVE
+        assert mbi["Protect"] == PAGE_NOACCESS  # not committed -> not accessible
+
+    def test_address_inside_region_not_at_base_resolves_to_region_base(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE])
+        base = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [base + 100, BUF, MBI_SIZE])
+        mbi = read_mbi(mem, BUF)
+        assert mbi["BaseAddress"] == base
+        assert mbi["RegionSize"] == 8192
+
+    def test_returns_mbi_size_on_success(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE])
+        addr = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [addr, BUF, MBI_SIZE])
+        assert cpu.regs[EAX] == MBI_SIZE
+
+    def test_stdcall_cleanup(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE])
+        addr = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [addr, BUF, MBI_SIZE])
+        assert cpu.regs[ESP] == STACK + 12
+
+    def test_untracked_address_halts(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualQuery", [0x12345678, BUF, MBI_SIZE])
+        assert cpu.halted is True
+
+    def test_undersized_buffer_halts(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE])
+        addr = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualQuery", [addr, BUF, MBI_SIZE - 1])
+        assert cpu.halted is True

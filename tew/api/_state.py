@@ -320,6 +320,7 @@ class CRTState:
         self.next_virtual_alloc: int = 0x40000000
         self.virtual_reserved: dict[int, int] = {}   # addr → size
         self.virtual_committed: dict[int, int] = {}  # addr → size
+        self.virtual_protect: dict[int, int] = {}    # addr → PAGE_* at last VirtualAlloc call
 
         # ── File handles ──────────────────────────────────────────────────
         self.file_handle_map: dict[int, FileHandleEntry] = {}

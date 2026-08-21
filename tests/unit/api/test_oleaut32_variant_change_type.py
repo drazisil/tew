@@ -43,6 +43,7 @@ DISP_E_OVERFLOW = 0x8002000A
 VT_I2   = 2
 VT_I4   = 3
 VT_BOOL = 11
+VT_INT  = 22
 
 
 @pytest.fixture
@@ -70,6 +71,11 @@ def write_i4(mem, addr, val):
 def write_bool(mem, addr, val):
     mem.write16(addr, VT_BOOL)
     mem.write16(addr + 8, 0xFFFF if val else 0x0000)
+
+
+def write_int(mem, addr, val):
+    mem.write16(addr, VT_INT)
+    mem.write32(addr + 8, val & 0xFFFFFFFF)
 
 
 def read_i2(mem, addr):
@@ -130,6 +136,51 @@ class TestI2ToI4:
         assert cpu.regs[EAX] == S_OK
         assert mem.read16(DEST) == VT_I4
         assert mem.read_signed32(DEST + 8) == -1234
+
+
+class TestVtIntIsI4Equivalent:
+    """VT_INT (22) is documented (MSDN VARENUM) as storage-identical to
+    VT_I4 -- a plain 4-byte signed int in the same +8 union slot. Live-
+    confirmed crash: DAO350.DLL's Field value-setter hit VariantChangeType
+    with src vt=22 and no handler existed, hard-halting the whole emulator
+    (2026-08-20/21, right after the DAO-3075 fix exposed real per-column
+    data now flowing through this path)."""
+
+    def test_int_source_to_i2(self, env):
+        cpu, mem, stubs = env
+        write_int(mem, SRC, 5)
+        call(cpu, mem, stubs, SRC, VT_I2)
+        assert cpu.regs[EAX] == S_OK
+        assert read_i2(mem, DEST) == 5
+
+    def test_int_source_overflow_to_i2_returns_disp_e_overflow(self, env):
+        cpu, mem, stubs = env
+        write_int(mem, SRC, 40000)
+        call(cpu, mem, stubs, SRC, VT_I2)
+        assert cpu.regs[EAX] == DISP_E_OVERFLOW
+
+    def test_int_source_negative_to_i2(self, env):
+        cpu, mem, stubs = env
+        write_int(mem, SRC, -5)
+        call(cpu, mem, stubs, SRC, VT_I2)
+        assert cpu.regs[EAX] == S_OK
+        assert read_i2(mem, DEST) == -5
+
+    def test_i4_source_to_int_target_writes_vt_int_tag(self, env):
+        cpu, mem, stubs = env
+        write_i4(mem, SRC, 12345)
+        call(cpu, mem, stubs, SRC, VT_INT)
+        assert cpu.regs[EAX] == S_OK
+        assert mem.read16(DEST) == VT_INT
+        assert mem.read_signed32(DEST + 8) == 12345
+
+    def test_int_source_to_int_target_roundtrips(self, env):
+        cpu, mem, stubs = env
+        write_int(mem, SRC, -99999)
+        call(cpu, mem, stubs, SRC, VT_INT)
+        assert cpu.regs[EAX] == S_OK
+        assert mem.read16(DEST) == VT_INT
+        assert mem.read_signed32(DEST + 8) == -99999
 
 
 class TestBool:

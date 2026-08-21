@@ -232,7 +232,46 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("kernel32.dll", "GetModuleFileNameA", _get_module_file_name_a)
-    stubs.register_handler("kernel32.dll", "GetModuleFileNameW", _halt("GetModuleFileNameW"))
+
+    def _get_module_file_name_w(cpu: "CPU") -> None:
+        # Same as GetModuleFileNameA above, except nSize is a WCHAR count
+        # (not bytes) and the path is written as null-terminated UTF-16LE.
+        h_module    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        lp_filename = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        n_size      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+
+        if h_module == 0:
+            if not state.exe_path:
+                logger.error("handlers", "GetModuleFileNameW: exe_path not set in CRTState — halting")
+                cpu.halted = True
+                cpu.fatal_halt = True
+                return
+            win_path = state.reverse_translate_path(state.exe_path)
+        else:
+            mod = state.dynamic_modules.get(h_module)
+            if mod is None:
+                logger.error(
+                    "handlers",
+                    f"GetModuleFileNameW: unknown hModule 0x{h_module:x} — halting",
+                )
+                cpu.halted = True
+                cpu.fatal_halt = True
+                return
+            win_path = mod.dll_path if mod.dll_path else mod.dll_name
+
+        chars_to_copy = min(len(win_path), max(n_size - 1, 0))
+        for i in range(chars_to_copy):
+            cp = ord(win_path[i])
+            memory.write8((lp_filename + i * 2) & 0xFFFFFFFF, cp & 0xFF)
+            memory.write8((lp_filename + i * 2 + 1) & 0xFFFFFFFF, (cp >> 8) & 0xFF)
+        memory.write8((lp_filename + chars_to_copy * 2) & 0xFFFFFFFF, 0)
+        memory.write8((lp_filename + chars_to_copy * 2 + 1) & 0xFFFFFFFF, 0)
+
+        # Return chars copied (not including null), or n_size when truncated.
+        cpu.regs[EAX] = n_size if len(win_path) >= n_size else len(win_path)
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "GetModuleFileNameW", _get_module_file_name_w)
 
     # ── Pointer validation ────────────────────────────────────────────────────
 
