@@ -31,7 +31,7 @@ from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig, read_cstring
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
-from tew.logger import logger, set_thread_id_provider
+from tew.logger import logger, set_thread_id_provider, WARN
 
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -926,7 +926,7 @@ try:
             # CPU core currently produces (see core.zig's memRead8/memWrite8),
             # so it's the honest default rather than a guess.
             fault_eip = cpu.eip & 0xFFFFFFFF
-            logger.warn("seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
+            logger.always(WARN, "seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
             handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
             if handled:
                 logger.info("seh", f"fault at 0x{fault_eip:08x} handled by game's own SEH chain -- resuming")
@@ -1018,7 +1018,8 @@ try:
             # unhandled halt already gets via the post-run block below,
             # rather than this block's own shallower ad-hoc dump.
             runaway_eip = cpu.eip & 0xFFFFFFFF
-            logger.warn(
+            logger.always(
+                WARN,
                 "seh",
                 f"RUNAWAY at step {step_count}, EIP=0x{runaway_eip:08x} (last valid "
                 f"step {last_valid_step}, EIP=0x{last_valid_eip & 0xFFFFFFFF:08x} in "

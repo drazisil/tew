@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-21 (cont'd x5) — Crash-diagnostic log lines can no longer be silently dropped by LOG_LEVEL/LOG_CATEGORIES
+
+Investigating the new runaway crash exposed after VarDateFromStr, the "last valid EIP before this jump went bad" diagnostic line was missing from the log twice in a row. Root cause: `tew/logger.py`'s `_emit()` already exempted ERROR-level messages from both the level and category filters (deliberately, so halt diagnostics are never silently dropped), but the runaway-detector's own "RUNAWAY at step..., last valid EIP..." line -- and its sibling in the cpu.faulted branch -- were logged at WARN, which got no such exemption from either filter.
+
+Added `logger.always(level, category, msg)`: bypasses both filters via a new `force` parameter in `_emit()`, while still printing the real `[WARN]`/`[INFO]`/`[ERROR]` prefix for the given level (doesn't misrepresent severity, only guarantees visibility). Applied to the two lines that actually caused the blind spot, not swept across the whole file -- that would defeat configurable log levels for normal runs. New `tests/unit/test_logger.py` (first test file for this module), 9 tests: 4 regression guards (ordinary filtering unchanged) + 5 for the new bypass. `pytest -q`: 1221/1221.
+
+Live-verified with a filter narrower than the bug ever needed (`LOG_LEVEL=error LOG_CATEGORIES=cpu`, excluding `seh` entirely): the diagnostic line shows up anyway. Full detail in `status.md`.
+
+---
+
 ## 2026-08-21 (cont'd x4) — Implemented VarDateFromStr (Ordinal #94), planned first via EnterPlanMode; new, harder runaway crash now exposed
 
 Continuation of the two ordinal fixes below. `VarDateFromStr` needed real planning (date parsing implies locale-aware formats in general) rather than the obviously-correct pattern of the last two fixes, so used `EnterPlanMode` per Molly's request. Added a temporary diagnostic-only stub first to capture the exact real input rather than guess: `'1/1/2010'`, confirmed no `#` delimiters (Jet's tokenizer strips them), no time component, no 2-digit year.

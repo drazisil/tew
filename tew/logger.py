@@ -92,21 +92,22 @@ def set_thread_id_provider(provider: ThreadIdProvider | None) -> None:
     _thread_id_provider = provider
 
 
-def _emit(level: int, category: str, msg: str) -> None:
-    if level > _active_level:
-        return
-    # ERROR is exempt from category filtering, same as "exception" already
-    # was: every halt/fault this emulator produces is required (CLAUDE.md's
-    # "halt loudly" rule) to log an ERROR right before setting cpu.halted --
-    # if that line could be silently dropped by an unrelated LOG_CATEGORIES
-    # scope, the halt diagnostic that follows would have no reason attached.
-    if (
-        _active_categories is not None
-        and category not in _active_categories
-        and category != "exception"
-        and level != ERROR
-    ):
-        return
+def _emit(level: int, category: str, msg: str, *, force: bool = False) -> None:
+    if not force:
+        if level > _active_level:
+            return
+        # ERROR is exempt from category filtering, same as "exception" already
+        # was: every halt/fault this emulator produces is required (CLAUDE.md's
+        # "halt loudly" rule) to log an ERROR right before setting cpu.halted --
+        # if that line could be silently dropped by an unrelated LOG_CATEGORIES
+        # scope, the halt diagnostic that follows would have no reason attached.
+        if (
+            _active_categories is not None
+            and category not in _active_categories
+            and category != "exception"
+            and level != ERROR
+        ):
+            return
 
     elapsed = time.monotonic() - _start_time
     ts = f"{elapsed:8.3f}s"
@@ -142,6 +143,19 @@ class _Logger:
 
     def trace(self, category: str, msg: str) -> None:
         _emit(TRACE, category, msg)
+
+    def always(self, level: int, category: str, msg: str) -> None:
+        """Bypasses BOTH level and category filtering entirely -- for
+        crash-diagnostic context that must never be silently dropped by
+        whatever LOG_LEVEL/LOG_CATEGORIES an operator happened to pick
+        (e.g. "here is the last valid EIP before this jump went bad").
+        `level` still controls the printed [ERROR]/[WARN]/[INFO] prefix
+        -- this doesn't misrepresent severity, it only guarantees
+        visibility. Genuine errors should still use .error() (already
+        exempt from both filters); reach for this only for the handful of
+        WARN/INFO-level lines that are load-bearing crash context, not as
+        a general escape hatch from log configuration."""
+        _emit(level, category, msg, force=True)
 
     def is_active(self, level: int, category: str) -> bool:
         return is_active(level, category)
