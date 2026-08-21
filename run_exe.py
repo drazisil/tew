@@ -1003,40 +1003,40 @@ try:
             last_valid_eip = eip_before
             last_valid_region = region
         elif not detected_runaway and step_count > 100:
-            detected_runaway = True
-            logger.error("cpu", f"RUNAWAY DETECTED at step {step_count}")
-            logger.error("cpu", f"  Current EIP: 0x{cpu.eip & 0xFFFFFFFF:08x} (INVALID)")
-            logger.error(
-                "cpu",
-                f"  Last valid step: {last_valid_step},"
-                f" EIP: 0x{last_valid_eip & 0xFFFFFFFF:08x} in {last_valid_region}",
+            # EIP left every region tew recognizes as valid code -- real
+            # Windows would raise STATUS_ACCESS_VIOLATION the moment the CPU
+            # tried to fetch from a page it never mapped executable (same
+            # honest-default reasoning as the cpu.faulted branch above; tew's
+            # flat memory model has no page protection to fault on this
+            # itself, so this heuristic is standing in for that fetch-fault).
+            # Route it through the exact same real-SEH-dispatch pipeline
+            # instead of a bespoke diagnostic dump: give the game's own
+            # fs:[0] handler chain a real chance to recover (some of these
+            # may be genuine, handled game-code exceptions we'd otherwise
+            # never see resolve), and on failure fall through to the same
+            # richer diagnose_halt() EBP-chain-walked report every other
+            # unhandled halt already gets via the post-run block below,
+            # rather than this block's own shallower ad-hoc dump.
+            runaway_eip = cpu.eip & 0xFFFFFFFF
+            logger.warn(
+                "seh",
+                f"RUNAWAY at step {step_count}, EIP=0x{runaway_eip:08x} (last valid "
+                f"step {last_valid_step}, EIP=0x{last_valid_eip & 0xFFFFFFFF:08x} in "
+                f"{last_valid_region}) -- attempting SEH dispatch",
             )
-            try:
-                raw = [f"{mem.read8(cpu.eip + i):02x}" for i in range(16)]
-                logger.error("cpu", f"  Bytes at EIP: {' '.join(raw)}")
-            except Exception:
-                logger.error("cpu", "  Bytes at EIP: (out of bounds)")
-            logger.error("cpu", "  Registers at crash:")
-            for i in range(8):
-                val = cpu.regs[i] & 0xFFFFFFFF
-                logger.error("cpu", f"    {REG_NAMES[i]}: 0x{val:08x}")
-            esp_val = cpu.regs[ESP] & 0xFFFFFFFF
-            logger.error("cpu", "  Stack at crash (top 32):")
-            for i in range(32):
+            handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, runaway_eip)
+            if handled:
+                logger.info("seh", f"runaway at 0x{runaway_eip:08x} handled by game's own SEH chain -- resuming")
+            else:
+                logger.error("seh", f"runaway at 0x{runaway_eip:08x} unhandled by SEH chain -- halting")
                 try:
-                    slot = mem.read32(esp_val + i * 4) & 0xFFFFFFFF
-                    logger.error("cpu", f"    [ESP+{i*4:02x}] 0x{slot:08x}")
+                    raw = [f"{mem.read8(runaway_eip + i):02x}" for i in range(16)]
+                    logger.error("seh", f"  Bytes at EIP: {' '.join(raw)}")
                 except Exception:
-                    break
-            logger.error("cpu", "  Last 30 Win32 handler calls:")
-            for call in win32_handlers.get_call_log()[-30:]:
-                logger.error("cpu", f"    {call}")
-            # Run a few more steps to capture the pattern
-            for _ in range(20):
-                if cpu.halted:
-                    break
-                cpu.step()
-                step_count += 1
+                    logger.error("seh", "  Bytes at EIP: (out of bounds)")
+                detected_runaway = True
+                cpu.halted = True
+                break
 except FatalHaltError as e:
     # cpu.run()/cpu.step() (tew/hardware/cpu_zig.py) raise this the moment
     # cpu.fatal_halt newly becomes true anywhere in the call chain, however
