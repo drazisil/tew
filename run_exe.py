@@ -377,21 +377,28 @@ def _dispatch_breakpoint() -> None:
 # (history-poc's docker-compose, port 8123, user default/password poc,
 # schema from history-poc/schema.sql).
 #
-# DISABLED for now (2026-08-07): confirmed live that this is NOT
-# lightweight in practice -- it hooks every single memory write and every
-# register/EIP/EFLAGS change for the whole run, and the periodic HTTP
-# flush to ClickHouse can't keep up with that volume (a run stalled at
-# 83s of virtual time after 2+ minutes of real wall-clock time, RSS
-# climbing past 2.3GB as the unflushed buffer piled up in memory). Also:
-# the FILE_allocateop/Dbcode_AtExit blocker this was wired up for turned
-# out to be downstream of a separate, earlier bug (IDirect3D8::Release
-# always reporting refcount 0 -- see idirect3d8.py -- which never even
-# let a run reach dbcode.c's failure point). Flip _HISTORY_CAPTURE_ENABLED
-# back on only if that investigation resumes and is worth the overhead.
+# DISABLED-FROM-START for now (2026-08-07): confirmed live that enabling
+# this from step 0 is NOT lightweight in practice -- it hooks every single
+# memory write and every register/EIP/EFLAGS change for the whole run, and
+# the periodic HTTP flush to ClickHouse can't keep up with that volume (a
+# run stalled at 83s of virtual time after 2+ minutes of real wall-clock
+# time, RSS climbing past 2.3GB as the unflushed buffer piled up in
+# memory).
+#
+# 2026-08-21: re-enabled, but gated to a narrow window instead of the
+# whole run -- see _HISTORY_CAPTURE_START_STEP/_HISTORY_CAPTURE_STOP_STEP
+# below, checked inside the step loop. This investigation (msjet35.dll's
+# per-session collation-cache field, DAT_7a9362c0[session]+0x2c0, never
+# observed being written by static analysis or by capturing the last
+# ~900k steps before the crash) needs exactly "what wrote address X last,
+# and from where". fileio logging confirms Online.mdb's header is read
+# very early (~step 1-2M, well before the first 5M-step heartbeat) --
+# capturing just that early window (database-open) instead of the whole
+# run avoids the overhead blowup hit last time.
 _HISTORY_CAPTURE_ENABLED = False
-if _HISTORY_CAPTURE_ENABLED:
-    cpu.enable_history_capture_clickhouse("http://localhost:8123", "default", "poc")
-    logger.info("startup", "[history] ClickHouse capture enabled, run_id will be queryable after the run")
+_HISTORY_CAPTURE_DONE = False
+_HISTORY_CAPTURE_START_STEP = 500_000
+_HISTORY_CAPTURE_STOP_STEP = 8_000_000
 
 
 # B-tree page-metadata/next-page-resolution/tail-page investigation
@@ -814,7 +821,13 @@ register_breakpoint(0x15026c87, _gated_scan_token_probe)  # static 0x7a866c87 (L
 # simplified back to entry-only to stay within the 8-slot budget.)
 def _fun_86a5a7_probe(cpu, mem):
     logger.error("cpu", "[selectlist-probe] FUN_7a86a5a7 (real SELECT-list handler) entered")
-register_breakpoint(0x1502a5a7, _fun_86a5a7_probe)  # static 0x7a86a5a7
+# register_breakpoint(0x1502a5a7, _fun_86a5a7_probe)  # static 0x7a86a5a7 -- disabled 2026-08-22, slot free to repurpose (stale, per status.md: "all 8 slots are free to repurpose")
+
+# The collation-locale probe that was here (2026-08-22) answered its
+# question -- confirmed MCity_d.exe's CreateDatabase call for Tmp.MDB
+# passes an empty Locale connect-string -- and has been removed. Root
+# cause fixed in tew/api/kernel32_io.py (CompareStringA/W now validate the
+# locale id instead of always succeeding); see memory/status.md.
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
@@ -914,6 +927,16 @@ _progress_countdown = 5_000_000
 
 try:
     while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
+        if not _HISTORY_CAPTURE_ENABLED and not _HISTORY_CAPTURE_DONE and step_count >= _HISTORY_CAPTURE_START_STEP:
+            cpu.enable_history_capture_clickhouse("http://localhost:8123", "default", "poc")
+            _HISTORY_CAPTURE_ENABLED = True
+            logger.always(WARN, "startup", f"[history] ClickHouse capture enabled at step {step_count:,}, run_id={cpu.run_id}")
+        elif _HISTORY_CAPTURE_ENABLED and step_count >= _HISTORY_CAPTURE_STOP_STEP:
+            cpu.flush_history_capture()
+            cpu.disable_history_capture()
+            _HISTORY_CAPTURE_ENABLED = False
+            _HISTORY_CAPTURE_DONE = True
+            logger.always(WARN, "startup", f"[history] ClickHouse capture disabled at step {step_count:,} (window closed)")
         eip_before = cpu.eip
         batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
         cpu.run(batch)

@@ -2006,12 +2006,39 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "LCMapStringA",    _halt("LCMapStringA"))
 
+    # Real CompareStringA/W validate the locale identifier (IsValidLocale)
+    # and fail (return 0, GetLastError()==ERROR_INVALID_PARAMETER) for one
+    # that isn't -- this emulator only ever models the single locale
+    # 0x0409 (see _is_valid_locale/_get_user_default_lcid/
+    # _get_system_default_lang_id below, all hardcoded to it, "no separate
+    # system-vs-user locale concept anywhere else"). Neither comparison
+    # handler used to read the locale argument at all, so ANY value
+    # (including 0, "no locale specified") silently "succeeded" -- found
+    # live: msjet35.dll's own default-collating-order fallback logic
+    # (FUN_7a84c830) deliberately probes CompareStringA with an
+    # unspecified locale specifically to detect this failure and substitute
+    # a safe default; tew's always-succeeds behavior meant that probe
+    # never failed, so the fallback path never triggered and a database
+    # opened with no explicit locale (msjet35.dll's CreateDatabase Locale=
+    # "") ended up with no valid collating-order id at all -- surfacing
+    # much later as a null per-session collation-interface pointer and an
+    # unrelated-looking crash deep in query evaluation.
+    def _locale_is_valid(locale: int) -> bool:
+        return locale == 0x0409
+
     def _compare_string_a(cpu: "CPU") -> None:
+        locale   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp1      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         cch1     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2      = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2     = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        if not _locale_is_valid(locale):
+            logger.debug("handlers", f"CompareStringA(locale=0x{locale:08x}) -> 0 (invalid locale)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
@@ -2032,11 +2059,18 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 24)
 
     def _compare_string_w(cpu: "CPU") -> None:
+        locale   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp1      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         cch1     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2      = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2     = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        if not _locale_is_valid(locale):
+            logger.debug("handlers", f"CompareStringW(locale=0x{locale:08x}) -> 0 (invalid locale)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
