@@ -119,6 +119,9 @@ def _bind_lib() -> ctypes.CDLL:
     lib.cpu_is_fatal_halted.argtypes  = [_vp]
     lib.cpu_is_fatal_halted.restype   = _b
 
+    lib.cpu_enable_null_page_guard.argtypes = [_vp]
+    lib.cpu_enable_null_page_guard.restype  = None
+
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
     lib.cpu_get_run_id.argtypes      = [_vp]
@@ -363,6 +366,18 @@ class ZigCPU:
         # crosses back into Python once enabled — it's all native code
         # inside libcpu.so; only these few control calls do.
         self._history_cap: int = 0
+
+    # ── Null-page guard ────────────────────────────────────────────────────────
+
+    def enable_null_page_guard(self) -> None:
+        """Makes reads/writes to addresses below 0x10000 (the first 64KB --
+        real Windows never maps this range in any 32-bit process) genuinely
+        fault, matching real Windows behavior. Off by default so bare
+        CpuState-level tests (address-0-based tiny buffers) are unaffected;
+        the real emulator's own startup calls this once. See core.zig's
+        CpuState.guard_null_page for the full rationale (MCity_d.exe's own
+        anti-debug self-test depends on a genuine fault at a low address)."""
+        _lib.cpu_enable_null_page_guard(self._state)
 
     # ── Execution-history capture ─────────────────────────────────────────────
 

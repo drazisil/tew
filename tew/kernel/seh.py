@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP, EBP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.logger import logger
 
@@ -116,12 +116,21 @@ class SehHandlerTimeout(Exception):
 
 class SehHandlerEscaped(Exception):
     """A handler didn't return via the sentinel -- it redirected execution
-    itself (the expected shape of a successful unwind: the handler called
-    RtlUnwind, which jumps directly to the __except block and never
-    returns normally to whoever invoked the handler)."""
-    def __init__(self, handler_addr: int, eip: int) -> None:
+    itself. Two genuinely different things produce this identical shape
+    (halted at some EIP other than the sentinel):
+      - The expected case: the handler called RtlUnwind, which jumps
+        directly to the __except block and never returns normally to
+        whoever invoked the handler.
+      - A real bug case: the handler's OWN execution (or the real code
+        RtlUnwind jumped into) hit a genuine CPU fault -- core.zig's
+        memRead8/memWrite8 set halted=True the same way a clean escape
+        does. `faulted` distinguishes them; callers must check it rather
+        than assume every escape is a clean one."""
+    def __init__(self, handler_addr: int, eip: int, *, faulted: bool, esp_before: int) -> None:
         self.handler_addr = handler_addr
         self.eip = eip
+        self.faulted = faulted
+        self.esp_before = esp_before
         super().__init__(f"SEH handler at 0x{handler_addr:08x} escaped to 0x{eip:08x}")
 
 
@@ -185,7 +194,9 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
         # left behind (which may itself be a genuine `hlt`, a real fault,
         # or anything else). Leave it exactly as-is: clearing it here
         # would silently erase a real halt/fault that actually happened.
-        raise SehHandlerEscaped(handler_addr, landed_eip)
+        # cpu.faulted distinguishes a real fault from a clean RtlUnwind
+        # escape -- callers must not assume every escape is clean.
+        raise SehHandlerEscaped(handler_addr, landed_eip, faulted=cpu.faulted, esp_before=esp_before)
 
     # Only our own sentinel's halt gets cleared -- that one is purely
     # internal bookkeeping for this call, not a real CPU event.
@@ -279,6 +290,14 @@ def dispatch_exception(
     frame = memory.read32(fs_base + 0x00)
     visited: set[int] = set()
 
+    # Stashed so RtlUnwind can restore EBP for the common case (unwinding
+    # back to the same frame/function the exception originated in) --
+    # see _rtl_unwind below. Captured here, once, before the chain walk
+    # reassigns `frame`: this is the original frame and the CPU's real EBP
+    # at the moment of the fault, nothing has changed yet.
+    cpu._seh_original_frame = frame
+    cpu._seh_original_ebp = cpu.regs[EBP] & 0xFFFFFFFF
+
     while frame not in (0, 0xFFFFFFFF):
         if frame in visited:
             logger.error("seh", f"SEH chain cycle detected at 0x{frame:08x} -- aborting dispatch")
@@ -293,6 +312,22 @@ def dispatch_exception(
         try:
             disposition = _invoke_handler(cpu, memory, handler, [record_addr, frame, context_addr, 0])
         except SehHandlerEscaped as e:
+            if e.faulted:
+                # Not a clean escape -- the handler's own execution (or
+                # whatever RtlUnwind jumped into) hit a genuine second
+                # fault. Reporting this as "handled" would silently resume
+                # execution from the crashed state. Treat it like the
+                # handler declined (ContinueSearch): restore a sane CPU
+                # state and keep walking the chain.
+                logger.error(
+                    "seh",
+                    f"handler at 0x{handler:08x} crashed mid-execution (fault at 0x{e.eip:08x}) "
+                    "instead of escaping via RtlUnwind -- treating as declined",
+                )
+                cpu.faulted = False
+                cpu.regs[ESP] = e.esp_before
+                frame = next_frame
+                continue
             # The expected shape of "handled": the handler called RtlUnwind
             # internally, which already redirected EIP/ESP to the __except
             # block. Nothing left for us to do.
@@ -390,6 +425,14 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
                 _invoke_handler(cpu, memory, handler, [exc_record, frame, 0, 0])
             except SehHandlerEscaped as e:
                 logger.warn("seh", f"RtlUnwind: handler at 0x{handler:08x} escaped to 0x{e.eip:08x} during unwind (unexpected)")
+                # Unlike the main dispatch loop, any escape here is already
+                # "unexpected" regardless of e.faulted -- these intervening
+                # handlers are only supposed to run __finally-style cleanup
+                # and return normally. Restore ESP either way so a crashed
+                # (or otherwise redirected) handler doesn't corrupt the rest
+                # of this unwind walk.
+                cpu.faulted = False
+                cpu.regs[ESP] = e.esp_before
             except SehHandlerTimeout:
                 logger.error("seh", f"RtlUnwind: handler at 0x{handler:08x} timed out during unwind")
             if exc_record:
@@ -406,6 +449,24 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
             # true saved per-frame CONTEXT).
             cpu.regs[EAX] = return_value & 0xFFFFFFFF
             cpu.regs[ESP] = target_frame & 0xFFFFFFFF
+            # EBP restoration: only handled for the common case of
+            # unwinding back to the same frame the exception originated in
+            # (dispatch_exception stashes that (frame, EBP) pairing --
+            # see there). A true multi-level unwind (target several call
+            # frames further out) would need an EBP-chain walk this module
+            # doesn't implement -- log clearly and leave EBP untouched
+            # rather than fabricate a value.
+            original_frame = getattr(cpu, "_seh_original_frame", None)
+            if target_frame == original_frame:
+                cpu.regs[EBP] = cpu._seh_original_ebp
+            else:
+                logger.warn(
+                    "seh",
+                    f"RtlUnwind: target_frame=0x{target_frame:08x} doesn't match the original "
+                    f"exception frame (0x{(original_frame or 0):08x}) -- EBP not restored "
+                    "(multi-level unwind recovery not implemented), __except-block code using "
+                    "EBP-relative addressing may misbehave",
+                )
             cpu.eip = target_ip & 0xFFFFFFFF
         else:
             cpu.regs[EAX] = return_value & 0xFFFFFFFF

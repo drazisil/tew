@@ -148,6 +148,15 @@ logger.debug("startup", f"Entry point in section: {entry_section.name if entry_s
 
 mem = Memory(2 * 1024 * 1024 * 1024)
 cpu = CPU(mem)
+# Real Windows never maps the first 64KB of address space ("the null page")
+# in any 32-bit process. Some guest code (MCity_d.exe's own anti-debug
+# self-test, _CLayer_DetectDebugger) depends on a genuine access violation
+# at a low address to detect whether a debugger is attached -- without this,
+# that self-test can never fault, so its "no debugger" correction path
+# never runs, leaving _Nfs_DebuggerIsPresent stuck at its wrong default.
+# Off by default at the Zig-core level (bare CpuState tests rely on
+# address-0-based tiny buffers); the real emulator always wants it on.
+cpu.enable_null_page_guard()
 
 kernel_structures = KernelStructures(mem)
 cpu.kernel_structures = kernel_structures
@@ -397,8 +406,8 @@ def _dispatch_breakpoint() -> None:
 # run avoids the overhead blowup hit last time.
 _HISTORY_CAPTURE_ENABLED = False
 _HISTORY_CAPTURE_DONE = False
-_HISTORY_CAPTURE_START_STEP = 500_000
-_HISTORY_CAPTURE_STOP_STEP = 8_000_000
+_HISTORY_CAPTURE_START_STEP = 0
+_HISTORY_CAPTURE_STOP_STEP = 9_000_000
 
 
 # B-tree page-metadata/next-page-resolution/tail-page investigation
@@ -828,6 +837,17 @@ def _fun_86a5a7_probe(cpu, mem):
 # passes an empty Locale connect-string -- and has been removed. Root
 # cause fixed in tew/api/kernel32_io.py (CompareStringA/W now validate the
 # locale id instead of always succeeding); see memory/status.md.
+
+# The EBP-restoration probe that was here (2026-08-23) answered its
+# question -- confirmed the RtlUnwind EBP-restoration fix (tew/kernel/
+# seh.py) DOES take effect correctly, but the crash isn't actually caused
+# by stale EBP: the second __except_handler3 invocation's own return
+# address (0x011f3b90) is inside a data/string-table region, not real
+# code -- meaning by that point the CPU is already executing from a wrong
+# EIP entirely. Traced to the thread's own outermost stack frame having an
+# invalid/garbage "return address" for when its own entry-point function
+# eventually returns -- a different, deeper gap than EBP restoration. See
+# memory/status.md.
 
 
 # ── Run loop ──────────────────────────────────────────────────────────────────
