@@ -4,6 +4,20 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-23, cont'd) — RtlUnwind EBP-restoration fix implemented, tested, and confirmed to work exactly as designed -- but does NOT resolve the anti-debug-self-test crash. Real root cause is different: the thread's own outermost stack frame has a garbage/invalid return address
+
+Superseded by the current `status.md` entry (2026-08-24, which found and fixed the actual root cause this entry was still searching for). Context preserved here since the "garbage return address" framing below turned out to be a plausible-but-wrong read of the same symptom the 2026-08-24 fix actually explains -- see the current entry for what `ret=0x011f3b90`/`EBP=0x7fffffdc` really were.
+
+**Context**: prior session chain (all fixed/verified, full detail in this file's older entries below and `changelog.md`'s matching dated entries): (1) `msjet35.dll` collation-cache crash (`CompareStringA`/`CompareStringW` locale validation), (2) opt-in null-page memory guard so the game's anti-debug self-test can genuinely fault, (3) `dispatch_exception` no longer conflates a handler crashing with a clean `RtlUnwind` escape, (4) traced the self-test's own crash to `RtlUnwind` never restoring EBP after redirecting execution -- planned and implemented this session.
+
+**This session's outcome, in one line**: the EBP-restoration fix is real, correct, tested (2 new tests, 1236/1236 passing), and live-confirmed to work exactly as designed -- but it does not fix the crash, because EBP was never actually the cause. Empirically ruled out: the same `EstablisherFrame=0x7ffffff0` garbage value recurs identically whether EBP is the old stale value or the newly-correctly-restored one.
+
+**Real root cause, found via one more probe (turned out to be a misread -- see 2026-08-24)**: the second `__except_handler3` invocation's own *return address* is `0x011f3b90` -- an address already established this session to be inside a data/string-table region, not real code. That's also the exact same value that appeared as the outermost stack frame's "return address" in every crash dump all night (previously misread as just "where the EBP-chain diagnostic walk gives up," not as an actual return path the CPU executes). The story as understood *at the time*: by the time this happens, `_CLayer_DetectDebugger`'s own function (and whatever calls it) has already returned normally all the way up the call stack to the thread's own outermost function -- which then tries to `RET` into *its own* stored return address, and that value is garbage instead of valid thread-exit/kernel32 code. Execution wanders from there into whatever that garbage decodes as, eventually hitting a `CALL` into `0x009f5eb8` with nonsense arguments.
+
+**Not yet investigated (at the time)**: how tew sets up a thread's initial stack frame. 2026-08-24's session found the real answer was elsewhere entirely -- `run_exe.py`'s own initial-frame setup was already correct; the actual bug was in `_rtl_unwind`'s `ESP=target_frame` for a specific real-CRT self-return pattern (`__global_unwind2`).
+
+---
+
 ## Previous status (2026-08-23) — RtlUnwind EBP-restoration fix implemented, tested, and confirmed to work exactly as designed -- but does NOT resolve the anti-debug-self-test crash. Real root cause is different: the thread's own outermost stack frame has a garbage/invalid return address
 
 Superseded by the current `status.md` entry. Planned via `EnterPlanMode` (plan file `vast-drifting-pike.md`), implemented per plan: `tew/kernel/seh.py`'s `dispatch_exception` now stashes `(original_frame, original_ebp)` once per exception (right after `_write_context`, before the chain-walk reassigns `frame`); `_rtl_unwind`'s `target_ip` branch restores `EBP` from that pairing when `target_frame` matches, and otherwise logs a clear warning and leaves EBP untouched (the documented, deliberately out-of-scope multi-level-unwind case). 2 new tests in `tests/unit/kernel/test_seh.py`, existing tests (including the clean-escape-via-JMP regression test) unaffected. `pytest -q`: 1236/1236.

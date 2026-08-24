@@ -25,11 +25,20 @@ Known, documented simplifications (see individual functions):
     faulting instruction (EIP advances during instruction fetch, before
     the memory access that triggers the fault) -- an honest approximation,
     not exact hardware fidelity.
-  - RtlUnwind resumes at the target frame using ESP = TargetFrame (the
-    conventional stack depth for that scope, same approach Wine's x86
-    RtlUnwind takes) rather than a saved per-frame CONTEXT, since MSVC's
-    frame layout doesn't expose one generically. EBP is left as whatever
-    the unwind-triggering handler's own execution left it as.
+  - RtlUnwind resumes at TargetIp with ESP set to what it would be after an
+    ordinary `RET <argbytes>` back to RtlUnwind's OWN caller (i.e. the
+    caller's real stack depth at the moment it called RtlUnwind) -- not
+    TargetFrame's address, which is just the SEH registration record's own
+    location and generally unrelated to the caller's actual stack depth.
+    Confirmed live 2026-08-24: MSVC's `__global_unwind2` calls RtlUnwind
+    with TargetIp = its own return address purely as a "fake return" trick
+    (so its own ordinary epilogue can run afterward) -- using ESP=TargetFrame
+    there made that epilogue pop the SEH registration record's own fields as
+    if they were its saved registers, landing back inside __except_handler3
+    via unrelated leftover stack content instead of a real return address.
+    EBP is left as whatever the unwind-triggering handler's own execution
+    left it as (see the separate EBP-restoration logic below for the common
+    case).
   - ExceptionContinueExecution (retry the faulting instruction) is
     accepted and clears the fault, but since EIP has typically already
     advanced past the faulting instruction by the time the fault is
@@ -443,12 +452,18 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
 
         if target_ip:
             # Real RtlUnwind never returns to its caller when TargetIp is
-            # set -- it resumes execution there directly. ESP = target_frame
-            # is the conventional stack depth for that scope (see module
-            # docstring re: this being a documented simplification vs. a
-            # true saved per-frame CONTEXT).
+            # set -- it resumes execution there directly, with ESP set as if
+            # RtlUnwind had just done an ordinary `RET 16` back to whoever
+            # called it (4 stdcall DWORD args). This is NOT target_frame's
+            # address -- confirmed live 2026-08-24 via MSVC's
+            # __global_unwind2, which calls RtlUnwind with TargetIp = its
+            # own return address as a "fake return" trick; using
+            # ESP=target_frame there corrupts its epilogue (see module
+            # docstring). `esp` here is RtlUnwind's own entry ESP, captured
+            # before its args were read, so esp+20 (retaddr + 4 args) is
+            # exactly that caller-return depth.
             cpu.regs[EAX] = return_value & 0xFFFFFFFF
-            cpu.regs[ESP] = target_frame & 0xFFFFFFFF
+            cpu.regs[ESP] = (esp + 20) & 0xFFFFFFFF
             # EBP restoration: only handled for the common case of
             # unwinding back to the same frame the exception originated in
             # (dispatch_exception stashes that (frame, EBP) pairing --

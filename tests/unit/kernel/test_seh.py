@@ -255,6 +255,7 @@ def test_rtlunwind_pops_current_frame_without_reinvoking_it(cpu_env):
     into that same handler forever."""
     cpu, mem, ks, stubs = cpu_env
     fs_base = ks.get_fs_base()
+    initial_esp = cpu.regs[ESP] & 0xFFFFFFFF
 
     outer_handler = CODE_BASE + 0x10
     write_bytes(mem, outer_handler, bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]))
@@ -282,7 +283,67 @@ def test_rtlunwind_pops_current_frame_without_reinvoking_it(cpu_env):
 
     assert handled is True
     assert mem.read32(fs_base) == FRAME_B  # chain correctly popped past FRAME_A
-    assert (cpu.regs[ESP] & 0xFFFFFFFF) == FRAME_B
+    # ESP resumes at the caller's own stack depth (as if RtlUnwind had just
+    # done an ordinary `RET 16`), not at FRAME_B's address -- see
+    # test_rtlunwind_resumes_at_callers_stack_depth_when_target_ip_is_its_own_return_address
+    # for why target_frame's address is the wrong value here. -20 accounts
+    # for _invoke_handler's own 4-arg+sentinel setup (20 bytes) followed by
+    # inner_handler's own 4 pushes + `call ecx`'s return-address push (20
+    # bytes) minus the fix's +20 restoration -- net -20 from initial_esp.
+    assert (cpu.regs[ESP] & 0xFFFFFFFF) == (initial_esp - 20) & 0xFFFFFFFF
     # recovered_label's own code ran to completion as part of the redirect.
     assert cpu.regs[EAX] == 0x77
     assert cpu.halted
+
+
+def test_rtlunwind_resumes_at_callers_stack_depth_when_target_ip_is_its_own_return_address(cpu_env):
+    """Regression test for the __global_unwind2 self-return trick: real
+    MSVC CRT code calls RtlUnwind(TargetFrame, TargetIp=<its own return
+    address>, ...) purely to simulate a normal function return, so its own
+    ordinary epilogue can run afterward. ESP must resume at the CALLER's
+    real stack depth (as if RtlUnwind had done `RET 16`), not at
+    TargetFrame's address -- TargetFrame is just the SEH registration
+    record's location, unrelated to the caller's actual stack depth.
+    Confirmed live 2026-08-24 against MCity_d.exe's real, compiled
+    __global_unwind2: using ESP=target_frame there made its epilogue pop the
+    registration record's own next/handler/scopetable fields as if they
+    were its saved EDI/ESI/EBX, eventually RETurning through unrelated
+    leftover stack content back into __except_handler3 a second, bogus
+    time -- the actual root cause of a fault that looked, from the outside,
+    like unrelated EBP/stack corruption."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+    initial_esp = cpu.regs[ESP] & 0xFFFFFFFF
+
+    rtlunwind_addr = stubs.get_handler_address("kernel32.dll", "RtlUnwind")
+
+    handler = CODE_BASE
+    # TargetIp = the address right after `call ecx` -- i.e. handler's own
+    # return address, exactly the __global_unwind2 self-return shape.
+    prefix_len = 5 + 2 + 5 + 5 + 5 + 2  # push,push,push,push,mov ecx,call ecx
+    target_ip = handler + prefix_len
+
+    code = b""
+    code += bytes([0x68]) + (0x99).to_bytes(4, "little")          # push 0x99 (ReturnValue)
+    code += bytes([0x6A, 0x00])                                    # push 0 (ExceptionRecord=NULL)
+    code += bytes([0x68]) + target_ip.to_bytes(4, "little")        # push target_ip (TargetIp = own return address)
+    code += bytes([0x68]) + FRAME_A.to_bytes(4, "little")          # push FRAME_A (TargetFrame == originating frame)
+    code += bytes([0xB9]) + rtlunwind_addr.to_bytes(4, "little")   # mov ecx, rtlunwind_addr
+    code += bytes([0xFF, 0xD1])                                    # call ecx
+    assert len(code) == prefix_len
+    code += bytes([0xB8, 0x77, 0x00, 0x00, 0x00, 0xF4])            # mov eax,0x77; hlt -- lands here on resume
+    write_bytes(mem, handler, code)
+    push_seh_frame(mem, fs_base, FRAME_A, handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+    assert cpu.regs[EAX] == 0x77  # the marker right after `call ecx` actually ran
+    assert cpu.halted
+    # ESP lands where an ordinary `RET 16` back to the caller would leave
+    # it -- NOT at FRAME_A's address (the old, wrong behavior this fix
+    # removes). -20 for the same reason as
+    # test_rtlunwind_pops_current_frame_without_reinvoking_it above.
+    final_esp = cpu.regs[ESP] & 0xFFFFFFFF
+    assert final_esp == (initial_esp - 20) & 0xFFFFFFFF
+    assert final_esp != FRAME_A
