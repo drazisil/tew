@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from os.path import dirname
@@ -215,6 +216,26 @@ def _auto_decline_fullscreen_prompt(caption, text, u_type):
 crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
 crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
 
+# `timeout N ... run_exe.py` (the standard way this project's debugging
+# sessions bound a run) sends SIGTERM on expiry -- Python's default handler
+# for that just kills the process immediately, skipping every line below
+# including window_manager.shutdown()'s SDL_Quit(). Every run that ever hit
+# its time limit this way left an orphaned SDL window/GL context behind
+# (confirmed 2026-08-24: no signal handler existed anywhere in this file).
+# Mirrors the normal post-run path's own os._exit() (not sys.exit()) for the
+# same NVIDIA-driver-atexit-crash reason documented there.
+def _handle_termination_signal(signum, frame):
+    logger.error("startup", f"Received signal {signum} -- shutting down SDL2 before exit")
+    try:
+        crt_state.window_manager.shutdown()
+    except Exception as e:
+        logger.error("startup", f"SDL2 shutdown during signal handling failed: {e}")
+    sys.stdout.flush()
+    os._exit(1)
+
+signal.signal(signal.SIGTERM, _handle_termination_signal)
+signal.signal(signal.SIGINT, _handle_termination_signal)
+
 win32_handlers.install(cpu)
 register_nt_handlers(win32_handlers.nt_dispatcher)
 
@@ -404,8 +425,19 @@ def _dispatch_breakpoint() -> None:
 # very early (~step 1-2M, well before the first 5M-step heartbeat) --
 # capturing just that early window (database-open) instead of the whole
 # run avoids the overhead blowup hit last time.
+#
+# DISABLED-FROM-START again (2026-08-24): that investigation is done and
+# the 0-9M window was left on, capturing nearly the whole run to
+# ClickHouse over HTTP -- real added wall-clock drag on every run since,
+# stacked on top of this session's separate SDL2-under-Xwayland slowness.
+# Not needed for the current RtlUnwind investigation (a live breakpoint
+# probe is enough, same as prior sessions used) -- _HISTORY_CAPTURE_DONE
+# starting True skips the trigger check below for the whole run via the
+# same completion flag the step-window logic already sets when it's done;
+# flip back to False (and pick a fresh narrow window) if a future
+# investigation genuinely needs the instruction-level trace.
 _HISTORY_CAPTURE_ENABLED = False
-_HISTORY_CAPTURE_DONE = False
+_HISTORY_CAPTURE_DONE = True
 _HISTORY_CAPTURE_START_STEP = 0
 _HISTORY_CAPTURE_STOP_STEP = 9_000_000
 
