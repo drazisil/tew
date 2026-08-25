@@ -2008,7 +2008,7 @@ def register_kernel32_io_handlers(
 
     # Real CompareStringA/W validate the locale identifier (IsValidLocale)
     # and fail (return 0, GetLastError()==ERROR_INVALID_PARAMETER) for one
-    # that isn't -- this emulator only ever models the single locale
+    # that isn't -- this emulator only ever models the single real locale
     # 0x0409 (see _is_valid_locale/_get_user_default_lcid/
     # _get_system_default_lang_id below, all hardcoded to it, "no separate
     # system-vs-user locale concept anywhere else"). Neither comparison
@@ -2023,8 +2023,30 @@ def register_kernel32_io_handlers(
     # "") ended up with no valid collating-order id at all -- surfacing
     # much later as a null per-session collation-interface pointer and an
     # unrelated-looking crash deep in query evaluation.
+    #
+    # 2026-08-25: that fix over-corrected -- LOCALE_USER_DEFAULT (0x0400)
+    # and LOCALE_SYSTEM_DEFAULT (0x0800) are real Windows sentinels meaning
+    # "resolve to whatever the caller's actual locale is", not "no locale
+    # specified"; real CompareStringA resolves them and succeeds. dao350.dll's
+    # own internal name-comparison helper (FUN_044c6284, reached from the
+    # column-collection dedup check in FUN_044d1d53/FUN_044da868) calls
+    # CompareStringA(LOCALE_USER_DEFAULT, ...) for every single field-name
+    # comparison -- confirmed live, 371 calls in one run, all rejected as
+    # "invalid locale" (EAX=0). dao350's own switch on the result maps
+    # failure (0) to the SAME code as CSTR_EQUAL (2) -- real Windows
+    # essentially never returns 0 for a well-formed call, so this collapsed
+    # error handling is harmless there, but tew's rejection turned every
+    # single name comparison through this path into an unconditional
+    # "equal", regardless of actual string content. Root cause of Fields.Count
+    # reading 1 instead of 10 for 3-table-join QueryDefs: every column after
+    # the first got misidentified as a duplicate of it and silently skipped.
+    _RESOLVABLE_LOCALES = {0x0400: 0x0409, 0x0800: 0x0409}  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT -> en-US
+
+    def _resolve_locale(locale: int) -> int:
+        return _RESOLVABLE_LOCALES.get(locale, locale)
+
     def _locale_is_valid(locale: int) -> bool:
-        return locale == 0x0409
+        return _resolve_locale(locale) == 0x0409
 
     def _compare_string_a(cpu: "CPU") -> None:
         locale   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)

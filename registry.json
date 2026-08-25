@@ -278,6 +278,12 @@
     }
   },
   "hklm\\software\\microsoft\\jet\\3.5\\engines": {},
+  "hklm\\software\\microsoft\\jet\\3.5\\engines\\debug": {
+    "jetshowplan": {
+      "type": 1,
+      "value": "ON"
+    }
+  },
   "hklm\\software\\microsoft\\jet\\3.5\\engines\\odbc": {
     "tryjetauth": {
       "type": 1,

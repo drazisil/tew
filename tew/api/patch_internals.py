@@ -52,22 +52,15 @@ def patch_crt_internals(
     # After DllMain does RET 12, EIP lands here. We restore EAX = hModule
     # (the correct LoadLibraryA return value) then RET back to the original caller.
     def _dll_main_finish(cpu: "CPU") -> None:
-        # TEMPORARY (2026-08-18): expression-service-init hypothesis probe --
-        # this path (the real LoadLibraryA-with-DllMain trampoline, distinct
-        # from _invoke_dependency_dllmain's synchronous nested-call path) has
-        # never actually looked at DllMain's real return value -- it always
-        # overwrites EAX with the handle regardless, so a DllMain that
-        # returns FALSE (init failure) has been silently treated as success
-        # this whole time. Logging the real value here, once, before it's
-        # overwritten, to check whether expsrv.dll's own DllMain -- loaded
-        # via a genuine LoadLibraryA from inside VBAGetExprSrv, per the
-        # DAO-3075 investigation -- actually succeeds. See status.md/
-        # changelog.md "2026-08-17"/"(cont'd)" for the thread this
-        # continues. Revert once this investigation concludes.
+        # This trampoline always overwrites EAX with the handle regardless
+        # of DllMain's real return value -- a DllMain returning FALSE (init
+        # failure) is silently treated as success. Confirmed not currently
+        # an issue (DAO-3075 investigation, 2026-08-22) but worth a debug
+        # trace if a DLL init failure is ever suspected again.
         real_dllmain_result = cpu.regs[EAX]
         handle = memory.read32(DLLMAIN_HANDLE_STORE)
-        logger.error("handlers",
-            f"[expr-svc-probe] LoadLibraryA-DllMain finished: handle=0x{handle:08x} "
+        logger.debug("handlers",
+            f"[dllmain-finish] LoadLibraryA-DllMain finished: handle=0x{handle:08x} "
             f"real_return_value={real_dllmain_result} (1=success, 0=failure)")
         cpu.regs[EAX] = handle
         # Stack at this point: [ESP] = original retAddr of LoadLibraryA call site.

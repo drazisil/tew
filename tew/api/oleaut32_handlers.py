@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 import struct
-from datetime import date
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -683,6 +683,73 @@ def register_oleaut32_ole32_handlers(
 
     _ole_ord(94, _VarDateFromStr)
     stubs.register_handler("oleaut32.dll", "VarDateFromStr", _VarDateFromStr)
+
+    # VarDateFromUdate(UDATE *pudateIn, ULONG dwFlags, DATE *pdateOut) -> HRESULT.
+    # UDATE = SYSTEMTIME (8 WORDs: wYear,wMonth,wDayOfWeek,wDay,wHour,wMinute,
+    # wSecond,wMilliseconds) + a trailing `long wDayOfYear` we don't need to
+    # read. Reuses the same OLE DATE epoch/Lotus-leap-year-quirk math as
+    # _VarDateFromStr above -- same output representation, different input
+    # shape (a struct instead of a parsed string).
+    def _VarDateFromUdate(cpu: "CPU") -> None:
+        pudate_in = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        pdate_out = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        year   = memory.read16(pudate_in & 0xFFFFFFFF)
+        month  = memory.read16((pudate_in + 2) & 0xFFFFFFFF)
+        day    = memory.read16((pudate_in + 6) & 0xFFFFFFFF)
+        hour   = memory.read16((pudate_in + 8) & 0xFFFFFFFF)
+        minute = memory.read16((pudate_in + 10) & 0xFFFFFFFF)
+        second = memory.read16((pudate_in + 12) & 0xFFFFFFFF)
+        millis = memory.read16((pudate_in + 14) & 0xFFFFFFFF)
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            cpu.regs[EAX] = _DISP_E_TYPEMISMATCH
+            cleanup_stdcall(cpu, memory, 12)
+            return
+        days = (parsed - _OLE_DATE_EPOCH).days
+        if parsed >= _OLE_DATE_LOTUS_QUIRK_CUTOFF:
+            days += 1
+        frac = (hour * 3600 + minute * 60 + second + millis / 1000.0) / 86400.0
+        _write_f64(pdate_out, float(days) + frac)
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("oleaut32.dll", "VarDateFromUdate", _VarDateFromUdate)
+
+    # VarUdateFromDate(DATE dateIn, ULONG dwFlags, UDATE *pudateOut) -> HRESULT.
+    # The inverse of VarDateFromUdate above -- dateIn is passed BY VALUE (8
+    # bytes on the stack, not a pointer), everything else mirrors it: same
+    # OLE DATE epoch, same Lotus leap-year quirk, inverted. UDATE output is a
+    # SYSTEMTIME (8 WORDs) followed by a `long wDayOfYear`; wDayOfWeek uses
+    # Win32's Sunday=0 convention (Python's date.weekday() is Monday=0).
+    def _VarUdateFromDate(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        raw = struct.pack("<II", memory.read32((esp + 4) & 0xFFFFFFFF), memory.read32((esp + 8) & 0xFFFFFFFF))
+        date_val = struct.unpack("<d", raw)[0]
+        pudate_out = memory.read32((esp + 16) & 0xFFFFFFFF)
+        days_frac, days_int = math.modf(date_val)
+        days_int = int(days_int)
+        candidate = _OLE_DATE_EPOCH + timedelta(days=days_int)
+        if candidate >= _OLE_DATE_LOTUS_QUIRK_CUTOFF:
+            candidate = _OLE_DATE_EPOCH + timedelta(days=days_int - 1)
+        total_millis = round(abs(days_frac) * 86400000)
+        hour, rem = divmod(total_millis, 3600000)
+        minute, rem = divmod(rem, 60000)
+        second, millis = divmod(rem, 1000)
+        win_day_of_week = (candidate.weekday() + 1) % 7  # Python Mon=0 -> Win32 Sun=0
+        memory.write16(pudate_out & 0xFFFFFFFF, candidate.year)
+        memory.write16((pudate_out + 2) & 0xFFFFFFFF, candidate.month)
+        memory.write16((pudate_out + 4) & 0xFFFFFFFF, win_day_of_week)
+        memory.write16((pudate_out + 6) & 0xFFFFFFFF, candidate.day)
+        memory.write16((pudate_out + 8) & 0xFFFFFFFF, hour)
+        memory.write16((pudate_out + 10) & 0xFFFFFFFF, minute)
+        memory.write16((pudate_out + 12) & 0xFFFFFFFF, second)
+        memory.write16((pudate_out + 14) & 0xFFFFFFFF, millis)
+        memory.write32((pudate_out + 16) & 0xFFFFFFFF, candidate.timetuple().tm_yday)
+        cpu.regs[EAX] = S_OK
+        cleanup_stdcall(cpu, memory, 16)
+
+    stubs.register_handler("oleaut32.dll", "VarUdateFromDate", _VarUdateFromDate)
 
     # Ordinal 154 — LoadTypeLibEx(...) -> HRESULT
     #

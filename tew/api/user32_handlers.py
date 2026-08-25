@@ -2307,3 +2307,29 @@ def register_user32_gdi32_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "CharUpperA", _CharUpperA)
+
+    # wvsprintfA(LPSTR lpOut, LPCSTR lpFmt, va_list arglist) -> int [stdcall]
+    # Same format engine as msvcrt's vsprintf; real wvsprintf supports a
+    # documented subset (no floating point), but reusing the full engine is
+    # safe since it's a superset -- any specifier Jet actually emits behaves
+    # identically. First exercised 2026-08-25 when JETSHOWPLAN was enabled
+    # (msjet35.dll's show-plan formatter calls this to build the plan text).
+    def _wvsprintfA(cpu: "CPU") -> None:
+        from tew.api._state import read_cstring
+        from tew.api.msvcrt_handlers import _sprintf_format, _write_cstring
+        dst     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        fmt_ptr = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        ap      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        fmt     = read_cstring(fmt_ptr, memory, 4096)
+        ap_off  = [0]
+
+        def get_arg() -> int:
+            v = memory.read32((ap + ap_off[0]) & 0xFFFFFFFF)
+            ap_off[0] += 4
+            return v
+
+        result = _sprintf_format(fmt, get_arg, memory)
+        cpu.regs[EAX] = _write_cstring(dst, result, memory)
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("user32.dll", "wvsprintfA", _wvsprintfA)
