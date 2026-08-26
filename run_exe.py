@@ -165,13 +165,24 @@ cpu.kernel_structures = kernel_structures
 
 exe.import_resolver.set_memory(mem)
 
-# DLL search paths: application directory first (mirrors Windows loader behavior),
-# then any additional directories (e.g. dgVoodoo d3d8 shim).
+# DLL search paths: application directory first (mirrors Windows loader behavior).
+# 2026-08-26: dropped the dgVoodoo/rayman_d3d8 search path (and deleted its
+# d3d8.dll) -- tew's own d3d8_handlers.py registers Python handlers for
+# every function the game actually calls (Direct3DCreate8, DebugSetMute,
+# Validate*Shader), and register_handler always wins over a real DLL's own
+# export (dll_loader.py's patch_iat_entry precedence). Loading dgVoodoo's
+# real, Vista+-targeting d3d8.dll and running its real DllMain provided
+# nothing the game uses, while costing an entire extra wave of Vista+-only
+# missing-handler chasing (LoadLibraryExW, InitializeSListHead, CreateEventW,
+# InitializeCriticalSectionEx, ...). Confirmed live: removing it entirely
+# changes nothing about the run past this point. General rule going forward:
+# DLL search paths should point into ~/.emu32 (period-correct, purpose-built
+# for this project) -- copy a file in there if something new is ever
+# genuinely needed, don't add an arbitrary ~/Downloads directory.
 exe.import_resolver.add_dll_search_path(dirname(exe_path))
-exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
 # Real, period-correct COM servers (oleaut32.dll, dao350.dll, ...) live here
 # -- must be registered before build_iat_map, not just later inside
-# register_oleaut32_ole32_handlers (oleaut32_handlers.py's own
+# register_ole32_handlers (ole32_handlers.py's own
 # _KNOWN_COM_SERVER_DIR add_search_path call): build_iat_map does its own
 # eager load_dll() for every DLL MCity_d.exe directly imports, and that
 # result is cached into _iat_map permanently -- if the search path isn't
@@ -179,8 +190,8 @@ exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
 # early ordinal-based BSTR alloc call, well before DAO/Jet loads it again
 # later via a different path) silently resolve to nothing and fall through
 # to an auto-generated fatal-halt stub instead of the genuinely correct,
-# already-loaded-later real DLL. Found 2026-08-26 after removing this
-# file's oleaut32.dll Python handlers exposed the gap they'd been silently
+# already-loaded-later real DLL. Found 2026-08-26 after removing the
+# old oleaut32.dll Python handlers exposed the gap they'd been silently
 # covering for.
 exe.import_resolver.add_dll_search_path("/home/drazisil/.emu32/WINDOWS/System32")
 

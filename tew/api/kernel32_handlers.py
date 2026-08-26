@@ -205,6 +205,24 @@ def register_kernel32_handlers(
 
     # ── LoadLibrary ───────────────────────────────────────────────────────────
 
+    def _normalized_dll_name(name: str) -> str:
+        """Lowercase, always ".dll"-suffixed module name for DynamicModule
+        caching -- must match get_stub_dll_handle/register_handler's own
+        normalization exactly. A bare name like "kernel32" (real Windows
+        accepts LoadLibraryA/GetModuleHandleA without the extension) cached
+        verbatim here permanently shadows the correct, suffixed lookup for
+        every later GetProcAddress(hModule, ...) call using this same
+        handle -- confirmed live: GetProcAddress("kernel32", ...) always
+        returned NULL for real, registered handlers (e.g.
+        IsProcessorFeaturePresent) once "kernel32" (no suffix) had been
+        cached this way, even though "kernel32.dll!IsProcessorFeaturePresent"
+        was a real, working registration the whole time.
+        """
+        norm = name.lower()
+        if not norm.endswith(".dll"):
+            norm += ".dll"
+        return norm
+
     def _load_dll_by_path(name: str, arg_bytes: int,
                           cpu: "CPU", memory: "Memory") -> bool:
         """Try to load a path-based DLL. Returns True if handled (caller should return)."""
@@ -223,7 +241,7 @@ def register_kernel32_handlers(
                         dll_loader.patch_dll_iats(memory, stubs)
                         handle = loaded.base_address & 0xFFFFFFFF
                         state.dynamic_modules[handle] = DynamicModule(
-                            dll_name=basename.lower(),
+                            dll_name=_normalized_dll_name(basename),
                             base_address=loaded.base_address,
                         )
                         logger.info("handlers",
@@ -254,7 +272,7 @@ def register_kernel32_handlers(
                 stub_handle = stubs.get_stub_dll_handle(basename)
                 if stub_handle is not None:
                     state.dynamic_modules[stub_handle] = DynamicModule(
-                        dll_name=basename.lower(),
+                        dll_name=_normalized_dll_name(basename),
                         base_address=stub_handle,
                     )
                     logger.debug("handlers",
@@ -295,7 +313,7 @@ def register_kernel32_handlers(
                 dll_loader.patch_dll_iats(memory, stubs)
                 handle = loaded.base_address & 0xFFFFFFFF
                 state.dynamic_modules[handle] = DynamicModule(
-                    dll_name=name.lower(), base_address=loaded.base_address)
+                    dll_name=_normalized_dll_name(name), base_address=loaded.base_address)
                 logger.info("handlers",
                     f'LoadLibraryA("{name}") -> 0x{handle:x} '
                     f'(loaded at 0x{loaded.base_address:x})')
@@ -309,7 +327,7 @@ def register_kernel32_handlers(
         stub_handle = stubs.get_stub_dll_handle(name)
         if stub_handle is not None:
             state.dynamic_modules[stub_handle] = DynamicModule(
-                dll_name=name.lower(), base_address=stub_handle)
+                dll_name=_normalized_dll_name(name), base_address=stub_handle)
             logger.debug("handlers", f'LoadLibraryA("{name}") -> 0x{stub_handle:x} (stub-only)')
             cpu.regs[EAX] = stub_handle
         else:

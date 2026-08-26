@@ -173,7 +173,7 @@ tew/
     kernel32_io.py                  — File I/O, sync objects, threading primitives
     msvcrt_handlers.py              — CRT: malloc/free/string/file/time
     user32_handlers.py              — User32/GDI32 handlers
-    oleaut32_handlers.py            — OleAut32/Ole32 handlers
+    ole32_handlers.py               — Ole32 COM handlers
     advapi32_handlers.py            — Advapi32 handlers
     d3d8_handlers.py                — Direct3D8 COM handlers
     wininet_handlers.py             — WinInet handlers

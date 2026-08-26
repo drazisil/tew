@@ -116,7 +116,7 @@ def register_crt_handlers(
     from tew.api.kernel32_io import register_winmm_handlers
     from tew.api.msvcrt_handlers import register_msvcrt_handlers
     from tew.api.user32_handlers import register_user32_gdi32_handlers
-    from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
+    from tew.api.ole32_handlers import register_ole32_handlers
     from tew.api.advapi32_handlers import register_advapi32_handlers
     from tew.api.d3d8 import register_d3d8_handlers
     from tew.api.version_handlers import register_version_handlers
@@ -130,7 +130,7 @@ def register_crt_handlers(
     register_winmm_handlers(stubs, memory, state)
     register_msvcrt_handlers(stubs, memory, state)
     register_user32_gdi32_handlers(stubs, memory, state, dll_loader)
-    register_oleaut32_ole32_handlers(stubs, memory, state, dll_loader)
+    register_ole32_handlers(stubs, memory, state, dll_loader)
     register_advapi32_handlers(stubs, memory, state)
     register_d3d8_handlers(stubs, memory, state)
     register_version_handlers(stubs, memory, state)
