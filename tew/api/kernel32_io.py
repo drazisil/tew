@@ -333,9 +333,11 @@ def register_kernel32_io_handlers(
         state.next_thread_id += 1
         handle = state.next_thread_handle
         state.next_thread_handle += 1
-        logger.info("thread",
+        ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        logger.debug("thread",
             f"CreateThread(start=0x{lp_start:x}, param=0x{lp_param:x}, "
-            f"flags=0x{dw_flags:x}) -> handle=0x{handle:x}, tid={tid}")
+            f"flags=0x{dw_flags:x}) -> handle=0x{handle:x}, tid={tid}  "
+            f"called_from=0x{ret_addr:x}")
         idx = state.scheduler.thread_count
         state.scheduler.create_thread(
             thread_id=tid,

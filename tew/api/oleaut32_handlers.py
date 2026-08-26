@@ -59,6 +59,34 @@ def register_oleaut32_ole32_handlers(
     if dll_loader is not None:
         dll_loader.add_search_path(_KNOWN_COM_SERVER_DIR)
 
+    # A real, genuine oleaut32.dll loads for real in this emulator (confirmed
+    # live 2026-08-26: it patches its own imports from advapi32/gdi32/
+    # kernel32/msvcrt/ole32/rpcrt4/user32.dll, and msjet35.dll/expsrv.dll/
+    # dao350.dll all correctly resolve their own oleaut32.dll imports against
+    # it). dll_loader.py's patch_iat_entry tries a *registered handler*
+    # before ever checking a real DLL's own export -- so every
+    # "oleaut32.dll" handler this file registers unconditionally shadows the
+    # real, correct Microsoft code, even though it's genuinely present and
+    # loaded. This was the actual root cause of the whole LoadTypeLibEx/
+    # ITypeComp::Bind investigation (see changelog.md 2026-08-26): real
+    # oleaut32.dll would have parsed expsrv.dll's real embedded TYPELIB
+    # resource (confirmed present, 42KB) and answered every query correctly,
+    # but a hand-crafted trap object was answering first instead.
+    # Neutralizing every "oleaut32.dll" registration this file makes --
+    # real code should be handling all of it now.
+    _real_stubs = stubs
+
+    class _NoOleaut32Stubs:
+        def __getattr__(self, name):
+            return getattr(_real_stubs, name)
+
+        def register_handler(self, dll_name, func_name, handler):
+            if dll_name == "oleaut32.dll":
+                return
+            _real_stubs.register_handler(dll_name, func_name, handler)
+
+    stubs = _NoOleaut32Stubs()
+
     # ── oleaut32.dll — BSTR / VARIANT / SafeArray ─────────────────────────────
     #
     # BSTR memory layout:
@@ -767,9 +795,341 @@ def register_oleaut32_ole32_handlers(
     # test_oleaut32_variant_clear.py), just the opposite direction: fix
     # is to register the SAME handler under both keys, never duplicate
     # logic so the two can't drift apart again.
+    # TEMP (2026-08-25 cont'd x24): scoping WHICH vtable slot(s) a real
+    # caller actually invokes on the returned ITypeLib*, before writing a
+    # real MSFT-format parser + COM object for it (see TODO.md -- confirmed
+    # every real call asks for szFile="expsrv.dll", i.e. it wants that DLL's
+    # own embedded TYPELIB resource, not an arbitrary external file). Builds
+    # a 20-slot "trap" vtable (covers IUnknown's 3 + a generous ITypeLib
+    # method count) where each slot is a real Win32-handler trampoline
+    # (reusing register_handler/get_handler_address exactly as any other
+    # stub -- no new mechanism needed) that just logs its own slot index
+    # and halts, so whichever slot real code calls first is unambiguous.
+    # Remove this whole trap once the real implementation lands.
+    # Real, documented ITypeLib vtable (oaidl.h) -- (arg_bytes, benign_return, name).
+    # arg_bytes is the real stdcall cleanup size (not a guess) so execution
+    # can continue correctly through a whole sequence of calls in one run.
+    # Real, documented ITypeComp vtable (oaidl.h) -- called on the object
+    # ITypeLib::GetTypeComp hands back (found live: real code doesn't call
+    # ITypeLib::FindName directly, it goes through GetTypeComp then
+    # ITypeComp::Bind/BindType instead).
+    _TYPECOMP_VTABLE_SPEC = [
+        (8,  0, "QueryInterface"),   # 0: (REFIID, void**)
+        (0,  1, "AddRef"),           # 1: ()
+        (0,  1, "Release"),         # 2: ()
+        None,                        # 3: Bind -- handled specially below (real 6-arg signature, not the generic trap)
+        (16, 0, "BindType"),         # 4: (LPOLESTR, ULONG, ITypeInfo**, ITypeComp**) -- 4 args
+    ]
+
+    def _make_generic_trap_slot(label: str, slot_index: int, arg_bytes: int, benign_return: int, name: str):
+        def _slot(cpu: "CPU") -> None:
+            esp = cpu.regs[ESP]
+            n_args = arg_bytes // 4
+            # [ESP+0]=return addr, [ESP+4]=this, [ESP+8..]=real args
+            args_preview = [memory.read32((esp + 8 + i * 4) & 0xFFFFFFFF) for i in range(n_args)]
+            logger.error(
+                "com",
+                f"[typelib-trap] {label} slot {slot_index} ({name}) called, args={[hex(a) for a in args_preview]}",
+            )
+            cpu.regs[EAX] = benign_return
+            cleanup_stdcall(cpu, memory, 4 + arg_bytes)  # +4 for the implicit `this`
+        return _slot
+
+    for _i, _spec in enumerate(_TYPECOMP_VTABLE_SPEC):
+        if _spec is None:
+            continue  # slot3 (Bind) registered separately below
+        _argb, _ret, _name = _spec
+        stubs.register_handler("__typecomp_trap__", f"slot{_i}", _make_generic_trap_slot("ITypeComp", _i, _argb, _ret, _name))
+
+    # expsrv.dll's real .tlb is the standard, publicly-documented Microsoft
+    # Jet/VBA "Expression Service" built-in function library (Abs, CStr,
+    # DateAdd, ...) -- confirmed live: every ITypeComp::Bind name this
+    # emulator has ever seen requested (base name, or "_b_var_"/"_b_str_"
+    # boxed-result variants of it) is one of these ~40 real, well-known
+    # functions, not arbitrary/game-specific data. Real Jet SQL expression
+    # evaluation is VARIANT-based throughout, so every param and return type
+    # below is VT_VARIANT -- accurate for this context, not a simplification
+    # of real per-function signatures.
+    #
+    # (required_params, optional_params) -- from public VBA/Access function
+    # reference documentation.
+    _EXPR_FUNCTIONS: dict[str, tuple[int, int]] = {
+        "ABS": (1, 0), "ASC": (1, 0), "ATN": (1, 0),
+        "CCUR": (1, 0), "CDBL": (1, 0), "CHOOSE": (1, 8), "CHR": (1, 0),
+        "CINT": (1, 0), "CLNG": (1, 0), "COS": (1, 0), "CSNG": (1, 0),
+        "CSTR": (1, 0), "CVDATE": (1, 0),
+        "DATE": (0, 0), "DATEADD": (3, 0), "DATEDIFF": (3, 2),
+        "DATEPART": (2, 2), "DATESERIAL": (3, 0), "DATEVALUE": (1, 0),
+        "DAY": (1, 0),
+        "EVAL": (1, 0), "EXP": (1, 0),
+        "FIX": (1, 0), "FORMAT": (1, 3),
+        "HOUR": (1, 0),
+        "INSTR": (2, 2), "INT": (1, 0),
+        "LCASE": (1, 0), "LEFT": (2, 0), "LEN": (1, 0), "LOG": (1, 0),
+        "LTRIM": (1, 0),
+        "MID": (2, 1), "MINUTE": (1, 0), "MONTH": (1, 0),
+        "NOW": (0, 0),
+        "RIGHT": (2, 0), "RND": (0, 1), "RTRIM": (1, 0),
+        "SECOND": (1, 0), "SGN": (1, 0), "SIN": (1, 0), "SPACE": (1, 0),
+        "SQR": (1, 0), "STR": (1, 0), "STRING": (2, 0), "SWITCH": (2, 12),
+        "TAN": (1, 0), "TIME": (0, 0), "TIMESERIAL": (3, 0),
+        "TIMEVALUE": (1, 0), "TRIM": (1, 0),
+        "UCASE": (1, 0), "USER": (0, 0),
+        "WEEKDAY": (1, 1),
+        "YEAR": (1, 0),
+    }
+
+    VT_VARIANT = 12
+    DESCKIND_FUNCDESC = 1
+    FUNC_DISPATCH = 4
+    INVOKE_FUNC = 1
+    CC_STDCALL = 4
+
+    def _write_typedesc(addr: int, vt: int) -> None:
+        memory.write32(addr & 0xFFFFFFFF, 0)             # union (unused for simple VT_*)
+        memory.write16((addr + 4) & 0xFFFFFFFF, vt)       # VARTYPE
+        memory.write16((addr + 6) & 0xFFFFFFFF, 0)        # padding
+
+    def _write_elemdesc(addr: int, vt: int) -> None:
+        _write_typedesc(addr, vt)                          # tdesc: 8 bytes
+        memory.write32((addr + 8) & 0xFFFFFFFF, 0)          # paramdesc.pparamdescex = NULL
+        memory.write16((addr + 12) & 0xFFFFFFFF, 0)         # paramdesc.wParamFlags
+        memory.write16((addr + 14) & 0xFFFFFFFF, 0)         # padding
+
+    _funcdesc_cache: dict[str, int] = {}  # base function name -> heap FUNCDESC address
+
+    def _build_funcdesc(base_name: str, memid: int) -> int:
+        """Allocate a real FUNCDESC (+ its param ELEMDESC array) for one of
+        the ~40 known expression-service functions, matching real oaidl.h
+        layout exactly. Cached per base name -- every caller asking for the
+        same function gets the same descriptor, matching how a real
+        ITypeInfo's member table would behave."""
+        cached = _funcdesc_cache.get(base_name)
+        if cached is not None:
+            return cached
+        required, optional = _EXPR_FUNCTIONS[base_name]
+        total_params = required + optional
+        params_addr = state.simple_alloc(16 * total_params) if total_params else 0
+        for i in range(total_params):
+            _write_elemdesc((params_addr + i * 16) & 0xFFFFFFFF, VT_VARIANT)
+        funcdesc_addr = state.simple_alloc(52)
+        memory.write32(funcdesc_addr & 0xFFFFFFFF, memid)                     # memid
+        memory.write32((funcdesc_addr + 4) & 0xFFFFFFFF, 0)                    # lprgscode
+        memory.write32((funcdesc_addr + 8) & 0xFFFFFFFF, params_addr)          # lprgelemdescParam
+        memory.write32((funcdesc_addr + 12) & 0xFFFFFFFF, FUNC_DISPATCH)       # funckind
+        memory.write32((funcdesc_addr + 16) & 0xFFFFFFFF, INVOKE_FUNC)         # invkind
+        memory.write32((funcdesc_addr + 20) & 0xFFFFFFFF, CC_STDCALL)          # callconv
+        memory.write16((funcdesc_addr + 24) & 0xFFFFFFFF, required + optional) # cParams
+        memory.write16((funcdesc_addr + 26) & 0xFFFFFFFF, optional)            # cParamsOpt
+        memory.write16((funcdesc_addr + 28) & 0xFFFFFFFF, 0)                   # oVft
+        memory.write16((funcdesc_addr + 30) & 0xFFFFFFFF, 0)                   # cScodes
+        _write_elemdesc((funcdesc_addr + 32) & 0xFFFFFFFF, VT_VARIANT)         # elemdescFunc (return type)
+        memory.write16((funcdesc_addr + 48) & 0xFFFFFFFF, 0)                   # wFuncFlags
+        _funcdesc_cache[base_name] = funcdesc_addr
+        return funcdesc_addr
+
+    _next_memid = [0x60000000]  # arbitrary but stable, distinct per base function
+
+    def _base_expr_name(sz_name: str) -> str | None:
+        upper = sz_name.upper()
+        for prefix in ("_B_VAR_", "_B_STR_"):
+            if upper.startswith(prefix):
+                upper = upper[len(prefix):]
+                break
+        return upper if upper in _EXPR_FUNCTIONS else None
+
+    # Real, documented ITypeInfo vtable (oaidl.h). Bind's ppTInfo out-param
+    # needs *something* real -- a caller that got DESCKIND_FUNCDESC may still
+    # AddRef/Release it, or call GetFuncDesc separately. GetFuncDesc genuinely
+    # forwards to the same FUNCDESC Bind already returned (real behavior, not
+    # a fabricated one).
+    #
+    # GetDllEntry is ALSO handled specially, not by the generic trap: live
+    # tracing showed msjet35.dll calls it immediately after a successful
+    # Bind, presumably to fast-path directly into expsrv.dll's own C export
+    # for the function rather than going through IDispatch::Invoke. Real
+    # semantics: GetDllEntry only applies to FUNC_STATIC members;
+    # our FUNCDESCs declare FUNC_DISPATCH (accurate for a VARIANT-based
+    # expression-service dispatch member without reverse-engineering
+    # expsrv.dll's real internal export names/ordinals), so the honest,
+    # correct answer is TYPE_E_BADMODULEKIND -- not a fabricated success with
+    # unset output params. This should route the real caller into its own
+    # real IDispatch::Invoke fallback. Real numeric/string execution of these
+    # ~40 functions via Invoke is NOT implemented (still the generic trap,
+    # benign no-op) -- a correctness gap for computed-expression *results*,
+    # separate from the crash this fix targets (which was about Bind never
+    # succeeding at all, not about executing what it finds).
+    #
+    # arg_bytes verified against each method's real oaidl.h signature
+    # (param count * 4) -- a wrong count here silently under/over-pops the
+    # stack in cleanup_stdcall, corrupting the caller's frame a few
+    # instructions later rather than failing at the call site itself. Caught
+    # live: GetDllEntry(MEMBERID,INVOKEKIND,BSTR*,BSTR*,WORD*) is 5 args (20
+    # bytes) -- an earlier wrong guess of 3 args (12 bytes) corrupted EBP a
+    # few calls later (`EBP=0x60000001`, a memid value shifted into the wrong
+    # stack slot by the resulting 8-byte misalignment). Re-audited every slot
+    # below against the real signature after finding that one.
+    TYPE_E_BADMODULEKIND = 0x8002802A
+
+    def _typeinfo_get_dll_entry(cpu: "CPU") -> None:
+        cpu.regs[EAX] = TYPE_E_BADMODULEKIND
+        cleanup_stdcall(cpu, memory, 4 + 20)  # this(4) + 5 args(20)
+
+    _TYPEINFO_VTABLE_SPEC = [
+        (8,  0, "QueryInterface"), (0, 1, "AddRef"), (0, 1, "Release"),
+        (4,  0, "GetTypeAttr"), (4, 0, "GetTypeComp"), None,  # 5: GetFuncDesc, handled specially
+        (8,  0, "GetVarDesc"), (16, 0, "GetNames"), (8, 0, "GetRefTypeOfImplType"),
+        (8,  0, "GetImplTypeFlags"), (12, 0, "GetIDsOfNames"), (28, 0, "Invoke"),
+        (20, 0, "GetDocumentation"), None, (8, 0, "GetRefTypeInfo"),  # 13: GetDllEntry, handled specially
+        (12, 0, "AddressOfMember"), (12, 0, "CreateInstance"), (8, 0, "GetMops"),
+        (8,  0, "GetContainingTypeLib"), (4, 0, "ReleaseTypeAttr"),
+        (4,  0, "ReleaseFuncDesc"), (4, 0, "ReleaseVarDesc"),
+    ]
+
+    def _typeinfo_get_func_desc(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        this_ptr = memory.read32((esp + 4) & 0xFFFFFFFF)
+        pp_funcdesc = memory.read32((esp + 12) & 0xFFFFFFFF)
+        # `index` ([ESP+8]) is the ordinal into the type's member table, not
+        # something we track -- every trap ITypeInfo this session hands out
+        # is already scoped to exactly one function (the one Bind resolved
+        # it for), so index 0 is the only value a correct caller would ever
+        # pass. Return whichever FUNCDESC this object's own Bind call built,
+        # found via the object->funcdesc side table.
+        funcdesc_addr = _typeinfo_obj_funcdesc.get(this_ptr, 0)
+        if pp_funcdesc:
+            memory.write32(pp_funcdesc & 0xFFFFFFFF, funcdesc_addr)
+        cpu.regs[EAX] = 0  # S_OK
+        cleanup_stdcall(cpu, memory, 8)
+
+    for _i, _spec in enumerate(_TYPEINFO_VTABLE_SPEC):
+        if _spec is None:
+            continue  # slot5 (GetFuncDesc), slot13 (GetDllEntry) registered separately
+        _argb, _ret, _name = _spec
+        stubs.register_handler("__typeinfo_trap__", f"slot{_i}", _make_generic_trap_slot("ITypeInfo", _i, _argb, _ret, _name))
+    stubs.register_handler("__typeinfo_trap__", "slot13", _typeinfo_get_dll_entry)
+    stubs.register_handler("__typeinfo_trap__", "slot5", _typeinfo_get_func_desc)
+
+    _typeinfo_obj_funcdesc: dict[int, int] = {}  # trap ITypeInfo object addr -> its FUNCDESC addr
+    _typeinfo_trap_objs: dict[int, int] = {}      # FUNCDESC addr -> cached trap ITypeInfo object addr
+
+    def _get_typeinfo_trap_obj(funcdesc_addr: int = 0) -> int:
+        cached = _typeinfo_trap_objs.get(funcdesc_addr)
+        if cached is not None:
+            return cached
+        vtable_addr = state.simple_alloc(4 * len(_TYPEINFO_VTABLE_SPEC))
+        for i in range(len(_TYPEINFO_VTABLE_SPEC)):
+            memory.write32((vtable_addr + i * 4) & 0xFFFFFFFF, stubs.get_handler_address("__typeinfo_trap__", f"slot{i}"))
+        obj_addr = state.simple_alloc(4)
+        memory.write32(obj_addr & 0xFFFFFFFF, vtable_addr)
+        _typeinfo_trap_objs[funcdesc_addr] = obj_addr
+        _typeinfo_obj_funcdesc[obj_addr] = funcdesc_addr
+        return obj_addr
+
+    # ITypeComp::Bind(LPOLESTR szName, ULONG lHashVal, WORD wFlags,
+    #                 ITypeInfo** ppTInfo, DESCKIND* pDescKind, BINDPTR* pBindPtr)
+    # expsrv.dll's real .tlb is the Jet/VBA expression-function library (see
+    # _EXPR_FUNCTIONS above) -- real names resolve to a real FUNCDESC now,
+    # not just an honest "not found". This matters: msjet35.dll's
+    # FUN_7a8a4975 only fully/correctly initializes its per-record fields on
+    # Bind's *success* path; "not found" (however honestly reported) still
+    # left three sibling fields as uninitialized stack garbage, which is what
+    # this whole investigation traced the expsrv.dll ESI=0xFFFFFFFF crash to
+    # (see changelog.md 2026-08-25 cont'd x31). A name genuinely outside this
+    # ~40-function set (should not happen for expsrv.dll callers, but the
+    # honest path is kept for anything unexpected) still gets a clean,
+    # always-initialized DESCKIND_NONE/S_OK answer.
+    def _bind_slot(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        sz_name_ptr, l_hash_val, w_flags, pp_tinfo, p_desc_kind, p_bind_ptr = (
+            memory.read32((esp + 8 + i * 4) & 0xFFFFFFFF) for i in range(6)
+        )
+        try:
+            sz_name = read_wide_string(sz_name_ptr, memory) if sz_name_ptr else "(null)"
+        except Exception as exc:
+            sz_name = f"(unreadable: {exc})"
+        base_name = _base_expr_name(sz_name) if sz_name_ptr else None
+        if base_name is not None:
+            if base_name not in _funcdesc_cache:
+                _next_memid[0] += 1
+            funcdesc_addr = _build_funcdesc(base_name, _next_memid[0])
+            logger.info("com", f"ITypeComp::Bind({sz_name!r}) -> expression function {base_name!r}, FUNCDESC at 0x{funcdesc_addr:x}")
+            if pp_tinfo:
+                memory.write32(pp_tinfo & 0xFFFFFFFF, _get_typeinfo_trap_obj(funcdesc_addr))
+            if p_desc_kind:
+                memory.write32(p_desc_kind & 0xFFFFFFFF, DESCKIND_FUNCDESC)
+            if p_bind_ptr:
+                memory.write32(p_bind_ptr & 0xFFFFFFFF, funcdesc_addr)  # BINDPTR union: lpfuncdesc is slot 0
+            cpu.regs[EAX] = 0  # S_OK
+        else:
+            logger.warn("com", f"ITypeComp::Bind({sz_name!r}) -- not one of the known expression-service functions, honestly reporting DESCKIND_NONE (not found)")
+            if pp_tinfo:
+                memory.write32(pp_tinfo & 0xFFFFFFFF, 0)
+            if p_desc_kind:
+                memory.write32(p_desc_kind & 0xFFFFFFFF, 0)  # DESCKIND_NONE
+            if p_bind_ptr:
+                memory.write32(p_bind_ptr & 0xFFFFFFFF, 0)
+            cpu.regs[EAX] = 0  # S_OK -- "not found" is success, not failure, for Bind
+        cleanup_stdcall(cpu, memory, 4 + 24)  # this(4) + 6 args(24)
+    stubs.register_handler("__typecomp_trap__", "slot3", _bind_slot)
+
+    _typecomp_trap_obj: list[int] = []  # lazily built once, cached (mutable cell since Python closures can't rebind an outer int)
+
+    def _get_typecomp_trap_obj() -> int:
+        if not _typecomp_trap_obj:
+            vtable_addr = state.simple_alloc(4 * len(_TYPECOMP_VTABLE_SPEC))
+            for i in range(len(_TYPECOMP_VTABLE_SPEC)):
+                memory.write32((vtable_addr + i * 4) & 0xFFFFFFFF, stubs.get_handler_address("__typecomp_trap__", f"slot{i}"))
+            obj_addr = state.simple_alloc(4)
+            memory.write32(obj_addr, vtable_addr)
+            _typecomp_trap_obj.append(obj_addr)
+        return _typecomp_trap_obj[0]
+
+    def _get_type_comp_slot(cpu: "CPU") -> None:
+        esp = cpu.regs[ESP]
+        ppv = memory.read32((esp + 8) & 0xFFFFFFFF)  # [ESP+4]=this, [ESP+8]=ppTComp
+        logger.error("com", f"[typelib-trap] ITypeLib slot 8 (GetTypeComp) called, ppv=0x{ppv:x}")
+        if ppv:
+            memory.write32(ppv & 0xFFFFFFFF, _get_typecomp_trap_obj())
+        cpu.regs[EAX] = 0  # S_OK
+        cleanup_stdcall(cpu, memory, 8)  # this(4) + ppTComp(4)
+    stubs.register_handler("__typelib_trap__", "slot8", _get_type_comp_slot)
+
+    _TYPELIB_VTABLE_SPEC = [
+        (8,  0,  "QueryInterface"),       # 0: (REFIID, void**) -- 2 args
+        (0,  1,  "AddRef"),               # 1: () -- refcount-ish return
+        (0,  1,  "Release"),              # 2: ()
+        (4,  0,  "GetTypeInfoCount"),     # 3: (UINT*)
+        (8,  0,  "GetTypeInfo"),          # 4: (UINT, ITypeInfo**)
+        (8,  0,  "GetTypeInfoType"),      # 5: (UINT, TYPEKIND*)
+        (8,  0,  "GetTypeInfoOfGuid"),    # 6: (REFGUID, ITypeInfo**)
+        (4,  0,  "GetLibAttr"),           # 7: (TLIBATTR**)
+        None,                             # 8: GetTypeComp -- handled specially above
+        (20, 0,  "GetDocumentation"),     # 9: (int, BSTR*, BSTR*, DWORD*, BSTR*) -- 5 args
+        (12, 0,  "IsName"),               # 10: (LPOLESTR, ULONG, BOOL*) -- 3 args
+        (20, 0,  "FindName"),             # 11: (LPOLESTR, ULONG, ITypeInfo**, MEMBERID*, USHORT*) -- 5 args
+        (4,  0,  "ReleaseTLibAttr"),      # 12: (TLIBATTR*)
+    ]
+    _TYPELIB_TRAP_SLOTS = len(_TYPELIB_VTABLE_SPEC)
+
+    for _i, _spec in enumerate(_TYPELIB_VTABLE_SPEC):
+        if _spec is None:
+            continue  # slot8 already registered above
+        _argb, _ret, _name = _spec
+        stubs.register_handler("__typelib_trap__", f"slot{_i}", _make_generic_trap_slot("ITypeLib", _i, _argb, _ret, _name))
+
     def _ord154(cpu: "CPU") -> None:
-        logger.warn("com", "LoadTypeLibEx (Ordinal 154) called — returning E_NOTIMPL (type library loading not implemented)")
-        cpu.regs[EAX] = 0x80004001  # E_NOTIMPL
+        ppv = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        if ppv:
+            vtable_addr = state.simple_alloc(4 * _TYPELIB_TRAP_SLOTS)
+            for i in range(_TYPELIB_TRAP_SLOTS):
+                slot_addr = stubs.get_handler_address("__typelib_trap__", f"slot{i}")
+                memory.write32((vtable_addr + i * 4) & 0xFFFFFFFF, slot_addr)
+            obj_addr = state.simple_alloc(4)
+            memory.write32(obj_addr, vtable_addr)
+            memory.write32(ppv & 0xFFFFFFFF, obj_addr)
+            logger.error("com", f"[typelib-trap] LoadTypeLibEx returning trap object at 0x{obj_addr:x} (vtable 0x{vtable_addr:x}, {_TYPELIB_TRAP_SLOTS} slots)")
+        cpu.regs[EAX] = 0  # S_OK
         cleanup_stdcall(cpu, memory, 12)
 
     _ole_ord(154, _ord154)

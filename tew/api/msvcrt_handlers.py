@@ -1015,6 +1015,16 @@ def register_msvcrt_handlers(
 
     stubs.register_handler("msvcrt.dll", "strlen", _strlen)
 
+    # wcslen(const wchar_t* s) -> size_t [cdecl]
+    def _wcslen(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        length = 0
+        while memory.read16((ptr + length * 2) & 0xFFFFFFFF) != 0:
+            length += 1
+        cpu.regs[EAX] = length
+
+    stubs.register_handler("msvcrt.dll", "wcslen", _wcslen)
+
     # strcpy(char* dst, const char* src) -> char* [cdecl]
     def _strcpy(cpu: "CPU") -> None:
         dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)

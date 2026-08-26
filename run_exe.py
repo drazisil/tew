@@ -168,6 +168,20 @@ exe.import_resolver.set_memory(mem)
 # then any additional directories (e.g. dgVoodoo d3d8 shim).
 exe.import_resolver.add_dll_search_path(dirname(exe_path))
 exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
+# Real, period-correct COM servers (oleaut32.dll, dao350.dll, ...) live here
+# -- must be registered before build_iat_map, not just later inside
+# register_oleaut32_ole32_handlers (oleaut32_handlers.py's own
+# _KNOWN_COM_SERVER_DIR add_search_path call): build_iat_map does its own
+# eager load_dll() for every DLL MCity_d.exe directly imports, and that
+# result is cached into _iat_map permanently -- if the search path isn't
+# registered yet, oleaut32.dll's real, direct-import IAT slots (e.g. an
+# early ordinal-based BSTR alloc call, well before DAO/Jet loads it again
+# later via a different path) silently resolve to nothing and fall through
+# to an auto-generated fatal-halt stub instead of the genuinely correct,
+# already-loaded-later real DLL. Found 2026-08-26 after removing this
+# file's oleaut32.dll Python handlers exposed the gap they'd been silently
+# covering for.
+exe.import_resolver.add_dll_search_path("/home/drazisil/.emu32/WINDOWS/System32")
 
 exe.import_resolver.build_iat_map(exe.import_table, exe.optional_header.image_base)
 
@@ -558,46 +572,298 @@ def _fields_count_probe(cpu, mem):
     return True  # never disable -- want every low-Count occurrence, not just the first
 register_breakpoint(0x008fbf90, _fields_count_probe)
 
-# 2026-08-25: ROOT CAUSE FOUND AND FIXED. Fields.Count reading 1 instead of
-# 10 for 3-table-join QueryDefs (e.g. StockVehicleAttributes_SelectAll2) was
-# never a marshaling/memory-corruption bug -- it was tew's CompareStringA/W
-# handler (tew/api/kernel32_io.py, _locale_is_valid) rejecting
-# LOCALE_USER_DEFAULT (0x0400), a completely standard Windows locale
-# sentinel that real CompareStringA resolves and succeeds on. dao350.dll's
-# internal field-name dedup check (FUN_044da868 -> FUN_044d1d53 ->
-# FUN_044c6126 -> FUN_044c6284) calls CompareStringA(LOCALE_USER_DEFAULT,
-# ...) for every column-name comparison during collection building (371
-# calls in one run, ALL rejected). dao350's own switch on the result maps
-# failure (EAX=0, "invalid locale") to the same code path as CSTR_EQUAL --
-# harmless on real Windows (which essentially never fails this call), but
-# under tew's rejection it turned every single name comparison into an
-# unconditional "equal", so every column after the first got misidentified
-# as a duplicate and silently skipped. Fixed by resolving LOCALE_USER_DEFAULT
-# (0x0400) and LOCALE_SYSTEM_DEFAULT (0x0800) to 0x0409 before validation.
-# Confirmed live: the prefClass assert below no longer fires, and the run
-# progresses ~16s further than it ever had before hitting an unrelated new
-# blocker (a Zig-level integer-overflow panic in cpu/src/core.zig's
-# readRmFixed32, op8B/MOV r32,r/m32 -- a different bug, not yet chased).
-#
-# Independently re-derives the correct branch decision in Python for the
-# captured local_1c value, to also verify tew's own CMP/JGE signed-comparison
-# flag computation isn't itself a bug (same general class as the already-
-# fixed 0x66-prefix INC/DEC issue) rather than the value being wrong.
-def _prefclass_assert_probe(cpu, mem):
+# 2026-08-25 (cont'd x16): tracing the expsrv.dll ESI=0xFFFFFFFF halt (see
+# status.md's current entry). Static analysis (file-based E8 scan + manual
+# vtable walk in expsrv.dll's .rdata, no live run needed for that part)
+# confirmed MSJET35.DLL's CALL DWORD PTR [EAX+0x24] at static 0x7a8a1d84
+# (runtime 0x18061d84 this session) targets expsrv.dll's FUN_0f9dd3d9
+# (vtable base 0x0FA041C0, slot 9/offset 0x24 -- its stored pointer,
+# 0xf9dd3d9, matches FUN_0f9dd3d9 exactly). What's NOT confirmable from the
+# file alone: the live value of ECX at that call, which by push order becomes
+# FUN_0f9dd3d9's arg3 ([EBP+0x10]), which FUN_0f9dd3d9 forwards unchanged as
+# FUN_0f9dd9a7's param_2 -- the pointer that ends up 0xFFFFFFFF in ESI at the
+# actual crash (static 0x0F9DD9E9, runtime 0x1a01d9e9). One-shot: confirms
+# the vtable-slot hypothesis live (EAX/[EAX+0x24] should equal the runtime
+# FUN_0f9dd3d9 address, 0x1a01d3d9) and captures ECX's real value.
+def _expsrv_vtable_call_probe(cpu, mem):
+    from tew.hardware.cpu_zig import EAX, ECX, EDX, EBX
+    eax = cpu.regs[EAX]
+    vtable_slot_target = mem.read32((eax + 0x24) & 0xFFFFFFFF) if eax else 0
+    logger.error(
+        "cpu",
+        f"[expsrv-vtable-call-probe] EAX(vtable)=0x{eax:x} "
+        f"[EAX+0x24]=0x{vtable_slot_target:x} (expect 0x1a01d3d9 == FUN_0f9dd3d9) "
+        f"ECX(->arg3->param_2)=0x{cpu.regs[ECX]:x} EDX=0x{cpu.regs[EDX]:x} EBX=0x{cpu.regs[EBX]:x}",
+    )
+    return True  # log every hit -- the crash may not be the first call through this vtable slot,
+    # only the one right before the halt matters; correlate by log order against the exception dump
+register_breakpoint(0x18061d84, _expsrv_vtable_call_probe)
+
+# 2026-08-25 (cont'd x17): one instruction earlier than the vtable-call probe
+# above -- static 0x7a8a1d5b (runtime 0x18061d5b), `MOV ECX,[EDX+ECX*4]`.
+# EDX here is the collation-array base (msjet35.dll's per-session
+# DAT_7a9362c0[slot].field_0x6d8, a pointer to a separately heap-allocated,
+# 0x1c-stride array -- confirmed via mcity project's decompile of
+# FUN_7a8a1c78/FUN_7a926327), and ECX has already been scaled to (index*7) by
+# 2026-08-25 (cont'd x18): TRUST CHECK -- bisected with one logpoint per
+# instruction to find that FUN_7a8a1c78's array-lookup branch never fires
+# (confirming a wrong branch assumption, not a tew bug -- see status.md/
+# changelog.md). Question answered, removed per usual practice.
+
+# 2026-08-25 (cont'd x19): live-stalking the locale-info object itself,
+# rather than continuing to decompile-guess who writes it. Breakpoint at
+# msjet35.dll's FUN_7a926327, right at its call into FUN_7a8a1c78 (static
+# 0x7a926414, runtime 0x180e6414 this session) -- by this point local_14
+# (the astruct being passed) is fully built from `iVar2 + 0x8f0..0x8fc`.
+# Recomputes iVar2 independently (session table base, read live from
+# PTR_7a9362c0's own runtime address, static 0x7a9362c0 -> runtime
+# 0x180f62c0 -- +param_1*0x708 +0x6f0) rather than trying to catch it in a
+# register, and dumps a wide window around it to see whether this is a
+# fully-populated object with one bad field, or an empty/unallocated one.
+# 2026-08-25 (cont'd x20): both the address above and the FUN_7a926327
+# assumption were wrong -- caller-hunt (byte-scanned all 12 direct E8 call
+# sites targeting FUN_7a8a1c78, one logpoint per distinct caller function)
+# found the real one live: FUN_7a9267a1, specifically its FIRST of six
+# sequential calls (static 0x7a926824, offset block 0x8c8-0x8d4 -- NOT
+# FUN_7a926327's 0x8f0-0x8fc block, a different function entirely).
+# FUN_7a9267a1's decompile: iVar1 = *(session+0x6f0) (the same locale-info
+# object pointer), then six field-block/FUN_7a8a1c78 call pairs at
+# iVar1+0x8c8, +0x7b0, +0x738, +0x760, +0x788, +0x800 -- our crash is the
+# FIRST of these (field3_0xc = *(iVar1+0x8d4)). Dumping iVar1 itself plus
+# all six blocks to see whether this is one bad field or the whole object.
+def _locale_info_object_probe(cpu, mem):
+    from tew.hardware.cpu_zig import ESP
+    esp = cpu.regs[ESP]
+    param_1 = mem.read32(esp & 0xFFFFFFFF)
+    local_14_ptr = mem.read32((esp + 0xC) & 0xFFFFFFFF)
+    table_base = mem.read32(0x180f62c0)
+    iVar1_addr = (table_base + param_1 * 0x708 + 0x6f0) & 0xFFFFFFFF
+    iVar1 = mem.read32(iVar1_addr)
+    logger.error(
+        "cpu",
+        f"[locale-info-object-probe] param_1(session)=0x{param_1:x} table_base=0x{table_base:x} "
+        f"iVar1_addr=0x{iVar1_addr:x} iVar1(locale obj ptr)=0x{iVar1:x}",
+    )
+    local_14_bytes = bytes(mem.read8((local_14_ptr + i) & 0xFFFFFFFF) for i in range(16))
+    logger.error("cpu", f"[locale-info-object-probe] local_14 (astruct passed to FUN_7a8a1c78, block 0x8c8): {local_14_bytes.hex()}")
+    if iVar1 != 0:
+        for block_off, block_label in [(0x8c8, "block_0x8c8_THIS_CALL"), (0x7b0, "block_0x7b0"),
+                                        (0x738, "block_0x738"), (0x760, "block_0x760"),
+                                        (0x788, "block_0x788"), (0x800, "block_0x800")]:
+            addr = (iVar1 + block_off) & 0xFFFFFFFF
+            block = bytes(mem.read8((addr + i) & 0xFFFFFFFF) for i in range(16))
+            logger.error("cpu", f"[locale-info-object-probe] {block_label} @0x{addr:x}: {block.hex()}")
+        # Testing whether record 0 (and a spread of others) also come back
+        # -1 (a systemic lookup failure) or are valid (record 56 is just one
+        # of 74 optional entries that legitimately isn't installed) -- each
+        # record is 40 (0x28) bytes, its result-block (local_1c/uStack_18/
+        # 14/10) starts at record_offset+8.
+        for record_idx in [0, 1, 2, 5, 10, 20, 40, 56, 73]:
+            addr = (iVar1 + record_idx * 0x28 + 8) & 0xFFFFFFFF
+            block = bytes(mem.read8((addr + i) & 0xFFFFFFFF) for i in range(16))
+            local_1c = int.from_bytes(block[0:4], "little", signed=True)
+            logger.error("cpu", f"[locale-info-object-probe] record[{record_idx}] result-block @0x{addr:x}: {block.hex()} (local_1c={local_1c})")
+    else:
+        logger.error("cpu", "[locale-info-object-probe] iVar1 is NULL -- locale-info object was never allocated")
+    return True
+register_breakpoint(0x180e6824, _locale_info_object_probe)
+
+# 2026-08-25 (cont'd x21): pinning down WHY uStack_18/14/10 stay garbage
+# while local_1c reliably reads -1 for failing records. Manual disassembly
+# of FUN_7a8a4975 (static 0x7a8a4975) hit real ambiguity: Ghidra's decompile
+# merges two different control-flow paths (the "iVar3<0 immediately" path
+# and the "iVar3==-2 after FUN_7a8a2b80" path) into one `if(iVar3==-1){...}`
+# shape, and manual byte-level tracing of the JMP targets didn't converge
+# cleanly -- exactly the kind of decompile-shape trap this investigation
+# already got burned by twice. Going live instead: breakpoint at the actual
+# copy site `LEA ESI,[local_1c]; LEA EDI,[puVar2+8]; MOVSD x4` (static
+# 0x7a8a49db, runtime 0x180649db this session -- delta 0x62840000, same as
+# the other msjet35.dll addresses on this page), which unconditionally
+# performs `puVar2[2..5] = local_1c/uStack_18/14/10` right before the copy
+# executes. Dumps EBP and a wide raw window so the actual byte layout is
+# visible regardless of whether local_1c's real offset is EBP-0x1c (source
+# names are a guess until confirmed live).
+# Answered 2026-08-25 (cont'd x22): three garbage siblings confirmed constant
+# across all 74 records -- never written by the failing path, just leftover
+# stack content. Question answered (see status_archive.md), no longer needs
+# re-verifying live each run.
+# register_breakpoint(0x180649db, _locale_result_copy_probe)
+
+# 2026-08-25 (cont'd x22): the copy-site probe above found the real offsets
+# (Ghidra's uStack_XX names are shifted 4 bytes off the true EBP-relative
+# layout) and confirmed the three garbage siblings are CONSTANT across all
+# 74 records (0x1, 0x082be46f, 0xffffffff at EBP-0x14/-0x10/-0xc this run) --
+# meaning they're never written by the failing path at all, just whatever
+# was already sitting in that stack slot before the loop started. Arming a
+# watchpoint on EBP-0x10's concrete runtime address (0x082be240-0x10 =
+# 0x082be230 this run, confirmed stable across all 74 hits above) from the
+# very start of execution, then reading it at FUN_7a8a4975's own entry
+# (runtime 0x18064975) -- before this function's prologue writes anything --
+# to find the actual last writer of that slot.
+# Answered 2026-08-25 (cont'd x22/x23): confirmed the three garbage siblings
+# are stale leftover stack content, never written by the failing path -- see
+# status_archive.md. Question answered; the watchpoint was left armed
+# unconditionally afterward and was silently misfiring as a false "crash" on
+# unrelated threads whose stacks happened to reuse this exact address
+# (discovered 2026-08-25 cont'd x29 -- tid=1011's apparent EIP=0x18001300
+# fault was actually this watchpoint's own halt, not a real SEH-dispatched
+# exception; wasted two full run cycles before the WATCHPOINT HIT log line
+# was noticed). Removed rather than re-gated -- its question is answered.
+# cpu.set_watchpoint(0x082be230)
+# register_breakpoint(0x18064975, _locale_result_stack_watch_probe)
+
+# 2026-08-25 (cont'd x25): with ITypeComp::Bind now honestly returning
+# DESCKIND_NONE/S_OK instead of the whole chain failing on LoadTypeLibEx's
+# E_NOTIMPL, the crash is gone (run completes past the old ~76-89s failure
+# point with no fault at all) -- but confirming WHY: is FUN_7a8a16b7 now
+# returning -2 (msjet35.dll's own "clean not found" internal code, which
+# routes into the FUN_7a8a2b80 success path) rather than -1 (the harder
+# failure code), or did the crash just happen not to reproduce by luck?
+# FUN_7a8a16b7's decompile kept timing out in Ghidra -- checking its actual
+# EAX at its own RET (static 0x7a8a1994, the confirmed terminator from its
+# raw instruction listing) live instead.
+# 2026-08-25 (cont'd x26): __beginthread (0x9f5820) stashes the REAL user
+# thread function/arg into two fields of the per-thread _tiddata block before
+# calling CreateThread with a shared generic trampoline (lpStartAddress_9f58f0)
+# -- confirmed all 5 worker threads (tid=1001..1005) share that same generic
+# entry, so the CreateThread log line alone can't tell them apart. Ghidra's
+# decompile names those fields _cvtbuf/_con_ch_buf (offsets 72/76 in its
+# 952-byte modern _tiddata type), but the actual __calloc_dbg call here only
+# allocates 0x74=116 bytes -- this binary's real (older/smaller) _tiddata
+# layout, where those two offsets happen to be the dedicated start-addr/arg
+# slots. Reading raw bytes live rather than trusting the mismatched type.
+def _beginthread_call_probe(cpu, mem):
+    # Breakpoint at the CALL itself (0x9f5880, a 6-byte COMPUTED_CALL --
+    # confirmed via get_function_instructions -- returning to 0x9f5886), so
+    # args are on the stack pre-call: [ESP+0]=lpThreadAttributes,
+    # +4=dwStackSize, +8=lpStartAddress, +12=lpParameter, +16=dwCreationFlags,
+    # +20=lpThreadId. First attempt used the post-call return-site address
+    # with the post-call (+4-shifted) offsets, which read stale stack garbage
+    # left over from an unrelated earlier call -- wrong breakpoint site, not
+    # a wrong struct offset.
+    from tew.hardware.cpu_zig import ESP
+    esp = cpu.regs[ESP]
+    ptd = mem.read32((esp + 12) & 0xFFFFFFFF)  # lpParameter arg to CreateThread
+    real_start = mem.read32((ptd + 72) & 0xFFFFFFFF) if ptd else 0
+    real_arg = mem.read32((ptd + 76) & 0xFFFFFFFF) if ptd else 0
+    logger.error(
+        "cpu",
+        f"[beginthread-call-probe] _Ptd=0x{ptd:x} real_start=0x{real_start:x} real_arg=0x{real_arg:x}",
+    )
+    return True  # need this for every __beginthread call, not just the first
+register_breakpoint(0x9f5880, _beginthread_call_probe)
+
+# 2026-08-25 (cont'd x27): tracing why NPSThreadSender (tid=1005, the "Sender"
+# NPS thread -- confirmed via the real _tiddata start-addr field AND
+# independently via NPS_ThreadCreateWithPriority's literal "Sender" name
+# string) faults at EIP=0x00000002 ~99s in, the first time it processes a
+# real (non-broadcast) outbound message. The crash path does 3 virtual calls
+# through a CryptoPP BufferedTransformation-derived filter object hanging off
+# a cServerData's +0x1e8 (or +0x1f8) field, via a vtordisp adjustor-thunk
+# pattern: base_obj = *(local_48+0x1e8); real_vtable = base_obj + 4 +
+# *(*(base_obj+4)+4). Molly found the real (healthy) vtable for this filter
+# class live at 0x011fed28 -- slot+4=0x9f4e30, slot+0x10=0xb814a0,
+# slot+0x2c=0xb818a0 are what a correctly-linked object should resolve to.
+# Ghidra's local_48 EBP-offset labels are not to be trusted at face value
+# (this binary has a known history of Ghidra's stack-offset labels being
+# shifted from the true EBP-relative address -- see the fields-probe note
+# above) so this breaks at the shared _memcpy call site (both branches always
+# reach it) and scans a window of candidate stack slots for the cServerData*,
+# resolving the vtordisp chain for each candidate rather than trusting one
+# guessed offset.
+# 2026-08-25 (cont'd x28): the +0x1e8 branch's memcpy (0x00acb1e0) got ZERO
+# hits in a full 99s+ run -- that branch never executes at all, another
+# decompile-shape trap (assumed top-to-bottom branch order matched execution
+# order). Moving to the mirrored +0x1f8 branch's memcpy (0x00acb3ba), and
+# checking BOTH offsets per candidate since which branch is real is now
+# exactly the open question, not an assumption.
+def _crypto_object_probe(cpu, mem):
     from tew.hardware.cpu_zig import EBP
     ebp = cpu.regs[EBP]
-    raw = mem.read32((ebp - 0x18) & 0xFFFFFFFF)
-    signed = raw - 0x100000000 if raw >= 0x80000000 else raw
-    should_assert = signed < 0 or signed >= 8
-    logger.error("cpu", f"[prefclass-assert-probe] local_1c=0x{raw:x} ({signed}) real_answer:{'ASSERT' if should_assert else 'ok'}")
-    return True  # log every occurrence -- fires once per row
-# Originally broken at 0x005baedb (the second CMP, local_1c>=8) -- moved to
-# 0x005baed5 (the FIRST cmp, local_1c<0) after live-confirming the probe
-# never fired there: when local_1c is negative, the first CMP's JL already
-# jumps straight to the assert block, so the second CMP never executes at
-# all. That's itself informative (consistent with a negative value), but
-# means this address only fires unconditionally.
-register_breakpoint(0x005baed5, _prefclass_assert_probe)
+    for off in range(0x30, 0x60, 4):
+        cand = mem.read32((ebp - off) & 0xFFFFFFFF)
+        if cand == 0 or (cand & 0xFFFF0000) == 0xcccc0000:
+            continue
+        for field_off, field_label in ((0x1e8, "+0x1e8"), (0x1f8, "+0x1f8")):
+            try:
+                base_obj = mem.read32((cand + field_off) & 0xFFFFFFFF)
+                if base_obj == 0:
+                    continue
+                vt2 = mem.read32((base_obj + 4) & 0xFFFFFFFF)
+                disp = mem.read32((vt2 + 4) & 0xFFFFFFFF)
+                real_vtable = (base_obj + 4 + disp) & 0xFFFFFFFF
+                logger.error(
+                    "cpu",
+                    f"[crypto-object-probe] candidate EBP-0x{off:x}=0x{cand:x} {field_label}: "
+                    f"base_obj=0x{base_obj:x} vt2=0x{vt2:x} disp=0x{disp:x} "
+                    f"real_vtable=0x{real_vtable:x} (expect 0x11fed28)",
+                )
+            except Exception as e:
+                logger.error("cpu", f"[crypto-object-probe] candidate EBP-0x{off:x}=0x{cand:x} {field_label} failed: {e!r}")
+    return True  # need every hit, not just the first -- want the one right before the fault
+register_breakpoint(0x00acb3ba, _crypto_object_probe)
+
+def _plain_sendtosocket_logpoint(eip, regs, memory, memory_size):
+    logger.error("cpu", "[plain-sendtosocket] LAB_00acb5ab path fired -- no crypto branch taken this message")
+cpu.add_logpoint(0x00acb643, _plain_sendtosocket_logpoint)
+
+# 2026-08-25 (cont'd x30): identifying tid=1010 (owner of thread-stack slot
+# 10, 0x08280000-0x082c0000 -- the range 0x082be46f, the "garbage" sibling
+# field in msjet35.dll's locale-info object, falls into) and tid=1011 (the
+# thread that crashes reading it), both spawned via the SAME generic
+# _beginthreadex trampoline (0x9fc3a0, decompiled: real start/arg stashed at
+# lpThreadParameter[0x12]/[0x13] = offsets 0x48/0x4c -- same 72/76 numeric
+# offsets as __beginthread's _tiddata, just DWORD-indexed here).
+# lpThreadParameter IS the CreateThread `param` value already in the thread
+# log (no extra indirection needed) -- breaking at the trampoline's own
+# entry to resolve real_start/real_arg for whichever thread hits it.
+def _beginthreadex_entry_probe(cpu, mem):
+    from tew.hardware.cpu_zig import ESP
+    esp = cpu.regs[ESP]
+    lp_thread_param = mem.read32((esp + 4) & 0xFFFFFFFF)  # cdecl arg at entry
+    real_start = mem.read32((lp_thread_param + 0x48) & 0xFFFFFFFF) if lp_thread_param else 0
+    real_arg = mem.read32((lp_thread_param + 0x4c) & 0xFFFFFFFF) if lp_thread_param else 0
+    logger.error(
+        "cpu",
+        f"[beginthreadex-entry-probe] lpThreadParameter=0x{lp_thread_param:x} "
+        f"real_start=0x{real_start:x} real_arg=0x{real_arg:x}",
+    )
+    return True  # need this for every thread using this trampoline
+register_breakpoint(0x009fc3a0, _beginthreadex_entry_probe)
+
+def _mem_init_logpoint(eip, regs, memory, memory_size):
+    logger.error("cpu", "[mem-init-probe] _MEM_init (00a719e0) reached")
+cpu.add_logpoint(0x00a719e0, _mem_init_logpoint)
+
+# 2026-08-26: re-opening the "who actually writes field2_0x8" question an
+# earlier pre-compaction pass in this same investigation started but never
+# finished (its watchpoint got removed as an apparently-answered leftover --
+# it wasn't). Copy site confirmed live: FUN_7a8a4975's `LEA ESI,[local_1c];
+# ...; MOVSD x4` (static 0x7a8a49db-0x7a8a49e4), real EBP-relative offsets
+# EBP-0x14/-0x10/-0xc (Ghidra's uStack_18/14/10 names are shifted 4 bytes
+# off the true layout -- established earlier this investigation). Pass 1:
+# find this run's concrete address for EBP-0x10 (the field2_0x8 slot) before
+# arming a watchpoint on it.
+# Pass 1/2 answered: field2_0x8's live address is stable at 0x082be230 for
+# this run (matches the pre-compaction investigation's original target
+# exactly), current_val=137094255=0x082be46f. The watchpoint showed this
+# address is a shallow, frequently-reused stack depth written by MULTIPLE
+# unrelated pieces of code throughout execution (0x180e859a, 0x180e866b,
+# ...), not owned by any single writer -- there is no "the" last writer to
+# find, it's whichever unrelated call happened to run last before
+# FUN_7a8a4975 reads it. Removed (was also causing an early false-positive
+# halt on the first unrelated write, same failure mode as the original
+# leftover watchpoint this reopened).
+# cpu.set_watchpoint(0x082be230)
+
+def _typelib_lookup_return_logpoint(eip, regs, memory, memory_size):
+    try:
+        eax = regs[EAX]
+        signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+        logger.error("cpu", f"[typelib-lookup-return] FUN_7a8a16b7 returned EAX=0x{eax:x} ({signed})")
+    except Exception as e:
+        logger.error("cpu", f"[typelib-lookup-return] EXCEPTION: {e!r}")
+cpu.add_logpoint(0x18061994, _typelib_lookup_return_logpoint)
 
 # 2026-08-25 (cont'd x14): clean function-boundary trace, redirected upstream
 # per Molly's request -- print params in / return out for the actual COM
@@ -699,9 +965,10 @@ def _openrecordset_call_boundary_probe(cpu, mem):
 # lookup TEST @ 0x044da8a8, and the pre-add struct dump @ 0x044dad7b) traced
 # the bug to its root: FUN_044da868's field-name dedup check calls into
 # CompareStringA(LOCALE_USER_DEFAULT, ...), which tew was rejecting as an
-# invalid locale -- see the note above _prefclass_assert_probe, and the
-# fix in tew/api/kernel32_io.py's _locale_is_valid. Removed now that it's
-# fixed and confirmed live; full chain preserved in memory/status.md.
+# invalid locale -- fixed in tew/api/kernel32_io.py's _locale_is_valid.
+# Removed now that it's fixed and confirmed live; full chain preserved in
+# memory/changelog.md. (_prefclass_assert_probe, the breakpoint that
+# confirmed the fix live, has itself since been removed the same way.)
 
 # The msjet35.dll FUN_7a84269c EBP-chain probe that was here (2026-08-25)
 # answered its question -- correlated by exact timestamp against

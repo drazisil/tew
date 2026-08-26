@@ -395,6 +395,7 @@ def dispatch_exception(
             return True
         except SehHandlerTimeout:
             logger.error("seh", f"handler at 0x{handler:08x} timed out -- treating chain as exhausted")
+            cpu.eip = exception_address & 0xFFFFFFFF
             return False
 
         if disposition == EXCEPTION_CONTINUE_EXECUTION:
@@ -405,6 +406,12 @@ def dispatch_exception(
 
         frame = next_frame
 
+    # Chain exhausted, nobody handled it. cpu.eip is whatever the last
+    # _invoke_handler call left it at (SEH_RETURN_SENTINEL + 2 -- internal
+    # bookkeeping for "the handler returned normally", not a real code
+    # address) -- restore it to the actual fault site so callers' halt
+    # diagnostics report where the exception really happened.
+    cpu.eip = exception_address & 0xFFFFFFFF
     return False
 
 
