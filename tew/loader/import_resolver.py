@@ -1,9 +1,9 @@
 """Import resolver — builds and populates the Import Address Table."""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
-from tew.loader.dll_loader import DLLLoader, patch_iat_entry
+from tew.loader.dll_loader import DLLLoader, LoadedDLL, patch_iat_entry, should_invoke_dependency_dllmain
 from tew.logger import logger
 
 if TYPE_CHECKING:
@@ -22,13 +22,34 @@ class ImportResolver:
     def set_memory(self, memory: "Memory") -> None:
         self._memory = memory
 
-    def build_iat_map(self, import_table: "ImportTable | None", image_base: int) -> None:
+    def build_iat_map(
+        self,
+        import_table: "ImportTable | None",
+        image_base: int,
+        on_dependency_loaded: "Callable[[LoadedDLL], None] | None" = None,
+    ) -> None:
+        """Resolve the main EXE's own direct imports.
+
+        on_dependency_loaded, if given, is invoked for each of these
+        directly-imported DLLs (and, via load_dll's own recursive descent,
+        any real-DLL dependencies of theirs) the first time it's loaded --
+        mirroring exactly how load_dll already handles a DLL's own PE-import
+        dependencies (should_invoke_dependency_dllmain), so a dependency
+        always gets the callback before the DLL that depends on it. Passing
+        None here (the old default) reproduces the pre-fix behavior exactly:
+        these DLLs get mapped and their exports resolved, but never run
+        their own DllMain.
+        """
         if not import_table or not self._memory:
             return
 
         for descriptor in import_table.descriptors:
             dll_name = descriptor.dll_name.lower()
-            loaded_dll = self._dll_loader.load_dll(descriptor.dll_name, self._memory)
+            dep_was_loaded = self._dll_loader.get_dll(dll_name) is not None
+            loaded_dll = self._dll_loader.load_dll(descriptor.dll_name, self._memory, on_dependency_loaded)
+
+            if should_invoke_dependency_dllmain(dep_was_loaded, loaded_dll, on_dependency_loaded):
+                on_dependency_loaded(loaded_dll)
 
             for entry in descriptor.entries:
                 real_addr: int | None = None

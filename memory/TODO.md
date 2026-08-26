@@ -6,6 +6,36 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-08-26): 101 `test_oleaut32_*.py` unit tests broken by the `_NoOleaut32Stubs` wrapper
+
+Pre-existing regression (confirmed via `git stash`, predates today's
+`build_iat_map`/`DllMain` work) -- `tests/unit/api/test_oleaut32_variant_*.py`
+and `test_oleaut32_varr8fromstr.py` call `stubs.get("oleaut32.dll", "Ordinal
+#N")` directly to test specific Python handlers by name. Since the
+`_NoOleaut32Stubs` wrapper (see OBSOLETE entry below) silently drops every
+`"oleaut32.dll"` handler registration, these lookups now raise `KeyError`.
+Needs a decision: delete these tests (if the handlers they test are
+genuinely dead code now that real `oleaut32.dll` handles everything), or
+rework them to exercise the real-DLL path instead (e.g. via a real emulator
+run) rather than calling the now-unused Python handler directly.
+
+## NEW (2026-08-26): statically-imported DLLs' `DllMain` now runs -- expect a wave of newly-exercised missing handlers
+
+Fixed `build_iat_map`/`run_exe.py` so `d3d8.dll`/`oleaut32.dll`/`rpcrt4.dll`/
+`secur32.dll` (MCity_d.exe's own direct imports) actually run their real
+`DllMain(DLL_PROCESS_ATTACH)` now, matching real Windows loader ordering
+(see status.md, "cont'd x34", for the full writeup and why this was never
+wired up before). This exercises a lot of previously-dormant code for the
+first time ever in this emulator. Already found+fixed: `GetSystemTimeAsFileTime`.
+Current blocker: `kernel32.dll!LoadLibraryExW` (`d3d8.dll`'s own `DllMain`,
+the dgVoodoo/Rayman shim -- unrelated to the DAO/oleaut32 investigation
+itself). Molly's direction: keep fixing these one at a time, not skip
+`d3d8.dll` or presurvey its `DllMain`'s full API surface first. Once past
+`d3d8.dll` (loads/attaches before `oleaut32.dll` in dependency order), the
+original DAO license-key BSTR bug (`Ordinal_2`/`SysAllocString` returning
+NULL because `TlsAlloc` never ran) still needs re-verification against a
+clean run.
+
 ## OBSOLETE (2026-08-26): real `.tlb` type-library parsing for `LoadTypeLibEx`
 
 **Superseded, do not pick this up** -- the entire premise was wrong. `LoadTypeLibEx`

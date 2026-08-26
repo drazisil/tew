@@ -4,6 +4,29 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-26, cont'd x32) — Real root cause found and fixed: a genuinely-loaded `oleaut32.dll` was being unconditionally shadowed by this project's own Python handlers. New, different, legitimate blocker now surfaced: a real in-game DB-init assertion.
+
+**The whole `LoadTypeLibEx`/expression-function investigation (see below, x9-x31) was chasing a fake symptom.** `oleaut32.dll` genuinely loads as real code here -- but `oleaut32_handlers.py`'s ~35 registered Python handlers unconditionally won over it every time (`dll_loader.py`'s `patch_iat_entry` tries a registered handler before ever checking a real DLL's own export). Fixed by wrapping `register_oleaut32_ole32_handlers`'s `stubs` so every `"oleaut32.dll"` registration it makes is silently dropped -- real code now handles all of it.
+
+**Two more real bugs this exposed, both fixed**: (1) `run_exe.py`'s `build_iat_map()` ran before the `~/.emu32/WINDOWS/System32/` search path was registered, so `MCity_d.exe`'s own early, direct `oleaut32.dll` import permanently cached as unresolved -- moved the search-path registration earlier. (2) `msvcrt.dll!wcslen` had no handler at all (never previously exercised) -- added, matching `strlen`'s pattern.
+
+**Blocker at the time, now traced further (see current status.md)**: with real `oleaut32.dll` genuinely running, `Dbcode_InitDao` (`MCity_d.exe`, static `008f4e70`) fails both its `IClassFactory2::CreateInstanceLic` attempts against the real `dao350.dll` object:
+1. First attempt (a `dbVariant`-wrapped ANSI license key `"mbmabptebkjcdlgtjmskjwtsdhjbmkmwtrak"`): the BSTR pointer passed (`local_38`) is live-confirmed **NULL** (`bstr_ptr=0x0`), HRESULT `0x80040112` (`CLASS_E_NOTLICENSED` -- makes sense for a null key).
+2. Fallback attempt (`local_44 = Ordinal_2(L"mbmabptebkjcdlgtjmskjwtsdhjbmkmwtrak", ...)`, real `SysAllocString`, real vtable call site static `008f59b3`... wait, `008f59b3` turned out to BE the `Ordinal_2`/`SysAllocString` call site itself, not the vtable call -- see current status.md): the BSTR pointer passed is live-confirmed `0xCCCCCCCC` -- the classic MSVC debug-build "stack slot never written" fill pattern.
+
+**Not yet pinned down at the time**: the exact instruction that's supposed to write `Ordinal_2`'s return into `local_44` and isn't. Resolved in the next round: `get_function_calls` (ground truth) showed `0x008f59b3`'s callee IS `Ordinal_2` -- every probe up to this point had mislabeled it as the `CreateInstanceLic` vtable call.
+
+**Also live-confirmed working at the time** (not part of this bug): real `CoGetClassObject`/`CoCreateInstance` against `dao350.dll` (`Got IClassFactory!`, `Got IClassFactory2!` both succeed), real `CoGetMalloc`, and `oleaut32.dll` handling everything else asked of it so far.
+
+**Tooling note**: logpoint callbacks receive a raw ctypes `LP_c_ubyte` pointer for `memory` (unlike breakpoints, which get the wrapped `Memory` object with `.read32()`) -- indexing it out of bounds doesn't raise, it segfaults the whole host process (confirmed live via `coredumpctl`/gdb: crash was in ctypes' own `Pointer_item_lock_held`, no Python-catchable exception). Any logpoint that reads guest memory must bounds-check against the `memory_size` argument manually first -- see `_read32_raw` in `run_exe.py` for the pattern.
+
+**Method note, worth remembering generally**: before spending an entire session investigating why a specific DLL's function "fails" or "returns garbage," check whether that DLL is actually loaded as real code or being intercepted by a Python handler *first* -- not after building an elaborate fix for the wrong layer. `dll_loader.py`'s `patch_iat_entry` docstring already documents the precedence (handler > real export > auto-stub); this should be habit, not something to discover by being asked directly.
+
+**Housekeeping, still live from earlier sessions**:
+- ClickHouse execution-history capture (`~/pe-walker/history-poc` docker-compose) does **not** survive a reboot/power-cut -- needs `docker compose up -d` again (schema/data persist on the bind-mounted volume, just the container needs restarting). Same for `ghidra-mcp.service`'s project state -- survives service restart via systemd, but needs a fresh MCP handshake (new session ID) and re-opening the project/program.
+- `CreateThread`'s log line (`tew/api/kernel32_io.py`) downgraded from `info` to `debug` -- was disproportionately noisy for a routine per-spawn event at `info` level.
+- Ghidra's full auto-analysis crashes on `expsrv.dll` but works fine on `msjet35.dll` -- both are in the `mcity` project (separate from this project's own default, `debug_clean`; remember to switch back and forth as needed, and to switch back to `debug_clean` when done so `mcity` isn't left locked).
+
 ## Previous status (2026-08-25/26, cont'd x31) — Root cause of the `expsrv.dll` crash was NOT `LoadTypeLibEx` after all: a real, genuinely-loaded `oleaut32.dll` was being unconditionally shadowed by this project's own Python handlers
 
 **The actual root cause, found by questioning the whole premise** (Molly: "we have a real oleaut32... unless you override things again"): `oleaut32.dll` genuinely loads as real code in this emulator (confirmed live: patches its own imports from advapi32/gdi32/kernel32/msvcrt/ole32/rpcrt4/user32.dll, and `dao350.dll`/`msjet35.dll`/`expsrv.dll` all correctly resolve their own `oleaut32.dll` imports against it). But `dll_loader.py`'s `patch_iat_entry` tries a *registered Python handler* before ever checking a real DLL's own export -- so `oleaut32_handlers.py`'s ~35 registered handlers (including every `LoadTypeLibEx`/`ITypeComp::Bind`/`GetFuncDesc`/`GetDllEntry` trap built earlier this session) unconditionally won over the real, correct Microsoft code, every time, regardless of it being genuinely present and loaded.

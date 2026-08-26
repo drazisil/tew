@@ -1424,6 +1424,12 @@ def register_kernel32_io_handlers(
         _write_systemtime(lp, now, utc=True)
         cleanup_stdcall(cpu, memory, 4)
 
+    def _get_system_time_as_filetime(cpu: "CPU") -> None:
+        lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        now_utc = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        _write_filetime(lp, _unix_to_filetime(now_utc))
+        cleanup_stdcall(cpu, memory, 4)
+
     def _get_tz_info(cpu: "CPU") -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         for i in range(172):
@@ -1485,6 +1491,7 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "GetLocalTime",            _get_local_time)
     stubs.register_handler("kernel32.dll", "GetSystemTime",           _get_system_time)
+    stubs.register_handler("kernel32.dll", "GetSystemTimeAsFileTime", _get_system_time_as_filetime)
     stubs.register_handler("kernel32.dll", "GetTimeZoneInformation",  _get_tz_info)
     stubs.register_handler("kernel32.dll", "FileTimeToLocalFileTime", _file_time_to_local)
     stubs.register_handler("kernel32.dll", "FileTimeToSystemTime",    _file_time_to_system)
