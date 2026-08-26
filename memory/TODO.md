@@ -19,22 +19,23 @@ genuinely dead code now that real `oleaut32.dll` handles everything), or
 rework them to exercise the real-DLL path instead (e.g. via a real emulator
 run) rather than calling the now-unused Python handler directly.
 
-## NEW (2026-08-26): statically-imported DLLs' `DllMain` now runs -- expect a wave of newly-exercised missing handlers
+## RESOLVED (2026-08-26): statically-imported DLLs' `DllMain` now runs; original DAO license-key BSTR bug confirmed fixed
 
 Fixed `build_iat_map`/`run_exe.py` so `d3d8.dll`/`oleaut32.dll`/`rpcrt4.dll`/
 `secur32.dll` (MCity_d.exe's own direct imports) actually run their real
-`DllMain(DLL_PROCESS_ATTACH)` now, matching real Windows loader ordering
-(see status.md, "cont'd x34", for the full writeup and why this was never
-wired up before). This exercises a lot of previously-dormant code for the
-first time ever in this emulator. Already found+fixed: `GetSystemTimeAsFileTime`.
-Current blocker: `kernel32.dll!LoadLibraryExW` (`d3d8.dll`'s own `DllMain`,
-the dgVoodoo/Rayman shim -- unrelated to the DAO/oleaut32 investigation
-itself). Molly's direction: keep fixing these one at a time, not skip
-`d3d8.dll` or presurvey its `DllMain`'s full API surface first. Once past
-`d3d8.dll` (loads/attaches before `oleaut32.dll` in dependency order), the
-original DAO license-key BSTR bug (`Ordinal_2`/`SysAllocString` returning
-NULL because `TlsAlloc` never ran) still needs re-verification against a
-clean run.
+`DllMain(DLL_PROCESS_ATTACH)` now, matching real Windows loader ordering.
+Working through the resulting wave of newly-exercised missing handlers
+(GetSystemTimeAsFileTime, LoadLibraryExW, InitializeSListHead, CreateEventW,
+several ntdll.dll Rtl* primitives, wsprintfA, RegisterClipboardFormatA,
+GetSystemDirectoryA, CoSetState) confirmed the original bug fixed
+end-to-end: `SysAllocString` now returns a real BSTR, and the game runs
+real single-race gameplay DB traffic instead of halting on
+`Database initialization failed!`. Full writeup: status.md "cont'd x35",
+status_archive.md "cont'd x34" for the root-cause trace.
+
+New, unrelated, later-stage blocker now open: `kernel32.dll!SearchPathW`,
+hit ~60s in inside `expsrv.dll`/`OLEAUT32.dll`/`MSJET35.DLL` interaction --
+see status.md "cont'd x35" for the EBP chain.
 
 ## OBSOLETE (2026-08-26): real `.tlb` type-library parsing for `LoadTypeLibEx`
 

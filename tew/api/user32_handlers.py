@@ -24,6 +24,7 @@ from tew.hardware.cpu_zig import EAX, ESP
 from tew.hardware.scheduler_zig import ThreadStatus
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState
+from tew.api.msvcrt_handlers import _sprintf_format, _write_cstring
 from tew.api.window_manager import (
     WindowManager,
     WM_INITDIALOG, BM_GETCHECK, BM_SETCHECK,
@@ -461,6 +462,47 @@ def register_user32_gdi32_handlers(
         cleanup_stdcall(cpu, memory, 16)
 
     stubs.register_handler("user32.dll", "MessageBoxW", _MessageBoxW)
+
+    # wsprintfA(LPSTR lpOut, LPCSTR lpFmt, ...) -> int [cdecl]
+    # Same shape/semantics as msvcrt's sprintf, just a user32.dll export --
+    # reuses the shared printf format engine.
+    def _wsprintfA(cpu: "CPU") -> None:
+        dst     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        fmt_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        fmt     = _read_cstr(fmt_ptr, 4096)
+        arg_off = [12]
+
+        def get_arg() -> int:
+            v = memory.read32((cpu.regs[ESP] + arg_off[0]) & 0xFFFFFFFF)
+            arg_off[0] += 4
+            return v
+
+        result = _sprintf_format(fmt, get_arg, memory)
+        cpu.regs[EAX] = _write_cstring(dst, result, memory)
+        # cdecl -- caller cleans the stack, no cleanup_stdcall
+
+    stubs.register_handler("user32.dll", "wsprintfA", _wsprintfA)
+
+    # RegisterClipboardFormatA(LPCSTR lpszFormat) -> UINT
+    # Real Windows assigns app-registered format IDs starting at 0xC000, and
+    # the same name always gets the same ID within a session -- no real
+    # clipboard/format-name integration needed for that contract, just a
+    # name->id table.
+    _clipboard_format_ids: dict[str, int] = {}
+    _next_clipboard_format_id = [0xC000]
+
+    def _register_clipboard_format_a(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        name = _read_cstr(name_ptr)
+        fmt_id = _clipboard_format_ids.get(name)
+        if fmt_id is None:
+            fmt_id = _next_clipboard_format_id[0]
+            _next_clipboard_format_id[0] += 1
+            _clipboard_format_ids[name] = fmt_id
+        cpu.regs[EAX] = fmt_id
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("user32.dll", "RegisterClipboardFormatA", _register_clipboard_format_a)
 
     # GetActiveWindow() -> HWND  (no args — NULL means no active window)
     def _GetActiveWindow(cpu: "CPU") -> None:

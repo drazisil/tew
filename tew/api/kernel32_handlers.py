@@ -330,21 +330,47 @@ def register_kernel32_handlers(
         else:
             _load_dll_by_name(name, 4, cpu, memory)
 
-    def _load_library_ex_a(cpu: "CPU") -> None:
-        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        if dw_flags != 0:
+    # dwFlags bits that only narrow *where* the loader searches for the DLL
+    # (a real-Windows DLL-planting defense) -- irrelevant here since
+    # dll_loader's own search path list is fixed and not attacker-influenced.
+    # Safe to ignore and load exactly as LoadLibrary(Ex) with dwFlags=0 would.
+    _LOAD_LIBRARY_SEARCH_FLAGS = (
+        0x8       # LOAD_WITH_ALTERED_SEARCH_PATH
+        | 0x10    # LOAD_IGNORE_CODE_AUTHZ_LEVEL
+        | 0x200   # LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+        | 0x400   # LOAD_LIBRARY_SEARCH_USER_DIRS
+        | 0x800   # LOAD_LIBRARY_SEARCH_SYSTEM32
+        | 0x1000  # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    )
+
+    def _load_library_ex_common(name: str, dw_flags: int, cpu: "CPU", memory: "Memory",
+                                caller_label: str) -> None:
+        if dw_flags & ~_LOAD_LIBRARY_SEARCH_FLAGS:
             logger.error("handlers",
-                f"[UNIMPLEMENTED] LoadLibraryExA dwFlags=0x{dw_flags:x} — halting")
+                f"[UNIMPLEMENTED] {caller_label} dwFlags=0x{dw_flags:x} — halting")
             cpu.halted = True
             cpu.fatal_halt = True
             return
-        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        if dw_flags:
+            logger.debug("handlers",
+                f"{caller_label}: ignoring search-scope-only dwFlags=0x{dw_flags:x}")
         has_sep = "\\" in name or "/" in name
         if has_sep:
             _load_dll_by_path(name, 12, cpu, memory)
         else:
             _load_dll_by_name(name, 12, cpu, memory)
+
+    def _load_library_ex_a(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExA")
+
+    def _load_library_ex_w(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name = read_wide_string(name_ptr, memory) if name_ptr else ""
+        _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExW")
 
     def _free_library(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1
@@ -356,6 +382,7 @@ def register_kernel32_handlers(
 
     stubs.register_handler("kernel32.dll", "LoadLibraryA",              _load_library_a)
     stubs.register_handler("kernel32.dll", "LoadLibraryExA",            _load_library_ex_a)
+    stubs.register_handler("kernel32.dll", "LoadLibraryExW",            _load_library_ex_w)
     stubs.register_handler("kernel32.dll", "FreeLibrary",               _free_library)
     stubs.register_handler("kernel32.dll", "DisableThreadLibraryCalls", _disable_thread_lib)
 

@@ -1189,6 +1189,18 @@ def register_oleaut32_ole32_handlers(
 
     stubs.register_handler("ole32.dll", "CoUninitialize", _CoUninitialize)
 
+    # CoSetState(LPVOID pv) -> HRESULT
+    # Undocumented, internal per-thread OLE-state pointer swap (used e.g. by
+    # oleaut32.dll's own lazy per-thread automation-state init). No real
+    # cross-apartment state tracking is modeled here -- callers only need a
+    # non-negative HRESULT to treat their own state setup as having
+    # succeeded, matching real S_OK.
+    def _CoSetState(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0  # S_OK
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("ole32.dll", "CoSetState", _CoSetState)
+
     # ── ole32.dll — CoGetMalloc / IMalloc ───────────────────────────────────────
     # The process-wide task allocator real COM code fetches via CoGetMalloc.
     # Previously unimplemented entirely -- dao350.dll's DllGetClassObject

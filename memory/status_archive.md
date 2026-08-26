@@ -4,6 +4,18 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-26, cont'd x34) — Found and fixed the real cause of the DAO license-key BSTR bug: statically-imported real DLLs never ran their own `DllMain`.
+
+**Root cause, traced all the way down**: `Ordinal_2`/`SysAllocString` (real `oleaut32.dll`) returned NULL for a perfectly valid string. Decompiling it live showed it defers to `SysAllocStringLen`, which lazily bootstraps a per-thread OLE-automation state block on first use via a TLS slot (`DAT_771a1000`). That slot was stuck at `0xFFFFFFFF` (`TLS_OUT_OF_INDEXES`) because `TlsAlloc()` -- called only from `oleaut32.dll`'s own real `DllMain` (`FUN_771215d4`, reason `DLL_PROCESS_ATTACH`) -- never ran at all. Confirmed via a live "log every DllMain call" pass: zero `DllMain` invocations all session for any of the 4 DLLs `MCity_d.exe` statically imports (`d3d8.dll`, `oleaut32.dll`, `rpcrt4.dll`, `secur32.dll`).
+
+**Why**: `should_invoke_dependency_dllmain`'s own docstring (`dll_loader.py`) documents this as a *deliberate* scoping choice from when the `on_dependency_loaded` mechanism was first built (2026-08-16, to fix `msjint35.dll`'s HINSTANCE global) -- `import_resolver.py`'s `build_iat_map` (the static-import path) never passed a callback, so this was never wired up for it.
+
+**Fix implemented** (branch `fix/static-import-dllmain`): `build_iat_map` now accepts an `on_dependency_loaded` callback and applies the exact same `should_invoke_dependency_dllmain` check `load_dll` already uses for nested dependencies -- so dependency-before-dependent ordering falls out for free. `run_exe.py` invokes `_invoke_dependency_dllmain` for each collected DLL after the main thread's stack/kernel-structures are initialized (not right after `build_iat_map`/`write_iat_handlers` -- crashes: `_invoke_emulated_proc` builds its nested call frame on top of the current `ESP`, still 0 that early) but still before the guest's own entry point runs.
+
+**Consequence, expected and desired**: every one of these 4 DLLs' real `DllMain` now executes for the first time ever, exercising a long tail of previously-dormant code. See the next status entry for the full list of missing handlers found and fixed working through it, and confirmation the original bug is actually fixed end-to-end.
+
+**Also found, unrelated regression (pre-existing, not caused by this fix)**: 101 unit tests in `tests/unit/api/test_oleaut32_*.py` fail against `main` too (confirmed via `git stash`) -- they call `stubs.get("oleaut32.dll", "Ordinal #N")` directly, which now raises `KeyError` since the `_NoOleaut32Stubs` wrapper drops every `"oleaut32.dll"` handler registration. Queued in TODO.md, not fixed yet.
+
 ## Previous status (2026-08-26, cont'd x32) — Real root cause found and fixed: a genuinely-loaded `oleaut32.dll` was being unconditionally shadowed by this project's own Python handlers. New, different, legitimate blocker now surfaced: a real in-game DB-init assertion.
 
 **The whole `LoadTypeLibEx`/expression-function investigation (see below, x9-x31) was chasing a fake symptom.** `oleaut32.dll` genuinely loads as real code here -- but `oleaut32_handlers.py`'s ~35 registered Python handlers unconditionally won over it every time (`dll_loader.py`'s `patch_iat_entry` tries a registered handler before ever checking a real DLL's own export). Fixed by wrapping `register_oleaut32_ole32_handlers`'s `stubs` so every `"oleaut32.dll"` registration it makes is silently dropped -- real code now handles all of it.

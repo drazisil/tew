@@ -630,6 +630,23 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 16)
 
+    def _create_event_w(cpu: "CPU") -> None:
+        b_manual   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        b_initial  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name_ptr   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        name = read_wide_string(name_ptr, memory) if name_ptr else "(unnamed)"
+        h = state.next_kernel_handle
+        state.next_kernel_handle += 1
+        state.kernel_handle_map[h] = EventHandle(
+            signaled=b_initial != 0,
+            manual_reset=b_manual != 0,
+        )
+        logger.debug("handlers",
+            f'[Win32] CreateEventW("{name}", manual={bool(b_manual)}, '
+            f'signaled={bool(b_initial)}) -> 0x{h:x}')
+        cpu.regs[EAX] = h
+        cleanup_stdcall(cpu, memory, 16)
+
     def _set_event(cpu: "CPU") -> None:
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         obj = state.kernel_handle_map.get(h)
@@ -654,6 +671,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "OpenMutexW",          _halt("OpenMutexW"))
     stubs.register_handler("kernel32.dll", "ReleaseMutex",        _release_mutex)
     stubs.register_handler("kernel32.dll", "CreateEventA",        _create_event_a)
+    stubs.register_handler("kernel32.dll", "CreateEventW",        _create_event_w)
     stubs.register_handler("kernel32.dll", "OpenEventA",          _halt("OpenEventA"))
     stubs.register_handler("kernel32.dll", "OpenEventW",          _halt("OpenEventW"))
     stubs.register_handler("kernel32.dll", "SetEvent",            _set_event)
@@ -1261,6 +1279,17 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = len(d)
         cleanup_stdcall(cpu, memory, 8)
 
+    def _get_system_dir_a(cpu: "CPU") -> None:
+        lp_buf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        u_size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        d = "C:\\WINDOWS\\SYSTEM32"
+        if lp_buf and u_size > len(d):
+            for i, ch in enumerate(d):
+                memory.write8(lp_buf + i, ord(ch))
+            memory.write8(lp_buf + len(d), 0)
+        cpu.regs[EAX] = len(d)
+        cleanup_stdcall(cpu, memory, 8)
+
     def _get_temp_path_a(cpu: "CPU") -> None:
         n_buf  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -1364,6 +1393,7 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetCurrentDirectoryA", _get_current_dir_a)
     stubs.register_handler("kernel32.dll", "SetCurrentDirectoryA", _set_current_dir_a)
     stubs.register_handler("kernel32.dll", "GetWindowsDirectoryA", _get_windows_dir_a)
+    stubs.register_handler("kernel32.dll", "GetSystemDirectoryA",  _get_system_dir_a)
     stubs.register_handler("kernel32.dll", "GetTempPathA",         _get_temp_path_a)
     stubs.register_handler("kernel32.dll", "GetTempFileNameA",     _get_temp_file_name_a)
     stubs.register_handler("kernel32.dll", "GetDiskFreeSpaceA",    _get_disk_free_space_a)

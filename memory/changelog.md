@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-26 (cont'd x35) — MILESTONE: DAO license-key BSTR bug confirmed fixed end-to-end; game now runs real single-race gameplay DB traffic
+
+With `DllMain` now running for all 4 statically-imported DLLs (previous entry), worked through the resulting wave of newly-exercised missing handlers, in the order hit: `kernel32.dll!GetSystemTimeAsFileTime`, `LoadLibraryExW` (plus a `dwFlags` fix so search-scope-only flags like `LOAD_LIBRARY_SEARCH_SYSTEM32` are ignored instead of halting, on both `LoadLibraryExA` and `LoadLibraryExW`), `InitializeSListHead`, `CreateEventW`; `ntdll.dll!RtlInitializeCriticalSection(AndSpinCount)`, `RtlInitializeResource`, `RtlAcquireResourceExclusive`, `RtlReleaseResource` (first `ntdll.dll`-export handlers in this project, as opposed to `INT 0x2E` syscalls); `user32.dll!wsprintfA` (reuses msvcrt's shared printf engine), `RegisterClipboardFormatA`; `kernel32.dll!GetSystemDirectoryA`; `ole32.dll!CoSetState` (the actual call inside `oleaut32.dll`'s lazy per-thread automation-state init that was failing -- a no-op returning `S_OK` is sufficient).
+
+**Confirmed live**: `Ordinal_2`/`SysAllocString` now returns a real heap BSTR pointer instead of `NULL`/`0xCCCCCCCC`. `dblog.txt` shows the game proceeding straight past DAO init into real gameplay (`DB_StartUpDatabase`, `DBServiceRequestQ` handling `DBT_GO_SINGLERACE`/`DBT_STARTUP`/`DBT_GET_GAMECONFIG_CAR_TABLE`, `DBPhysics_GetTireAuxData`, `DBMem_Alloc`) -- no more `Database initialization failed!`. Run reaches 60+ seconds before the next halt, vs. ~2-3s before this fix. Full test suite re-run: same 101 pre-existing failures (unrelated, see previous entry), no new regressions.
+
+**New blocker, unrelated to this bug**: `kernel32.dll!SearchPathW`, hit ~60s in, inside `expsrv.dll`/`OLEAUT32.dll`/`MSJET35.DLL` interaction -- likely typelib-loading related. Not yet investigated.
+
+---
+
 ## 2026-08-26 (cont'd x34) — Root cause of the DAO license-key BSTR bug: statically-imported real DLLs never ran their own `DllMain`; fixed
 
 Traced `Ordinal_2`/`SysAllocString` returning NULL (previous entry) all the way down: real `oleaut32.dll` lazily bootstraps per-thread OLE-automation state on first use via a TLS slot, and that bootstrap fails because `TlsAlloc()` -- called only from `oleaut32.dll`'s own real `DllMain` -- never ran. A live "log every `DllMain` call" pass confirmed it: zero `DllMain` invocations all session for any of the 4 DLLs `MCity_d.exe` statically imports (`d3d8.dll`, `oleaut32.dll`, `rpcrt4.dll`, `secur32.dll`). `dll_loader.py`'s `should_invoke_dependency_dllmain` docstring explains why -- this was a deliberate scoping choice from 2026-08-16 (the `msjint35.dll` fix): the `on_dependency_loaded` callback was only ever wired up at runtime `LoadLibraryA`/`CoGetClassObject` call sites, never at `import_resolver.py`'s static-import `build_iat_map`.
