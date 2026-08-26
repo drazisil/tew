@@ -4,6 +4,14 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-26 (cont'd x33) — Traced the DB-init failure to a live, concrete garbage value; found and fixed a real native-segfault risk in logpoint memory access
+
+With real `oleaut32.dll` running, `Dbcode_InitDao`'s two `IClassFactory2::CreateInstanceLic` attempts against real `dao350.dll` both use bad BSTR keys: the first (`dbVariant`-wrapped) is NULL; the fallback (`Ordinal_2`/presumably `SysAllocString`) is `0xCCCCCCCC` -- MSVC's debug-build "never written" stack-fill pattern, meaning the real `SysAllocString` return value never reached `local_44` before use. The fallback call still returns `HRESULT=S_OK` from `dao350.dll` despite the garbage key -- real DAO code isn't validating it, so downstream consumption of a bad engine-interface pointer is the live risk. Not yet pinned down which exact instruction is supposed to write `Ordinal_2`'s result and doesn't -- see status.md.
+
+**Found and fixed along the way**: a logpoint reading guest memory via raw pointer arithmetic (`memory[addr]` on the ctypes `LP_c_ubyte` passed to logpoint callbacks) segfaulted the whole host process on an out-of-bounds index -- confirmed via `coredumpctl`/gdb (crash was inside ctypes' own `Pointer_item_lock_held`, not a Python-catchable exception). Unlike breakpoints (which get the wrapped `Memory` object with bounds-checked `.read32()`), logpoints get the raw pointer -- any logpoint touching guest memory must manually bounds-check against the `memory_size` argument first. Added `_read32_raw` in `run_exe.py` as the safe pattern for future logpoints.
+
+---
+
 ## 2026-08-26 (cont'd x32) — FIXED: real `oleaut32.dll` was being unconditionally shadowed by this project's own Python handlers; the entire LoadTypeLibEx investigation was chasing a fake symptom
 
 **The real root cause**: `oleaut32.dll` genuinely loads as real code in this emulator (confirmed live: correctly resolves its own imports from advapi32/gdi32/kernel32/msvcrt/ole32/rpcrt4/user32.dll; `dao350.dll`/`msjet35.dll`/`expsrv.dll` all correctly resolve their own `oleaut32.dll` imports against it). But `dll_loader.py`'s `patch_iat_entry` tries a *registered Python handler* before ever checking a real DLL's own export -- so every one of `oleaut32_handlers.py`'s ~35 registered handlers (both pre-existing and everything built during the entire prior `LoadTypeLibEx` investigation, x9-x31) unconditionally won over the real, correct Microsoft code, regardless of it being genuinely present and loaded. Found only after being asked directly whether the DLL was even really loaded, or being shadowed -- a foundational check that should have happened first, not 20+ turns into hand-crafting an approximation of real COM/OLE Automation behavior.

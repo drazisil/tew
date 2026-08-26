@@ -865,6 +865,55 @@ def _typelib_lookup_return_logpoint(eip, regs, memory, memory_size):
         logger.error("cpu", f"[typelib-lookup-return] EXCEPTION: {e!r}")
 cpu.add_logpoint(0x18061994, _typelib_lookup_return_logpoint)
 
+# 2026-08-26: with real oleaut32.dll now genuinely running, dbcode.c's
+# Dbcode_InitDao (MCity_d.exe) fails at IClassFactory2::CreateInstanceLic --
+# a real dao350.dll vtable call -- for BOTH its license-key attempts (a
+# dbVariant-wrapped ANSI string, then a plain SysAllocString'd BSTR), where
+# it used to succeed earlier this session with the old, Python-faked BSTR
+# layout. Real vtable COMPUTED_CALL sites found live via
+# get_function_instructions: static 0x008f580c (dbVariant attempt) and
+# 0x008f59b3 (SysAllocString attempt) -- both in MCity_d.exe (loads at its
+# preferred base, no delta needed). Pre-call stdcall stack layout (COM
+# vtable call, args pushed right-to-left): [ESP+0]=this, +4=pUnkOuter,
+# +8=pUnkReserved, +12=&riid, +16=bstrKey, +20=&ppvObj. Dumping the BSTR's
+# length-prefix and content at the call site, plus EAX (HRESULT) right after
+# the call's paired __chkesp completes.
+def _read32_raw(memory, memory_size, addr: int) -> int | None:
+    # Raw LP_c_ubyte ctypes pointer -- unlike Memory.read32, indexing past
+    # memory_size doesn't raise, it segfaults the whole process (confirmed
+    # live: ctypes Pointer_item_lock_held, no bounds check at all). Every
+    # byte access here MUST be range-checked first.
+    addr &= 0xFFFFFFFF
+    if addr + 3 >= memory_size:
+        return None
+    return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+
+def _make_createinstancelic_probe(label: str):
+    def _probe(eip, regs, memory, memory_size):
+        esp = regs[ESP]
+        bstr_ptr = _read32_raw(memory, memory_size, esp + 16)
+        byte_len, text = 0, ""
+        if bstr_ptr:
+            byte_len = _read32_raw(memory, memory_size, bstr_ptr - 4)
+            if byte_len is None or byte_len > 1000 or bstr_ptr + byte_len >= memory_size:
+                byte_len, text = -1, "<out of bounds or implausible length>"
+            else:
+                raw = bytes(memory[bstr_ptr + i] for i in range(byte_len))
+                text = raw.decode("utf-16-le", errors="replace")
+        logger.error("com", f"[createinstancelic-{label}] bstr_ptr=0x{bstr_ptr or 0:x} byte_len={byte_len} content={text!r}")
+    return _probe
+cpu.add_logpoint(0x008f580c, _make_createinstancelic_probe("dbvariant-call"))
+cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
+
+def _make_createinstancelic_return_probe(label: str):
+    def _probe(eip, regs, memory, memory_size):
+        eax = regs[EAX]
+        signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+        logger.error("com", f"[createinstancelic-{label}-return] HRESULT=0x{eax:x} ({signed})")
+    return _probe
+cpu.add_logpoint(0x008f5816, _make_createinstancelic_return_probe("dbvariant"))
+cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
+
 # 2026-08-25 (cont'd x14): clean function-boundary trace, redirected upstream
 # per Molly's request -- print params in / return out for the actual COM
 # OpenRecordset call, rather than more scattered internal-state probes.
