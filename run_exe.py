@@ -360,8 +360,18 @@ kernel_structures.initialize_kernel_structures(stack_base, stack_limit, crt_stat
 # started yet), matching real Windows load-then-attach-then-run ordering.
 # See the long comment at build_iat_map's call site for why this whole
 # invocation is deferred this far rather than running inline there.
-for _pending_dll in _pending_dllmain_dlls:
-    _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll)
+_failed_static_dllmains = [
+    _pending_dll.name for _pending_dll in _pending_dllmain_dlls
+    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll)
+]
+if _failed_static_dllmains:
+    logger.warn(
+        "startup",
+        f"DllMain(DLL_PROCESS_ATTACH) returned FALSE for: {', '.join(_failed_static_dllmains)} "
+        "-- real LoadLibrary would treat this as a failed load; continuing anyway "
+        "since these are direct EXE imports we can't simply not-load, but their exports "
+        "may be unreliable from here on.",
+    )
 
 # ── Build valid EIP range table ───────────────────────────────────────────────
 

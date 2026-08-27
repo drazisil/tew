@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from tew.loader.dll_loader import DLLLoader
 
 from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, unimplemented_halt as _halt
 from tew.api.win32_errors import Win32Error
 from tew.api.ini_file import (
     GetPrivateProfileStringArgs,
@@ -118,14 +118,6 @@ def register_kernel32_io_handlers(
     dll_loader: Optional["DLLLoader"] = None,
 ) -> None:
     """Register kernel32.dll handlers for I/O, threading, sync, time, and misc."""
-
-    def _halt(name: str):
-        def _h(cpu: "CPU") -> None:
-            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-
-        return _h
 
     # ── Handle management ─────────────────────────────────────────────────────
 
@@ -1262,7 +1254,11 @@ def register_kernel32_io_handlers(
 
         # Otherwise, search list of directories
         search_dirs: list[str] = []
-        if path_override is not None and path_override != "":
+        if path_override is not None:
+            # Per MSDN: a non-NULL lpPath (even an empty string) restricts
+            # the search to exactly the directories it lists -- it must NOT
+            # fall through to the default exe-dir/cwd/System32/PATH sequence
+            # below, which is reserved for lpPath == NULL only.
             for d in path_override.split(";"):
                 d = d.strip()
                 if d:

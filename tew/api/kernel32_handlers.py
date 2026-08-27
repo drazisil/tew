@@ -19,7 +19,10 @@ if TYPE_CHECKING:
     from tew.loader.dll_loader import DLLLoader
 
 from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
+from tew.api.win32_handlers import (
+    Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE,
+    unimplemented_halt as _halt,
+)
 from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
 from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
 from tew.logger import logger
@@ -47,8 +50,14 @@ def _load_dll_with_dllmain(
 
 def _invoke_dependency_dllmain(
     cpu: "CPU", memory: "Memory", state: CRTState, loaded,
-) -> None:
+) -> bool:
     """Synchronously run a dependency DLL's own DllMain(DLL_PROCESS_ATTACH).
+
+    Returns True if DllMain returned TRUE (or the DLL has no entry point at
+    all, so there's nothing to check), False if it explicitly returned
+    FALSE -- callers must not silently treat a FALSE return as success
+    (real LoadLibrary treats it as a load failure); see ole32_handlers.py's
+    _ensure_dll_ready for the same contract on its own DllMain call.
 
     dll_loader.load_dll() recursively loads a DLL's own PE-import
     dependencies but never runs their DllMain -- only the top-level
@@ -74,10 +83,24 @@ def _invoke_dependency_dllmain(
     result = _invoke_emulated_proc(
         cpu, memory, loaded.entry_point,
         [handle, 1, 0],  # hinstDLL, DLL_PROCESS_ATTACH, lpvReserved
-        sentinel, scheduler=state.scheduler,
+        sentinel,
+        # Default max_steps=5_000_000 was too small here: with real
+        # cooperative threads (timers etc.) running while this thread is
+        # swapped out, the whole budget was routinely exhausted before this
+        # thread ever got back to finish its own call -- see
+        # ole32_handlers.py's _ensure_dll_ready, which hit and fixed the
+        # exact same issue on its own DllMain call.
+        max_steps=50_000_000,
+        scheduler=state.scheduler,
     )
     logger.debug("handlers",
         f"[dependency-dllmain] {loaded.name}'s DllMain returned {result}")
+    if result == 0:
+        logger.error("handlers",
+            f"[dependency-dllmain] {loaded.name}: DllMain(DLL_PROCESS_ATTACH) "
+            "returned FALSE -- treating as a failed load")
+        return False
+    return True
 
 
 def register_kernel32_handlers(
@@ -87,13 +110,6 @@ def register_kernel32_handlers(
     dll_loader: Optional["DLLLoader"] = None,
 ) -> None:
     """Register all kernel32.dll handlers."""
-
-    def _halt(name: str):
-        def _h(cpu: "CPU") -> None:
-            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-        return _h
 
     # ── Module handles ────────────────────────────────────────────────────────
 

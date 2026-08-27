@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.hardware.scheduler_zig import ThreadStatus
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, unimplemented_halt as _halt
 from tew.api._state import CRTState
 from tew.api.msvcrt_handlers import _sprintf_format, _write_cstring
 from tew.api.window_manager import (
@@ -289,14 +289,6 @@ def register_user32_gdi32_handlers(
     # Per-type chain: idHook → [hhook, ...] in call order (most recently installed first)
     _winhook_chains: dict[int, list[int]] = {}
     _next_hhook = [0xA000]
-
-    def _halt(name: str):
-        """Return a handler that halts with an UNIMPLEMENTED log."""
-        def _h(cpu: "CPU") -> None:
-            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-        return _h
 
     # ── user32.dll ────────────────────────────────────────────────────────────
 

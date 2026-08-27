@@ -159,15 +159,30 @@ def register_kernel32_sync_handlers(
 
     # RtlAcquireResourceExclusive(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN
     # RtlReleaseResource(PRTL_RESOURCE) -> void
-    # No real contention modeling (cooperative scheduler, single-threaded at
-    # every actual instruction boundary) -- acquire always succeeds
-    # immediately; NumberOfActive/ExclusiveOwnerThread offsets match
-    # _rtl_init_resource's layout above.
+    # No real blocking is modeled -- the cooperative scheduler can still
+    # swap to a different thread mid-critical-section (e.g. on a Sleep or a
+    # contested CS elsewhere) while this resource is held, so a naive
+    # unconditional-success acquire would let that other thread "acquire"
+    # the same exclusive resource too, clobbering NumberOfActive/
+    # ExclusiveOwnerThread and corrupting the resource's bookkeeping.
+    # Recursive acquisition by the SAME thread is real, documented Windows
+    # behavior and is allowed here without changing state; a genuinely
+    # contested acquire (different thread, already held) returns FALSE --
+    # true blocking isn't implemented, so Wait=TRUE can't actually wait.
     def _rtl_acquire_resource_exclusive(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        memory.write32(ptr + 0x28, 0xFFFFFFFF)  # NumberOfActive = -1 (exclusive)
-        memory.write32(ptr + 0x2C, state.tls_current_thread_id())  # ExclusiveOwnerThread
-        cpu.regs[EAX] = 1  # TRUE
+        tid = state.tls_current_thread_id()
+        number_active = memory.read32((ptr + 0x28) & 0xFFFFFFFF)
+        owner = memory.read32((ptr + 0x2C) & 0xFFFFFFFF)
+        if number_active != 0 and owner != tid:
+            logger.debug("kernel32",
+                f"[RtlAcquireResourceExclusive] 0x{ptr:08x} contested: "
+                f"owner=0x{owner:08x} tid=0x{tid:08x} -- returning FALSE")
+            cpu.regs[EAX] = 0  # FALSE
+        else:
+            memory.write32(ptr + 0x28, 0xFFFFFFFF)  # NumberOfActive = -1 (exclusive)
+            memory.write32(ptr + 0x2C, tid)          # ExclusiveOwnerThread
+            cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 8)
 
     def _rtl_release_resource(cpu: "CPU") -> None:
