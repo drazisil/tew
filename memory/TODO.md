@@ -59,9 +59,11 @@ real single-race gameplay DB traffic instead of halting on
 `Database initialization failed!`. Full writeup: status.md "cont'd x35",
 status_archive.md "cont'd x34" for the root-cause trace.
 
-New, unrelated, later-stage blocker now open: `kernel32.dll!SearchPathW`,
-hit ~60s in inside `expsrv.dll`/`OLEAUT32.dll`/`MSJET35.DLL` interaction --
-see status.md "cont'd x35" for the EBP chain.
+## RESOLVED (2026-08-26): `kernel32.dll!SearchPathA` and `SearchPathW` implemented
+
+Implemented standard Win32 file search sequence and custom path search for `SearchPathA` and `SearchPathW` (`kernel32_io.py`). Live run confirmed `SearchPathW("expsrv.dll")` resolves cleanly to `C:\WINDOWS\SYSTEM32\expsrv.dll`.
+
+New blocker opened immediately downstream: `msvcrt.dll!wcsncpy`, called by `OLEAUT32.dll` at ~61.3s to copy the found typelib/DLL path.
 
 ## OBSOLETE (2026-08-26): real `.tlb` type-library parsing for `LoadTypeLibEx`
 

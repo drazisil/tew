@@ -31,11 +31,11 @@ Path: ~/Documents/i386.pdf (421 pages)
 - `kernel32.dll!GetSystemDirectoryA` (`kernel32_io.py`) -- mirrors the existing `GetWindowsDirectoryA` pattern, returns `C:\WINDOWS\SYSTEM32`.
 - `ole32.dll!CoSetState` (`oleaut32_handlers.py`) -- the actual call inside `oleaut32.dll`'s lazy per-thread automation-state init (`FUN_77125311`) that was failing; a real no-op returning `S_OK` is sufficient (undocumented internal API, no real cross-apartment state tracked here).
 
+- `kernel32.dll!SearchPathA`/`SearchPathW` (`kernel32_io.py`) -- implemented standard Win32 search sequence (App dir, CWD, System32, Windows, PATH) and custom `lpPath` search; verified live resolving `C:\WINDOWS\SYSTEM32\expsrv.dll`.
+
 `d3d8.dll`'s own `DllMain` returns `0` (FALSE/failure) -- not investigated further since nothing downstream currently depends on it succeeding, but worth remembering if a d3d8-related bug shows up later.
 
-**New blocker, unrelated to tonight's bug**: `kernel32.dll!SearchPathW` is unimplemented, hit ~60s in, deep inside `expsrv.dll`/`OLEAUT32.dll`/`MSJET35.DLL` interaction (EBP chain: `expsrv.dll+0x1cbd7` -> `expsrv.dll+0x9d1b` -> `OLEAUT32.dll+0x863d` -> ... -- likely typelib-loading related, possibly touching the same territory as the OBSOLETE `LoadTypeLibEx` investigation from earlier this session, though real `oleaut32.dll` handling it now rather than a hand-built Python trap).
-
-**Also still open, unrelated regression (pre-existing, not caused by this fix)**: 101 unit tests in `tests/unit/api/test_oleaut32_*.py` fail against `main` too (confirmed via `git stash`) -- see TODO.md.
+**New blocker, unrelated to tonight's bug**: `msvcrt.dll!wcsncpy` is unimplemented, hit ~61.3s in, called by `OLEAUT32.dll` to copy the resolved typelib DLL path from `SearchPathW` (EBP chain: `expsrv.dll+0x1cbd7` -> `expsrv.dll+0x9d1b` -> `OLEAUT32.dll+0x863d` -> `OLEAUT32.dll+0x38f82` -> `OLEAUT32.dll+0x6f028` -> `OLEAUT32.dll+0x6ef0d` -> `msvcrt.dll!wcsncpy`).
 
 Repro: `cd /data/Code/tew && TEW_WATCH_ADDR=82bfa60 TEW_FIXED_HEARTBEAT_MS=100 TEW_MAX_STEPS=5000000000 LOG_LEVEL=debug LOG_CATEGORIES=cpu,startup,loader,com,handlers timeout 120 .venv/bin/python run_exe.py`.
 

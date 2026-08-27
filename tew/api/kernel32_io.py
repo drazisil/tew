@@ -21,13 +21,21 @@ from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api.win32_errors import Win32Error
 from tew.api.ini_file import (
-    GetPrivateProfileStringArgs, GetPrivateProfileIntArgs,
-    parse_ini, read_profile_string, read_profile_int,
-    write_profile_string, write_profile_section,
+    GetPrivateProfileStringArgs,
+    GetPrivateProfileIntArgs,
+    parse_ini,
+    read_profile_string,
+    read_profile_int,
+    write_profile_string,
+    write_profile_section,
 )
 from tew.api._state import (
-    CRTState, MutexHandle, EventHandle,
-    find_file_ci, read_cstring, read_wide_string,
+    CRTState,
+    MutexHandle,
+    EventHandle,
+    find_file_ci,
+    read_cstring,
+    read_wide_string,
     TEB_BASE,
 )
 from tew.api.kernel32_system import _fire_due_timers
@@ -40,7 +48,7 @@ _env_vars: dict[str, str] = {}
 # ── Win32 handle constants ─────────────────────────────────────────────────────
 
 _CURRENT_PROCESS_HANDLE = 0xFFFFFFFF  # GetCurrentProcess() pseudo-handle
-_CURRENT_THREAD_HANDLE  = 0xFFFFFFFE  # GetCurrentThread() pseudo-handle
+_CURRENT_THREAD_HANDLE = 0xFFFFFFFE  # GetCurrentThread() pseudo-handle
 _DUPLICATE_CLOSE_SOURCE = 0x00000001
 
 
@@ -66,35 +74,40 @@ def _duplicate_handle_entry(state: CRTState, h_source: int, close_source: bool) 
     if h_source in (_CURRENT_PROCESS_HANDLE, _CURRENT_THREAD_HANDLE):
         new_handle = state.next_kernel_handle
         state.next_kernel_handle += 1
-        state.kernel_handle_map[new_handle] = EventHandle(signaled=True, manual_reset=True)
+        state.kernel_handle_map[new_handle] = EventHandle(
+            signaled=True, manual_reset=True
+        )
 
     elif h_source in state.file_handle_map:
         entry = state.file_handle_map[h_source]
         new_handle = state.next_file_handle
         state.next_file_handle += 1
-        state.file_handle_map[new_handle] = entry   # shared ref → shared file position
+        state.file_handle_map[new_handle] = entry  # shared ref → shared file position
 
     elif h_source in state.kernel_handle_map:
         obj = state.kernel_handle_map[h_source]
         new_handle = state.next_kernel_handle
         state.next_kernel_handle += 1
-        state.kernel_handle_map[new_handle] = obj   # shared ref
+        state.kernel_handle_map[new_handle] = obj  # shared ref
 
     else:
         # Thread handle or other value not tracked in a lookup table.
         # Register a dummy so CloseHandle on the result does not warn.
-        logger.debug("handlers",
-            f"DuplicateHandle: untracked src=0x{h_source:08x} — registering dummy")
+        logger.debug(
+            "handlers",
+            f"DuplicateHandle: untracked src=0x{h_source:08x} — registering dummy",
+        )
         new_handle = state.next_kernel_handle
         state.next_kernel_handle += 1
-        state.kernel_handle_map[new_handle] = EventHandle(signaled=True, manual_reset=True)
+        state.kernel_handle_map[new_handle] = EventHandle(
+            signaled=True, manual_reset=True
+        )
 
     if close_source:
         state.file_handle_map.pop(h_source, None)
         state.kernel_handle_map.pop(h_source, None)
 
     return new_handle
-
 
 
 def register_kernel32_io_handlers(
@@ -110,6 +123,7 @@ def register_kernel32_io_handlers(
             logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
             cpu.halted = True
             cpu.fatal_halt = True
+
         return _h
 
     # ── Handle management ─────────────────────────────────────────────────────
@@ -121,7 +135,9 @@ def register_kernel32_io_handlers(
             try:
                 os.close(entry.fd)
             except OSError as e:
-                logger.warn("fileio", f"CloseHandle: os.close(fd={entry.fd}) failed: {e}")
+                logger.warn(
+                    "fileio", f"CloseHandle: os.close(fd={entry.fd}) failed: {e}"
+                )
         if entry is not None:
             # Real Windows releases every byte-range lock a handle holds the
             # moment it's closed, whether or not UnlockFile was called first.
@@ -140,16 +156,16 @@ def register_kernel32_io_handlers(
     # ── File I/O ──────────────────────────────────────────────────────────────
 
     def _write_file(cpu: "CPU") -> None:
-        h_file       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_buf       = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_bytes      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_written   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        n_bytes = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_written = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp_overlapped = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         # See _read_file's comment: a real positioned write via OVERLAPPED
         # must not disturb the handle's own sequential cursor either.
         overlapped_pos = None
         if lp_overlapped:
-            off_low  = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
+            off_low = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
             off_high = memory.read32((lp_overlapped + 0xC) & 0xFFFFFFFF)
             overlapped_pos = off_low | (off_high << 32)
         entry = state.file_handle_map.get(h_file)
@@ -157,14 +173,20 @@ def register_kernel32_io_handlers(
             if lp_written:
                 memory.write32(lp_written, 0)
             if not entry:
-                logger.warn("fileio",
-                    f'[Win32] WriteFile(handle=0x{h_file:x}) -> FALSE (unknown handle)')
+                logger.warn(
+                    "fileio",
+                    f"[Win32] WriteFile(handle=0x{h_file:x}) -> FALSE (unknown handle)",
+                )
             elif not entry.writable:
-                logger.warn("fileio",
-                    f'[Win32] WriteFile(handle=0x{h_file:x}) -> FALSE (read-only)')
+                logger.warn(
+                    "fileio",
+                    f"[Win32] WriteFile(handle=0x{h_file:x}) -> FALSE (read-only)",
+                )
             else:
-                logger.warn("fileio",
-                    f'[Win32] WriteFile(handle=0x{h_file:x}, "{entry.path}") -> FALSE (no fd)')
+                logger.warn(
+                    "fileio",
+                    f'[Win32] WriteFile(handle=0x{h_file:x}, "{entry.path}") -> FALSE (no fd)',
+                )
             cpu.regs[EAX] = 0
         else:
             data = memory.read_bytes(lp_buf & 0xFFFFFFFF, n_bytes)
@@ -175,9 +197,15 @@ def register_kernel32_io_handlers(
                 entry.position += n_bytes
             if lp_written:
                 memory.write32(lp_written, n_bytes)
-            logger.debug("fileio",
-                f'[Win32] WriteFile(handle=0x{h_file:x}, nBytes={n_bytes}) -> TRUE'
-                + (f' [overlapped offset={overlapped_pos}]' if overlapped_pos is not None else ''))
+            logger.debug(
+                "fileio",
+                f"[Win32] WriteFile(handle=0x{h_file:x}, nBytes={n_bytes}) -> TRUE"
+                + (
+                    f" [overlapped offset={overlapped_pos}]"
+                    if overlapped_pos is not None
+                    else ""
+                ),
+            )
             cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 20)
 
@@ -190,18 +218,22 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
-    stubs.register_handler("kernel32.dll", "WriteFile",       _write_file)
-    stubs.register_handler("kernel32.dll", "SetHandleCount",  _set_handle_count)
-    stubs.register_handler("kernel32.dll", "SetStdHandle",    _set_std_handle)
+    stubs.register_handler("kernel32.dll", "WriteFile", _write_file)
+    stubs.register_handler("kernel32.dll", "SetHandleCount", _set_handle_count)
+    stubs.register_handler("kernel32.dll", "SetStdHandle", _set_std_handle)
+
     def _get_module_file_name_a(cpu: "CPU") -> None:
-        h_module    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_filename = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_size      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        h_module = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_filename = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        n_size = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
 
         if h_module == 0:
             # NULL → return the path of the running executable.
             if not state.exe_path:
-                logger.error("handlers", "GetModuleFileNameA: exe_path not set in CRTState — halting")
+                logger.error(
+                    "handlers",
+                    "GetModuleFileNameA: exe_path not set in CRTState — halting",
+                )
                 cpu.halted = True
                 cpu.fatal_halt = True
                 return
@@ -231,18 +263,23 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = n_size if len(encoded) >= n_size else len(encoded)
         cleanup_stdcall(cpu, memory, 12)
 
-    stubs.register_handler("kernel32.dll", "GetModuleFileNameA", _get_module_file_name_a)
+    stubs.register_handler(
+        "kernel32.dll", "GetModuleFileNameA", _get_module_file_name_a
+    )
 
     def _get_module_file_name_w(cpu: "CPU") -> None:
         # Same as GetModuleFileNameA above, except nSize is a WCHAR count
         # (not bytes) and the path is written as null-terminated UTF-16LE.
-        h_module    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_filename = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_size      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        h_module = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_filename = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        n_size = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
 
         if h_module == 0:
             if not state.exe_path:
-                logger.error("handlers", "GetModuleFileNameW: exe_path not set in CRTState — halting")
+                logger.error(
+                    "handlers",
+                    "GetModuleFileNameW: exe_path not set in CRTState — halting",
+                )
                 cpu.halted = True
                 cpu.fatal_halt = True
                 return
@@ -271,19 +308,21 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = n_size if len(win_path) >= n_size else len(win_path)
         cleanup_stdcall(cpu, memory, 12)
 
-    stubs.register_handler("kernel32.dll", "GetModuleFileNameW", _get_module_file_name_w)
+    stubs.register_handler(
+        "kernel32.dll", "GetModuleFileNameW", _get_module_file_name_w
+    )
 
     # ── Pointer validation ────────────────────────────────────────────────────
 
     def _is_bad_read_ptr(cpu: "CPU") -> None:
-        lp  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ucb = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         mem_size = memory.size
         cpu.regs[EAX] = 1 if (lp == 0 or lp + ucb > mem_size) else 0
         cleanup_stdcall(cpu, memory, 8)
 
     def _is_bad_write_ptr(cpu: "CPU") -> None:
-        lp  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ucb = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         mem_size = memory.size
         cpu.regs[EAX] = 1 if (lp == 0 or lp + ucb > mem_size) else 0
@@ -295,9 +334,9 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1 if (lpfn == 0 or lpfn >= mem_size) else 0
         cleanup_stdcall(cpu, memory, 4)
 
-    stubs.register_handler("kernel32.dll", "IsBadReadPtr",  _is_bad_read_ptr)
+    stubs.register_handler("kernel32.dll", "IsBadReadPtr", _is_bad_read_ptr)
     stubs.register_handler("kernel32.dll", "IsBadWritePtr", _is_bad_write_ptr)
-    stubs.register_handler("kernel32.dll", "IsBadCodePtr",  _is_bad_code_ptr)
+    stubs.register_handler("kernel32.dll", "IsBadCodePtr", _is_bad_code_ptr)
 
     # ── Process termination ───────────────────────────────────────────────────
 
@@ -313,31 +352,34 @@ def register_kernel32_io_handlers(
         cpu.fatal_halt = True
 
     stubs.register_handler("kernel32.dll", "TerminateProcess", _terminate_process)
-    stubs.register_handler("kernel32.dll", "FatalAppExitA",    _fatal_app_exit)
+    stubs.register_handler("kernel32.dll", "FatalAppExitA", _fatal_app_exit)
     # RtlUnwind/RaiseException: real implementations, not _halt placeholders
     # -- see tew/kernel/seh.py. register_handler dedupes by key, so this
     # must run before anything else tries to register the same names.
     from tew.kernel.seh import register_seh_handlers
+
     register_seh_handlers(stubs, memory)
 
     # ── Thread creation and management ────────────────────────────────────────
 
     def _create_thread(cpu: "CPU") -> None:
-        lp_start  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_param  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        dw_flags  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        lp_tid    = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        lp_start = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_param = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        lp_tid = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         CREATE_SUSPENDED = 0x4
         is_susp = bool(dw_flags & CREATE_SUSPENDED)
-        tid    = state.next_thread_id
+        tid = state.next_thread_id
         state.next_thread_id += 1
         handle = state.next_thread_handle
         state.next_thread_handle += 1
         ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-        logger.debug("thread",
+        logger.debug(
+            "thread",
             f"CreateThread(start=0x{lp_start:x}, param=0x{lp_param:x}, "
             f"flags=0x{dw_flags:x}) -> handle=0x{handle:x}, tid={tid}  "
-            f"called_from=0x{ret_addr:x}")
+            f"called_from=0x{ret_addr:x}",
+        )
         idx = state.scheduler.thread_count
         state.scheduler.create_thread(
             thread_id=tid,
@@ -356,8 +398,10 @@ def register_kernel32_io_handlers(
     def _resume_thread(cpu: "CPU") -> None:
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if h in state.pending_threads and state.scheduler.get_suspended(h):
-            logger.debug("thread",
-                f"ResumeThread(0x{h:x}) - unsuspending thread {state.scheduler.get_thread_id(h)}")
+            logger.debug(
+                "thread",
+                f"ResumeThread(0x{h:x}) - unsuspending thread {state.scheduler.get_thread_id(h)}",
+            )
             state.scheduler.set_suspended(h, False)
         cpu.regs[EAX] = 1  # previous suspend count
         cleanup_stdcall(cpu, memory, 4)
@@ -368,9 +412,11 @@ def register_kernel32_io_handlers(
         state.scheduler.mark_current_dead(cpu, memory)
 
     def _terminate_thread(cpu: "CPU") -> None:
-        h         = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         exit_code = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        logger.info("thread", f"TerminateThread(handle=0x{h:x}, exitCode=0x{exit_code:x})")
+        logger.info(
+            "thread", f"TerminateThread(handle=0x{h:x}, exitCode=0x{exit_code:x})"
+        )
         result = state.scheduler.terminate_thread(cpu, memory, h)
         if result is None:
             cpu.regs[EAX] = 0  # invalid handle
@@ -382,19 +428,23 @@ def register_kernel32_io_handlers(
         # already switched the live CPU away, must not touch it here.
 
     def _get_exit_code_thread(cpu: "CPU") -> None:
-        h         = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        lp_code   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_code = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         is_pending = h in state.pending_threads
         if lp_code:
-            memory.write32(lp_code, 0 if (is_pending and state.scheduler.get_completed(h)) else 259)
+            memory.write32(
+                lp_code, 0 if (is_pending and state.scheduler.get_completed(h)) else 259
+            )
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
     def _suspend_thread(cpu: "CPU") -> None:
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if h in state.pending_threads:
-            logger.debug("thread",
-                f"SuspendThread(0x{h:x}) - suspending thread {state.scheduler.get_thread_id(h)}")
+            logger.debug(
+                "thread",
+                f"SuspendThread(0x{h:x}) - suspending thread {state.scheduler.get_thread_id(h)}",
+            )
             state.scheduler.set_suspended(h, True)
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
@@ -407,18 +457,18 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 0  # THREAD_PRIORITY_NORMAL
         cleanup_stdcall(cpu, memory, 4)
 
-    stubs.register_handler("kernel32.dll", "CreateThread",        _create_thread)
-    stubs.register_handler("kernel32.dll", "ResumeThread",        _resume_thread)
-    stubs.register_handler("kernel32.dll", "ExitThread",          _exit_thread)
-    stubs.register_handler("kernel32.dll", "TerminateThread",     _terminate_thread)
-    stubs.register_handler("kernel32.dll", "GetExitCodeThread",   _get_exit_code_thread)
-    stubs.register_handler("kernel32.dll", "OpenThread",          _halt("OpenThread"))
-    stubs.register_handler("kernel32.dll", "CreateProcessA",      _halt("CreateProcessA"))
-    stubs.register_handler("kernel32.dll", "CreateProcessW",      _halt("CreateProcessW"))
-    stubs.register_handler("kernel32.dll", "OpenProcess",         _halt("OpenProcess"))
-    stubs.register_handler("kernel32.dll", "SuspendThread",       _suspend_thread)
-    stubs.register_handler("kernel32.dll", "SetThreadPriority",   _set_thread_priority)
-    stubs.register_handler("kernel32.dll", "GetThreadPriority",   _get_thread_priority)
+    stubs.register_handler("kernel32.dll", "CreateThread", _create_thread)
+    stubs.register_handler("kernel32.dll", "ResumeThread", _resume_thread)
+    stubs.register_handler("kernel32.dll", "ExitThread", _exit_thread)
+    stubs.register_handler("kernel32.dll", "TerminateThread", _terminate_thread)
+    stubs.register_handler("kernel32.dll", "GetExitCodeThread", _get_exit_code_thread)
+    stubs.register_handler("kernel32.dll", "OpenThread", _halt("OpenThread"))
+    stubs.register_handler("kernel32.dll", "CreateProcessA", _halt("CreateProcessA"))
+    stubs.register_handler("kernel32.dll", "CreateProcessW", _halt("CreateProcessW"))
+    stubs.register_handler("kernel32.dll", "OpenProcess", _halt("OpenProcess"))
+    stubs.register_handler("kernel32.dll", "SuspendThread", _suspend_thread)
+    stubs.register_handler("kernel32.dll", "SetThreadPriority", _set_thread_priority)
+    stubs.register_handler("kernel32.dll", "GetThreadPriority", _get_thread_priority)
 
     # ── SleepEx ───────────────────────────────────────────────────────────────
 
@@ -426,7 +476,9 @@ def register_kernel32_io_handlers(
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         logger.debug("scheduler", f"SleepEx(ms={dw_ms}) ret=0x{return_eip:x}")
-        cpu.regs[ESP] = (cpu.regs[ESP] + 12) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
+        cpu.regs[ESP] = (
+            cpu.regs[ESP] + 12
+        ) & 0xFFFFFFFF  # stdcall: pop ret addr + 8-byte args
         state.scheduler.tick(dw_ms, memory)
         _fire_due_timers(cpu, memory, state)
         state.scheduler.sleep_current(cpu, memory, return_eip, 0, dw_ms)
@@ -438,7 +490,7 @@ def register_kernel32_io_handlers(
     _WAIT_INFINITE = 0xFFFFFFFF
 
     def _wait_for_single(cpu: "CPU") -> None:
-        h          = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         timeout_ms = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         obj = state.kernel_handle_map.get(h)
         if obj is not None:
@@ -449,9 +501,8 @@ def register_kernel32_io_handlers(
                 cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 8)
                 return
-            ready = (
-                (isinstance(obj, MutexHandle) and obj.owner_tid is None) or
-                (isinstance(obj, EventHandle) and obj.signaled)
+            ready = (isinstance(obj, MutexHandle) and obj.owner_tid is None) or (
+                isinstance(obj, EventHandle) and obj.signaled
             )
             if ready:
                 if isinstance(obj, MutexHandle):
@@ -472,26 +523,28 @@ def register_kernel32_io_handlers(
                 return
             retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
             deadline_ms = (
-                None if timeout_ms == _WAIT_INFINITE
+                None
+                if timeout_ms == _WAIT_INFINITE
                 else (state.virtual_ticks_ms + timeout_ms) & 0xFFFFFFFF
             )
             state.scheduler.block_current_on_handles(
-                cpu, memory, frozenset([h]), retry_eip, deadline_ms)
+                cpu, memory, frozenset([h]), retry_eip, deadline_ms
+            )
             return
         # Unknown handle (thread handle etc.) — treat as signaled.
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
     def _wait_for_multiple_ex(cpu: "CPU") -> None:
-        base       = cpu.regs[ESP]
-        n_count    = memory.read32((base +  4) & 0xFFFFFFFF)
-        lp_handles = memory.read32((base +  8) & 0xFFFFFFFF)
+        base = cpu.regs[ESP]
+        n_count = memory.read32((base + 4) & 0xFFFFFFFF)
+        lp_handles = memory.read32((base + 8) & 0xFFFFFFFF)
         b_wait_all = memory.read32((base + 12) & 0xFFFFFFFF) != 0
         timeout_ms = memory.read32((base + 16) & 0xFFFFFFFF)
-        tid        = state.tls_current_thread_id()
-        all_ready  = True
+        tid = state.tls_current_thread_id()
+        all_ready = True
         for i in range(n_count):
-            h   = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
+            h = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
             obj = state.kernel_handle_map.get(h)
             if obj is None:
                 # Unknown handle (e.g. thread handle) — treat as always-ready.
@@ -501,7 +554,8 @@ def register_kernel32_io_handlers(
                     return
                 continue
             ready = (isinstance(obj, MutexHandle) and obj.owner_tid is None) or (
-                isinstance(obj, EventHandle) and obj.signaled)
+                isinstance(obj, EventHandle) and obj.signaled
+            )
             if ready:
                 if not b_wait_all:
                     if isinstance(obj, EventHandle) and not obj.manual_reset:
@@ -510,8 +564,9 @@ def register_kernel32_io_handlers(
                         obj.owner_tid = tid
                         obj.recursion_count = 1
                         obj.locked = True
-                    logger.debug("scheduler",
-                        f"WaitForMultipleEx: satisfied h=0x{h:x} idx={i}")
+                    logger.debug(
+                        "scheduler", f"WaitForMultipleEx: satisfied h=0x{h:x} idx={i}"
+                    )
                     cpu.regs[EAX] = i & 0xFFFFFFFF
                     cleanup_stdcall(cpu, memory, 20)
                     return
@@ -521,7 +576,7 @@ def register_kernel32_io_handlers(
                     break
         if b_wait_all and all_ready:
             for i in range(n_count):
-                h   = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
+                h = memory.read32((lp_handles + i * 4) & 0xFFFFFFFF)
                 obj = state.kernel_handle_map.get(h)
                 if obj is not None:
                     if isinstance(obj, EventHandle) and not obj.manual_reset:
@@ -545,28 +600,38 @@ def register_kernel32_io_handlers(
         for i in range(n_count):
             handles_set.add(memory.read32((lp_handles + i * 4) & 0xFFFFFFFF))
         deadline_ms = (
-            None if timeout_ms == _WAIT_INFINITE
+            None
+            if timeout_ms == _WAIT_INFINITE
             else (state.virtual_ticks_ms + timeout_ms) & 0xFFFFFFFF
         )
         state.scheduler.block_current_on_handles(
-            cpu, memory, frozenset(handles_set), retry_eip, deadline_ms)
+            cpu, memory, frozenset(handles_set), retry_eip, deadline_ms
+        )
 
-    stubs.register_handler("kernel32.dll", "WaitForSingleObject",     _wait_for_single)
-    stubs.register_handler("kernel32.dll", "WaitForMultipleObjects",  _halt("WaitForMultipleObjects"))
-    stubs.register_handler("kernel32.dll", "WaitForMultipleObjectsEx", _wait_for_multiple_ex)
+    stubs.register_handler("kernel32.dll", "WaitForSingleObject", _wait_for_single)
+    stubs.register_handler(
+        "kernel32.dll", "WaitForMultipleObjects", _halt("WaitForMultipleObjects")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "WaitForMultipleObjectsEx", _wait_for_multiple_ex
+    )
 
     # ── Mutex / Event ─────────────────────────────────────────────────────────
 
     def _create_mutex_a(cpu: "CPU") -> None:
-        b_owner  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        b_owner = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         name_ptr = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory) if name_ptr else ""
         if name:
             for h_existing, obj in state.kernel_handle_map.items():
                 if isinstance(obj, MutexHandle) and obj.name == name:
-                    memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_ALREADY_EXISTS))
-                    logger.debug("handlers",
-                        f'[Win32] CreateMutexA("{name}") -> 0x{h_existing:x} (already exists)')
+                    memory.write32(
+                        TEB_BASE + 0x34, int(Win32Error.ERROR_ALREADY_EXISTS)
+                    )
+                    logger.debug(
+                        "handlers",
+                        f'[Win32] CreateMutexA("{name}") -> 0x{h_existing:x} (already exists)',
+                    )
                     cpu.regs[EAX] = h_existing
                     cleanup_stdcall(cpu, memory, 12)
                     return
@@ -579,7 +644,9 @@ def register_kernel32_io_handlers(
             owner_tid=owner_tid,
             recursion_count=1 if b_owner != 0 else 0,
         )
-        logger.debug("handlers", f'[Win32] CreateMutexA("{name or "(unnamed)"}") -> 0x{h:x}')
+        logger.debug(
+            "handlers", f'[Win32] CreateMutexA("{name or "(unnamed)"}") -> 0x{h:x}'
+        )
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 12)
 
@@ -589,14 +656,17 @@ def register_kernel32_io_handlers(
         if name:
             for h_existing, obj in state.kernel_handle_map.items():
                 if isinstance(obj, MutexHandle) and obj.name == name:
-                    logger.debug("handlers",
-                        f'[Win32] OpenMutexA("{name}") -> 0x{h_existing:x}')
+                    logger.debug(
+                        "handlers", f'[Win32] OpenMutexA("{name}") -> 0x{h_existing:x}'
+                    )
                     cpu.regs[EAX] = h_existing
                     cleanup_stdcall(cpu, memory, 12)
                     return
         memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
-        logger.warn("handlers",
-            f'[Win32] OpenMutexA("{name or "(unnamed)"}") -> NULL (not found)')
+        logger.warn(
+            "handlers",
+            f'[Win32] OpenMutexA("{name or "(unnamed)"}") -> NULL (not found)',
+        )
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 12)
 
@@ -614,9 +684,9 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     def _create_event_a(cpu: "CPU") -> None:
-        b_manual   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        b_initial  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        name_ptr   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        b_manual = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        b_initial = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name_ptr = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory) if name_ptr else "(unnamed)"
         h = state.next_kernel_handle
         state.next_kernel_handle += 1
@@ -624,16 +694,18 @@ def register_kernel32_io_handlers(
             signaled=b_initial != 0,
             manual_reset=b_manual != 0,
         )
-        logger.debug("handlers",
+        logger.debug(
+            "handlers",
             f'[Win32] CreateEventA("{name}", manual={bool(b_manual)}, '
-            f'signaled={bool(b_initial)}) -> 0x{h:x}')
+            f"signaled={bool(b_initial)}) -> 0x{h:x}",
+        )
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 16)
 
     def _create_event_w(cpu: "CPU") -> None:
-        b_manual   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        b_initial  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        name_ptr   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        b_manual = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        b_initial = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name_ptr = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         name = read_wide_string(name_ptr, memory) if name_ptr else "(unnamed)"
         h = state.next_kernel_handle
         state.next_kernel_handle += 1
@@ -641,9 +713,11 @@ def register_kernel32_io_handlers(
             signaled=b_initial != 0,
             manual_reset=b_manual != 0,
         )
-        logger.debug("handlers",
+        logger.debug(
+            "handlers",
             f'[Win32] CreateEventW("{name}", manual={bool(b_manual)}, '
-            f'signaled={bool(b_initial)}) -> 0x{h:x}')
+            f"signaled={bool(b_initial)}) -> 0x{h:x}",
+        )
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 16)
 
@@ -653,7 +727,9 @@ def register_kernel32_io_handlers(
         if isinstance(obj, EventHandle):
             obj.signaled = True
             n = state.scheduler.unblock_handle(h)
-            logger.debug("scheduler", f"SetEvent(0x{h:x}) signaled={obj.signaled} unblocked={n}")
+            logger.debug(
+                "scheduler", f"SetEvent(0x{h:x}) signaled={obj.signaled} unblocked={n}"
+            )
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -665,69 +741,104 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
-    stubs.register_handler("kernel32.dll", "CreateMutexA",        _create_mutex_a)
-    stubs.register_handler("kernel32.dll", "CreateMutexW",        _halt("CreateMutexW"))
-    stubs.register_handler("kernel32.dll", "OpenMutexA",          _open_mutex_a)
-    stubs.register_handler("kernel32.dll", "OpenMutexW",          _halt("OpenMutexW"))
-    stubs.register_handler("kernel32.dll", "ReleaseMutex",        _release_mutex)
-    stubs.register_handler("kernel32.dll", "CreateEventA",        _create_event_a)
-    stubs.register_handler("kernel32.dll", "CreateEventW",        _create_event_w)
-    stubs.register_handler("kernel32.dll", "OpenEventA",          _halt("OpenEventA"))
-    stubs.register_handler("kernel32.dll", "OpenEventW",          _halt("OpenEventW"))
-    stubs.register_handler("kernel32.dll", "SetEvent",            _set_event)
-    stubs.register_handler("kernel32.dll", "ResetEvent",          _reset_event)
-    stubs.register_handler("kernel32.dll", "CreateFileMappingA",  _halt("CreateFileMappingA"))
-    stubs.register_handler("kernel32.dll", "CreateFileMappingW",  _halt("CreateFileMappingW"))
-    stubs.register_handler("kernel32.dll", "OpenFileMappingA",    _halt("OpenFileMappingA"))
-    stubs.register_handler("kernel32.dll", "OpenFileMappingW",    _halt("OpenFileMappingW"))
-    stubs.register_handler("kernel32.dll", "CreateNamedPipeA",    _halt("CreateNamedPipeA"))
-    stubs.register_handler("kernel32.dll", "ConnectNamedPipe",    _halt("ConnectNamedPipe"))
-    stubs.register_handler("kernel32.dll", "WaitNamedPipeA",      _halt("WaitNamedPipeA"))
+    stubs.register_handler("kernel32.dll", "CreateMutexA", _create_mutex_a)
+    stubs.register_handler("kernel32.dll", "CreateMutexW", _halt("CreateMutexW"))
+    stubs.register_handler("kernel32.dll", "OpenMutexA", _open_mutex_a)
+    stubs.register_handler("kernel32.dll", "OpenMutexW", _halt("OpenMutexW"))
+    stubs.register_handler("kernel32.dll", "ReleaseMutex", _release_mutex)
+    stubs.register_handler("kernel32.dll", "CreateEventA", _create_event_a)
+    stubs.register_handler("kernel32.dll", "CreateEventW", _create_event_w)
+    stubs.register_handler("kernel32.dll", "OpenEventA", _halt("OpenEventA"))
+    stubs.register_handler("kernel32.dll", "OpenEventW", _halt("OpenEventW"))
+    stubs.register_handler("kernel32.dll", "SetEvent", _set_event)
+    stubs.register_handler("kernel32.dll", "ResetEvent", _reset_event)
+    stubs.register_handler(
+        "kernel32.dll", "CreateFileMappingA", _halt("CreateFileMappingA")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "CreateFileMappingW", _halt("CreateFileMappingW")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "OpenFileMappingA", _halt("OpenFileMappingA")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "OpenFileMappingW", _halt("OpenFileMappingW")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "CreateNamedPipeA", _halt("CreateNamedPipeA")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "ConnectNamedPipe", _halt("ConnectNamedPipe")
+    )
+    stubs.register_handler("kernel32.dll", "WaitNamedPipeA", _halt("WaitNamedPipeA"))
 
     # ── CreateFile / ReadFile ─────────────────────────────────────────────────
 
-    GENERIC_READ  = 0x80000000
+    GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
 
-    _CF_CREATE_NEW        = 1
-    _CF_CREATE_ALWAYS     = 2
-    _CF_OPEN_EXISTING     = 3
-    _CF_OPEN_ALWAYS       = 4
+    _CF_CREATE_NEW = 1
+    _CF_CREATE_ALWAYS = 2
+    _CF_OPEN_EXISTING = 3
+    _CF_OPEN_ALWAYS = 4
     _CF_TRUNCATE_EXISTING = 5
 
     def _create_file_a(cpu: "CPU") -> None:
-        name_ptr    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        access      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        access = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory)
         if not name:
-            logger.debug("fileio", f'CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})')
-        writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+            logger.debug(
+                "fileio",
+                f"CreateFileA: name_ptr=0x{name_ptr:08x} (ESP=0x{cpu.regs[ESP]:08x})",
+            )
+        writable = bool(access & GENERIC_WRITE) or disposition in (
+            _CF_CREATE_NEW,
+            _CF_CREATE_ALWAYS,
+            _CF_OPEN_ALWAYS,
+            _CF_TRUNCATE_EXISTING,
+        )
         also_readable = bool(access & GENERIC_READ)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
         cpu.regs[EAX] = state.open_file_handle(
-            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition,
-            also_readable=also_readable)
+            name,
+            writable,
+            memory,
+            no_create_prompt=no_prompt,
+            disposition=disposition,
+            also_readable=also_readable,
+        )
         cleanup_stdcall(cpu, memory, 28)
 
     def _create_file_w(cpu: "CPU") -> None:
-        name_ptr    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        access      = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        access = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         disposition = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         name = read_wide_string(name_ptr, memory)
-        writable = bool(access & GENERIC_WRITE) or disposition in (_CF_CREATE_NEW, _CF_CREATE_ALWAYS, _CF_OPEN_ALWAYS, _CF_TRUNCATE_EXISTING)
+        writable = bool(access & GENERIC_WRITE) or disposition in (
+            _CF_CREATE_NEW,
+            _CF_CREATE_ALWAYS,
+            _CF_OPEN_ALWAYS,
+            _CF_TRUNCATE_EXISTING,
+        )
         also_readable = bool(access & GENERIC_READ)
         no_prompt = disposition in (_CF_OPEN_EXISTING, _CF_TRUNCATE_EXISTING)
         cpu.regs[EAX] = state.open_file_handle(
-            name, writable, memory, no_create_prompt=no_prompt, disposition=disposition,
-            also_readable=also_readable)
+            name,
+            writable,
+            memory,
+            no_create_prompt=no_prompt,
+            disposition=disposition,
+            also_readable=also_readable,
+        )
         cleanup_stdcall(cpu, memory, 28)
 
     def _read_file(cpu: "CPU") -> None:
-        h_file       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_buf       = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        n_to_read    = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_read      = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        n_to_read = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_read = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp_overlapped = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         # OVERLAPPED.Offset/.OffsetHigh sit at +8/+0xC (after Internal/
         # InternalHigh) -- a real positioned read: use this position instead
@@ -737,14 +848,16 @@ def register_kernel32_io_handlers(
         # handle not opened with FILE_FLAG_OVERLAPPED).
         overlapped_pos = None
         if lp_overlapped:
-            off_low  = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
+            off_low = memory.read32((lp_overlapped + 8) & 0xFFFFFFFF)
             off_high = memory.read32((lp_overlapped + 0xC) & 0xFFFFFFFF)
             overlapped_pos = off_low | (off_high << 32)
         entry = state.file_handle_map.get(h_file)
         if not entry or (entry.writable and not entry.readable):
-            logger.warn("fileio",
-                f'[Win32] ReadFile(handle=0x{h_file:x}) -> FALSE'
-                + (' (write-only handle)' if entry else ' (unknown handle)'))
+            logger.warn(
+                "fileio",
+                f"[Win32] ReadFile(handle=0x{h_file:x}) -> FALSE"
+                + (" (write-only handle)" if entry else " (unknown handle)"),
+            )
             if lp_read:
                 memory.write32(lp_read, 0)
             cpu.regs[EAX] = 0
@@ -764,35 +877,39 @@ def register_kernel32_io_handlers(
                 memory.write32(lp_read, len(data))
             cpu.regs[EAX] = 1
             name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            logger.debug("fileio",
-                f'ReadFile({name_short} h=0x{h_file:x}) '
-                f'offset={pos} req={n_to_read} got={len(data)} '
-                f'pos_after={entry.position} buf=0x{lp_buf:x} [read+write handle]'
-                + (' [overlapped]' if overlapped_pos is not None else ''))
+            logger.debug(
+                "fileio",
+                f"ReadFile({name_short} h=0x{h_file:x}) "
+                f"offset={pos} req={n_to_read} got={len(data)} "
+                f"pos_after={entry.position} buf=0x{lp_buf:x} [read+write handle]"
+                + (" [overlapped]" if overlapped_pos is not None else ""),
+            )
         else:
             pos = overlapped_pos if overlapped_pos is not None else entry.position
             available = len(entry.data) - pos
             to_read = min(n_to_read, max(available, 0))
             if to_read > 0:
-                memory.load(lp_buf & 0xFFFFFFFF, entry.data[pos:pos + to_read])
+                memory.load(lp_buf & 0xFFFFFFFF, entry.data[pos : pos + to_read])
             if overlapped_pos is None:
                 entry.position += to_read
             if lp_read:
                 memory.write32(lp_read, to_read)
             cpu.regs[EAX] = 1
             name_short = entry.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            logger.debug("fileio",
-                f'ReadFile({name_short} h=0x{h_file:x}) '
-                f'offset={pos} req={n_to_read} got={to_read} '
-                f'pos_after={entry.position} buf=0x{lp_buf:x} eof={len(entry.data)}'
-                + (' [overlapped]' if overlapped_pos is not None else ''))
+            logger.debug(
+                "fileio",
+                f"ReadFile({name_short} h=0x{h_file:x}) "
+                f"offset={pos} req={n_to_read} got={to_read} "
+                f"pos_after={entry.position} buf=0x{lp_buf:x} eof={len(entry.data)}"
+                + (" [overlapped]" if overlapped_pos is not None else ""),
+            )
         cleanup_stdcall(cpu, memory, 20)
 
     def _lock_file(cpu: "CPU") -> None:
-        h_file   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        off_low  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        off_low = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         off_high = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        len_low  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        len_low = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         len_high = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
         if entry is None:
@@ -801,27 +918,32 @@ def register_kernel32_io_handlers(
             cleanup_stdcall(cpu, memory, 20)
             return
         start = off_low | (off_high << 32)
-        end   = start + (len_low | (len_high << 32))
+        end = start + (len_low | (len_high << 32))
         locks = state.file_locks.setdefault(entry.path, [])
-        for (l_start, l_end, l_handle) in locks:
+        for l_start, l_end, l_handle in locks:
             if l_handle != h_file and start < l_end and l_start < end:
-                logger.warn("fileio",
-                    f'[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE '
-                    f'(conflicts with [{l_start},{l_end}) held by 0x{l_handle:x})')
+                logger.warn(
+                    "fileio",
+                    f"[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE "
+                    f"(conflicts with [{l_start},{l_end}) held by 0x{l_handle:x})",
+                )
                 memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_LOCK_VIOLATION))
                 cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 20)
                 return
         locks.append((start, end, h_file))
-        logger.debug("fileio", f'[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE')
+        logger.debug(
+            "fileio",
+            f"[Win32] LockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE",
+        )
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 20)
 
     def _unlock_file(cpu: "CPU") -> None:
-        h_file   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        off_low  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        off_low = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         off_high = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        len_low  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        len_low = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         len_high = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
         if entry is None:
@@ -830,21 +952,27 @@ def register_kernel32_io_handlers(
             cleanup_stdcall(cpu, memory, 20)
             return
         start = off_low | (off_high << 32)
-        end   = start + (len_low | (len_high << 32))
+        end = start + (len_low | (len_high << 32))
         locks = state.file_locks.get(entry.path, [])
         for i, (l_start, l_end, l_handle) in enumerate(locks):
             if l_handle == h_file and l_start == start and l_end == end:
                 locks.pop(i)
-                logger.debug("fileio", f'[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE')
+                logger.debug(
+                    "fileio",
+                    f"[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> TRUE",
+                )
                 cpu.regs[EAX] = 1
                 cleanup_stdcall(cpu, memory, 20)
                 return
-        logger.warn("fileio", f'[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE (not locked)')
+        logger.warn(
+            "fileio",
+            f"[Win32] UnlockFile(handle=0x{h_file:x}, range=[{start},{end})) -> FALSE (not locked)",
+        )
         memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_NOT_LOCKED))
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 20)
 
-    stubs.register_handler("kernel32.dll", "LockFile",   _lock_file)
+    stubs.register_handler("kernel32.dll", "LockFile", _lock_file)
     stubs.register_handler("kernel32.dll", "UnlockFile", _unlock_file)
 
     def _delete_file_a(cpu: "CPU") -> None:
@@ -889,41 +1017,41 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "CreateFileA", _create_file_a)
     stubs.register_handler("kernel32.dll", "CreateFileW", _create_file_w)
-    stubs.register_handler("kernel32.dll", "ReadFile",    _read_file)
+    stubs.register_handler("kernel32.dll", "ReadFile", _read_file)
     stubs.register_handler("kernel32.dll", "DeleteFileA", _delete_file_a)
     stubs.register_handler("kernel32.dll", "DeleteFileW", _delete_file_w)
 
     # ── Find file / attributes ────────────────────────────────────────────────
 
     # WIN32_FIND_DATAA field offsets
-    _FIND_OFF_ATTRS    = 0    # DWORD dwFileAttributes
-    _FIND_OFF_FNAME    = 44   # CHAR  cFileName[260]
-    _FIND_OFF_ALTNAME  = 304  # CHAR  cAlternateFileName[14]
+    _FIND_OFF_ATTRS = 0  # DWORD dwFileAttributes
+    _FIND_OFF_FNAME = 44  # CHAR  cFileName[260]
+    _FIND_OFF_ALTNAME = 304  # CHAR  cAlternateFileName[14]
     FILE_ATTRIBUTE_DIRECTORY = 0x10
-    FILE_ATTRIBUTE_ARCHIVE   = 0x20
+    FILE_ATTRIBUTE_ARCHIVE = 0x20
 
     def _write_find_data(addr: int, name: str, attrs: int) -> None:
         memory.write32(addr + _FIND_OFF_ATTRS, attrs)
-        for i in range(4, 44):          # timestamps + sizes: zero
+        for i in range(4, 44):  # timestamps + sizes: zero
             memory.write8(addr + i, 0)
         name_b = name.encode("ascii", errors="replace")[:259]
         for i, b in enumerate(name_b):
             memory.write8(addr + _FIND_OFF_FNAME + i, b)
         memory.write8(addr + _FIND_OFF_FNAME + len(name_b), 0)
-        for i in range(14):             # cAlternateFileName: empty
+        for i in range(14):  # cAlternateFileName: empty
             memory.write8(addr + _FIND_OFF_ALTNAME + i, 0)
 
     def _find_first_file_a(cpu: "CPU") -> None:
         INVALID = 0xFFFFFFFF
-        lp_name     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_name = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_find_data = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         pattern_win = read_cstring(lp_name, memory, 260)
-        linux_pat   = state.translate_windows_path(pattern_win)
-        dir_path    = os.path.dirname(linux_pat)
-        pat         = os.path.basename(linux_pat)
-        if pat in ("*.*", ""):          # Windows *.*  matches everything
+        linux_pat = state.translate_windows_path(pattern_win)
+        dir_path = os.path.dirname(linux_pat)
+        pat = os.path.basename(linux_pat)
+        if pat in ("*.*", ""):  # Windows *.*  matches everything
             pat = "*"
-        logger.debug("handlers", f'FindFirstFileA({pattern_win!r})')
+        logger.debug("handlers", f"FindFirstFileA({pattern_win!r})")
         real_dir = find_file_ci(dir_path) if dir_path else None
         if not real_dir or not os.path.isdir(real_dir):
             cpu.regs[EAX] = INVALID
@@ -934,7 +1062,11 @@ def register_kernel32_io_handlers(
             for name in sorted(os.listdir(real_dir), key=str.lower):
                 if fnmatch.fnmatch(name.lower(), pat.lower()):
                     full = os.path.join(real_dir, name)
-                    attrs = FILE_ATTRIBUTE_DIRECTORY if os.path.isdir(full) else FILE_ATTRIBUTE_ARCHIVE
+                    attrs = (
+                        FILE_ATTRIBUTE_DIRECTORY
+                        if os.path.isdir(full)
+                        else FILE_ATTRIBUTE_ARCHIVE
+                    )
                     entries.append((name, attrs))
         except OSError:
             cpu.regs[EAX] = INVALID
@@ -949,12 +1081,15 @@ def register_kernel32_io_handlers(
         state.find_handle_map[handle] = entries
         state.find_handle_idx[handle] = 0
         _write_find_data(lp_find_data, entries[0][0], entries[0][1])
-        logger.debug("handlers", f'  -> handle=0x{handle:x} first={entries[0][0]!r} ({len(entries)} total)')
+        logger.debug(
+            "handlers",
+            f"  -> handle=0x{handle:x} first={entries[0][0]!r} ({len(entries)} total)",
+        )
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 8)
 
     def _find_next_file_a(cpu: "CPU") -> None:
-        h            = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_find_data = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entries = state.find_handle_map.get(h)
         if entries is None:
@@ -964,12 +1099,12 @@ def register_kernel32_io_handlers(
         idx = state.find_handle_idx[h] + 1
         state.find_handle_idx[h] = idx
         if idx >= len(entries):
-            logger.debug("handlers", f'FindNextFileA(0x{h:x}) -> no more files')
+            logger.debug("handlers", f"FindNextFileA(0x{h:x}) -> no more files")
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 8)
             return
         _write_find_data(lp_find_data, entries[idx][0], entries[idx][1])
-        logger.debug("handlers", f'FindNextFileA(0x{h:x}) -> {entries[idx][0]!r}')
+        logger.debug("handlers", f"FindNextFileA(0x{h:x}) -> {entries[idx][0]!r}")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
@@ -977,7 +1112,7 @@ def register_kernel32_io_handlers(
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         state.find_handle_map.pop(h, None)
         state.find_handle_idx.pop(h, None)
-        logger.debug("handlers", f'FindClose(0x{h:x})')
+        logger.debug("handlers", f"FindClose(0x{h:x})")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -990,13 +1125,16 @@ def register_kernel32_io_handlers(
             try:
                 s = os.stat(real_path)
                 FILE_ATTRIBUTE_DIRECTORY = 0x10
-                FILE_ATTRIBUTE_NORMAL    = 0x80
-                cpu.regs[EAX] = (FILE_ATTRIBUTE_DIRECTORY
-                                  if stat.S_ISDIR(s.st_mode)
-                                  else FILE_ATTRIBUTE_NORMAL)
+                FILE_ATTRIBUTE_NORMAL = 0x80
+                cpu.regs[EAX] = (
+                    FILE_ATTRIBUTE_DIRECTORY
+                    if stat.S_ISDIR(s.st_mode)
+                    else FILE_ATTRIBUTE_NORMAL
+                )
             except OSError as e:
-                logger.warn("fileio",
-                    f'GetFileAttributesA: stat failed for "{real_path}": {e}')
+                logger.warn(
+                    "fileio", f'GetFileAttributesA: stat failed for "{real_path}": {e}'
+                )
                 cpu.regs[EAX] = 0xFFFFFFFF
         else:
             cpu.regs[EAX] = 0xFFFFFFFF
@@ -1004,22 +1142,22 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "FindFirstFileA", _find_first_file_a)
     stubs.register_handler("kernel32.dll", "FindFirstFileW", _halt("FindFirstFileW"))
-    stubs.register_handler("kernel32.dll", "FindNextFileA",  _find_next_file_a)
-    stubs.register_handler("kernel32.dll", "FindNextFileW",  _halt("FindNextFileW"))
-    stubs.register_handler("kernel32.dll", "FindClose",      _find_close)
+    stubs.register_handler("kernel32.dll", "FindNextFileA", _find_next_file_a)
+    stubs.register_handler("kernel32.dll", "FindNextFileW", _halt("FindNextFileW"))
+    stubs.register_handler("kernel32.dll", "FindClose", _find_close)
     stubs.register_handler("kernel32.dll", "CompareFileTime", _halt("CompareFileTime"))
     stubs.register_handler("kernel32.dll", "GetFileAttributesA", _get_file_attributes_a)
 
     def _get_full_path_name_a(cpu: "CPU") -> None:
-        lp_file = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        n_buf   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        lp_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lp_part = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
 
         raw = read_cstring(lp_file, memory, 260) if lp_file else ""
 
         CWD = state.current_directory
-        if raw and len(raw) >= 2 and raw[1] == ':':
+        if raw and len(raw) >= 2 and raw[1] == ":":
             full_win = raw
         elif raw.startswith("\\\\"):
             full_win = raw
@@ -1049,7 +1187,7 @@ def register_kernel32_io_handlers(
                 else:
                     memory.write32(lp_part, 0)
             cpu.regs[EAX] = len(result)
-            logger.trace("handlers", f'GetFullPathNameA({raw!r}) -> {result!r}')
+            logger.trace("handlers", f"GetFullPathNameA({raw!r}) -> {result!r}")
         else:
             cpu.regs[EAX] = needed
         cleanup_stdcall(cpu, memory, 16)
@@ -1057,9 +1195,9 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetFullPathNameA", _get_full_path_name_a)
 
     def _get_short_path_name_a(cpu: "CPU") -> None:
-        lp_long  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_short = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        cch_buf  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_long = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_short = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        cch_buf = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
 
         long_path = read_cstring(lp_long, memory) if lp_long else ""
         linux_path = state.translate_windows_path(long_path)
@@ -1083,21 +1221,191 @@ def register_kernel32_io_handlers(
                 memory.write8((lp_short + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
             memory.write8((lp_short + len(result)) & 0xFFFFFFFF, 0)
             cpu.regs[EAX] = len(result)
-            logger.trace("handlers", f'GetShortPathNameA({long_path!r}) -> {result!r}')
+            logger.trace("handlers", f"GetShortPathNameA({long_path!r}) -> {result!r}")
         else:
             cpu.regs[EAX] = needed
         cleanup_stdcall(cpu, memory, 12)
 
     stubs.register_handler("kernel32.dll", "GetShortPathNameA", _get_short_path_name_a)
 
+    def _search_path_find(
+        path_override: Optional[str],
+        filename: str,
+        extension: Optional[str],
+    ) -> Optional[str]:
+        if not filename:
+            return None
+
+        # If extension provided and filename has no extension in base name, append it
+        base = filename.replace("/", "\\").split("\\")[-1]
+        effective_filename = filename
+        if extension and "." not in base:
+            ext = extension if extension.startswith(".") else "." + extension
+            effective_filename = filename + ext
+
+        # If effective_filename contains directory separators or drive letter, search only that path
+        if (
+            "\\" in effective_filename
+            or "/" in effective_filename
+            or (
+                len(effective_filename) >= 2
+                and effective_filename[1] == ":"
+                and effective_filename[0].isalpha()
+            )
+        ):
+            linux_path = state.translate_windows_path(effective_filename)
+            resolved = find_file_ci(linux_path)
+            if resolved and os.path.isfile(resolved):
+                return state.reverse_translate_path(resolved)
+            return None
+
+        # Otherwise, search list of directories
+        search_dirs: list[str] = []
+        if path_override is not None and path_override != "":
+            for d in path_override.split(";"):
+                d = d.strip()
+                if d:
+                    search_dirs.append(d)
+        else:
+            # Standard search sequence:
+            # 1. Directory of the executable
+            if state.exe_path:
+                exe_dir = os.path.dirname(state.exe_path)
+                win_exe_dir = state.reverse_translate_path(exe_dir)
+                if win_exe_dir:
+                    search_dirs.append(win_exe_dir)
+            # 2. Current working directory
+            search_dirs.append(state.current_directory)
+            # 3. System32 directory
+            search_dirs.append("C:\\WINDOWS\\SYSTEM32")
+            # 4. Windows directory
+            search_dirs.append("C:\\WINDOWS")
+            # 5. PATH environment variable
+            path_env = _env_vars.get("PATH", "")
+            if path_env:
+                for d in path_env.split(";"):
+                    d = d.strip()
+                    if d:
+                        search_dirs.append(d)
+
+        for d in search_dirs:
+            cand_win = f"{d.rstrip('\\')}\\{effective_filename}"
+            cand_linux = state.translate_windows_path(cand_win)
+            resolved = find_file_ci(cand_linux)
+            if resolved and os.path.isfile(resolved):
+                return state.reverse_translate_path(resolved)
+
+        return None
+
+    def _search_path_a(cpu: "CPU") -> None:
+        lp_path = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_file = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp_ext = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        n_buf = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        lp_part = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+
+        if not lp_file:
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        path_override = read_cstring(lp_path, memory) if lp_path else None
+        filename = read_cstring(lp_file, memory)
+        ext = read_cstring(lp_ext, memory) if lp_ext else None
+
+        found_path = _search_path_find(path_override, filename, ext)
+        if found_path is None:
+            logger.debug(
+                "fileio", f'SearchPathA(file="{filename}", ext={ext!r}) — not found'
+            )
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        needed = len(found_path) + 1
+        if lp_buf and n_buf >= needed:
+            for i, ch in enumerate(found_path):
+                memory.write8((lp_buf + i) & 0xFFFFFFFF, ord(ch) & 0xFF)
+            memory.write8((lp_buf + len(found_path)) & 0xFFFFFFFF, 0)
+            if lp_part:
+                last_sep = found_path.rfind("\\")
+                if 0 <= last_sep < len(found_path) - 1:
+                    memory.write32(lp_part, (lp_buf + last_sep + 1) & 0xFFFFFFFF)
+                else:
+                    memory.write32(lp_part, 0)
+            cpu.regs[EAX] = len(found_path)
+            logger.debug(
+                "fileio",
+                f'SearchPathA(file="{filename}", ext={ext!r}) -> "{found_path}"',
+            )
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 24)
+
+    def _search_path_w(cpu: "CPU") -> None:
+        lp_path = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_file = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp_ext = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        n_buf = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_buf = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        lp_part = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+
+        if not lp_file:
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        path_override = read_wide_string(lp_path, memory) if lp_path else None
+        filename = read_wide_string(lp_file, memory)
+        ext = read_wide_string(lp_ext, memory) if lp_ext else None
+
+        found_path = _search_path_find(path_override, filename, ext)
+        if found_path is None:
+            logger.debug(
+                "fileio", f'SearchPathW(file="{filename}", ext={ext!r}) — not found'
+            )
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_FILE_NOT_FOUND))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        needed = len(found_path) + 1
+        if lp_buf and n_buf >= needed:
+            for i, ch in enumerate(found_path):
+                memory.write16((lp_buf + i * 2) & 0xFFFFFFFF, ord(ch) & 0xFFFF)
+            memory.write16((lp_buf + len(found_path) * 2) & 0xFFFFFFFF, 0)
+            if lp_part:
+                last_sep = found_path.rfind("\\")
+                if 0 <= last_sep < len(found_path) - 1:
+                    memory.write32(lp_part, (lp_buf + (last_sep + 1) * 2) & 0xFFFFFFFF)
+                else:
+                    memory.write32(lp_part, 0)
+            cpu.regs[EAX] = len(found_path)
+            logger.debug(
+                "fileio",
+                f'SearchPathW(file="{filename}", ext={ext!r}) -> "{found_path}"',
+            )
+        else:
+            cpu.regs[EAX] = needed
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("kernel32.dll", "SearchPathA", _search_path_a)
+    stubs.register_handler("kernel32.dll", "SearchPathW", _search_path_w)
+
     # ── SetFilePointer / GetFileSize ──────────────────────────────────────────
 
     def _set_file_pointer(cpu: "CPU") -> None:
-        h_file   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        dist_raw = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        dist_raw = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         distance = dist_raw if dist_raw < 0x80000000 else dist_raw - 0x100000000
-        method   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        FILE_BEGIN = 0; FILE_CURRENT = 1; FILE_END = 2
+        method = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        FILE_BEGIN = 0
+        FILE_CURRENT = 1
+        FILE_END = 2
         entry = state.file_handle_map.get(h_file)
         if entry and not entry.writable:
             if method == FILE_BEGIN:
@@ -1127,8 +1435,8 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 16)
 
     def _get_file_size(cpu: "CPU") -> None:
-        h_file    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        lp_high   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_high = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
         size = None
         if entry is not None:
@@ -1163,8 +1471,8 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _get_file_size_ex(cpu: "CPU") -> None:
-        h_file    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        lp_size   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
         if entry and lp_size:
             if not entry.writable:
@@ -1175,7 +1483,7 @@ def register_kernel32_io_handlers(
                 cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 8)
                 return
-            memory.write32(lp_size,     size & 0xFFFFFFFF)
+            memory.write32(lp_size, size & 0xFFFFFFFF)
             memory.write32(lp_size + 4, 0)
             cpu.regs[EAX] = 1
         else:
@@ -1189,11 +1497,11 @@ def register_kernel32_io_handlers(
         return int(unix_seconds * 10_000_000) + _FILETIME_EPOCH_DIFF
 
     def _write_filetime(addr: int, ft: int) -> None:
-        memory.write32(addr,     ft & 0xFFFFFFFF)
+        memory.write32(addr, ft & 0xFFFFFFFF)
         memory.write32(addr + 4, (ft >> 32) & 0xFFFFFFFF)
 
     def _get_file_information_by_handle(cpu: "CPU") -> None:
-        h_file  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h_file = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_info = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(h_file)
         if not entry or not lp_info:
@@ -1207,18 +1515,30 @@ def register_kernel32_io_handlers(
             cleanup_stdcall(cpu, memory, 8)
             return
 
-        attrs = FILE_ATTRIBUTE_DIRECTORY if stat.S_ISDIR(st.st_mode) else FILE_ATTRIBUTE_ARCHIVE
-        memory.write32(lp_info + 0x00, attrs)                          # dwFileAttributes
-        _write_filetime(lp_info + 0x04, _unix_to_filetime(st.st_ctime))  # ftCreationTime
-        _write_filetime(lp_info + 0x0C, _unix_to_filetime(st.st_atime))  # ftLastAccessTime
-        _write_filetime(lp_info + 0x14, _unix_to_filetime(st.st_mtime))  # ftLastWriteTime
-        memory.write32(lp_info + 0x1C, 0x12345678)                     # dwVolumeSerialNumber
-        memory.write32(lp_info + 0x20, 0)                              # nFileSizeHigh
-        memory.write32(lp_info + 0x24, st.st_size & 0xFFFFFFFF)        # nFileSizeLow
-        memory.write32(lp_info + 0x28, 1)                              # nNumberOfLinks
-        memory.write32(lp_info + 0x2C, 0)                              # nFileIndexHigh
-        memory.write32(lp_info + 0x30, st.st_ino & 0xFFFFFFFF)         # nFileIndexLow
-        logger.debug("fileio", f'GetFileInformationByHandle(0x{h_file:x}) -> size={st.st_size}')
+        attrs = (
+            FILE_ATTRIBUTE_DIRECTORY
+            if stat.S_ISDIR(st.st_mode)
+            else FILE_ATTRIBUTE_ARCHIVE
+        )
+        memory.write32(lp_info + 0x00, attrs)  # dwFileAttributes
+        _write_filetime(
+            lp_info + 0x04, _unix_to_filetime(st.st_ctime)
+        )  # ftCreationTime
+        _write_filetime(
+            lp_info + 0x0C, _unix_to_filetime(st.st_atime)
+        )  # ftLastAccessTime
+        _write_filetime(
+            lp_info + 0x14, _unix_to_filetime(st.st_mtime)
+        )  # ftLastWriteTime
+        memory.write32(lp_info + 0x1C, 0x12345678)  # dwVolumeSerialNumber
+        memory.write32(lp_info + 0x20, 0)  # nFileSizeHigh
+        memory.write32(lp_info + 0x24, st.st_size & 0xFFFFFFFF)  # nFileSizeLow
+        memory.write32(lp_info + 0x28, 1)  # nNumberOfLinks
+        memory.write32(lp_info + 0x2C, 0)  # nFileIndexHigh
+        memory.write32(lp_info + 0x30, st.st_ino & 0xFFFFFFFF)  # nFileIndexLow
+        logger.debug(
+            "fileio", f"GetFileInformationByHandle(0x{h_file:x}) -> size={st.st_size}"
+        )
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
@@ -1236,17 +1556,19 @@ def register_kernel32_io_handlers(
             cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    stubs.register_handler("kernel32.dll", "SetFilePointer",   _set_file_pointer)
-    stubs.register_handler("kernel32.dll", "GetFileSize",      _get_file_size)
-    stubs.register_handler("kernel32.dll", "GetFileSizeEx",    _get_file_size_ex)
-    stubs.register_handler("kernel32.dll", "GetFileInformationByHandle", _get_file_information_by_handle)
+    stubs.register_handler("kernel32.dll", "SetFilePointer", _set_file_pointer)
+    stubs.register_handler("kernel32.dll", "GetFileSize", _get_file_size)
+    stubs.register_handler("kernel32.dll", "GetFileSizeEx", _get_file_size_ex)
+    stubs.register_handler(
+        "kernel32.dll", "GetFileInformationByHandle", _get_file_information_by_handle
+    )
     stubs.register_handler("kernel32.dll", "FlushFileBuffers", _flush_file_buffers)
-    stubs.register_handler("kernel32.dll", "SetEndOfFile",     _set_end_of_file)
+    stubs.register_handler("kernel32.dll", "SetEndOfFile", _set_end_of_file)
 
     # ── Directory / drives ────────────────────────────────────────────────────
 
     def _get_current_dir_a(cpu: "CPU") -> None:
-        n_buf  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_buf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         d = state.current_directory
         if lp_buf and n_buf > len(d):
@@ -1263,7 +1585,9 @@ def register_kernel32_io_handlers(
         path = read_cstring(lp_path, memory, 260) if lp_path else ""
         if path:
             # Preserve root "C:\" as-is; strip trailing backslash from subdirs
-            state.current_directory = path if path.endswith(":\\") else path.rstrip("\\")
+            state.current_directory = (
+                path if path.endswith(":\\") else path.rstrip("\\")
+            )
             logger.debug("handlers", f"SetCurrentDirectoryA({path!r})")
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
@@ -1291,7 +1615,7 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _get_temp_path_a(cpu: "CPU") -> None:
-        n_buf  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        n_buf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_buf = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         d = "C:\\WINDOWS\\TEMP\\"
         if lp_buf and n_buf > len(d):
@@ -1307,12 +1631,12 @@ def register_kernel32_io_handlers(
     _temp_file_unique = [0xA000]
 
     def _get_temp_file_name_a(cpu: "CPU") -> None:
-        lp_path_name = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        lp_prefix    = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        u_unique     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_path_name = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_prefix = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        u_unique = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lp_temp_file = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
 
-        path   = read_cstring(lp_path_name, memory, 260) if lp_path_name else ""
+        path = read_cstring(lp_path_name, memory, 260) if lp_path_name else ""
         prefix = (read_cstring(lp_prefix, memory, 260) if lp_prefix else "")[:3]
         if path and not path.endswith("\\"):
             path += "\\"
@@ -1335,9 +1659,13 @@ def register_kernel32_io_handlers(
                 dirname = os.path.dirname(real_path)
                 if dirname:
                     os.makedirs(dirname, exist_ok=True)
-                os.close(os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644))
+                os.close(
+                    os.open(real_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                )
             except OSError as e:
-                logger.warn("fileio", f'GetTempFileNameA: failed to reserve "{full_name}": {e}')
+                logger.warn(
+                    "fileio", f'GetTempFileNameA: failed to reserve "{full_name}": {e}'
+                )
                 cpu.regs[EAX] = 0
                 cleanup_stdcall(cpu, memory, 16)
                 return
@@ -1347,19 +1675,26 @@ def register_kernel32_io_handlers(
                 memory.write8(lp_temp_file + i, ord(ch))
             memory.write8(lp_temp_file + len(full_name), 0)
 
-        logger.debug("fileio", f'GetTempFileNameA(path="{path}", prefix="{prefix}", unique={u_unique}) -> "{full_name}"')
+        logger.debug(
+            "fileio",
+            f'GetTempFileNameA(path="{path}", prefix="{prefix}", unique={u_unique}) -> "{full_name}"',
+        )
         cpu.regs[EAX] = unique
         cleanup_stdcall(cpu, memory, 16)
 
     def _get_disk_free_space_a(cpu: "CPU") -> None:
-        lp_spc = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        lp_spc = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         lp_bps = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        lp_fc  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        lp_tc  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        if lp_spc: memory.write32(lp_spc, 8)
-        if lp_bps: memory.write32(lp_bps, 512)
-        if lp_fc:  memory.write32(lp_fc, 1000000)
-        if lp_tc:  memory.write32(lp_tc, 2000000)
+        lp_fc = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp_tc = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        if lp_spc:
+            memory.write32(lp_spc, 8)
+        if lp_bps:
+            memory.write32(lp_bps, 512)
+        if lp_fc:
+            memory.write32(lp_fc, 1000000)
+        if lp_tc:
+            memory.write32(lp_tc, 2000000)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 20)
 
@@ -1370,8 +1705,16 @@ def register_kernel32_io_handlers(
         # DRIVE_UNKNOWN=0, DRIVE_NO_ROOT_DIR=1, DRIVE_REMOVABLE=2,
         # DRIVE_FIXED=3, DRIVE_REMOTE=4, DRIVE_CDROM=5, DRIVE_RAMDISK=6
         DRIVE_NO_ROOT_DIR = 1
-        DRIVE_FIXED       = 3
-        _NAMES = {0: "UNKNOWN", 1: "NO_ROOT_DIR", 2: "REMOVABLE", 3: "FIXED", 4: "REMOTE", 5: "CDROM", 6: "RAMDISK"}
+        DRIVE_FIXED = 3
+        _NAMES = {
+            0: "UNKNOWN",
+            1: "NO_ROOT_DIR",
+            2: "REMOVABLE",
+            3: "FIXED",
+            4: "REMOTE",
+            5: "CDROM",
+            6: "RAMDISK",
+        }
         lp_root = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if lp_root == 0:
             cpu.regs[EAX] = DRIVE_FIXED
@@ -1383,7 +1726,10 @@ def register_kernel32_io_handlers(
                 cpu.regs[EAX] = DRIVE_FIXED
             else:
                 cpu.regs[EAX] = DRIVE_NO_ROOT_DIR
-            logger.debug("handlers", f"GetDriveTypeA({root_path!r}) -> {_NAMES.get(cpu.regs[EAX], cpu.regs[EAX])}")
+            logger.debug(
+                "handlers",
+                f"GetDriveTypeA({root_path!r}) -> {_NAMES.get(cpu.regs[EAX], cpu.regs[EAX])}",
+            )
         if not _drive_type_traced[0]:
             _drive_type_traced[0] = True
             ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
@@ -1393,11 +1739,12 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "GetCurrentDirectoryA", _get_current_dir_a)
     stubs.register_handler("kernel32.dll", "SetCurrentDirectoryA", _set_current_dir_a)
     stubs.register_handler("kernel32.dll", "GetWindowsDirectoryA", _get_windows_dir_a)
-    stubs.register_handler("kernel32.dll", "GetSystemDirectoryA",  _get_system_dir_a)
-    stubs.register_handler("kernel32.dll", "GetTempPathA",         _get_temp_path_a)
-    stubs.register_handler("kernel32.dll", "GetTempFileNameA",     _get_temp_file_name_a)
-    stubs.register_handler("kernel32.dll", "GetDiskFreeSpaceA",    _get_disk_free_space_a)
-    stubs.register_handler("kernel32.dll", "GetDriveTypeA",        _get_drive_type_a)
+    stubs.register_handler("kernel32.dll", "GetSystemDirectoryA", _get_system_dir_a)
+    stubs.register_handler("kernel32.dll", "GetTempPathA", _get_temp_path_a)
+    stubs.register_handler("kernel32.dll", "GetTempFileNameA", _get_temp_file_name_a)
+    stubs.register_handler("kernel32.dll", "GetDiskFreeSpaceA", _get_disk_free_space_a)
+    stubs.register_handler("kernel32.dll", "GetDriveTypeA", _get_drive_type_a)
+
     def _global_memory_status(cpu: "CPU") -> None:
         """
         void GlobalMemoryStatus(LPMEMORYSTATUS lpBuffer)
@@ -1418,12 +1765,12 @@ def register_kernel32_io_handlers(
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if lp:
             MB = 1024 * 1024
-            memory.write32(lp +  0, 32)          # dwLength
-            memory.write32(lp +  4, 50)          # dwMemoryLoad (50%)
-            memory.write32(lp +  8, 256 * MB)    # dwTotalPhys
-            memory.write32(lp + 12, 128 * MB)    # dwAvailPhys
-            memory.write32(lp + 16, 512 * MB)    # dwTotalPageFile
-            memory.write32(lp + 20, 384 * MB)    # dwAvailPageFile
+            memory.write32(lp + 0, 32)  # dwLength
+            memory.write32(lp + 4, 50)  # dwMemoryLoad (50%)
+            memory.write32(lp + 8, 256 * MB)  # dwTotalPhys
+            memory.write32(lp + 12, 128 * MB)  # dwAvailPhys
+            memory.write32(lp + 16, 512 * MB)  # dwTotalPageFile
+            memory.write32(lp + 20, 384 * MB)  # dwAvailPageFile
             memory.write32(lp + 24, 0x7FFF0000)  # dwTotalVirtual
             memory.write32(lp + 28, 0x7FF00000)  # dwAvailVirtual
         cleanup_stdcall(cpu, memory, 4)
@@ -1433,11 +1780,11 @@ def register_kernel32_io_handlers(
     # ── Time ──────────────────────────────────────────────────────────────────
 
     def _write_systemtime(lp: int, dt: datetime.datetime, *, utc: bool) -> None:
-        memory.write16(lp,      dt.year)
-        memory.write16(lp +  2, dt.month)
-        memory.write16(lp +  4, dt.weekday() + 1 if not utc else dt.isoweekday() % 7)
-        memory.write16(lp +  6, dt.day)
-        memory.write16(lp +  8, dt.hour)
+        memory.write16(lp, dt.year)
+        memory.write16(lp + 2, dt.month)
+        memory.write16(lp + 4, dt.weekday() + 1 if not utc else dt.isoweekday() % 7)
+        memory.write16(lp + 6, dt.day)
+        memory.write16(lp + 8, dt.hour)
         memory.write16(lp + 10, dt.minute)
         memory.write16(lp + 12, dt.second)
         memory.write16(lp + 14, dt.microsecond // 1000)
@@ -1472,16 +1819,18 @@ def register_kernel32_io_handlers(
         jul_off = -int(jul.utcoffset().total_seconds() // 60)
         std_offset = max(jan_off, jul_off)
         dst_offset = min(jan_off, jul_off)
-        cur_off = -int(datetime.datetime.now().astimezone().utcoffset().total_seconds() // 60)
+        cur_off = -int(
+            datetime.datetime.now().astimezone().utcoffset().total_seconds() // 60
+        )
         is_dst = (cur_off == dst_offset) and (std_offset != dst_offset)
-        memory.write32(lp,      std_offset & 0xFFFFFFFF)  # Bias
-        memory.write32(lp + 84, 0)                        # StandardBias
+        memory.write32(lp, std_offset & 0xFFFFFFFF)  # Bias
+        memory.write32(lp + 84, 0)  # StandardBias
         memory.write32(lp + 168, (dst_offset - std_offset) & 0xFFFFFFFF)
         cpu.regs[EAX] = 2 if is_dst else 1
         cleanup_stdcall(cpu, memory, 4)
 
     def _file_time_to_local(cpu: "CPU") -> None:
-        lp_in  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_in = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_out = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if lp_in == 0 or lp_out == 0:
             cpu.regs[EAX] = 0
@@ -1490,10 +1839,12 @@ def register_kernel32_io_handlers(
         lo = memory.read32(lp_in)
         hi = memory.read32(lp_in + 4)
         utc = (hi << 32) | lo
-        bias_min = -int(datetime.datetime.now().astimezone().utcoffset().total_seconds() // 60)
+        bias_min = -int(
+            datetime.datetime.now().astimezone().utcoffset().total_seconds() // 60
+        )
         bias_100ns = bias_min * 60 * 10_000_000
         local = (utc - bias_100ns) & 0xFFFFFFFFFFFFFFFF
-        memory.write32(lp_out,     local & 0xFFFFFFFF)
+        memory.write32(lp_out, local & 0xFFFFFFFF)
         memory.write32(lp_out + 4, (local >> 32) & 0xFFFFFFFF)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
@@ -1519,12 +1870,16 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
-    stubs.register_handler("kernel32.dll", "GetLocalTime",            _get_local_time)
-    stubs.register_handler("kernel32.dll", "GetSystemTime",           _get_system_time)
-    stubs.register_handler("kernel32.dll", "GetSystemTimeAsFileTime", _get_system_time_as_filetime)
-    stubs.register_handler("kernel32.dll", "GetTimeZoneInformation",  _get_tz_info)
-    stubs.register_handler("kernel32.dll", "FileTimeToLocalFileTime", _file_time_to_local)
-    stubs.register_handler("kernel32.dll", "FileTimeToSystemTime",    _file_time_to_system)
+    stubs.register_handler("kernel32.dll", "GetLocalTime", _get_local_time)
+    stubs.register_handler("kernel32.dll", "GetSystemTime", _get_system_time)
+    stubs.register_handler(
+        "kernel32.dll", "GetSystemTimeAsFileTime", _get_system_time_as_filetime
+    )
+    stubs.register_handler("kernel32.dll", "GetTimeZoneInformation", _get_tz_info)
+    stubs.register_handler(
+        "kernel32.dll", "FileTimeToLocalFileTime", _file_time_to_local
+    )
+    stubs.register_handler("kernel32.dll", "FileTimeToSystemTime", _file_time_to_system)
 
     # ── Misc ──────────────────────────────────────────────────────────────────
 
@@ -1540,8 +1895,8 @@ def register_kernel32_io_handlers(
     # this emulator's own handlers actually produce (mostly COM HRESULTs) --
     # exact wording isn't load-bearing, callers just display/log the string.
     _FORMAT_MESSAGE_ALLOCATE_BUFFER = 0x00000100
-    _FORMAT_MESSAGE_FROM_STRING     = 0x00000400
-    _FORMAT_MESSAGE_FROM_SYSTEM     = 0x00001000
+    _FORMAT_MESSAGE_FROM_STRING = 0x00000400
+    _FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
 
     _SYSTEM_MESSAGES: dict[int, str] = {
         0x00000000: "The operation completed successfully.",
@@ -1559,18 +1914,19 @@ def register_kernel32_io_handlers(
     }
 
     def _format_message_a(cpu: "CPU") -> None:
-        sp            = cpu.regs[ESP]
-        dw_flags      = memory.read32((sp + 4)  & 0xFFFFFFFF)
-        lp_source     = memory.read32((sp + 8)  & 0xFFFFFFFF)
+        sp = cpu.regs[ESP]
+        dw_flags = memory.read32((sp + 4) & 0xFFFFFFFF)
+        lp_source = memory.read32((sp + 8) & 0xFFFFFFFF)
         dw_message_id = memory.read32((sp + 12) & 0xFFFFFFFF)
-        lp_buffer     = memory.read32((sp + 20) & 0xFFFFFFFF)
-        n_size        = memory.read32((sp + 24) & 0xFFFFFFFF)
+        lp_buffer = memory.read32((sp + 20) & 0xFFFFFFFF)
+        n_size = memory.read32((sp + 24) & 0xFFFFFFFF)
 
         if dw_flags & _FORMAT_MESSAGE_FROM_STRING:
             text = read_cstring(lp_source, memory) if lp_source else ""
         elif dw_flags & _FORMAT_MESSAGE_FROM_SYSTEM:
             text = _SYSTEM_MESSAGES.get(
-                dw_message_id, f"Unknown error (0x{dw_message_id:08x})")
+                dw_message_id, f"Unknown error (0x{dw_message_id:08x})"
+            )
         else:
             text = f"Unknown error (0x{dw_message_id:08x})"
 
@@ -1584,27 +1940,33 @@ def register_kernel32_io_handlers(
         else:
             out_addr = lp_buffer
             if n_size > 0 and len(text) > n_size - 1:
-                text = text[:n_size - 1]
+                text = text[: n_size - 1]
 
         if out_addr:
             for i, ch in enumerate(text):
                 memory.write8(out_addr + i, ord(ch) & 0xFF)
             memory.write8(out_addr + len(text), 0)
 
-        logger.debug("handlers",
-            f"FormatMessageA(flags=0x{dw_flags:x}, id=0x{dw_message_id:x}) -> \"{text}\"")
+        logger.debug(
+            "handlers",
+            f'FormatMessageA(flags=0x{dw_flags:x}, id=0x{dw_message_id:x}) -> "{text}"',
+        )
         cpu.regs[EAX] = len(text)
         cleanup_stdcall(cpu, memory, 28)
 
     stubs.register_handler("kernel32.dll", "FormatMessageA", _format_message_a)
-    stubs.register_handler("kernel32.dll", "GlobalAddAtom",         _halt("GlobalAddAtom"))
-    stubs.register_handler("kernel32.dll", "GlobalFindAtom",        _halt("GlobalFindAtom"))
-    stubs.register_handler("kernel32.dll", "GlobalGetAtomNameA",    _halt("GlobalGetAtomNameA"))
-    stubs.register_handler("kernel32.dll", "GlobalDeleteAtom",      _halt("GlobalDeleteAtom"))
-    stubs.register_handler("kernel32.dll", "AddAtom",               _halt("AddAtom"))
-    stubs.register_handler("kernel32.dll", "FindAtom",              _halt("FindAtom"))
-    stubs.register_handler("kernel32.dll", "GetAtomName",           _halt("GetAtomName"))
-    stubs.register_handler("kernel32.dll", "DeleteAtom",            _halt("DeleteAtom"))
+    stubs.register_handler("kernel32.dll", "GlobalAddAtom", _halt("GlobalAddAtom"))
+    stubs.register_handler("kernel32.dll", "GlobalFindAtom", _halt("GlobalFindAtom"))
+    stubs.register_handler(
+        "kernel32.dll", "GlobalGetAtomNameA", _halt("GlobalGetAtomNameA")
+    )
+    stubs.register_handler(
+        "kernel32.dll", "GlobalDeleteAtom", _halt("GlobalDeleteAtom")
+    )
+    stubs.register_handler("kernel32.dll", "AddAtom", _halt("AddAtom"))
+    stubs.register_handler("kernel32.dll", "FindAtom", _halt("FindAtom"))
+    stubs.register_handler("kernel32.dll", "GetAtomName", _halt("GetAtomName"))
+    stubs.register_handler("kernel32.dll", "DeleteAtom", _halt("DeleteAtom"))
 
     def _device_io_control(cpu: "CPU") -> None:
         cpu.regs[EAX] = 0
@@ -1630,43 +1992,50 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "DeviceIoControl", _device_io_control)
-    stubs.register_handler("kernel32.dll", "WinExec",         _win_exec)
-    stubs.register_handler("kernel32.dll", "_lopen",          _lopen)
-    stubs.register_handler("kernel32.dll", "_lclose",         _lclose)
+    stubs.register_handler("kernel32.dll", "WinExec", _win_exec)
+    stubs.register_handler("kernel32.dll", "_lopen", _lopen)
+    stubs.register_handler("kernel32.dll", "_lclose", _lclose)
 
     # ── Private profile (INI file) ────────────────────────────────────────────
 
     def _get_private_profile_string_a(cpu: "CPU") -> None:
         esp = cpu.regs[ESP]
-        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
-        lp_default   = memory.read32((esp + 12) & 0xFFFFFFFF)
-        lp_returned  = memory.read32((esp + 16) & 0xFFFFFFFF)
-        n_size       = memory.read32((esp + 20) & 0xFFFFFFFF)
+        lp_app_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_key_name = memory.read32((esp + 8) & 0xFFFFFFFF)
+        lp_default = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_returned = memory.read32((esp + 16) & 0xFFFFFFFF)
+        n_size = memory.read32((esp + 20) & 0xFFFFFFFF)
         lp_file_name = memory.read32((esp + 24) & 0xFFFFFFFF)
 
-        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
-        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else None
-        default   = read_cstring(lp_default,   memory) if lp_default   else ""
+        app_name = read_cstring(lp_app_name, memory) if lp_app_name else None
+        key_name = read_cstring(lp_key_name, memory) if lp_key_name else None
+        default = read_cstring(lp_default, memory) if lp_default else ""
         file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
 
         args = GetPrivateProfileStringArgs(
-            app_name=app_name, key_name=key_name, default=default,
-            out_ptr=lp_returned, n_size=n_size, file_name=file_name,
+            app_name=app_name,
+            key_name=key_name,
+            default=default,
+            out_ptr=lp_returned,
+            n_size=n_size,
+            file_name=file_name,
         )
 
         # Load and parse the INI file from the translated Linux path.
         ini: dict = {}
         if file_name:
             linux_path = state.translate_windows_path(file_name)
-            real_path  = find_file_ci(linux_path)
+            real_path = find_file_ci(linux_path)
             if real_path:
                 # find_file_ci confirmed the path exists — any OSError here is not ENOENT.
                 try:
                     with open(real_path, "r", encoding="latin-1") as fh:
                         ini = parse_ini(fh.read())
                 except OSError as e:
-                    logger.error("fileio", f"GetPrivateProfileStringA: file exists but cannot be read {real_path!r}: {e}")
+                    logger.error(
+                        "fileio",
+                        f"GetPrivateProfileStringA: file exists but cannot be read {real_path!r}: {e}",
+                    )
 
         value = read_profile_string(ini, args.app_name, args.key_name, args.default)
 
@@ -1685,7 +2054,7 @@ def register_kernel32_io_handlers(
 
         # Clamp to buffer; always null-terminate.
         if len(encoded) >= n_size:
-            encoded = encoded[:n_size - 1]
+            encoded = encoded[: n_size - 1]
         for i, b in enumerate(encoded):
             memory.write8(lp_returned + i, b)
         memory.write8(lp_returned + len(encoded), 0)
@@ -1700,32 +2069,37 @@ def register_kernel32_io_handlers(
 
     def _get_private_profile_int_a(cpu: "CPU") -> None:
         esp = cpu.regs[ESP]
-        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
-        n_default    = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_app_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_key_name = memory.read32((esp + 8) & 0xFFFFFFFF)
+        n_default = memory.read32((esp + 12) & 0xFFFFFFFF)
         lp_file_name = memory.read32((esp + 16) & 0xFFFFFFFF)
 
-        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else ""
-        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else ""
+        app_name = read_cstring(lp_app_name, memory) if lp_app_name else ""
+        key_name = read_cstring(lp_key_name, memory) if lp_key_name else ""
         file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
-        default   = n_default if n_default < 0x80000000 else n_default - 0x100000000
+        default = n_default if n_default < 0x80000000 else n_default - 0x100000000
 
         args = GetPrivateProfileIntArgs(
-            app_name=app_name, key_name=key_name,
-            default=default, file_name=file_name,
+            app_name=app_name,
+            key_name=key_name,
+            default=default,
+            file_name=file_name,
         )
 
         ini: dict = {}
         if file_name:
             linux_path = state.translate_windows_path(file_name)
-            real_path  = find_file_ci(linux_path)
+            real_path = find_file_ci(linux_path)
             if real_path:
                 # find_file_ci confirmed the path exists — any OSError here is not ENOENT.
                 try:
                     with open(real_path, "r", encoding="latin-1") as fh:
                         ini = parse_ini(fh.read())
                 except OSError as e:
-                    logger.error("fileio", f"GetPrivateProfileIntA: file exists but cannot be read {real_path!r}: {e}")
+                    logger.error(
+                        "fileio",
+                        f"GetPrivateProfileIntA: file exists but cannot be read {real_path!r}: {e}",
+                    )
 
         result = read_profile_int(ini, args.app_name, args.key_name, args.default)
         logger.debug(
@@ -1738,14 +2112,14 @@ def register_kernel32_io_handlers(
 
     def _write_private_profile_string_a(cpu: "CPU") -> None:
         esp = cpu.regs[ESP]
-        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_key_name  = memory.read32((esp +  8) & 0xFFFFFFFF)
-        lp_string    = memory.read32((esp + 12) & 0xFFFFFFFF)
+        lp_app_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_key_name = memory.read32((esp + 8) & 0xFFFFFFFF)
+        lp_string = memory.read32((esp + 12) & 0xFFFFFFFF)
         lp_file_name = memory.read32((esp + 16) & 0xFFFFFFFF)
 
-        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
-        key_name  = read_cstring(lp_key_name,  memory) if lp_key_name  else None
-        value     = read_cstring(lp_string,    memory) if lp_string    else None
+        app_name = read_cstring(lp_app_name, memory) if lp_app_name else None
+        key_name = read_cstring(lp_key_name, memory) if lp_key_name else None
+        value = read_cstring(lp_string, memory) if lp_string else None
         file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
 
         linux_path = state.translate_windows_path(file_name) if file_name else ""
@@ -1760,11 +2134,11 @@ def register_kernel32_io_handlers(
 
     def _write_private_profile_section_a(cpu: "CPU") -> None:
         esp = cpu.regs[ESP]
-        lp_app_name  = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_string    = memory.read32((esp +  8) & 0xFFFFFFFF)
+        lp_app_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_string = memory.read32((esp + 8) & 0xFFFFFFFF)
         lp_file_name = memory.read32((esp + 12) & 0xFFFFFFFF)
 
-        app_name  = read_cstring(lp_app_name,  memory) if lp_app_name  else None
+        app_name = read_cstring(lp_app_name, memory) if lp_app_name else None
         file_name = read_cstring(lp_file_name, memory) if lp_file_name else ""
 
         # lpString is a double-null-terminated list of "key=value" entries.
@@ -1774,11 +2148,11 @@ def register_kernel32_io_handlers(
             while True:
                 entry = read_cstring(ptr, memory)
                 if not entry:
-                    break                   # hit the double-null terminator
+                    break  # hit the double-null terminator
                 if "=" in entry:
                     k, _, v = entry.partition("=")
                     pairs[k.strip().lower()] = v.strip()
-                ptr += len(entry.encode("latin-1")) + 1   # advance past the null
+                ptr += len(entry.encode("latin-1")) + 1  # advance past the null
 
         linux_path = state.translate_windows_path(file_name) if file_name else ""
         ok = write_profile_section(linux_path, app_name, pairs)
@@ -1789,10 +2163,18 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 12)
 
-    stubs.register_handler("kernel32.dll", "GetPrivateProfileStringA",   _get_private_profile_string_a)
-    stubs.register_handler("kernel32.dll", "GetPrivateProfileIntA",      _get_private_profile_int_a)
-    stubs.register_handler("kernel32.dll", "WritePrivateProfileStringA",  _write_private_profile_string_a)
-    stubs.register_handler("kernel32.dll", "WritePrivateProfileSectionA", _write_private_profile_section_a)
+    stubs.register_handler(
+        "kernel32.dll", "GetPrivateProfileStringA", _get_private_profile_string_a
+    )
+    stubs.register_handler(
+        "kernel32.dll", "GetPrivateProfileIntA", _get_private_profile_int_a
+    )
+    stubs.register_handler(
+        "kernel32.dll", "WritePrivateProfileStringA", _write_private_profile_string_a
+    )
+    stubs.register_handler(
+        "kernel32.dll", "WritePrivateProfileSectionA", _write_private_profile_section_a
+    )
 
     # ── Interlocked operations ────────────────────────────────────────────────
 
@@ -1811,8 +2193,8 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     def _interlocked_exch(cpu: "CPU") -> None:
-        p    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        val  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        p = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        val = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         orig = memory.read32(p)
         memory.write32(p, val)
         cpu.regs[EAX] = orig
@@ -1820,7 +2202,7 @@ def register_kernel32_io_handlers(
 
     stubs.register_handler("kernel32.dll", "InterlockedIncrement", _interlocked_inc)
     stubs.register_handler("kernel32.dll", "InterlockedDecrement", _interlocked_dec)
-    stubs.register_handler("kernel32.dll", "InterlockedExchange",  _interlocked_exch)
+    stubs.register_handler("kernel32.dll", "InterlockedExchange", _interlocked_exch)
 
     # ── Debug output ──────────────────────────────────────────────────────────
 
@@ -1844,7 +2226,7 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "OutputDebugStringA", _output_debug_string_a)
-    stubs.register_handler("kernel32.dll", "DebugBreak",         _halt("DebugBreak"))
+    stubs.register_handler("kernel32.dll", "DebugBreak", _halt("DebugBreak"))
 
     # ── Error mode / string utils / memory alloc ──────────────────────────────
 
@@ -1893,8 +2275,8 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _lstrcpyn_a(cpu: "CPU") -> None:
-        dst     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
-        src     = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        src = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         max_len = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         max_len = min(max_len, 65535)
         if dst and max_len > 0:
@@ -1949,7 +2331,7 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 8)
 
     def _local_alloc(cpu: "CPU") -> None:
-        flags  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        flags = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_bytes = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         LMEM_ZEROINIT = 0x0040
         addr = state.simple_alloc(n_bytes)
@@ -1967,7 +2349,7 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     def _global_alloc(cpu: "CPU") -> None:
-        flags  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        flags = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n_bytes = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         GMEM_ZEROINIT = 0x0040
         addr = state.simple_alloc(n_bytes)
@@ -1999,23 +2381,23 @@ def register_kernel32_io_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("kernel32.dll", "SetErrorMode", _set_error_mode)
-    stubs.register_handler("kernel32.dll", "lstrlenA",     _lstrlen_a)
-    stubs.register_handler("kernel32.dll", "lstrcpyA",     _lstrcpy_a)
-    stubs.register_handler("kernel32.dll", "lstrcpynA",    _lstrcpyn_a)
-    stubs.register_handler("kernel32.dll", "lstrcatA",     _lstrcat_a)
-    stubs.register_handler("kernel32.dll", "lstrcmpW",     _lstrcmp_w)
-    stubs.register_handler("kernel32.dll", "lstrcmpiA",    _lstrcmpi_a)
-    stubs.register_handler("kernel32.dll", "LocalAlloc",   _local_alloc)
-    stubs.register_handler("kernel32.dll", "LocalFree",    _local_free)
-    stubs.register_handler("kernel32.dll", "GlobalAlloc",  _global_alloc)
-    stubs.register_handler("kernel32.dll", "GlobalFree",   _global_free)
-    stubs.register_handler("kernel32.dll", "GlobalLock",   _global_lock)
+    stubs.register_handler("kernel32.dll", "lstrlenA", _lstrlen_a)
+    stubs.register_handler("kernel32.dll", "lstrcpyA", _lstrcpy_a)
+    stubs.register_handler("kernel32.dll", "lstrcpynA", _lstrcpyn_a)
+    stubs.register_handler("kernel32.dll", "lstrcatA", _lstrcat_a)
+    stubs.register_handler("kernel32.dll", "lstrcmpW", _lstrcmp_w)
+    stubs.register_handler("kernel32.dll", "lstrcmpiA", _lstrcmpi_a)
+    stubs.register_handler("kernel32.dll", "LocalAlloc", _local_alloc)
+    stubs.register_handler("kernel32.dll", "LocalFree", _local_free)
+    stubs.register_handler("kernel32.dll", "GlobalAlloc", _global_alloc)
+    stubs.register_handler("kernel32.dll", "GlobalFree", _global_free)
+    stubs.register_handler("kernel32.dll", "GlobalLock", _global_lock)
     stubs.register_handler("kernel32.dll", "GlobalUnlock", _global_unlock)
 
     # ── Heap / handle ops ─────────────────────────────────────────────────────
 
-    stubs.register_handler("kernel32.dll", "HeapValidate",     _halt("HeapValidate"))
-    stubs.register_handler("kernel32.dll", "HeapDestroy",      _halt("HeapDestroy"))
+    stubs.register_handler("kernel32.dll", "HeapValidate", _halt("HeapValidate"))
+    stubs.register_handler("kernel32.dll", "HeapDestroy", _halt("HeapDestroy"))
 
     def _duplicate_handle(cpu: "CPU") -> None:
         """DuplicateHandle(hSourceProcess, hSource, hTargetProcess, lpTarget, access, inherit, options)
@@ -2024,18 +2406,19 @@ def register_kernel32_io_handlers(
         ignored — the emulator is single-process and both are always the
         current-process pseudo-handle.
         """
-        h_source   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        lp_target  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        h_source = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp_target = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         dw_options = memory.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
 
         close_source = bool(dw_options & _DUPLICATE_CLOSE_SOURCE)
-        new_handle   = _duplicate_handle_entry(state, h_source, close_source)
+        new_handle = _duplicate_handle_entry(state, h_source, close_source)
 
         if lp_target:
             memory.write32(lp_target & 0xFFFFFFFF, new_handle)
 
-        logger.debug("handlers",
-            f"DuplicateHandle(src=0x{h_source:08x}) -> 0x{new_handle:08x}")
+        logger.debug(
+            "handlers", f"DuplicateHandle(src=0x{h_source:08x}) -> 0x{new_handle:08x}"
+        )
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 28)
 
@@ -2043,7 +2426,7 @@ def register_kernel32_io_handlers(
 
     # ── Locale / string type ──────────────────────────────────────────────────
 
-    stubs.register_handler("kernel32.dll", "LCMapStringA",    _halt("LCMapStringA"))
+    stubs.register_handler("kernel32.dll", "LCMapStringA", _halt("LCMapStringA"))
 
     # Real CompareStringA/W validate the locale identifier (IsValidLocale)
     # and fail (return 0, GetLastError()==ERROR_INVALID_PARAMETER) for one
@@ -2079,7 +2462,10 @@ def register_kernel32_io_handlers(
     # "equal", regardless of actual string content. Root cause of Fields.Count
     # reading 1 instead of 10 for 3-table-join QueryDefs: every column after
     # the first got misidentified as a duplicate of it and silently skipped.
-    _RESOLVABLE_LOCALES = {0x0400: 0x0409, 0x0800: 0x0409}  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT -> en-US
+    _RESOLVABLE_LOCALES = {
+        0x0400: 0x0409,
+        0x0800: 0x0409,
+    }  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT -> en-US
 
     def _resolve_locale(locale: int) -> int:
         return _RESOLVABLE_LOCALES.get(locale, locale)
@@ -2088,14 +2474,17 @@ def register_kernel32_io_handlers(
         return _resolve_locale(locale) == 0x0409
 
     def _compare_string_a(cpu: "CPU") -> None:
-        locale   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        lp1      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        cch1     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        lp2      = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        cch2     = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp1 = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if not _locale_is_valid(locale):
-            logger.debug("handlers", f"CompareStringA(locale=0x{locale:08x}) -> 0 (invalid locale)")
+            logger.debug(
+                "handlers",
+                f"CompareStringA(locale=0x{locale:08x}) -> 0 (invalid locale)",
+            )
             memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 24)
@@ -2103,6 +2492,7 @@ def register_kernel32_io_handlers(
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
+
         def read_ansi(ptr: int, count: int) -> str:
             s = []
             mx = 4096 if count == 0xFFFFFFFF else count
@@ -2112,22 +2502,27 @@ def register_kernel32_io_handlers(
                     break
                 s.append(chr(ch))
             return "".join(s)
+
         s1 = read_ansi(lp1, cch1)
         s2 = read_ansi(lp2, cch2)
         if ignore_case:
-            s1 = s1.upper(); s2 = s2.upper()
+            s1 = s1.upper()
+            s2 = s2.upper()
         cpu.regs[EAX] = 1 if s1 < s2 else (3 if s1 > s2 else 2)
         cleanup_stdcall(cpu, memory, 24)
 
     def _compare_string_w(cpu: "CPU") -> None:
-        locale   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
-        lp1      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        cch1     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        lp2      = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
-        cch2     = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        lp1 = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if not _locale_is_valid(locale):
-            logger.debug("handlers", f"CompareStringW(locale=0x{locale:08x}) -> 0 (invalid locale)")
+            logger.debug(
+                "handlers",
+                f"CompareStringW(locale=0x{locale:08x}) -> 0 (invalid locale)",
+            )
             memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 24)
@@ -2135,6 +2530,7 @@ def register_kernel32_io_handlers(
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
+
         def read_wide(ptr: int, count: int) -> str:
             s = []
             mx = 4096 if count == 0xFFFFFFFF else count
@@ -2144,10 +2540,12 @@ def register_kernel32_io_handlers(
                     break
                 s.append(chr(ch))
             return "".join(s)
+
         s1 = read_wide(lp1, cch1)
         s2 = read_wide(lp2, cch2)
         if ignore_case:
-            s1 = s1.upper(); s2 = s2.upper()
+            s1 = s1.upper()
+            s2 = s2.upper()
         cpu.regs[EAX] = 1 if s1 < s2 else (3 if s1 > s2 else 2)
         cleanup_stdcall(cpu, memory, 24)
 
@@ -2178,21 +2576,30 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 16)
 
-    stubs.register_handler("kernel32.dll", "CompareStringA",       _compare_string_a)
-    stubs.register_handler("kernel32.dll", "CompareStringW",       _compare_string_w)
-    stubs.register_handler("kernel32.dll", "GetStringTypeA",       _halt("GetStringTypeA"))
-    stubs.register_handler("kernel32.dll", "GetOEMCP",             _get_oemc_p)
-    stubs.register_handler("kernel32.dll", "GetUserDefaultLCID",   _get_user_default_lcid)
-    stubs.register_handler("kernel32.dll", "GetUserDefaultLangID", _get_user_default_lang_id)
-    stubs.register_handler("kernel32.dll", "GetSystemDefaultLangID", _get_system_default_lang_id)
-    stubs.register_handler("kernel32.dll", "IsValidLocale",        _is_valid_locale)
-    stubs.register_handler("kernel32.dll", "EnumSystemLocalesA",   _halt("EnumSystemLocalesA"))
-    stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)
-    stubs.register_handler("kernel32.dll", "SetConsoleCtrlHandler", _halt("SetConsoleCtrlHandler"))
+    stubs.register_handler("kernel32.dll", "CompareStringA", _compare_string_a)
+    stubs.register_handler("kernel32.dll", "CompareStringW", _compare_string_w)
+    stubs.register_handler("kernel32.dll", "GetStringTypeA", _halt("GetStringTypeA"))
+    stubs.register_handler("kernel32.dll", "GetOEMCP", _get_oemc_p)
+    stubs.register_handler("kernel32.dll", "GetUserDefaultLCID", _get_user_default_lcid)
+    stubs.register_handler(
+        "kernel32.dll", "GetUserDefaultLangID", _get_user_default_lang_id
+    )
+    stubs.register_handler(
+        "kernel32.dll", "GetSystemDefaultLangID", _get_system_default_lang_id
+    )
+    stubs.register_handler("kernel32.dll", "IsValidLocale", _is_valid_locale)
+    stubs.register_handler(
+        "kernel32.dll", "EnumSystemLocalesA", _halt("EnumSystemLocalesA")
+    )
+    stubs.register_handler("kernel32.dll", "GetLocaleInfoW", _get_locale_info_w)
+    stubs.register_handler(
+        "kernel32.dll", "SetConsoleCtrlHandler", _halt("SetConsoleCtrlHandler")
+    )
+
     def _set_environment_variable_a(cpu: "CPU") -> None:
         """BOOL SetEnvironmentVariableA(LPCSTR lpName, LPCSTR lpValue)"""
-        esp      = cpu.regs[ESP]
-        lp_name  = memory.read32((esp + 4) & 0xFFFFFFFF)
+        esp = cpu.regs[ESP]
+        lp_name = memory.read32((esp + 4) & 0xFFFFFFFF)
         lp_value = memory.read32((esp + 8) & 0xFFFFFFFF)
         name = read_cstring(lp_name, memory) if lp_name else ""
         if name:
@@ -2205,8 +2612,8 @@ def register_kernel32_io_handlers(
 
     def _set_environment_variable_w(cpu: "CPU") -> None:
         """BOOL SetEnvironmentVariableW(LPCWSTR lpName, LPCWSTR lpValue)"""
-        esp      = cpu.regs[ESP]
-        lp_name  = memory.read32((esp + 4) & 0xFFFFFFFF)
+        esp = cpu.regs[ESP]
+        lp_name = memory.read32((esp + 4) & 0xFFFFFFFF)
         lp_value = memory.read32((esp + 8) & 0xFFFFFFFF)
         name = read_wide_string(lp_name, memory) if lp_name else ""
         if name:
@@ -2219,11 +2626,11 @@ def register_kernel32_io_handlers(
 
     def _get_environment_variable_a(cpu: "CPU") -> None:
         """DWORD GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer, DWORD nSize)"""
-        esp     = cpu.regs[ESP]
-        lp_name = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_buf  = memory.read32((esp +  8) & 0xFFFFFFFF)
-        n_size  = memory.read32((esp + 12) & 0xFFFFFFFF)
-        name  = read_cstring(lp_name, memory).upper() if lp_name else ""
+        esp = cpu.regs[ESP]
+        lp_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_buf = memory.read32((esp + 8) & 0xFFFFFFFF)
+        n_size = memory.read32((esp + 12) & 0xFFFFFFFF)
+        name = read_cstring(lp_name, memory).upper() if lp_name else ""
         value = _env_vars.get(name, "")
         encoded = value.encode("latin-1", errors="replace")
         if n_size > len(encoded):
@@ -2238,11 +2645,11 @@ def register_kernel32_io_handlers(
 
     def _get_environment_variable_w(cpu: "CPU") -> None:
         """DWORD GetEnvironmentVariableW(LPCWSTR lpName, LPWSTR lpBuffer, DWORD nSize)"""
-        esp     = cpu.regs[ESP]
-        lp_name = memory.read32((esp +  4) & 0xFFFFFFFF)
-        lp_buf  = memory.read32((esp +  8) & 0xFFFFFFFF)
-        n_size  = memory.read32((esp + 12) & 0xFFFFFFFF)
-        name  = read_wide_string(lp_name, memory).upper() if lp_name else ""
+        esp = cpu.regs[ESP]
+        lp_name = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_buf = memory.read32((esp + 8) & 0xFFFFFFFF)
+        n_size = memory.read32((esp + 12) & 0xFFFFFFFF)
+        name = read_wide_string(lp_name, memory).upper() if lp_name else ""
         value = _env_vars.get(name, "")
         if n_size > len(value):
             for i, ch in enumerate(value):
@@ -2253,10 +2660,19 @@ def register_kernel32_io_handlers(
             cpu.regs[EAX] = len(value) + 1
         cleanup_stdcall(cpu, memory, 12)
 
-    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableA",  _set_environment_variable_a)
-    stubs.register_handler("kernel32.dll", "SetEnvironmentVariableW",  _set_environment_variable_w)
-    stubs.register_handler("kernel32.dll", "GetEnvironmentVariableA",  _get_environment_variable_a)
-    stubs.register_handler("kernel32.dll", "GetEnvironmentVariableW",  _get_environment_variable_w)
+    stubs.register_handler(
+        "kernel32.dll", "SetEnvironmentVariableA", _set_environment_variable_a
+    )
+    stubs.register_handler(
+        "kernel32.dll", "SetEnvironmentVariableW", _set_environment_variable_w
+    )
+    stubs.register_handler(
+        "kernel32.dll", "GetEnvironmentVariableA", _get_environment_variable_a
+    )
+    stubs.register_handler(
+        "kernel32.dll", "GetEnvironmentVariableW", _get_environment_variable_w
+    )
+
     def _virtual_protect(cpu: "CPU") -> None:
         """
         BOOL VirtualProtect(LPVOID lpAddress, SIZE_T dwSize,
@@ -2267,10 +2683,10 @@ def register_kernel32_io_handlers(
         PAGE_EXECUTE_READ_WRITE (0x40) so callers that save and restore it
         get a consistent value, and return TRUE.
         """
-        esp            = cpu.regs[ESP]
+        esp = cpu.regs[ESP]
         lp_old_protect = memory.read32((esp + 16) & 0xFFFFFFFF)
         if lp_old_protect:
-            memory.write32(lp_old_protect, 0x40)   # PAGE_EXECUTE_READWRITE
+            memory.write32(lp_old_protect, 0x40)  # PAGE_EXECUTE_READWRITE
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
@@ -2297,10 +2713,10 @@ def register_winmm_handlers(
     # MMRESULT timeGetDevCaps(LPTIMECAPS ptc, UINT cbtc)
     # TIMECAPS: {UINT wPeriodMin, UINT wPeriodMax} = 8 bytes
     def _time_get_dev_caps(cpu: "CPU") -> None:
-        ptc  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        ptc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cbtc = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if ptc and cbtc >= 8:
-            memory.write32(ptc,     1)       # wPeriodMin = 1 ms
+            memory.write32(ptc, 1)  # wPeriodMin = 1 ms
             memory.write32(ptc + 4, 0x7FFF)  # wPeriodMax = 32767 ms
         cpu.regs[EAX] = 0  # TIMERR_NOERROR
         cleanup_stdcall(cpu, memory, 8)
@@ -2317,7 +2733,7 @@ def register_winmm_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("winmm.dll", "timeBeginPeriod", _time_begin_period)
-    stubs.register_handler("winmm.dll", "timeEndPeriod",   _time_end_period)
+    stubs.register_handler("winmm.dll", "timeEndPeriod", _time_end_period)
 
     # ── timeSetEvent ──────────────────────────────────────────────────────────
     # MMRESULT timeSetEvent(UINT uDelay, UINT uResolution,
@@ -2326,25 +2742,31 @@ def register_winmm_handlers(
     _TIME_PERIODIC = 0x0001
 
     def _time_set_event(cpu: "CPU") -> None:
-        sp           = cpu.regs[ESP]
-        u_delay      = memory.read32((sp +  4) & 0xFFFFFFFF)
+        sp = cpu.regs[ESP]
+        u_delay = memory.read32((sp + 4) & 0xFFFFFFFF)
         lp_time_proc = memory.read32((sp + 12) & 0xFFFFFFFF)
-        dw_user      = memory.read32((sp + 16) & 0xFFFFFFFF)
-        fu_event     = memory.read32((sp + 20) & 0xFFFFFFFF)
+        dw_user = memory.read32((sp + 16) & 0xFFFFFFFF)
+        fu_event = memory.read32((sp + 20) & 0xFFFFFFFF)
 
         if u_delay == 0:
             u_delay = 1
         period_ms = u_delay if (fu_event & _TIME_PERIODIC) else 0
-        due_at    = state.virtual_ticks_ms + u_delay
+        due_at = state.virtual_ticks_ms + u_delay
 
         tid = _next_timer_id[0]
         _next_timer_id[0] += 1
         pending_timers[tid] = PendingTimer(
-            id=tid, due_at=due_at, period_ms=period_ms,
-            cb_addr=lp_time_proc, dw_user=dw_user, fu_event=fu_event,
+            id=tid,
+            due_at=due_at,
+            period_ms=period_ms,
+            cb_addr=lp_time_proc,
+            dw_user=dw_user,
+            fu_event=fu_event,
         )
-        logger.trace("handlers",
-            f"timeSetEvent(delay={u_delay}ms, proc=0x{lp_time_proc:08x}, fuEvent=0x{fu_event:x}) -> id={tid}")
+        logger.trace(
+            "handlers",
+            f"timeSetEvent(delay={u_delay}ms, proc=0x{lp_time_proc:08x}, fuEvent=0x{fu_event:x}) -> id={tid}",
+        )
         cpu.regs[EAX] = tid
         cleanup_stdcall(cpu, memory, 20)
 

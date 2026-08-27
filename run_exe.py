@@ -68,7 +68,8 @@ try:
     with open(os.path.join(_repo_dir, "emulator.json"), "r", encoding="utf-8") as _f:
         _cfg = json.load(_f)
 except Exception:
-    pass
+    logger.error("startup", f"Failed to load emulator.json from {_repo_dir} -- using defaults")
+    raise SystemExit(f"emulator.json not found in {_repo_dir} -- run from the repo root or pass --install-dir")
 
 install_dir: str | None = None
 if _args.install_dir:
