@@ -82,7 +82,8 @@ def _duplicate_handle_entry(state: CRTState, h_source: int, close_source: bool) 
         entry = state.file_handle_map[h_source]
         new_handle = state.next_file_handle
         state.next_file_handle += 1
-        state.file_handle_map[new_handle] = entry  # shared ref → shared file position
+        # shared ref → shared file position
+        state.file_handle_map[new_handle] = entry
 
     elif h_source in state.kernel_handle_map:
         obj = state.kernel_handle_map[h_source]
@@ -1624,7 +1625,8 @@ def register_kernel32_io_handlers(
             memory.write8(lp_buf + len(d), 0)
             cpu.regs[EAX] = len(d)
         else:
-            cpu.regs[EAX] = len(d) + 1  # required size, including null terminator
+            # required size, including null terminator
+            cpu.regs[EAX] = len(d) + 1
         logger.debug("handlers", f'GetTempPathA({n_buf}) -> "{d}"')
         cleanup_stdcall(cpu, memory, 8)
 
