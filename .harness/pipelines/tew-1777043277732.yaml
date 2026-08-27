@@ -129,6 +129,16 @@ pipeline:
                               shell: Bash
                               command: |-
                                 set -euo pipefail
+
+                                # The cpu/ directory is a git submodule (git@github.com:drazisil/tew-cpu.git).
+                                # cloneCodebase: true only clones the main repo, not submodules, and the
+                                # submodule's SSH URL has no credential configured on this runner -- rewrite
+                                # it to HTTPS so it reuses the same GitHub OAuth-backed credentials the main
+                                # clone already authenticated with.
+                                echo "=== Initializing cpu/ submodule ==="
+                                git config --global url."https://github.com/".insteadOf "git@github.com:"
+                                git submodule update --init --recursive
+
                                 ZIG_VERSION="0.15.2"
                                 ZIG_DIR="$HOME/opt/zig-x86_64-linux-${ZIG_VERSION}"
                                 if ! command -v zig &> /dev/null; then
