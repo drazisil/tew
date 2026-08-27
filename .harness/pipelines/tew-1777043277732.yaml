@@ -165,11 +165,22 @@ pipeline:
                         name: run tests
                         spec:
                           shell: Bash
+                          envVariables:
+                            CI_ENABLE_HCLI_FOR_TESTS: "true"
                           command: |-
                             set -euo pipefail
                             VENV_DIR="${UV_VENV_PATH:-.venv}"
                             source "$VENV_DIR/bin/activate"
                             pytest --cov=tew --cov-report=term-missing --junitxml=test-results/junit.xml
+
+                            # Harness native code coverage (Coverage tab) -- needs the
+                            # account-level CI_CODE_COVERAGE feature flag enabled (Harness
+                            # Support toggles this, not self-service) and hcli, which ships
+                            # in Harness Cloud runners already. Non-fatal: if the flag isn't
+                            # on yet, hcli should just report that rather than break the
+                            # build -- this is a trial run, not a required gate yet.
+                            coverage lcov -o lcov.info
+                            hcli cov upload --file=lcov.info || echo "hcli cov upload failed (CI_CODE_COVERAGE flag likely not enabled yet) -- continuing"
                           reports:
                             type: JUnit
                             spec:
