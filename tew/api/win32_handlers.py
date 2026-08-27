@@ -86,6 +86,19 @@ def cleanup_stdcall(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
     memory.write32(cpu.regs[ESP], ret_addr)
 
 
+def unimplemented_halt(name: str) -> Callable[["CPU"], None]:
+    """Return a handler that halts loudly with an UNIMPLEMENTED log.
+
+    Use for a real Win32 API this project has deliberately not implemented
+    yet, so calling it fails loudly instead of silently returning garbage.
+    """
+    def _h(cpu: "CPU") -> None:
+        logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
+        cpu.halted = True
+        cpu.fatal_halt = True
+    return _h
+
+
 # ── Win32Handlers ─────────────────────────────────────────────────────────────
 
 

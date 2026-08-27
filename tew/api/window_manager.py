@@ -231,6 +231,15 @@ class WindowManager:
 
     def shutdown(self) -> None:
         """Destroy all SDL2 resources and shut down SDL2."""
+        # Vulkan objects (D3D8's swapchain/surface/device/instance) must be
+        # torn down BEFORE SDL_DestroyWindow below -- destroying the native
+        # window handle out from under a still-live VkSurfaceKHR/swapchain is
+        # undefined behavior per the Vulkan spec and was suspected of
+        # destabilizing the desktop compositor. See d3d8._state.shutdown()'s
+        # own docstring (added 2026-08-24).
+        from tew.api.d3d8 import _state as _d3d8_state
+        _d3d8_state.shutdown()
+
         for entry in list(self._windows.values()):
             if entry.bitmap_texture is not None:
                 from sdl2 import SDL_DestroyTexture

@@ -25,11 +25,20 @@ Known, documented simplifications (see individual functions):
     faulting instruction (EIP advances during instruction fetch, before
     the memory access that triggers the fault) -- an honest approximation,
     not exact hardware fidelity.
-  - RtlUnwind resumes at the target frame using ESP = TargetFrame (the
-    conventional stack depth for that scope, same approach Wine's x86
-    RtlUnwind takes) rather than a saved per-frame CONTEXT, since MSVC's
-    frame layout doesn't expose one generically. EBP is left as whatever
-    the unwind-triggering handler's own execution left it as.
+  - RtlUnwind resumes at TargetIp with ESP set to what it would be after an
+    ordinary `RET <argbytes>` back to RtlUnwind's OWN caller (i.e. the
+    caller's real stack depth at the moment it called RtlUnwind) -- not
+    TargetFrame's address, which is just the SEH registration record's own
+    location and generally unrelated to the caller's actual stack depth.
+    Confirmed live 2026-08-24: MSVC's `__global_unwind2` calls RtlUnwind
+    with TargetIp = its own return address purely as a "fake return" trick
+    (so its own ordinary epilogue can run afterward) -- using ESP=TargetFrame
+    there made that epilogue pop the SEH registration record's own fields as
+    if they were its saved registers, landing back inside __except_handler3
+    via unrelated leftover stack content instead of a real return address.
+    EBP is left as whatever the unwind-triggering handler's own execution
+    left it as (see the separate EBP-restoration logic below for the common
+    case).
   - ExceptionContinueExecution (retry the faulting instruction) is
     accepted and clears the fault, but since EIP has typically already
     advanced past the faulting instruction by the time the fault is
@@ -98,6 +107,20 @@ SEH_RETURN_SENTINEL = 0x001FE010
 
 _STEP_BATCH = 10_000
 _STEP_LIMIT = 2_000_000  # safety net against a genuinely broken/looping handler
+_FINE_STEP_BATCH = 50
+_FINE_STEP_WINDOW = 3_000  # steps watched closely after any RtlUnwind redirect,
+# see _invoke_handler's docstring point (2) -- live-verified against
+# MCity_d.exe's __except_handler3 as comfortably larger than the handful of
+# instructions it needs between resuming from __global_unwind2 and jumping
+# into the real __except block (that whole sequence, from __except_handler3's
+# own entry through __global_unwind2's prologue, took ~70 steps in a full
+# single-step trace 2026-08-24).
+_ESCAPE_EIP_DISTANCE = 0x200000  # 2MB -- see _invoke_handler's docstring
+# point (2). Live-verified 2026-08-24: a handler's own bounded logic
+# (prologue, filter call, __global_unwind2, __NLG_Notify) stays within
+# ~0x10000 bytes of handler_addr; resuming into the protected function's
+# real __except block lands millions of bytes away, in the game's own EXE
+# code -- 2MB gives a large, deliberate margin either side of that gap.
 # Observed live 2026-07-10: a real handler at 0x00c76920 (matched for a
 # fault at 0x00a6bfcb, inside the MAD audio decoder) hit this limit against
 # the real MCity_d.exe. Not yet determined whether it's legitimate heavy
@@ -160,7 +183,34 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
     Raises SehHandlerEscaped if the handler redirects execution instead of
     returning via the sentinel (the RtlUnwind-called-internally case) --
     callers must not touch ESP/EIP themselves in that case, since the
-    handler already did.
+    handler already did. Detected two ways: (1) post-hoc, once `cpu.halted`
+    becomes true for some other reason (a real fault, a genuine `hlt`) -- the
+    original mechanism; (2) proactively, once EIP has moved more than
+    `_ESCAPE_EIP_DISTANCE` away from `handler_addr` itself. Confirmed live
+    2026-08-24 (a full single-step trace, ~90 steps, against MCity_d.exe's
+    real `__except_handler3`/`__global_unwind2`) that a handler's own bounded
+    logic -- prologue, filter evaluation, calling `__global_unwind2`, its
+    epilogue, `__NLG_Notify` -- stays tightly clustered near `handler_addr`
+    (observed within roughly 0x10000 bytes, all inside the same statically-
+    linked CRT region), while resuming into the protected function's real
+    `__except` block (a plain JMP baked into the compiler's scope table, not
+    a second RtlUnwind call -- confirmed exactly one RtlUnwind call happens
+    for this pattern) lands *millions* of bytes away, in the game's own EXE
+    code. An ESP-based version of this check was tried first and found
+    empirically wrong: ESP never approached the original exception's own SEH
+    frame address at any point during the real trace, even though execution
+    had genuinely resumed into ordinary game code -- the assumption that the
+    `__except` block resumes near that address doesn't hold. Without (2),
+    such a handler silently holds this loop hostage for the full
+    `_STEP_LIMIT` (2,000,000 steps) even though nothing is actually stuck.
+
+    (2) is checked every batch regardless of size, but `_rtl_unwind` also
+    sets `cpu._seh_just_redirected` right after any redirect, which makes
+    this loop switch to much smaller batches (`_FINE_STEP_BATCH`) for the
+    next `_FINE_STEP_WINDOW` steps -- catching the transition within a
+    handful of instructions instead of waiting for it to happen to fall
+    within whatever's left of a 10,000-step batch, then reverting to
+    normal-size batches once that window elapses without a crossing.
     """
     esp_before = cpu.regs[ESP] & 0xFFFFFFFF
     esp = esp_before
@@ -174,11 +224,21 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
     if not cpu.fatal_halt:
         cpu.halted = False
 
+    cpu._seh_just_redirected = False  # clear any stale flag from a prior call
+
     steps_left = _STEP_LIMIT
+    fine_steps_remaining = 0
     while not cpu.halted and steps_left > 0:
-        batch = min(_STEP_BATCH, steps_left)
+        if getattr(cpu, "_seh_just_redirected", False):
+            cpu._seh_just_redirected = False
+            fine_steps_remaining = _FINE_STEP_WINDOW
+        batch = min(_FINE_STEP_BATCH if fine_steps_remaining > 0 else _STEP_BATCH, steps_left)
         cpu.run(batch)
         steps_left -= batch
+        if fine_steps_remaining > 0:
+            fine_steps_remaining -= batch
+        if not cpu.halted and abs((cpu.eip & 0xFFFFFFFF) - handler_addr) > _ESCAPE_EIP_DISTANCE:
+            raise SehHandlerEscaped(handler_addr, cpu.eip & 0xFFFFFFFF, faulted=False, esp_before=esp_before)
 
     if not cpu.halted:
         cpu.halted = True
@@ -335,6 +395,7 @@ def dispatch_exception(
             return True
         except SehHandlerTimeout:
             logger.error("seh", f"handler at 0x{handler:08x} timed out -- treating chain as exhausted")
+            cpu.eip = exception_address & 0xFFFFFFFF
             return False
 
         if disposition == EXCEPTION_CONTINUE_EXECUTION:
@@ -345,6 +406,12 @@ def dispatch_exception(
 
         frame = next_frame
 
+    # Chain exhausted, nobody handled it. cpu.eip is whatever the last
+    # _invoke_handler call left it at (SEH_RETURN_SENTINEL + 2 -- internal
+    # bookkeeping for "the handler returned normally", not a real code
+    # address) -- restore it to the actual fault site so callers' halt
+    # diagnostics report where the exception really happened.
+    cpu.eip = exception_address & 0xFFFFFFFF
     return False
 
 
@@ -443,12 +510,18 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
 
         if target_ip:
             # Real RtlUnwind never returns to its caller when TargetIp is
-            # set -- it resumes execution there directly. ESP = target_frame
-            # is the conventional stack depth for that scope (see module
-            # docstring re: this being a documented simplification vs. a
-            # true saved per-frame CONTEXT).
+            # set -- it resumes execution there directly, with ESP set as if
+            # RtlUnwind had just done an ordinary `RET 16` back to whoever
+            # called it (4 stdcall DWORD args). This is NOT target_frame's
+            # address -- confirmed live 2026-08-24 via MSVC's
+            # __global_unwind2, which calls RtlUnwind with TargetIp = its
+            # own return address as a "fake return" trick; using
+            # ESP=target_frame there corrupts its epilogue (see module
+            # docstring). `esp` here is RtlUnwind's own entry ESP, captured
+            # before its args were read, so esp+20 (retaddr + 4 args) is
+            # exactly that caller-return depth.
             cpu.regs[EAX] = return_value & 0xFFFFFFFF
-            cpu.regs[ESP] = target_frame & 0xFFFFFFFF
+            cpu.regs[ESP] = (esp + 20) & 0xFFFFFFFF
             # EBP restoration: only handled for the common case of
             # unwinding back to the same frame the exception originated in
             # (dispatch_exception stashes that (frame, EBP) pairing --
@@ -468,6 +541,14 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
                     "EBP-relative addressing may misbehave",
                 )
             cpu.eip = target_ip & 0xFFFFFFFF
+            # Tells _invoke_handler's loop to watch ESP closely for a few
+            # thousand steps -- see its docstring point (2). This redirect
+            # itself is a normal, expected part of SEH dispatch (not
+            # inherently suspicious); it's what happens in the next handful
+            # of instructions (does __except_handler3 keep running its own
+            # bounded logic, or jump into the protected function's __except
+            # block and never come back) that this is watching for.
+            cpu._seh_just_redirected = True
         else:
             cpu.regs[EAX] = return_value & 0xFFFFFFFF
             cleanup_stdcall(cpu, memory, 16)

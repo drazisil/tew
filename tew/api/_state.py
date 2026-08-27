@@ -478,7 +478,15 @@ class CRTState:
         and the size-tracking dict stay Python-owned, same split as
         ZigMemory leaving the buffer Python-owned in memory_zig.py."""
         addr = self.next_heap_alloc
-        self.next_heap_alloc = bump_alloc_next(self.next_heap_alloc, size)
+        new_cursor = bump_alloc_next(self.next_heap_alloc, size)
+        if new_cursor > THREAD_STACK_BASE:
+            raise RuntimeError(
+                f"heap allocator ran into THREAD_STACK_BASE: alloc of {size} bytes at "
+                f"0x{addr:x} would push the heap cursor to 0x{new_cursor:x}, past "
+                f"THREAD_STACK_BASE (0x{THREAD_STACK_BASE:x}) -- this would silently "
+                f"alias live thread-stack memory instead of failing"
+            )
+        self.next_heap_alloc = new_cursor
         self.heap_alloc_sizes[addr] = size
         return addr
 

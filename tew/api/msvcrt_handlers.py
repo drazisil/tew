@@ -1015,6 +1015,16 @@ def register_msvcrt_handlers(
 
     stubs.register_handler("msvcrt.dll", "strlen", _strlen)
 
+    # wcslen(const wchar_t* s) -> size_t [cdecl]
+    def _wcslen(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        length = 0
+        while memory.read16((ptr + length * 2) & 0xFFFFFFFF) != 0:
+            length += 1
+        cpu.regs[EAX] = length
+
+    stubs.register_handler("msvcrt.dll", "wcslen", _wcslen)
+
     # strcpy(char* dst, const char* src) -> char* [cdecl]
     def _strcpy(cpu: "CPU") -> None:
         dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -1049,6 +1059,26 @@ def register_msvcrt_handlers(
         cpu.regs[EAX] = dst
 
     stubs.register_handler("msvcrt.dll", "strncpy", _strncpy)
+
+    # wcsncpy(wchar_t* dst, const wchar_t* src, size_t n) -> wchar_t* [cdecl]
+    def _wcsncpy(cpu: "CPU") -> None:
+        dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        i = 0
+        while i < n:
+            ch = memory.read16((src + i * 2) & 0xFFFFFFFF)
+            memory.write16((dst + i * 2) & 0xFFFFFFFF, ch)
+            i += 1
+            if ch == 0:
+                break
+        # Pad remainder with zeros
+        while i < n:
+            memory.write16((dst + i * 2) & 0xFFFFFFFF, 0)
+            i += 1
+        cpu.regs[EAX] = dst
+
+    stubs.register_handler("msvcrt.dll", "wcsncpy", _wcsncpy)
 
     # strcat(char* dst, const char* src) -> char* [cdecl]
     def _strcat(cpu: "CPU") -> None:

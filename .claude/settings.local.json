@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ghidra__dump_bytes",
+      "mcp__ghidra__decompile_function",
+      "mcp__ghidra__get_references_to",
+      "mcp__ghidra__switch_active_program",
+      "mcp__ghidra__list_functions",
+      "mcp__ghidra__list_projects",
+      "mcp__ghidra__list_programs",
+      "mcp__ghidra__switch_active_project",
+      "mcp__ghidra__import_and_analyze",
+      "mcp__ghidra__get_function_calls",
+      "mcp__ghidra__get_function_instructions",
+      "mcp__ghidra__search_strings"
+    ]
+  }
+}

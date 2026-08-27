@@ -255,6 +255,7 @@ def test_rtlunwind_pops_current_frame_without_reinvoking_it(cpu_env):
     into that same handler forever."""
     cpu, mem, ks, stubs = cpu_env
     fs_base = ks.get_fs_base()
+    initial_esp = cpu.regs[ESP] & 0xFFFFFFFF
 
     outer_handler = CODE_BASE + 0x10
     write_bytes(mem, outer_handler, bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]))
@@ -282,7 +283,131 @@ def test_rtlunwind_pops_current_frame_without_reinvoking_it(cpu_env):
 
     assert handled is True
     assert mem.read32(fs_base) == FRAME_B  # chain correctly popped past FRAME_A
-    assert (cpu.regs[ESP] & 0xFFFFFFFF) == FRAME_B
+    # ESP resumes at the caller's own stack depth (as if RtlUnwind had just
+    # done an ordinary `RET 16`), not at FRAME_B's address -- see
+    # test_rtlunwind_resumes_at_callers_stack_depth_when_target_ip_is_its_own_return_address
+    # for why target_frame's address is the wrong value here. -20 accounts
+    # for _invoke_handler's own 4-arg+sentinel setup (20 bytes) followed by
+    # inner_handler's own 4 pushes + `call ecx`'s return-address push (20
+    # bytes) minus the fix's +20 restoration -- net -20 from initial_esp.
+    assert (cpu.regs[ESP] & 0xFFFFFFFF) == (initial_esp - 20) & 0xFFFFFFFF
     # recovered_label's own code ran to completion as part of the redirect.
     assert cpu.regs[EAX] == 0x77
     assert cpu.halted
+
+
+def test_rtlunwind_resumes_at_callers_stack_depth_when_target_ip_is_its_own_return_address(cpu_env):
+    """Regression test for the __global_unwind2 self-return trick: real
+    MSVC CRT code calls RtlUnwind(TargetFrame, TargetIp=<its own return
+    address>, ...) purely to simulate a normal function return, so its own
+    ordinary epilogue can run afterward. ESP must resume at the CALLER's
+    real stack depth (as if RtlUnwind had done `RET 16`), not at
+    TargetFrame's address -- TargetFrame is just the SEH registration
+    record's location, unrelated to the caller's actual stack depth.
+    Confirmed live 2026-08-24 against MCity_d.exe's real, compiled
+    __global_unwind2: using ESP=target_frame there made its epilogue pop the
+    registration record's own next/handler/scopetable fields as if they
+    were its saved EDI/ESI/EBX, eventually RETurning through unrelated
+    leftover stack content back into __except_handler3 a second, bogus
+    time -- the actual root cause of a fault that looked, from the outside,
+    like unrelated EBP/stack corruption."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+    initial_esp = cpu.regs[ESP] & 0xFFFFFFFF
+
+    rtlunwind_addr = stubs.get_handler_address("kernel32.dll", "RtlUnwind")
+
+    handler = CODE_BASE
+    # TargetIp = the address right after `call ecx` -- i.e. handler's own
+    # return address, exactly the __global_unwind2 self-return shape.
+    prefix_len = 5 + 2 + 5 + 5 + 5 + 2  # push,push,push,push,mov ecx,call ecx
+    target_ip = handler + prefix_len
+
+    code = b""
+    code += bytes([0x68]) + (0x99).to_bytes(4, "little")          # push 0x99 (ReturnValue)
+    code += bytes([0x6A, 0x00])                                    # push 0 (ExceptionRecord=NULL)
+    code += bytes([0x68]) + target_ip.to_bytes(4, "little")        # push target_ip (TargetIp = own return address)
+    code += bytes([0x68]) + FRAME_A.to_bytes(4, "little")          # push FRAME_A (TargetFrame == originating frame)
+    code += bytes([0xB9]) + rtlunwind_addr.to_bytes(4, "little")   # mov ecx, rtlunwind_addr
+    code += bytes([0xFF, 0xD1])                                    # call ecx
+    assert len(code) == prefix_len
+    code += bytes([0xB8, 0x77, 0x00, 0x00, 0x00, 0xF4])            # mov eax,0x77; hlt -- lands here on resume
+    write_bytes(mem, handler, code)
+    push_seh_frame(mem, fs_base, FRAME_A, handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert handled is True
+    assert cpu.regs[EAX] == 0x77  # the marker right after `call ecx` actually ran
+    assert cpu.halted
+    # ESP lands where an ordinary `RET 16` back to the caller would leave
+    # it -- NOT at FRAME_A's address (the old, wrong behavior this fix
+    # removes). -20 for the same reason as
+    # test_rtlunwind_pops_current_frame_without_reinvoking_it above.
+    final_esp = cpu.regs[ESP] & 0xFFFFFFFF
+    assert final_esp == (initial_esp - 20) & 0xFFFFFFFF
+    assert final_esp != FRAME_A
+
+
+def test_dispatch_exception_returns_immediately_when_handler_resumes_far_from_itself(cpu_env):
+    """Regression test for the anti-debug-self-test hang that survived the
+    RtlUnwind resume-ESP fix: once a handler's RtlUnwind-driven redirect
+    resumes execution millions of bytes away from the handler's own code
+    (the real __except block, confirmed live 2026-08-24 against
+    MCity_d.exe's own __except_handler3 -> real __except body jump -- a
+    plain JMP baked into the compiler's scope table, not a second RtlUnwind
+    call), that's ordinary, effectively unbounded program continuation -- it
+    was never going to return to our sentinel or hit a halt on its own (real
+    MSVC __except blocks fall straight through into the rest of the
+    enclosing function). An earlier version of this fix tried detecting this
+    via ESP reaching the original exception's own SEH frame address; live
+    tracing proved that assumption wrong (ESP never got anywhere near it,
+    even mid-escape) -- EIP distance from handler_addr is what actually
+    distinguishes a handler's own bounded logic (clustered within ~0x10000
+    bytes, confirmed live) from a genuine escape into unrelated code.
+    Without detecting this proactively, _invoke_handler holds the CPU
+    hostage for the full 2,000,000-step _STEP_LIMIT even though nothing is
+    actually stuck, which then starves run_exe.py's own outer-loop timer/
+    thread-scheduling machinery (already proven to work correctly on its
+    own) for that whole duration. This test proves detection happens
+    immediately (well within one _STEP_BATCH), not just eventually via the
+    step-limit fallback: the resumed code jumps to itself forever (`jmp $`)
+    and would otherwise burn through the entire 2,000,000-step budget before
+    dispatch_exception ever returned."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+
+    rtlunwind_addr = stubs.get_handler_address("kernel32.dll", "RtlUnwind")
+
+    # target_ip: comfortably more than _ESCAPE_EIP_DISTANCE (2MB) away from
+    # `handler` below, well within this fixture's MEM_SIZE (4MB) -- then
+    # spins forever. If _invoke_handler doesn't detect this proactively, it
+    # never returns.
+    handler = CODE_BASE
+    resume_target = handler + 0x300000
+    resume_code = bytes([0xEB, 0xFE])  # jmp $ (infinite self-loop)
+    write_bytes(mem, resume_target, resume_code)
+
+    code = b""
+    code += bytes([0x68]) + (0x99).to_bytes(4, "little")          # push 0x99 (ReturnValue)
+    code += bytes([0x6A, 0x00])                                    # push 0 (ExceptionRecord=NULL)
+    code += bytes([0x68]) + resume_target.to_bytes(4, "little")    # push resume_target (TargetIp)
+    code += bytes([0x68]) + FRAME_A.to_bytes(4, "little")          # push FRAME_A (TargetFrame == originating frame)
+    code += bytes([0xB9]) + rtlunwind_addr.to_bytes(4, "little")   # mov ecx, rtlunwind_addr
+    code += bytes([0xFF, 0xD1])                                    # call ecx
+    code += bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3])            # (unreached)
+    write_bytes(mem, handler, code)
+    push_seh_frame(mem, fs_base, FRAME_A, handler, 0xFFFFFFFF)
+
+    handled = dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    # Only reachable quickly if the proactive EIP-distance check fired --
+    # without it, this would run the full _STEP_LIMIT (raising
+    # SehHandlerTimeout internally, caught by dispatch_exception as
+    # handled=False) before ever getting here.
+    assert handled is True
+    # Execution is genuinely still sitting in the infinite loop -- proof
+    # dispatch_exception returned control without waiting for it to halt
+    # or return, exactly like a real __except block that never comes back.
+    assert (cpu.eip & 0xFFFFFFFF) == resume_target  # the `jmp $` instruction itself
+    assert not cpu.halted

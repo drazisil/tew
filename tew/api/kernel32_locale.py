@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from tew.api._state import CRTState
 
 from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import cleanup_stdcall
+from tew.api.win32_handlers import cleanup_stdcall, unimplemented_halt as _halt
 from tew.api.char_type import GetStringTypeArgs, classify_wide_string
 from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string
 from tew.logger import logger
@@ -44,13 +44,6 @@ def register_kernel32_locale_handlers(
     state: "CRTState",
 ) -> None:
     """Register code page, locale, and string conversion handlers."""
-
-    def _halt(name: str):
-        def _h(cpu: "CPU") -> None:
-            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-        return _h
 
     # ── Code pages ────────────────────────────────────────────────────────────
 

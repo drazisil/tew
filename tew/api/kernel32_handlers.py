@@ -19,7 +19,10 @@ if TYPE_CHECKING:
     from tew.loader.dll_loader import DLLLoader
 
 from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE
+from tew.api.win32_handlers import (
+    Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE,
+    unimplemented_halt as _halt,
+)
 from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
 from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
 from tew.logger import logger
@@ -47,8 +50,14 @@ def _load_dll_with_dllmain(
 
 def _invoke_dependency_dllmain(
     cpu: "CPU", memory: "Memory", state: CRTState, loaded,
-) -> None:
+) -> bool:
     """Synchronously run a dependency DLL's own DllMain(DLL_PROCESS_ATTACH).
+
+    Returns True if DllMain returned TRUE (or the DLL has no entry point at
+    all, so there's nothing to check), False if it explicitly returned
+    FALSE -- callers must not silently treat a FALSE return as success
+    (real LoadLibrary treats it as a load failure); see ole32_handlers.py's
+    _ensure_dll_ready for the same contract on its own DllMain call.
 
     dll_loader.load_dll() recursively loads a DLL's own PE-import
     dependencies but never runs their DllMain -- only the top-level
@@ -74,22 +83,24 @@ def _invoke_dependency_dllmain(
     result = _invoke_emulated_proc(
         cpu, memory, loaded.entry_point,
         [handle, 1, 0],  # hinstDLL, DLL_PROCESS_ATTACH, lpvReserved
-        sentinel, scheduler=state.scheduler,
+        sentinel,
+        # Default max_steps=5_000_000 was too small here: with real
+        # cooperative threads (timers etc.) running while this thread is
+        # swapped out, the whole budget was routinely exhausted before this
+        # thread ever got back to finish its own call -- see
+        # ole32_handlers.py's _ensure_dll_ready, which hit and fixed the
+        # exact same issue on its own DllMain call.
+        max_steps=50_000_000,
+        scheduler=state.scheduler,
     )
-    # TEMPORARY (2026-08-18): expression-service-init hypothesis probe --
-    # bumped to error level, scoped to expsrv.dll only, to check whether its
-    # DllMain now actually completes (result=1) with the reentrancy
-    # starvation fixed (was 160,433 violations/3.7s before the scheduler-
-    # to-Zig port; 0 as of that port's completion). See status.md/
-    # changelog.md "2026-08-17"/"(cont'd)" for the DAO-3075 thread this
-    # continues. Revert to plain logger.debug once this investigation
-    # concludes.
-    if loaded.name.lower() == "expsrv.dll":
-        logger.error("handlers",
-            f"[expr-svc-probe] expsrv.dll DllMain returned {result} "
-            f"(1=success, 0=failure)")
     logger.debug("handlers",
         f"[dependency-dllmain] {loaded.name}'s DllMain returned {result}")
+    if result == 0:
+        logger.error("handlers",
+            f"[dependency-dllmain] {loaded.name}: DllMain(DLL_PROCESS_ATTACH) "
+            "returned FALSE -- treating as a failed load")
+        return False
+    return True
 
 
 def register_kernel32_handlers(
@@ -99,13 +110,6 @@ def register_kernel32_handlers(
     dll_loader: Optional["DLLLoader"] = None,
 ) -> None:
     """Register all kernel32.dll handlers."""
-
-    def _halt(name: str):
-        def _h(cpu: "CPU") -> None:
-            logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-        return _h
 
     # ── Module handles ────────────────────────────────────────────────────────
 
@@ -217,6 +221,24 @@ def register_kernel32_handlers(
 
     # ── LoadLibrary ───────────────────────────────────────────────────────────
 
+    def _normalized_dll_name(name: str) -> str:
+        """Lowercase, always ".dll"-suffixed module name for DynamicModule
+        caching -- must match get_stub_dll_handle/register_handler's own
+        normalization exactly. A bare name like "kernel32" (real Windows
+        accepts LoadLibraryA/GetModuleHandleA without the extension) cached
+        verbatim here permanently shadows the correct, suffixed lookup for
+        every later GetProcAddress(hModule, ...) call using this same
+        handle -- confirmed live: GetProcAddress("kernel32", ...) always
+        returned NULL for real, registered handlers (e.g.
+        IsProcessorFeaturePresent) once "kernel32" (no suffix) had been
+        cached this way, even though "kernel32.dll!IsProcessorFeaturePresent"
+        was a real, working registration the whole time.
+        """
+        norm = name.lower()
+        if not norm.endswith(".dll"):
+            norm += ".dll"
+        return norm
+
     def _load_dll_by_path(name: str, arg_bytes: int,
                           cpu: "CPU", memory: "Memory") -> bool:
         """Try to load a path-based DLL. Returns True if handled (caller should return)."""
@@ -235,7 +257,7 @@ def register_kernel32_handlers(
                         dll_loader.patch_dll_iats(memory, stubs)
                         handle = loaded.base_address & 0xFFFFFFFF
                         state.dynamic_modules[handle] = DynamicModule(
-                            dll_name=basename.lower(),
+                            dll_name=_normalized_dll_name(basename),
                             base_address=loaded.base_address,
                         )
                         logger.info("handlers",
@@ -266,7 +288,7 @@ def register_kernel32_handlers(
                 stub_handle = stubs.get_stub_dll_handle(basename)
                 if stub_handle is not None:
                     state.dynamic_modules[stub_handle] = DynamicModule(
-                        dll_name=basename.lower(),
+                        dll_name=_normalized_dll_name(basename),
                         base_address=stub_handle,
                     )
                     logger.debug("handlers",
@@ -307,7 +329,7 @@ def register_kernel32_handlers(
                 dll_loader.patch_dll_iats(memory, stubs)
                 handle = loaded.base_address & 0xFFFFFFFF
                 state.dynamic_modules[handle] = DynamicModule(
-                    dll_name=name.lower(), base_address=loaded.base_address)
+                    dll_name=_normalized_dll_name(name), base_address=loaded.base_address)
                 logger.info("handlers",
                     f'LoadLibraryA("{name}") -> 0x{handle:x} '
                     f'(loaded at 0x{loaded.base_address:x})')
@@ -321,7 +343,7 @@ def register_kernel32_handlers(
         stub_handle = stubs.get_stub_dll_handle(name)
         if stub_handle is not None:
             state.dynamic_modules[stub_handle] = DynamicModule(
-                dll_name=name.lower(), base_address=stub_handle)
+                dll_name=_normalized_dll_name(name), base_address=stub_handle)
             logger.debug("handlers", f'LoadLibraryA("{name}") -> 0x{stub_handle:x} (stub-only)')
             cpu.regs[EAX] = stub_handle
         else:
@@ -342,21 +364,47 @@ def register_kernel32_handlers(
         else:
             _load_dll_by_name(name, 4, cpu, memory)
 
-    def _load_library_ex_a(cpu: "CPU") -> None:
-        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
-        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        if dw_flags != 0:
+    # dwFlags bits that only narrow *where* the loader searches for the DLL
+    # (a real-Windows DLL-planting defense) -- irrelevant here since
+    # dll_loader's own search path list is fixed and not attacker-influenced.
+    # Safe to ignore and load exactly as LoadLibrary(Ex) with dwFlags=0 would.
+    _LOAD_LIBRARY_SEARCH_FLAGS = (
+        0x8       # LOAD_WITH_ALTERED_SEARCH_PATH
+        | 0x10    # LOAD_IGNORE_CODE_AUTHZ_LEVEL
+        | 0x200   # LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+        | 0x400   # LOAD_LIBRARY_SEARCH_USER_DIRS
+        | 0x800   # LOAD_LIBRARY_SEARCH_SYSTEM32
+        | 0x1000  # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    )
+
+    def _load_library_ex_common(name: str, dw_flags: int, cpu: "CPU", memory: "Memory",
+                                caller_label: str) -> None:
+        if dw_flags & ~_LOAD_LIBRARY_SEARCH_FLAGS:
             logger.error("handlers",
-                f"[UNIMPLEMENTED] LoadLibraryExA dwFlags=0x{dw_flags:x} — halting")
+                f"[UNIMPLEMENTED] {caller_label} dwFlags=0x{dw_flags:x} — halting")
             cpu.halted = True
             cpu.fatal_halt = True
             return
-        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        if dw_flags:
+            logger.debug("handlers",
+                f"{caller_label}: ignoring search-scope-only dwFlags=0x{dw_flags:x}")
         has_sep = "\\" in name or "/" in name
         if has_sep:
             _load_dll_by_path(name, 12, cpu, memory)
         else:
             _load_dll_by_name(name, 12, cpu, memory)
+
+    def _load_library_ex_a(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name = read_cstring(name_ptr, memory) if name_ptr else ""
+        _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExA")
+
+    def _load_library_ex_w(cpu: "CPU") -> None:
+        name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
+        dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        name = read_wide_string(name_ptr, memory) if name_ptr else ""
+        _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExW")
 
     def _free_library(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1
@@ -368,6 +416,7 @@ def register_kernel32_handlers(
 
     stubs.register_handler("kernel32.dll", "LoadLibraryA",              _load_library_a)
     stubs.register_handler("kernel32.dll", "LoadLibraryExA",            _load_library_ex_a)
+    stubs.register_handler("kernel32.dll", "LoadLibraryExW",            _load_library_ex_w)
     stubs.register_handler("kernel32.dll", "FreeLibrary",               _free_library)
     stubs.register_handler("kernel32.dll", "DisableThreadLibraryCalls", _disable_thread_lib)
 
