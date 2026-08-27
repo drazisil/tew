@@ -37,7 +37,7 @@ Path: ~/Documents/i386.pdf (421 pages)
 
 **New blocker, unrelated to tonight's bug**: `msvcrt.dll!wcsncpy` is unimplemented, hit ~61.3s in, called by `OLEAUT32.dll` to copy the resolved typelib DLL path from `SearchPathW` (EBP chain: `expsrv.dll+0x1cbd7` -> `expsrv.dll+0x9d1b` -> `OLEAUT32.dll+0x863d` -> `OLEAUT32.dll+0x38f82` -> `OLEAUT32.dll+0x6f028` -> `OLEAUT32.dll+0x6ef0d` -> `msvcrt.dll!wcsncpy`).
 
-Repro: `cd /data/Code/tew && TEW_WATCH_ADDR=82bfa60 TEW_FIXED_HEARTBEAT_MS=100 TEW_MAX_STEPS=5000000000 LOG_LEVEL=debug LOG_CATEGORIES=cpu,startup,loader,com,handlers timeout 120 .venv/bin/python run_exe.py`.
+Repro: `cd /data/Code/tew && TEW_WATCH_ADDR=82bfa60 TEW_FIXED_HEARTBEAT_MS=100 TEW_MAX_STEPS=5000000000 LOG_LEVEL=debug LOG_CATEGORIES=cpu,startup,loader,com,handlers timeout 300 .venv/bin/python run_exe.py`.
 
 **Housekeeping, still live from earlier sessions**:
 - ClickHouse execution-history capture (`~/pe-walker/history-poc` docker-compose) does **not** survive a reboot/power-cut -- needs `docker compose up -d` again (schema/data persist on the bind-mounted volume, just the container needs restarting). Same for `ghidra-mcp.service`'s project state -- survives service restart via systemd, but needs a fresh MCP handshake (new session ID) and re-opening the project/program.
