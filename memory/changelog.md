@@ -4,6 +4,28 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-26 (cont'd x35) — MILESTONE: DAO license-key BSTR bug confirmed fixed end-to-end; game now runs real single-race gameplay DB traffic
+
+With `DllMain` now running for all 4 statically-imported DLLs (previous entry), worked through the resulting wave of newly-exercised missing handlers, in the order hit: `kernel32.dll!GetSystemTimeAsFileTime`, `LoadLibraryExW` (plus a `dwFlags` fix so search-scope-only flags like `LOAD_LIBRARY_SEARCH_SYSTEM32` are ignored instead of halting, on both `LoadLibraryExA` and `LoadLibraryExW`), `InitializeSListHead`, `CreateEventW`; `ntdll.dll!RtlInitializeCriticalSection(AndSpinCount)`, `RtlInitializeResource`, `RtlAcquireResourceExclusive`, `RtlReleaseResource` (first `ntdll.dll`-export handlers in this project, as opposed to `INT 0x2E` syscalls); `user32.dll!wsprintfA` (reuses msvcrt's shared printf engine), `RegisterClipboardFormatA`; `kernel32.dll!GetSystemDirectoryA`; `ole32.dll!CoSetState` (the actual call inside `oleaut32.dll`'s lazy per-thread automation-state init that was failing -- a no-op returning `S_OK` is sufficient).
+
+**Confirmed live**: `Ordinal_2`/`SysAllocString` now returns a real heap BSTR pointer instead of `NULL`/`0xCCCCCCCC`. `dblog.txt` shows the game proceeding straight past DAO init into real gameplay (`DB_StartUpDatabase`, `DBServiceRequestQ` handling `DBT_GO_SINGLERACE`/`DBT_STARTUP`/`DBT_GET_GAMECONFIG_CAR_TABLE`, `DBPhysics_GetTireAuxData`, `DBMem_Alloc`) -- no more `Database initialization failed!`. Run reaches 60+ seconds before the next halt, vs. ~2-3s before this fix. Full test suite re-run: same 101 pre-existing failures (unrelated, see previous entry), no new regressions.
+
+**New blocker, unrelated to this bug**: `kernel32.dll!SearchPathW`, hit ~60s in, inside `expsrv.dll`/`OLEAUT32.dll`/`MSJET35.DLL` interaction -- likely typelib-loading related. Not yet investigated.
+
+---
+
+## 2026-08-26 (cont'd x34) — Root cause of the DAO license-key BSTR bug: statically-imported real DLLs never ran their own `DllMain`; fixed
+
+Traced `Ordinal_2`/`SysAllocString` returning NULL (previous entry) all the way down: real `oleaut32.dll` lazily bootstraps per-thread OLE-automation state on first use via a TLS slot, and that bootstrap fails because `TlsAlloc()` -- called only from `oleaut32.dll`'s own real `DllMain` -- never ran. A live "log every `DllMain` call" pass confirmed it: zero `DllMain` invocations all session for any of the 4 DLLs `MCity_d.exe` statically imports (`d3d8.dll`, `oleaut32.dll`, `rpcrt4.dll`, `secur32.dll`). `dll_loader.py`'s `should_invoke_dependency_dllmain` docstring explains why -- this was a deliberate scoping choice from 2026-08-16 (the `msjint35.dll` fix): the `on_dependency_loaded` callback was only ever wired up at runtime `LoadLibraryA`/`CoGetClassObject` call sites, never at `import_resolver.py`'s static-import `build_iat_map`.
+
+**Fix**: `build_iat_map` now accepts an `on_dependency_loaded` callback and applies the same `should_invoke_dependency_dllmain` check `load_dll` already uses for its own recursive dependencies, so correct dependency-before-dependent ordering falls out for free. `run_exe.py` collects the resulting DLL list and invokes `_invoke_dependency_dllmain` for each one after the main thread's stack and kernel structures are initialized (had to move it there from right after `write_iat_handlers` -- `_invoke_emulated_proc` builds its nested call frame on top of the current `ESP`, which is still 0 that early) but still strictly before the guest's own entry point starts running.
+
+**Consequence**: every one of these DLLs' real `DllMain` now runs for the first time ever in this emulator, exercising a long tail of previously-dormant code. Found and fixed along the way: `kernel32.dll!GetSystemTimeAsFileTime` had no handler at all (`kernel32_io.py`, matching the existing `GetSystemTime`/`_write_filetime` pattern). Currently blocked on `kernel32.dll!LoadLibraryExW`, hit by `d3d8.dll`'s own `DllMain` (unrelated third-party shim, just newly reachable) -- see status.md for the live list as it grows.
+
+**Also found, not caused by this fix**: 101 `tests/unit/api/test_oleaut32_*.py` unit tests fail against `main` even before this change (confirmed via `git stash`) -- they call `stubs.get("oleaut32.dll", "Ordinal #N")` directly, which the earlier `_NoOleaut32Stubs` wrapper (previous-previous entry) now makes raise `KeyError` for everything. Queued in TODO.md, not fixed yet.
+
+---
+
 ## 2026-08-26 (cont'd x33) — Traced the DB-init failure to a live, concrete garbage value; found and fixed a real native-segfault risk in logpoint memory access
 
 With real `oleaut32.dll` running, `Dbcode_InitDao`'s two `IClassFactory2::CreateInstanceLic` attempts against real `dao350.dll` both use bad BSTR keys: the first (`dbVariant`-wrapped) is NULL; the fallback (`Ordinal_2`/presumably `SysAllocString`) is `0xCCCCCCCC` -- MSVC's debug-build "never written" stack-fill pattern, meaning the real `SysAllocString` return value never reached `local_44` before use. The fallback call still returns `HRESULT=S_OK` from `dao350.dll` despite the garbage key -- real DAO code isn't validating it, so downstream consumption of a bad engine-interface pointer is the live risk. Not yet pinned down which exact instruction is supposed to write `Ordinal_2`'s result and doesn't -- see status.md.

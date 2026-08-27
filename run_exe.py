@@ -28,6 +28,7 @@ from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt, _dum
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
+from tew.api.kernel32_handlers import _invoke_dependency_dllmain
 from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
 from tew.api.nt_handlers import register_nt_handlers
@@ -67,7 +68,8 @@ try:
     with open(os.path.join(_repo_dir, "emulator.json"), "r", encoding="utf-8") as _f:
         _cfg = json.load(_f)
 except Exception:
-    pass
+    logger.error("startup", f"Failed to load emulator.json from {_repo_dir} -- using defaults")
+    raise SystemExit(f"emulator.json not found in {_repo_dir} -- run from the repo root or pass --install-dir")
 
 install_dir: str | None = None
 if _args.install_dir:
@@ -164,13 +166,24 @@ cpu.kernel_structures = kernel_structures
 
 exe.import_resolver.set_memory(mem)
 
-# DLL search paths: application directory first (mirrors Windows loader behavior),
-# then any additional directories (e.g. dgVoodoo d3d8 shim).
+# DLL search paths: application directory first (mirrors Windows loader behavior).
+# 2026-08-26: dropped the dgVoodoo/rayman_d3d8 search path (and deleted its
+# d3d8.dll) -- tew's own d3d8_handlers.py registers Python handlers for
+# every function the game actually calls (Direct3DCreate8, DebugSetMute,
+# Validate*Shader), and register_handler always wins over a real DLL's own
+# export (dll_loader.py's patch_iat_entry precedence). Loading dgVoodoo's
+# real, Vista+-targeting d3d8.dll and running its real DllMain provided
+# nothing the game uses, while costing an entire extra wave of Vista+-only
+# missing-handler chasing (LoadLibraryExW, InitializeSListHead, CreateEventW,
+# InitializeCriticalSectionEx, ...). Confirmed live: removing it entirely
+# changes nothing about the run past this point. General rule going forward:
+# DLL search paths should point into ~/.emu32 (period-correct, purpose-built
+# for this project) -- copy a file in there if something new is ever
+# genuinely needed, don't add an arbitrary ~/Downloads directory.
 exe.import_resolver.add_dll_search_path(dirname(exe_path))
-exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
 # Real, period-correct COM servers (oleaut32.dll, dao350.dll, ...) live here
 # -- must be registered before build_iat_map, not just later inside
-# register_oleaut32_ole32_handlers (oleaut32_handlers.py's own
+# register_ole32_handlers (ole32_handlers.py's own
 # _KNOWN_COM_SERVER_DIR add_search_path call): build_iat_map does its own
 # eager load_dll() for every DLL MCity_d.exe directly imports, and that
 # result is cached into _iat_map permanently -- if the search path isn't
@@ -178,12 +191,36 @@ exe.import_resolver.add_dll_search_path("/data/Downloads/rayman_d3d8")
 # early ordinal-based BSTR alloc call, well before DAO/Jet loads it again
 # later via a different path) silently resolve to nothing and fall through
 # to an auto-generated fatal-halt stub instead of the genuinely correct,
-# already-loaded-later real DLL. Found 2026-08-26 after removing this
-# file's oleaut32.dll Python handlers exposed the gap they'd been silently
+# already-loaded-later real DLL. Found 2026-08-26 after removing the
+# old oleaut32.dll Python handlers exposed the gap they'd been silently
 # covering for.
 exe.import_resolver.add_dll_search_path("/home/drazisil/.emu32/WINDOWS/System32")
 
-exe.import_resolver.build_iat_map(exe.import_table, exe.optional_header.image_base)
+# 2026-08-26: MCity_d.exe's own directly-imported real DLLs (d3d8.dll,
+# oleaut32.dll, rpcrt4.dll, secur32.dll -- and their own real-DLL
+# dependencies, e.g. ole32.dll, loaded recursively by build_iat_map's own
+# load_dll calls) never ran their DllMain at all -- should_invoke_dependency_dllmain's
+# own docstring documents this as a deliberate scoping choice when the
+# on_dependency_loaded mechanism was first built (it only ever got wired up
+# at runtime LoadLibraryA/CoGetClassObject call sites). Real, confirmed bug
+# this caused: oleaut32.dll's own TlsAlloc() (called from its DllMain, via
+# FUN_77121f36) never ran, so its module-global TLS slot stayed at
+# TLS_OUT_OF_INDEXES, which made every real SysAllocString call fail (its
+# lazy per-thread init bails out on the first TlsSetValue). Collecting the
+# DLLs here instead of invoking DllMain inline: at this point in startup,
+# these DLLs' own kernel32/user32/etc. IAT slots aren't patched with
+# working Python handler stubs yet (that's write_iat_handlers/
+# patch_crt_internals, below) -- calling DllMain this early would call
+# through unresolved/zeroed IAT entries. _pending_dllmain_dlls ends up in
+# correct dependency-before-dependent order for free, since it's populated
+# via the same should_invoke_dependency_dllmain check used by the existing,
+# already-proven-correct runtime dependency-DllMain path (a dependency's
+# own load_dll call, and thus its own DllMain, always completes before its
+# dependent's does).
+_pending_dllmain_dlls: list = []
+exe.import_resolver.build_iat_map(
+    exe.import_table, exe.optional_header.image_base, _pending_dllmain_dlls.append
+)
 
 # ── Register Win32 stubs ──────────────────────────────────────────────────────
 
@@ -310,6 +347,31 @@ cpu.regs[ESP] -= 4
 mem.write32(cpu.regs[ESP], SENTINEL_ADDR)
 
 kernel_structures.initialize_kernel_structures(stack_base, stack_limit, crt_state.process_heap)
+
+# Now that the main thread has a real stack (ESP/EBP above) and kernel
+# structures (TEB/PEB) are initialized, it's safe to run the
+# statically-imported real DLLs' DllMain(DLL_PROCESS_ATTACH) --
+# _invoke_emulated_proc builds its nested call's stack frame "on top of the
+# current stack" (see its own docstring), which needs a real ESP to build
+# on top of; calling this any earlier (e.g. right after write_iat_handlers/
+# patch_crt_internals above, before ESP is set) crashes with a write32
+# bounds error from ESP still being 0. Still strictly before the guest
+# entry point itself runs (cpu.eip was set above, but the step loop hasn't
+# started yet), matching real Windows load-then-attach-then-run ordering.
+# See the long comment at build_iat_map's call site for why this whole
+# invocation is deferred this far rather than running inline there.
+_failed_static_dllmains = [
+    _pending_dll.name for _pending_dll in _pending_dllmain_dlls
+    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll)
+]
+if _failed_static_dllmains:
+    logger.warn(
+        "startup",
+        f"DllMain(DLL_PROCESS_ATTACH) returned FALSE for: {', '.join(_failed_static_dllmains)} "
+        "-- real LoadLibrary would treat this as a failed load; continuing anyway "
+        "since these are direct EXE imports we can't simply not-load, but their exports "
+        "may be unreliable from here on.",
+    )
 
 # ── Build valid EIP range table ───────────────────────────────────────────────
 
@@ -552,7 +614,7 @@ def _fields_probe(cpu, mem):
     fields_ptr = mem.read32((ebp - 0x20) & 0xFFFFFFFF)  # real offset, hand-decoded -- see note above
     _fields_by_ebp[ebp] = (fields_ptr, cpu.regs[EAX])
     return True  # never disable -- need this for every GetValue call
-register_breakpoint(0x008fbde4, _fields_probe)
+# register_breakpoint(0x008fbde4, _fields_probe)
 
 def _fields_count_probe(cpu, mem):
     # Once per distinct recordset's first fetch (col==0/row==0): sanity-check
@@ -570,7 +632,7 @@ def _fields_count_probe(cpu, mem):
             raw_count = mem.read16((rec_base + 0x2C) & 0xFFFFFFFF) if rec_base else None
             logger.error("cpu", f"[fields-count-probe] rec_base=0x{rec_base:x} raw_count={raw_count}")
     return True  # never disable -- want every low-Count occurrence, not just the first
-register_breakpoint(0x008fbf90, _fields_count_probe)
+# register_breakpoint(0x008fbf90, _fields_count_probe)
 
 # 2026-08-25 (cont'd x16): tracing the expsrv.dll ESI=0xFFFFFFFF halt (see
 # status.md's current entry). Static analysis (file-based E8 scan + manual
@@ -597,7 +659,7 @@ def _expsrv_vtable_call_probe(cpu, mem):
     )
     return True  # log every hit -- the crash may not be the first call through this vtable slot,
     # only the one right before the halt matters; correlate by log order against the exception dump
-register_breakpoint(0x18061d84, _expsrv_vtable_call_probe)
+# register_breakpoint(0x18061d84, _expsrv_vtable_call_probe)
 
 # 2026-08-25 (cont'd x17): one instruction earlier than the vtable-call probe
 # above -- static 0x7a8a1d5b (runtime 0x18061d5b), `MOV ECX,[EDX+ECX*4]`.
@@ -666,7 +728,7 @@ def _locale_info_object_probe(cpu, mem):
     else:
         logger.error("cpu", "[locale-info-object-probe] iVar1 is NULL -- locale-info object was never allocated")
     return True
-register_breakpoint(0x180e6824, _locale_info_object_probe)
+# register_breakpoint(0x180e6824, _locale_info_object_probe)
 
 # 2026-08-25 (cont'd x21): pinning down WHY uStack_18/14/10 stay garbage
 # while local_1c reliably reads -1 for failing records. Manual disassembly
@@ -751,7 +813,7 @@ def _beginthread_call_probe(cpu, mem):
         f"[beginthread-call-probe] _Ptd=0x{ptd:x} real_start=0x{real_start:x} real_arg=0x{real_arg:x}",
     )
     return True  # need this for every __beginthread call, not just the first
-register_breakpoint(0x9f5880, _beginthread_call_probe)
+# register_breakpoint(0x9f5880, _beginthread_call_probe)
 
 # 2026-08-25 (cont'd x27): tracing why NPSThreadSender (tid=1005, the "Sender"
 # NPS thread -- confirmed via the real _tiddata start-addr field AND
@@ -801,11 +863,11 @@ def _crypto_object_probe(cpu, mem):
             except Exception as e:
                 logger.error("cpu", f"[crypto-object-probe] candidate EBP-0x{off:x}=0x{cand:x} {field_label} failed: {e!r}")
     return True  # need every hit, not just the first -- want the one right before the fault
-register_breakpoint(0x00acb3ba, _crypto_object_probe)
+# register_breakpoint(0x00acb3ba, _crypto_object_probe)
 
 def _plain_sendtosocket_logpoint(eip, regs, memory, memory_size):
     logger.error("cpu", "[plain-sendtosocket] LAB_00acb5ab path fired -- no crypto branch taken this message")
-cpu.add_logpoint(0x00acb643, _plain_sendtosocket_logpoint)
+# cpu.add_logpoint(0x00acb643, _plain_sendtosocket_logpoint)
 
 # 2026-08-25 (cont'd x30): identifying tid=1010 (owner of thread-stack slot
 # 10, 0x08280000-0x082c0000 -- the range 0x082be46f, the "garbage" sibling
@@ -829,11 +891,11 @@ def _beginthreadex_entry_probe(cpu, mem):
         f"real_start=0x{real_start:x} real_arg=0x{real_arg:x}",
     )
     return True  # need this for every thread using this trampoline
-register_breakpoint(0x009fc3a0, _beginthreadex_entry_probe)
+# register_breakpoint(0x009fc3a0, _beginthreadex_entry_probe)
 
 def _mem_init_logpoint(eip, regs, memory, memory_size):
     logger.error("cpu", "[mem-init-probe] _MEM_init (00a719e0) reached")
-cpu.add_logpoint(0x00a719e0, _mem_init_logpoint)
+# cpu.add_logpoint(0x00a719e0, _mem_init_logpoint)
 
 # 2026-08-26: re-opening the "who actually writes field2_0x8" question an
 # earlier pre-compaction pass in this same investigation started but never
@@ -863,7 +925,7 @@ def _typelib_lookup_return_logpoint(eip, regs, memory, memory_size):
         logger.error("cpu", f"[typelib-lookup-return] FUN_7a8a16b7 returned EAX=0x{eax:x} ({signed})")
     except Exception as e:
         logger.error("cpu", f"[typelib-lookup-return] EXCEPTION: {e!r}")
-cpu.add_logpoint(0x18061994, _typelib_lookup_return_logpoint)
+# cpu.add_logpoint(0x18061994, _typelib_lookup_return_logpoint)
 
 # 2026-08-26: with real oleaut32.dll now genuinely running, dbcode.c's
 # Dbcode_InitDao (MCity_d.exe) fails at IClassFactory2::CreateInstanceLic --
@@ -891,7 +953,13 @@ def _read32_raw(memory, memory_size, addr: int) -> int | None:
 def _make_createinstancelic_probe(label: str):
     def _probe(eip, regs, memory, memory_size):
         esp = regs[ESP]
+        ebp = regs[EBP]
+        this_ptr = _read32_raw(memory, memory_size, esp + 0)
+        p_unk_outer = _read32_raw(memory, memory_size, esp + 4)
+        p_unk_reserved = _read32_raw(memory, memory_size, esp + 8)
+        riid_ptr = _read32_raw(memory, memory_size, esp + 12)
         bstr_ptr = _read32_raw(memory, memory_size, esp + 16)
+        ppv_obj_ptr = _read32_raw(memory, memory_size, esp + 20)
         byte_len, text = 0, ""
         if bstr_ptr:
             byte_len = _read32_raw(memory, memory_size, bstr_ptr - 4)
@@ -900,10 +968,72 @@ def _make_createinstancelic_probe(label: str):
             else:
                 raw = bytes(memory[bstr_ptr + i] for i in range(byte_len))
                 text = raw.decode("utf-16-le", errors="replace")
-        logger.error("com", f"[createinstancelic-{label}] bstr_ptr=0x{bstr_ptr or 0:x} byte_len={byte_len} content={text!r}")
+        logger.error(
+            "com",
+            f"[createinstancelic-{label}] EBP=0x{ebp:x} this=0x{this_ptr or 0:x} "
+            f"pUnkOuter=0x{p_unk_outer or 0:x} pUnkReserved=0x{p_unk_reserved or 0:x} "
+            f"riid_ptr=0x{riid_ptr or 0:x} bstr_ptr=0x{bstr_ptr or 0:x} "
+            f"byte_len={byte_len} content={text!r} ppvObj_ptr=0x{ppv_obj_ptr or 0:x}",
+        )
     return _probe
-cpu.add_logpoint(0x008f580c, _make_createinstancelic_probe("dbvariant-call"))
+# cpu.add_logpoint(0x008f580c, _make_createinstancelic_probe("dbvariant-call"))
 cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
+
+# 2026-08-26 (cont'd): local_44's real address confirmed live == EBP-0x44 ==
+# 0x082bfa60 this run (matched bstr_ptr exactly). Watching that concrete
+# address from program start to find who's actually supposed to write
+# Ordinal_2's (SysAllocString's) return value there and isn't -- if this
+# comes back with zero hits, it's never written at all (same class of bug as
+# the earlier field2_0x8 investigation); if it fires from unrelated code
+# reusing this stack depth before Dbcode_InitDao runs, that's the false-
+# positive-prone "shared shallow stack slot" pattern seen before with
+# 0x082be230 -- watch for that before trusting a hit here.
+# cpu.set_watchpoint(0x082bfa60)
+
+# Answered: watchpoint_hit=True, last_write_eip=0x8f4ea3 (the function-entry
+# 0xCCCCCCCC stack-fill loop) -- local_44 is never written after that.
+# Removed this breakpoint: it shared 0x008f59b3 with the logpoint just above,
+# and the createinstancelic-sysallocstring-call logpoint was firing TWICE,
+# identically, per hit -- suspect a breakpoint+logpoint-at-the-same-address
+# double-dispatch/re-execution artifact, not a real double CALL. Testing
+# with the breakpoint removed (logpoint alone) to see if the duplicate and
+# the garbage bstr_ptr reading were self-inflicted measurement artifacts.
+# def _local_44_watch_probe(cpu, mem):
+#     logger.error(
+#         "cpu",
+#         f"[local-44-watch] watchpoint_hit={cpu.watchpoint_hit} "
+#         f"last_write_eip=0x{cpu.watchpoint_eip:x} last_write_val=0x{cpu.watchpoint_val:x}",
+#     )
+#     return True
+# register_breakpoint(0x008f59b3, _local_44_watch_probe)
+
+# 2026-08-26 (cont'd): does real oleaut32.dll's SysAllocString (ordinal 2,
+# real runtime address computed live from the actual loaded file:
+# 0x11000000 base + 0x4ba2 RVA = 0x11004ba2) even get called during
+# Dbcode_InitDao's window at all? If this never fires, the game's own
+# control flow skips the whole "call Ordinal_2, retry CreateInstanceLic"
+# branch entirely (another wrong-branch-assumption case); if it fires but
+# EAX comes back wrong, the bug is in the call/return path itself.
+def _sysallocstring_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    psz = _read32_raw(memory, memory_size, esp + 4)
+    text = "<null>"
+    if psz:
+        # wide-string read, 2 bytes at a time, bounds-checked
+        out = []
+        for i in range(60):
+            addr = psz + i * 2
+            if addr + 1 >= memory_size:
+                break
+            lo = memory[addr]
+            hi = memory[addr + 1]
+            ch = lo | (hi << 8)
+            if ch == 0:
+                break
+            out.append(chr(ch))
+        text = "".join(out)
+    logger.error("com", f"[sysallocstring-entry] called, psz=0x{psz or 0:x} text={text!r}")
+# cpu.add_logpoint(0x11004ba2, _sysallocstring_entry_probe)
 
 def _make_createinstancelic_return_probe(label: str):
     def _probe(eip, regs, memory, memory_size):
@@ -911,8 +1041,70 @@ def _make_createinstancelic_return_probe(label: str):
         signed = eax - 0x100000000 if eax >= 0x80000000 else eax
         logger.error("com", f"[createinstancelic-{label}-return] HRESULT=0x{eax:x} ({signed})")
     return _probe
-cpu.add_logpoint(0x008f5816, _make_createinstancelic_return_probe("dbvariant"))
+# cpu.add_logpoint(0x008f5816, _make_createinstancelic_return_probe("dbvariant"))
 cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
+
+# 2026-08-26: SysAllocString (Ordinal_2) returned NULL. Real oleaut32.dll's
+# SysAllocStringLen NULLs out on first-ever-call-on-this-thread lazy COM
+# state init (FUN_77125311 in oleaut32.dll @ preferred base 0x77120000,
+# runtime base 0x11000000 this run -- delta -0x66120000) failing at any of:
+# CoGetMalloc, TlsSetValue, or CoSetState. Logging args in / return out for
+# each, at their real call sites inside oleaut32.dll's own code (not their
+# real callee entry points, since CoGetMalloc/TlsSetValue are external
+# imports and CoSetState resolves to a local in-module thunk).
+def _cogetmalloc_call_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    dw_mem_context = _read32_raw(memory, memory_size, esp + 0)
+    ppmalloc = _read32_raw(memory, memory_size, esp + 4)
+    logger.error("com", f"[cogetmalloc-call] dwMemContext=0x{dw_mem_context or 0:x} ppMalloc=0x{ppmalloc or 0:x}")
+cpu.add_logpoint(0x11005500, _cogetmalloc_call_probe)
+
+def _cogetmalloc_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[cogetmalloc-return] HRESULT=0x{eax:x} ({signed})")
+cpu.add_logpoint(0x11005506, _cogetmalloc_return_probe)
+
+def _tlssetvalue_call_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    dw_tls_index = _read32_raw(memory, memory_size, esp + 0)
+    lp_tls_value = _read32_raw(memory, memory_size, esp + 4)
+    logger.error("com", f"[tlssetvalue-call] dwTlsIndex=0x{dw_tls_index or 0:x} lpTlsValue=0x{lp_tls_value or 0:x}")
+cpu.add_logpoint(0x1100553f, _tlssetvalue_call_probe)
+
+def _tlssetvalue_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[tlssetvalue-return] BOOL={eax}")
+cpu.add_logpoint(0x11005541, _tlssetvalue_return_probe)
+
+def _cosetstate_call_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    pv = _read32_raw(memory, memory_size, esp + 0)
+    logger.error("com", f"[cosetstate-call] pv=0x{pv or 0:x}")
+cpu.add_logpoint(0x1100557e, _cosetstate_call_probe)
+
+def _cosetstate_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[cosetstate-return] HRESULT=0x{eax:x} ({signed})")
+cpu.add_logpoint(0x11005583, _cosetstate_return_probe)
+
+# 2026-08-26 (cont'd): dwTlsIndex was always 0xFFFFFFFF (TLS_OUT_OF_INDEXES)
+# at every TlsSetValue call above -- oleaut32.dll's own module-global slot
+# index (DAT_771a1000, static base) is only ever written by TlsAlloc() in
+# FUN_77121f36 (its one-time process-init routine). Logging that call+return
+# directly: call site 0x77121f47, return 0x77121f4d (static) -> runtime
+# 0x11001f47 / 0x11001f4d (same -0x66120000 delta as the other oleaut32
+# probes above). TlsAlloc takes no args; EAX on return is the TLS index
+# (0xFFFFFFFF = TlsAlloc itself failed).
+def _tlsalloc_call_probe(eip, regs, memory, memory_size):
+    logger.error("com", "[tlsalloc-call] TlsAlloc()")
+cpu.add_logpoint(0x11001f47, _tlsalloc_call_probe)
+
+def _tlsalloc_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[tlsalloc-return] index=0x{eax:x}{' (TLS_OUT_OF_INDEXES)' if eax == 0xFFFFFFFF else ''}")
+cpu.add_logpoint(0x11001f4d, _tlsalloc_return_probe)
 
 # 2026-08-25 (cont'd x14): clean function-boundary trace, redirected upstream
 # per Molly's request -- print params in / return out for the actual COM

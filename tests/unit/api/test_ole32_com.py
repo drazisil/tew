@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from tew.api._state import CRTState
-from tew.api.oleaut32_handlers import register_oleaut32_ole32_handlers
+from tew.api.ole32_handlers import register_ole32_handlers
 from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
 
@@ -41,7 +41,7 @@ def env():
     mem   = Memory(MEM_SIZE)
     state = CRTState()
     stubs = _StubHandlers()
-    register_oleaut32_ole32_handlers(stubs, mem, state)
+    register_ole32_handlers(stubs, mem, state)
     cpu = _FakeCPU()
     cpu.regs[ESP] = STACK
     mem.write32(STACK, 0xDEAD)  # return address

@@ -215,3 +215,4 @@ except.txt
 memdump.txt
 trace*.txt
 stdout.txt
+.vscode/settings.json

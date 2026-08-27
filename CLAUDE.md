@@ -173,7 +173,7 @@ tew/
     kernel32_io.py                  — File I/O, sync objects, threading primitives
     msvcrt_handlers.py              — CRT: malloc/free/string/file/time
     user32_handlers.py              — User32/GDI32 handlers
-    oleaut32_handlers.py            — OleAut32/Ole32 handlers
+    ole32_handlers.py               — Ole32 COM handlers
     advapi32_handlers.py            — Advapi32 handlers
     d3d8_handlers.py                — Direct3D8 COM handlers
     wininet_handlers.py             — WinInet handlers
@@ -229,7 +229,7 @@ tew/
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **tew** (3964 symbols, 12164 relationships, 94 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **tew** (5201 symbols, 11910 relationships, 204 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

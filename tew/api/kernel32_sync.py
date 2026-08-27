@@ -33,18 +33,36 @@ def register_kernel32_sync_handlers(
         memory.write32(ptr + 0x0C, 0)
         memory.write32(ptr + 0x10, 0)
         memory.write32(ptr + 0x14, 0)
+        # kernel32's InitializeCriticalSection is void; ntdll's own
+        # RtlInitializeCriticalSection (same struct layout, same effect --
+        # real kernel32 just forwards to it) returns NTSTATUS STATUS_SUCCESS.
+        # Setting EAX=0 here is correct for both and harmless for the void case.
+        cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _init_cs_spin(cpu: "CPU") -> None:
-        ptr        = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        spin_count = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+    def _write_cs_with_spin(ptr: int, spin_count: int) -> None:
         memory.write32(ptr + 0x00, 0)
         memory.write32(ptr + 0x04, 0xFFFFFFFF)
         memory.write32(ptr + 0x08, 0)
         memory.write32(ptr + 0x0C, 0)
         memory.write32(ptr + 0x10, 0)
         memory.write32(ptr + 0x14, spin_count)
-        cpu.regs[EAX] = 1
+
+    def _init_cs_spin(cpu: "CPU") -> None:
+        ptr        = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        spin_count = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        _write_cs_with_spin(ptr, spin_count)
+        cpu.regs[EAX] = 1  # BOOL TRUE
+        cleanup_stdcall(cpu, memory, 8)
+
+    # ntdll's own RtlInitializeCriticalSectionAndSpinCount -- same struct/
+    # effect as kernel32's version above (which forwards to it on real
+    # Windows), but returns NTSTATUS (0 = STATUS_SUCCESS) instead of BOOL.
+    def _rtl_init_cs_spin(cpu: "CPU") -> None:
+        ptr        = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        spin_count = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        _write_cs_with_spin(ptr, spin_count)
+        cpu.regs[EAX] = 0  # STATUS_SUCCESS
         cleanup_stdcall(cpu, memory, 8)
 
     def _enter_cs(cpu: "CPU") -> None:
@@ -110,7 +128,75 @@ def register_kernel32_sync_handlers(
             cpu.regs[EAX] = 0  # FALSE
         cleanup_stdcall(cpu, memory, 4)
 
+    # InitializeSListHead(PSLIST_HEADER) -> void
+    # SLIST_HEADER is an 8-byte (32-bit) aligned union (Depth/Sequence/Next);
+    # zeroing it is the real implementation's own effect (empty, depth 0).
+    def _init_slist_head(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        memory.write32(ptr,     0)
+        memory.write32(ptr + 4, 0)
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("kernel32.dll", "InitializeSListHead",                    _init_slist_head)
+    # RtlInitializeResource(PRTL_RESOURCE) -> void
+    # RTL_RESOURCE = embedded RTL_CRITICAL_SECTION (24 bytes, same layout/
+    # init as _init_cs above) + 8 ULONG/HANDLE fields (semaphores, waiter
+    # counts, NumberOfActive, owner thread, flags, debug info), all zeroed
+    # by the real init -- acquire/exclusive/shared semantics aren't modeled
+    # since nothing has needed them yet; add RtlAcquireResourceShared/
+    # Exclusive/RtlReleaseResource for real if that ever halts.
+    def _rtl_init_resource(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        memory.write32(ptr + 0x00, 0)
+        memory.write32(ptr + 0x04, 0xFFFFFFFF)
+        memory.write32(ptr + 0x08, 0)
+        memory.write32(ptr + 0x0C, 0)
+        memory.write32(ptr + 0x10, 0)
+        memory.write32(ptr + 0x14, 0)
+        for _off in (0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34):
+            memory.write32(ptr + _off, 0)
+        cleanup_stdcall(cpu, memory, 4)
+
+    # RtlAcquireResourceExclusive(PRTL_RESOURCE, BOOLEAN Wait) -> BOOLEAN
+    # RtlReleaseResource(PRTL_RESOURCE) -> void
+    # No real blocking is modeled -- the cooperative scheduler can still
+    # swap to a different thread mid-critical-section (e.g. on a Sleep or a
+    # contested CS elsewhere) while this resource is held, so a naive
+    # unconditional-success acquire would let that other thread "acquire"
+    # the same exclusive resource too, clobbering NumberOfActive/
+    # ExclusiveOwnerThread and corrupting the resource's bookkeeping.
+    # Recursive acquisition by the SAME thread is real, documented Windows
+    # behavior and is allowed here without changing state; a genuinely
+    # contested acquire (different thread, already held) returns FALSE --
+    # true blocking isn't implemented, so Wait=TRUE can't actually wait.
+    def _rtl_acquire_resource_exclusive(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        tid = state.tls_current_thread_id()
+        number_active = memory.read32((ptr + 0x28) & 0xFFFFFFFF)
+        owner = memory.read32((ptr + 0x2C) & 0xFFFFFFFF)
+        if number_active != 0 and owner != tid:
+            logger.debug("kernel32",
+                f"[RtlAcquireResourceExclusive] 0x{ptr:08x} contested: "
+                f"owner=0x{owner:08x} tid=0x{tid:08x} -- returning FALSE")
+            cpu.regs[EAX] = 0  # FALSE
+        else:
+            memory.write32(ptr + 0x28, 0xFFFFFFFF)  # NumberOfActive = -1 (exclusive)
+            memory.write32(ptr + 0x2C, tid)          # ExclusiveOwnerThread
+            cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 8)
+
+    def _rtl_release_resource(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        memory.write32(ptr + 0x28, 0)  # NumberOfActive = 0
+        memory.write32(ptr + 0x2C, 0)  # ExclusiveOwnerThread = NULL
+        cleanup_stdcall(cpu, memory, 4)
+
     stubs.register_handler("kernel32.dll", "InitializeCriticalSection",             _init_cs)
+    stubs.register_handler("ntdll.dll",    "RtlInitializeCriticalSection",         _init_cs)
+    stubs.register_handler("ntdll.dll",    "RtlInitializeResource",                _rtl_init_resource)
+    stubs.register_handler("ntdll.dll",    "RtlAcquireResourceExclusive",          _rtl_acquire_resource_exclusive)
+    stubs.register_handler("ntdll.dll",    "RtlReleaseResource",                   _rtl_release_resource)
+    stubs.register_handler("ntdll.dll",    "RtlInitializeCriticalSectionAndSpinCount", _rtl_init_cs_spin)
     stubs.register_handler("kernel32.dll", "InitializeCriticalSectionAndSpinCount", _init_cs_spin)
     stubs.register_handler("kernel32.dll", "EnterCriticalSection",                  _enter_cs)
     stubs.register_handler("kernel32.dll", "LeaveCriticalSection",                  _leave_cs)
