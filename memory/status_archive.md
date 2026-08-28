@@ -4,6 +4,32 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-27, cont'd x36) — `SearchPathW`/`wcsncpy` blockers from x35 both resolved (parallel work while waiting on quota reset -- not fully reflected in this file until now); found and fixed two more real-file-I/O gaps (`_llseek`, `_lread`); run now reaches 156s+ with real DirectSound/window-message activity.
+
+**Housekeeping note**: `kernel32.dll!SearchPathA`/`SearchPathW` (standard Win32 search sequence) and `msvcrt.dll!wcsncpy` were already fixed and merged into `main` by the time this session picked back up -- this file's x35 entry still listed `wcsncpy` as the open blocker, which was stale. Confirmed both work correctly in a fresh run tonight.
+
+**Environment note, worth remembering**: hit a real SDL2/X11 hang tonight, unrelated to any code bug -- `SDL_CreateWindow`/`SDL_ShowWindow` blocked forever in `XIfEvent`/`xcb_wait_for_event` waiting for a `MapNotify` the (kwin) compositor never sent (confirmed via a live `gdb -p <pid> -batch -ex bt` on the stuck process -- full native stack showed `X11_ShowWindow` -> `_XReadEvents` -> `xcb_wait_for_event` -> `poll`, called from the emulated `CreateWindow` handler via `engine.opCD`/`cpu_run`). This is the same class of issue as the 2026-07-24 "Xwayland/kwin compositor wedge" ([[feedback_dont_alarm_before_verifying]]) -- fixed the same way Molly's done before: `kwin_wayland --replace --xwayland &` (restarts the compositor in place, no logout needed). If a run hangs immediately after window creation with virtual time frozen, try this before assuming a code regression -- check `ps aux | grep run_exe.py` for a stray orphaned process from an earlier killed run first, since that alone can look identical (two processes fighting over CPU, log frozen because both are equally starved) -- confirmed both symptoms independently tonight, don't conflate them.
+
+**Two more real-file-I/O gaps found and fixed, same `_lopen`/_lread`/`_lwrite`/`_llseek` old 16-bit-compat family, both genuine `kernel32.dll` STDCALL exports (not the `msvcrt.dll` cdecl `_lseek`/`_read` they resemble) -- share `file_handle_map` with `CreateFile(A/W)` since their `HFILE` is interchangeable with a real `HANDLE`**:
+- `kernel32.dll!_llseek` (`kernel32_io.py`) -- hit ~70.6s, called by `OLEAUT32.dll`'s typelib reader right after opening a real file via `SearchPathW`->`CreateFileW`. Same seek logic as msvcrt's existing `_lseek`.
+- `kernel32.dll!_lread` (`kernel32_io.py`) -- hit ~156.7s, the very next function in the same open->seek->read sequence. Same read logic as msvcrt's existing `_read`.
+
+`d3d8.dll`'s own `DllMain` returns `0` (FALSE/failure) -- not investigated further since nothing downstream currently depends on it succeeding.
+
+## Previous status (2026-08-26, cont'd x35) — MILESTONE: the DAO license-key BSTR bug (this whole session's original goal) is fixed and confirmed end-to-end. Game now runs real single-race gameplay DB traffic. New, unrelated, later-stage blocker found: `SearchPathW` unimplemented, deep in `expsrv.dll`/`MSJET35.DLL` typelib code.
+
+**Confirmed fixed, live**: with statically-imported DLLs' `DllMain` now running (previous entry), `oleaut32.dll`'s `TlsAlloc` succeeds (`dwTlsIndex=0x4`, not `0xFFFFFFFF`), and `Dbcode_InitDao`'s `Ordinal_2`/`SysAllocString` call now returns a real heap BSTR pointer (e.g. `0x06fa0814`) instead of `NULL`/`0xCCCCCCCC`. `dblog.txt` now shows the game proceeding straight past DAO init into real gameplay: `DB_StartUpDatabase`, `DBServiceRequestQ` handling `DBT_GO_SINGLERACE`/`DBT_STARTUP`/`DBT_GET_GAMECONFIG_CAR_TABLE`, `DBPhysics_GetTireAuxData`, `DBMem_Alloc`. `stdout.txt` shows only the two known-benign "class has not been licensed" lines -- no more `Database initialization failed!`. Run now reaches 60+ seconds before the next halt, vs. ~2-3s before this fix.
+
+**Handlers added/fixed working through the newly-exercised `DllMain` code for all 4 statically-imported DLLs** (`d3d8.dll`, `Secur32.dll`, `RPCRT4.dll`, `OLEAUT32.dll`, invoked in that dependency order):
+- `kernel32.dll!GetSystemTimeAsFileTime`, `LoadLibraryExW` (plus a `dwFlags` fix so search-scope-only flags don't halt), `InitializeSListHead`, `CreateEventW`.
+- `ntdll.dll!RtlInitializeCriticalSection(AndSpinCount)`, `RtlInitializeResource`, `RtlAcquireResourceExclusive`, `RtlReleaseResource` -- first `ntdll.dll`-exported (not `INT 0x2E` syscall) handlers in this project.
+- `user32.dll!wsprintfA`, `RegisterClipboardFormatA`; `kernel32.dll!GetSystemDirectoryA`; `ole32.dll!CoSetState` (the actual call inside `oleaut32.dll`'s lazy per-thread automation-state init that was failing).
+- `kernel32.dll!SearchPathA`/`SearchPathW` -- implemented standard Win32 search sequence; verified live resolving `C:\WINDOWS\SYSTEM32\expsrv.dll`.
+
+`d3d8.dll`'s own `DllMain` returns `0` (FALSE/failure) -- not investigated further since nothing downstream currently depends on it succeeding.
+
+**Blocker at the time**: `msvcrt.dll!wcsncpy` unimplemented, hit ~61.3s in, called by `OLEAUT32.dll` to copy the resolved typelib DLL path from `SearchPathW`. Resolved in the next entry.
+
 ## Previous status (2026-08-26, cont'd x34) — Found and fixed the real cause of the DAO license-key BSTR bug: statically-imported real DLLs never ran their own `DllMain`.
 
 **Root cause, traced all the way down**: `Ordinal_2`/`SysAllocString` (real `oleaut32.dll`) returned NULL for a perfectly valid string. Decompiling it live showed it defers to `SysAllocStringLen`, which lazily bootstraps a per-thread OLE-automation state block on first use via a TLS slot (`DAT_771a1000`). That slot was stuck at `0xFFFFFFFF` (`TLS_OUT_OF_INDEXES`) because `TlsAlloc()` -- called only from `oleaut32.dll`'s own real `DllMain` (`FUN_771215d4`, reason `DLL_PROCESS_ATTACH`) -- never ran at all. Confirmed via a live "log every DllMain call" pass: zero `DllMain` invocations all session for any of the 4 DLLs `MCity_d.exe` statically imports (`d3d8.dll`, `oleaut32.dll`, `rpcrt4.dll`, `secur32.dll`).

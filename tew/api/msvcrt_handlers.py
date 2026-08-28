@@ -1080,6 +1080,26 @@ def register_msvcrt_handlers(
 
     stubs.register_handler("msvcrt.dll", "wcsncpy", _wcsncpy)
 
+    # wcsncmp(const wchar_t* s1, const wchar_t* s2, size_t n) -> int [cdecl]
+    def _wcsncmp(cpu: "CPU") -> None:
+        s1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        s2 = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        n  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        i = 0
+        while i < n:
+            a = memory.read16((s1 + i * 2) & 0xFFFFFFFF)
+            b = memory.read16((s2 + i * 2) & 0xFFFFFFFF)
+            if a != b:
+                cpu.regs[EAX] = (1 if a > b else 0xFFFFFFFF) & 0xFFFFFFFF
+                return
+            if a == 0:
+                cpu.regs[EAX] = 0
+                return
+            i += 1
+        cpu.regs[EAX] = 0
+
+    stubs.register_handler("msvcrt.dll", "wcsncmp", _wcsncmp)
+
     # strcat(char* dst, const char* src) -> char* [cdecl]
     def _strcat(cpu: "CPU") -> None:
         dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -1309,6 +1329,15 @@ def register_msvcrt_handlers(
         cpu.regs[EAX] = 1 if chr(c) in " \t\n\r\x0b\x0c" else 0
 
     stubs.register_handler("msvcrt.dll", "isspace", _isspace)
+
+    # iswspace(wint_t wc) -> int [cdecl]
+    # Wide-char sibling of isspace above -- same whitespace set, full
+    # 16-bit code unit instead of masking to a byte.
+    def _iswspace(cpu: "CPU") -> None:
+        wc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
+        cpu.regs[EAX] = 1 if chr(wc) in " \t\n\r\x0b\x0c" else 0
+
+    stubs.register_handler("msvcrt.dll", "iswspace", _iswspace)
 
     # isupper(int c) -> int [cdecl]
     def _isupper(cpu: "CPU") -> None:

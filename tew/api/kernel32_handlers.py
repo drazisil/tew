@@ -10,6 +10,7 @@ Delegates to sub-modules:
 
 from __future__ import annotations
 
+import ntpath
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -284,7 +285,7 @@ def register_kernel32_handlers(
                         cpu.regs[EAX] = handle
                         cleanup_stdcall(cpu, memory, arg_bytes)
                         return True
-                basename = os.path.basename(name)
+                basename = ntpath.basename(name)
                 stub_handle = stubs.get_stub_dll_handle(basename)
                 if stub_handle is not None:
                     state.dynamic_modules[stub_handle] = DynamicModule(
@@ -298,6 +299,25 @@ def register_kernel32_handlers(
                     logger.warn("handlers",
                         f'LoadLibraryA("{name}") -> NULL (not found: no real file, no handler coverage)')
                     cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, arg_bytes)
+                return True
+            # No real file on disk at all -- still check whether the basename
+            # is one of our own Python-simulated-only DLLs (kernel32.dll,
+            # user32.dll, etc: real Win32 API surfaces MCity_d.exe or a
+            # loaded real DLL may LoadLibrary by a full, defensively-built
+            # path, e.g. real OLEAUT32.dll's NLS-cache-version helper calling
+            # LoadLibraryA("<cached SYSTEM32 dir>\\kernel32.dll") -- before
+            # falling through to the not-found/interactive-prompt path.
+            basename = ntpath.basename(name)
+            stub_handle = stubs.get_stub_dll_handle(basename)
+            if stub_handle is not None:
+                state.dynamic_modules[stub_handle] = DynamicModule(
+                    dll_name=_normalized_dll_name(basename),
+                    base_address=stub_handle,
+                )
+                logger.debug("handlers",
+                    f'LoadLibraryA("{name}") -> 0x{stub_handle:x} (stub-only, no real file)')
+                cpu.regs[EAX] = stub_handle
                 cleanup_stdcall(cpu, memory, arg_bytes)
                 return True
             if not state.config.interactive_on_missing_file:

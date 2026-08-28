@@ -6,6 +6,23 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-08-28): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count; does table really exist?"
+
+With DB init now genuinely working (see `RESOLVED` entry below, superseding the old "Database initialization failure" entry) the run reaches ~80.5s and hits a real, unhandled `INT3` inside `MCity_d.exe` itself. `~/.emu32/MCity/stdout.txt`'s own stated reason: `nfspc.c(1164) NFS_abortmsg callback 'AMF=166 DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?'`. Molly confirmed 2026-08-28 the `StockAssembly` table genuinely exists and is populated in the shipped DB -- rules out a missing/malformed table. Real gap is somewhere in tew's DAO/Jet query-parameter emulation (`expsrv.dll`/`MSJET35.DLL`/`vbajet32.dll`, all now running as real code rather than Python stubs since the x34/x35 `DllMain` fix). Not yet investigated -- next session should start here. See status.md "cont'd x37" for the exact call chain (`OLEAUT32.dll+0x1c619`/`+0x1c5bd`/`+0x1c26e`/`+0x2f12f` <- `MSJET35.DLL+0x62863`).
+
+## NEW (2026-08-28): `WaitForMultipleObjects(Ex)`'s `bAlertable` param is a no-op -- fine today, must be wired in if APCs ever get modeled
+
+`_wait_for_multiple_common` (`kernel32_io.py`) reads `WaitForMultipleObjectsEx`'s
+trailing `bAlertable` arg but never uses it -- a wait can never be interrupted
+early by a pending APC. Verified this is currently harmless, not just
+unimplemented: `QueueUserAPC`, `ReadFileEx`, and `WriteFileEx` (the only three
+real Win32 APIs that can ever queue an APC to a thread) are not implemented
+anywhere in `tew/api/*.py` -- with no APC source, there is no pending-APC
+state `bAlertable` could ever act on. If any of those three are implemented
+later, `bAlertable` (and the plain, non-Ex `SleepEx`'s alertable semantics --
+same gap, same cause) need to be wired in at the same time, or an alertable
+wait/sleep will silently never wake early for a queued APC.
+
 ## NEW (2026-08-26): `THREAD_SENTINEL` collision between `_call_guest_void` (static initializers) and real thread completion -- currently harmless, likely to bite later
 
 `_call_guest_void` (`msvcrt_handlers.py:272`, used by `_initterm` to invoke a
@@ -79,16 +96,10 @@ real, embedded `TYPELIB` PE resource itself and answers `Bind`/`GetDllEntry`/
 
 **Follow-up cleanup (RESOLVED 2026-08-26)**: dead `oleaut32_handlers.py` code removed and active `ole32.dll` handlers moved to `ole32_handlers.py`.
 
-## Database initialization failure (NEW, 2026-08-26, cont'd x32 -- current blocker)
+## RESOLVED (2026-08-27/28, cont'd x36/x37): "Database initialization failed!" cleared -- DB init now runs for real
 
-With real `oleaut32.dll` now genuinely running, the emulator reaches a new,
-legitimate `INT3` assertion inside `MCity_d.exe` itself at ~40.6s (`tid=1000`).
-Real, human-readable reason from the game's own `~/.emu32/MCity/stdout.txt`:
-`Nfs.c(677) Database initialization failed!` / `nfspc.c(1164) NFS_abortmsg
-callback 'Failed to initialize database. Please be sure you have setup the
-DCOM and DAO drivers provided on your installation disk...'`. Not yet
-investigated at all -- next session should start here. Unclear whether this
-is a new manifestation of something related to the original `expsrv.dll`
-crash chain, or a completely separate DAO/DCOM setup issue that was simply
-never reached before (since the old trap-object code was intercepting calls
-before real `oleaut32.dll`/DAO initialization could run this far for real).
+Was caused by the chain of missing handlers fixed across x36/x37 (`_llseek`/`_lread`,
+`LoadLibraryA` stub-DLL fallback, `RegNotifyChangeKeyValue`, `WaitForMultipleObjects`,
+`GetStringTypeExW`, `wcsncmp`, etc.) -- DB init itself now completes and the game reaches
+real query execution. New, deeper blocker opened immediately downstream: see the
+`StockAssembly_SelectAPT` DAO/Jet query-parameter entry above.

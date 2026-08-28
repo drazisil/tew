@@ -445,6 +445,33 @@ def register_advapi32_handlers(
 
     stubs.register_handler("advapi32.dll", "RegFlushKey", _reg_flush_key)
 
+    # RegNotifyChangeKeyValue(hKey, bWatchSubtree, dwNotifyFilter, hEvent,
+    #                         fAsynchronous) - 5 args (20 bytes)
+    # Real Windows blocks the caller (or signals hEvent later) when the key
+    # changes. registry.json is only ever written by this same guest process
+    # -- nothing external ever mutates a watched key mid-run -- so no change
+    # is ever coming. Synchronous mode (hEvent==0) would otherwise block the
+    # calling thread forever, which we can't model; return success
+    # immediately instead, i.e. "watch registered, nothing changed yet".
+    # Asynchronous mode (hEvent!=0) registers a watch whose event fires on a
+    # future change -- since that never happens here, leave hEvent unsignaled
+    # and just report the watch as successfully registered, matching real
+    # RegNotifyChangeKeyValue's own return-value semantics (the return value
+    # reflects whether the watch was registered, not whether a change fired).
+    def _reg_notify_change_key_value(cpu: "CPU") -> None:
+        h_key = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        h_event = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        key_name = _reg_key_names.get(h_key, f"hkey:{h_key:x}")
+        logger.info(
+            "registry",
+            f'RegNotifyChangeKeyValue("{key_name}", hEvent=0x{h_event:x}) -> '
+            "OK (watch registered, no external writers modeled)",
+        )
+        cpu.regs[EAX] = ERROR_SUCCESS
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("advapi32.dll", "RegNotifyChangeKeyValue", _reg_notify_change_key_value)
+
     # RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
     #               lpftLastWriteTime) - 8 args (32 bytes)
     def _reg_enum_key_ex_a(cpu: "CPU") -> None:

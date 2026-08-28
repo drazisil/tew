@@ -528,7 +528,12 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _wait_for_multiple_ex(cpu: "CPU") -> None:
+    def _wait_for_multiple_common(cpu: "CPU", arg_bytes: int) -> None:
+        # WaitForMultipleObjects(nCount, lpHandles, bWaitAll, dwMilliseconds)
+        # and WaitForMultipleObjectsEx (same 4 leading args plus a trailing
+        # bAlertable we don't model — alertable I/O/APC delivery isn't
+        # simulated) share identical logic; arg_bytes picks the right
+        # stdcall cleanup size (16 vs 20) for the caller actually used.
         base = cpu.regs[ESP]
         n_count = memory.read32((base + 4) & 0xFFFFFFFF)
         lp_handles = memory.read32((base + 8) & 0xFFFFFFFF)
@@ -543,7 +548,7 @@ def register_kernel32_io_handlers(
                 # Unknown handle (e.g. thread handle) — treat as always-ready.
                 if not b_wait_all:
                     cpu.regs[EAX] = i & 0xFFFFFFFF
-                    cleanup_stdcall(cpu, memory, 20)
+                    cleanup_stdcall(cpu, memory, arg_bytes)
                     return
                 continue
             ready = (isinstance(obj, MutexHandle) and obj.owner_tid is None) or (
@@ -561,7 +566,7 @@ def register_kernel32_io_handlers(
                         "scheduler", f"WaitForMultipleEx: satisfied h=0x{h:x} idx={i}"
                     )
                     cpu.regs[EAX] = i & 0xFFFFFFFF
-                    cleanup_stdcall(cpu, memory, 20)
+                    cleanup_stdcall(cpu, memory, arg_bytes)
                     return
             else:
                 all_ready = False
@@ -579,14 +584,14 @@ def register_kernel32_io_handlers(
                         obj.recursion_count = 1
                         obj.locked = True
             cpu.regs[EAX] = 0
-            cleanup_stdcall(cpu, memory, 20)
+            cleanup_stdcall(cpu, memory, arg_bytes)
             return
         # Not yet ready — check timeout then block.
         current = state.scheduler.current_thread()
         if current.wait_timed_out:
             current.wait_timed_out = False
             cpu.regs[EAX] = 0x102  # WAIT_TIMEOUT
-            cleanup_stdcall(cpu, memory, 20)
+            cleanup_stdcall(cpu, memory, arg_bytes)
             return
         retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
         handles_set: set[int] = set()
@@ -601,9 +606,15 @@ def register_kernel32_io_handlers(
             cpu, memory, frozenset(handles_set), retry_eip, deadline_ms
         )
 
+    def _wait_for_multiple_objects(cpu: "CPU") -> None:
+        _wait_for_multiple_common(cpu, 16)
+
+    def _wait_for_multiple_ex(cpu: "CPU") -> None:
+        _wait_for_multiple_common(cpu, 20)
+
     stubs.register_handler("kernel32.dll", "WaitForSingleObject", _wait_for_single)
     stubs.register_handler(
-        "kernel32.dll", "WaitForMultipleObjects", _halt("WaitForMultipleObjects")
+        "kernel32.dll", "WaitForMultipleObjects", _wait_for_multiple_objects
     )
     stubs.register_handler(
         "kernel32.dll", "WaitForMultipleObjectsEx", _wait_for_multiple_ex
@@ -803,6 +814,68 @@ def register_kernel32_io_handlers(
             also_readable=also_readable,
         )
         cleanup_stdcall(cpu, memory, 28)
+
+    # _llseek(HFILE hFile, LONG lOffset, int iOrigin) -> LONG [stdcall]
+    # Real kernel32.dll API -- part of the old 16-bit-compatible file I/O
+    # family (_lopen/_lread/_lwrite/_llseek), still exported on NT-based
+    # Windows. Distinct from msvcrt.dll's _lseek (cdecl, CRT fd-based) --
+    # this one is stdcall and its HFILE is interchangeable with a real
+    # HANDLE from CreateFile(A/W), so it shares the same file_handle_map
+    # entries CreateFile populates. Same seek logic as msvcrt's _lseek.
+    def _llseek(cpu: "CPU") -> None:
+        h_file = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        raw    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        offset = raw if raw < 0x80000000 else (raw - 0x100000000)  # signed
+        origin = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        entry  = state.file_handle_map.get(h_file)
+        if entry is None:
+            cpu.regs[EAX] = 0xFFFFFFFF  # HFILE_ERROR
+            cleanup_stdcall(cpu, memory, 12)
+            return
+        if origin == 0:       # SEEK_SET
+            entry.position = offset
+        elif origin == 1:     # SEEK_CUR
+            entry.position = entry.position + offset
+        else:                 # SEEK_END
+            entry.position = len(entry.data) + offset
+        entry.position = max(0, min(entry.position, len(entry.data)))
+        cpu.regs[EAX] = entry.position & 0xFFFFFFFF
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "_llseek", _llseek)
+
+    # _lread(HFILE hFile, LPVOID lpBuffer, UINT wBytes) -> UINT [stdcall]
+    # Same old 16-bit-compat family as _llseek above -- shares
+    # file_handle_map with CreateFile(A/W). Returns bytes actually read
+    # (0 at EOF), or HFILE_ERROR (0xFFFFFFFF) on error -- mirrors msvcrt's
+    # _read logic (kernel32_io.py's own analog isn't defined yet at this
+    # point in the file, so this reimplements the same entry.data slicing).
+    def _lread(cpu: "CPU") -> None:
+        h_file = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        buf    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        n_want = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        entry  = state.file_handle_map.get(h_file)
+        if entry is None:
+            cpu.regs[EAX] = 0xFFFFFFFF  # HFILE_ERROR
+            cleanup_stdcall(cpu, memory, 12)
+            return
+        if entry.writable and entry.readable:
+            data = os.pread(entry.fd, n_want, entry.position) if entry.fd is not None else b""
+            if data:
+                memory.load(buf & 0xFFFFFFFF, data)
+            entry.position += len(data)
+            cpu.regs[EAX] = len(data)
+            cleanup_stdcall(cpu, memory, 12)
+            return
+        available = len(entry.data) - entry.position
+        n_read = max(0, min(n_want, available))
+        if n_read > 0:
+            memory.load(buf & 0xFFFFFFFF, entry.data[entry.position:entry.position + n_read])
+        entry.position += n_read
+        cpu.regs[EAX] = n_read
+        cleanup_stdcall(cpu, memory, 12)
+
+    stubs.register_handler("kernel32.dll", "_lread", _lread)
 
     def _create_file_w(cpu: "CPU") -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
