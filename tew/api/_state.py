@@ -71,6 +71,23 @@ class FileHandleEntry:
     readable: bool = False
 
 
+def file_entry_size(entry: "FileHandleEntry") -> int:
+    """Return the real length of a file handle's backing data.
+
+    `len(entry.data)` is wrong for any fd-backed handle (`entry.fd is not
+    None`) -- `open_file_handle` always sets `data=b""` for those and does
+    real I/O through the fd instead, so `len(entry.data)` is always 0.
+    Confirmed live 2026-08-28: `_lseek`/`_llseek` clamping against
+    `len(entry.data)` silently reset a writable+readable (fd-backed)
+    handle's position to 0 on any nonzero seek -- the exact access mode
+    DAO/Jet uses to reread its own `.MDB` header (see `readable`'s own
+    docstring above).
+    """
+    if entry.fd is not None:
+        return os.fstat(entry.fd).st_size
+    return len(entry.data)
+
+
 # ── Kernel object types ───────────────────────────────────────────────────────
 
 @dataclass

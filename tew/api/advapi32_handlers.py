@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, pending_timers, PendingTimer
-from tew.api._state import CRTState, RegistryEntry, save_registry_json
+from tew.api._state import CRTState, EventHandle, RegistryEntry, save_registry_json
 from tew.logger import logger
 
 # ── Win32 error constants ────────────────────────────────────────────────────
@@ -444,6 +444,62 @@ def register_advapi32_handlers(
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("advapi32.dll", "RegFlushKey", _reg_flush_key)
+
+    _reg_notify_wait_handle: int | None = None
+
+    # RegNotifyChangeKeyValue(hKey, bWatchSubtree, dwNotifyFilter, hEvent,
+    #                         fAsynchronous) - 5 args (20 bytes)
+    # registry.json is only ever written by this same guest process --
+    # nothing external ever mutates a watched key mid-run -- so no change is
+    # ever coming, in either mode.
+    #
+    # Asynchronous mode (fAsynchronous != 0): registers a watch whose hEvent
+    # fires on a future change. Since that never happens here, leave hEvent
+    # unsignaled and just report the watch as successfully registered,
+    # matching real RegNotifyChangeKeyValue's own return-value semantics
+    # (the return value reflects whether the watch was registered, not
+    # whether a change fired).
+    #
+    # Synchronous mode (fAsynchronous == 0): real Windows blocks the calling
+    # thread until the key *actually* changes -- the call returning is
+    # itself the change signal, not a "watch armed" acknowledgment.
+    # Fabricating an immediate success here would report a change that
+    # never happened, and a caller looping on "wait, reread, wait again"
+    # would busy-spin. Since no change is ever coming, blocking forever is
+    # the behavior a real Windows thread would see too -- so route through
+    # the same handle-block scheduler machinery WaitForSingleObject uses,
+    # parked on a shared, permanently-unsignaled sentinel event (which key
+    # is irrelevant: none of them will ever wake it).
+    def _reg_notify_change_key_value(cpu: "CPU") -> None:
+        nonlocal _reg_notify_wait_handle
+        h_key = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        h_event = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        f_asynchronous = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        key_name = _reg_key_names.get(h_key, f"hkey:{h_key:x}")
+        if f_asynchronous:
+            logger.info(
+                "registry",
+                f'RegNotifyChangeKeyValue("{key_name}", async, hEvent=0x{h_event:x}) -> '
+                "OK (watch registered, no external writers modeled)",
+            )
+            cpu.regs[EAX] = ERROR_SUCCESS
+            cleanup_stdcall(cpu, memory, 20)
+            return
+        if _reg_notify_wait_handle is None:
+            _reg_notify_wait_handle = state.next_kernel_handle
+            state.next_kernel_handle += 1
+            state.kernel_handle_map[_reg_notify_wait_handle] = EventHandle(signaled=False)
+        logger.info(
+            "registry",
+            f'RegNotifyChangeKeyValue("{key_name}", sync) -> blocking '
+            "(no external writers modeled -- will not wake)",
+        )
+        retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+        state.scheduler.block_current_on_handles(
+            cpu, memory, frozenset([_reg_notify_wait_handle]), retry_eip, None
+        )
+
+    stubs.register_handler("advapi32.dll", "RegNotifyChangeKeyValue", _reg_notify_change_key_value)
 
     # RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
     #               lpftLastWriteTime) - 8 args (32 bytes)

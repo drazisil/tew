@@ -126,6 +126,27 @@ def register_kernel32_locale_handlers(
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 16)
 
+    def _get_string_type_ex_w(cpu: "CPU") -> None:
+        # GetStringTypeExW(Locale, dwInfoType, lpSrcStr, cchSrc, lpCharType) --
+        # same 4 trailing args as GetStringTypeW plus a leading Locale that
+        # real Windows ignores for character-type classification (Unicode
+        # char typing isn't locale-dependent), so this delegates to the same
+        # classify_wide_string logic GetStringTypeW uses.
+        args = GetStringTypeArgs(
+            info_type = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF),
+            src_ptr   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF),
+            cch_src   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF),
+            out_ptr   = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF),
+        )
+        if not classify_wide_string(memory, args):
+            logger.error("handlers",
+                f"GetStringTypeExW: unsupported dwInfoType {args.info_type:#010x} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        cpu.regs[EAX] = 1  # TRUE
+        cleanup_stdcall(cpu, memory, 20)
+
     def _lc_map_string_w(cpu: "CPU") -> None:
         args = LCMapStringArgs(
             locale    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF),
@@ -152,6 +173,7 @@ def register_kernel32_locale_handlers(
     stubs.register_handler("kernel32.dll", "MultiByteToWideChar",  _multi_byte_to_wide)
     stubs.register_handler("kernel32.dll", "WideCharToMultiByte",  _wide_to_multi_byte)
     stubs.register_handler("kernel32.dll", "GetStringTypeW",       _get_string_type_w)
+    stubs.register_handler("kernel32.dll", "GetStringTypeExW",     _get_string_type_ex_w)
     stubs.register_handler("kernel32.dll", "LCMapStringW",         _lc_map_string_w)
     stubs.register_handler("kernel32.dll", "GetLocaleInfoA",       _get_locale_info_a)
 

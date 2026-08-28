@@ -4,6 +4,30 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-28 (cont'd x37) — Five more handler/bug fixes; DB init now runs for real; new blocker is a genuine DAO/Jet query-parameter gap, not a missing Win32 handler
+
+Fixed, in the order hit, each verified by a fresh full re-run:
+
+1. **`kernel32.dll!LoadLibraryA` full-path calls to our own Python-simulated-only DLLs never resolved** (`kernel32_handlers.py::_load_dll_by_path`) -- the stub-DLL fallback (`stubs.get_stub_dll_handle(basename)`) was only ever checked inside `if real_path is not None:`, never when no real file exists at all. Hit at ~60s: real `OLEAUT32.dll`'s own NLS-cache-version helper calls `LoadLibraryA("<cached SYSTEM32 dir>\kernel32.dll")` defensively (confirmed by decompiling the actual caller in Ghidra after running `analyze_existing_program` on it -- auto-analysis had never run on that program instance -- and translating its runtime return address to a static address via the DLL's own PE image-base header field); `kernel32.dll` has no real file backing it, so this fell into the interactive-missing-file prompt and crashed on non-interactive stdin. Fixed by checking the stub-handle fallback in the not-found path too.
+2. **Real bug found fixing #1**: `os.path.basename()` doesn't split on `\` on a POSIX host -- silently returned the whole Windows-style guest path unchanged instead of just the DLL's basename. Switched both call sites to `ntpath.basename()`, which has correct Windows semantics on any host OS.
+3. **`advapi32.dll!RegNotifyChangeKeyValue` implemented** -- since `registry.json` is only ever written by the guest process itself, a watched key never changes externally in our model; returns success immediately in both sync and async mode without ever signaling `hEvent`.
+4. **`kernel32.dll!WaitForMultipleObjects` implemented** by factoring out `WaitForMultipleObjectsEx`'s already-correct logic into `_wait_for_multiple_common(cpu, arg_bytes)` -- both share identical leading args, `Ex` just also takes an unused `bAlertable`. Verified `bAlertable`/`SleepEx`'s alertable-wait semantics are a real no-op today (no APC source exists anywhere -- `QueueUserAPC`/`ReadFileEx`/`WriteFileEx` are all unimplemented), flagged in `TODO.md` for if that ever changes.
+5. **`kernel32.dll!GetStringTypeExW` and `msvcrt.dll!wcsncmp` implemented** -- thin wrappers around the existing `GetStringTypeW`/`strncmp` logic (wide-char sibling / locale-irrelevant-param sibling, matching the existing `wcsncpy`/`strncpy` pattern).
+
+Run now reaches ~80.5s (up from ~60s). New blocker is a different class of failure entirely: a real, unhandled `INT3` inside `MCity_d.exe` itself, with the game's own stated reason in `stdout.txt`: `DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?`. Molly confirmed the table genuinely exists and is populated, ruling out a missing/malformed DB -- this is a real gap somewhere in tew's DAO/Jet query-parameter emulation. Not yet investigated.
+
+---
+
+## 2026-08-27 (cont'd x36) — Two more real-file-I/O gaps fixed (`_llseek`, `_lread`); SDL2/X11 window-creation hang traced and fixed (compositor restart, not a code bug)
+
+`SearchPathW` and `msvcrt.dll!wcsncpy` (x35's open blocker) were already fixed and merged into `main` from parallel work done while waiting on a quota reset -- confirmed both work correctly in a fresh run. Real current progress: found and fixed `kernel32.dll!_llseek` (~70.6s) and `kernel32.dll!_lread` (~156.7s), both real `kernel32.dll` STDCALL exports from the old 16-bit-compat file I/O family (`_lopen`/`_lread`/`_lwrite`/`_llseek`), called by `OLEAUT32.dll`'s typelib reader right after opening a real file via `SearchPathW`->`CreateFileW`. Their `HFILE` is interchangeable with a real `HANDLE`, so both reuse `file_handle_map`/the same seek-and-read logic already proven correct in msvcrt's `_lseek`/`_read`.
+
+Also hit and root-caused a real environment hang, unrelated to any code path: `SDL_CreateWindow`/`SDL_ShowWindow` blocked forever waiting for an X11 `MapNotify` the kwin compositor never sent -- confirmed via a live `gdb -p <pid> -batch -ex bt` full native stack trace (`X11_ShowWindow` -> `_XReadEvents` -> `xcb_wait_for_event` -> `poll`). Same class of issue as the 2026-07-24 Xwayland/kwin wedge; fixed with `kwin_wayland --replace --xwayland &` (restarts the compositor in place). A stray orphaned `run_exe.py` process from an earlier killed background run can look identical (frozen virtual time from CPU starvation, not a hang) -- check `ps aux` for duplicates before assuming either cause.
+
+Run now reaches 156s+ with real DirectSound audio setup and window-message activity before the next (not yet identified) halt.
+
+---
+
 ## 2026-08-26 (cont'd x35) — MILESTONE: DAO license-key BSTR bug confirmed fixed end-to-end; game now runs real single-race gameplay DB traffic
 
 With `DllMain` now running for all 4 statically-imported DLLs (previous entry), worked through the resulting wave of newly-exercised missing handlers, in the order hit: `kernel32.dll!GetSystemTimeAsFileTime`, `LoadLibraryExW` (plus a `dwFlags` fix so search-scope-only flags like `LOAD_LIBRARY_SEARCH_SYSTEM32` are ignored instead of halting, on both `LoadLibraryExA` and `LoadLibraryExW`), `InitializeSListHead`, `CreateEventW`; `ntdll.dll!RtlInitializeCriticalSection(AndSpinCount)`, `RtlInitializeResource`, `RtlAcquireResourceExclusive`, `RtlReleaseResource` (first `ntdll.dll`-export handlers in this project, as opposed to `INT 0x2E` syscalls); `user32.dll!wsprintfA` (reuses msvcrt's shared printf engine), `RegisterClipboardFormatA`; `kernel32.dll!GetSystemDirectoryA`; `ole32.dll!CoSetState` (the actual call inside `oleaut32.dll`'s lazy per-thread automation-state init that was failing -- a no-op returning `S_OK` is sufficient).
