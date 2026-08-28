@@ -33,6 +33,7 @@ from tew.api._state import (
     CRTState,
     MutexHandle,
     EventHandle,
+    file_entry_size,
     find_file_ci,
     read_cstring,
     read_wide_string,
@@ -832,13 +833,14 @@ def register_kernel32_io_handlers(
             cpu.regs[EAX] = 0xFFFFFFFF  # HFILE_ERROR
             cleanup_stdcall(cpu, memory, 12)
             return
+        size = file_entry_size(entry)
         if origin == 0:       # SEEK_SET
             entry.position = offset
         elif origin == 1:     # SEEK_CUR
             entry.position = entry.position + offset
         else:                 # SEEK_END
-            entry.position = len(entry.data) + offset
-        entry.position = max(0, min(entry.position, len(entry.data)))
+            entry.position = size + offset
+        entry.position = max(0, min(entry.position, size))
         cpu.regs[EAX] = entry.position & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 12)
 

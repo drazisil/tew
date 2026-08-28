@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, read_cstring, THREAD_SENTINEL
+from tew.api._state import CRTState, file_entry_size, read_cstring, THREAD_SENTINEL
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────
@@ -1856,13 +1856,14 @@ def register_msvcrt_handlers(
         if entry is None:
             cpu.regs[EAX] = 0xFFFFFFFF  # -1 = error
             return
+        size = file_entry_size(entry)
         if whence == 0:       # SEEK_SET
             entry.position = offset
         elif whence == 1:     # SEEK_CUR
             entry.position = entry.position + offset
         else:                 # SEEK_END
-            entry.position = len(entry.data) + offset
-        entry.position = max(0, min(entry.position, len(entry.data)))
+            entry.position = size + offset
+        entry.position = max(0, min(entry.position, size))
         cpu.regs[EAX] = entry.position & 0xFFFFFFFF
 
     stubs.register_handler("msvcrt.dll", "_lseek", _lseek)
