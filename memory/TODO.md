@@ -6,9 +6,62 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## NEW (2026-08-28): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count; does table really exist?"
+## UPDATED (2026-08-28, cont'd x38): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- traced deep into real Jet SQL-compiler internals, still open
 
-With DB init now genuinely working (see `RESOLVED` entry below, superseding the old "Database initialization failure" entry) the run reaches ~80.5s and hits a real, unhandled `INT3` inside `MCity_d.exe` itself. `~/.emu32/MCity/stdout.txt`'s own stated reason: `nfspc.c(1164) NFS_abortmsg callback 'AMF=166 DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?'`. Molly confirmed 2026-08-28 the `StockAssembly` table genuinely exists and is populated in the shipped DB -- rules out a missing/malformed table. Real gap is somewhere in tew's DAO/Jet query-parameter emulation (`expsrv.dll`/`MSJET35.DLL`/`vbajet32.dll`, all now running as real code rather than Python stubs since the x34/x35 `DllMain` fix). Not yet investigated -- next session should start here. See status.md "cont'd x37" for the exact call chain (`OLEAUT32.dll+0x1c619`/`+0x1c5bd`/`+0x1c26e`/`+0x2f12f` <- `MSJET35.DLL+0x62863`).
+Full call chain now confirmed live via probes correlated against the exact
+failing call (see status.md "cont'd x38" for the complete trace with
+addresses): `DBParamQuery::get_Count` -> `dao350.dll`'s real `get_Count`
+implementer (`FUN_0447dc1c`) -> type-indexed refresh gate (`FUN_044d26ce`,
+Parameters type) -> per-type populate handler (`FUN_044c69bc`, its own
+allocation confirmed to succeed) -> name-based lookup (`FUN_044d525b`,
+given `"StockAssembly_SelectAPT"` directly) -> dynamically-bound call into
+real `msjet35.dll` (confirmed: two earlier calls through the identical
+pointer succeeded for other queries this same run, ruling out a structural
+code-path bug) -> real msjet35.dll dispatch (`FUN_7a89ff40` ->
+`FUN_7a89fd45`) -> the real Jet SQL execution-plan compiler
+(`FUN_7a862215`, same `JETSHOWPLAN` code path the earlier
+`StockVehicleAttributes_SelectAll2`/`Fields.Count` investigation also
+reached) -> raw internal error `-3100`, translated into DAO error 3075.
+
+Ruled out along the way (all confirmed live, not guesses): the pool
+allocator returning NULL (false lead, itself caused by the logpoint-cap
+bug below); the `CreateErrorInfo`/`SetErrorInfo`/`GetErrorInfo` plumbing
+(already implemented/working from an earlier session -- `Error.Description`
+is a real, validly-allocated, genuinely-zero-length BSTR, not a plumbing
+gap); two real, independently-fixed bugs found while investigating
+(`GetEnvironmentStrings(W)`'s garbage pointer, `DllMain`-before-IAT-patch
+ordering, `WriteFile`/`_write`'s wrong-fd-position bug) -- none of them
+change the outcome.
+
+**Not yet located**: `FUN_7a862215`'s return traces to
+`local_44 = FUN_7a85e7e1(local_18, local_1c, local_14[0x1f])`, not yet
+live-probed. Genuine, deep, undocumented Jet SQL-compiler internals.
+`StockAssembly_SelectAPT` never appears as its own top-level plan in
+`showplan.out`, consistent with compilation failing before a plan gets
+written. Same shape as the still-unresolved Fields.Count investigation's
+own conclusion (multi-table `Table.Column`-qualified-reference tokenization,
+upstream of where either investigation has reached) -- may be the same
+underlying compile-time defect manifesting on parameters instead of
+columns; not confirmed.
+
+## NEW (2026-08-28, cont'd x38): `cpu_add_logpoint` silently drops registrations past its 8-slot cap -- violates this project's own fail-loudly standard
+
+`cpu/src/core.zig`: `lp_eip: [8]u32`/`lp_cb: [8]?LogpointFn`, fixed-size
+arrays in the FFI-shared `CpuState` struct (same pattern as the breakpoint
+table, `bp_table: [8]u32` -- not derived from any real hardware limit,
+just a round number picked when this was built). `kernel.zig`'s
+`cpu_add_logpoint` loops the 8 slots looking for an empty one and just
+`return`s with no signal at all if none is free -- the new registration is
+silently discarded, and the caller has no way to know. Bit this
+investigation live 2026-08-28: 9-10 active logpoints (several stale, from
+already-resolved earlier investigations) meant two newly-added probes
+never fired, producing a real false lead (see the DAO/Jet entry above)
+before the cap was noticed and probes were pruned. Not yet fixed --
+`cpu_add_logpoint` should return a bool (or otherwise signal) on failure,
+and the Python `add_logpoint` wrapper (`cpu_zig.py`) should raise/log
+loudly when registration fails, matching this project's own "fail loudly
+or not at all" standard. Deferred by Molly ("stay on the trace, come back
+to it after") -- pick this up next.
 
 ## NEW (2026-08-28): `WaitForMultipleObjects(Ex)`'s `bAlertable` param is a no-op -- fine today, must be wired in if APCs ever get modeled
 

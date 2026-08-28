@@ -1834,7 +1834,12 @@ def register_msvcrt_handlers(
         data  = memory.read_bytes(buf & 0xFFFFFFFF, count)
         entry = state.file_handle_map.get(fd)
         if entry is not None and entry.writable and entry.fd is not None:
-            n = os.write(entry.fd, data)
+            # Explicit-position write -- see kernel32_io.py's WriteFile for
+            # why: os.write()'s implicit (kernel fd cursor) position
+            # silently diverges from entry.position the moment _lseek/
+            # SetFilePointer seeks this handle, since those only ever
+            # update entry.position and never the real fd's own position.
+            n = os.pwrite(entry.fd, data, entry.position)
             entry.position += n
             cpu.regs[EAX] = n
             return

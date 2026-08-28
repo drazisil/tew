@@ -187,7 +187,20 @@ def register_kernel32_io_handlers(
             if overlapped_pos is not None:
                 os.pwrite(entry.fd, data, overlapped_pos)
             else:
-                os.write(entry.fd, data)
+                # Explicit-position write, not os.write()'s implicit
+                # (kernel fd cursor-tracked) position -- _llseek/_lseek/
+                # SetFilePointer only ever update entry.position, they
+                # never call os.lseek() on the real fd, so an implicit
+                # write silently diverges from entry.position the moment
+                # any seek happens on this handle. Confirmed live
+                # 2026-08-28: this exact bug corrupted ~/.emu32/
+                # showplan.out (JETSHOWPLAN diagnostic output) -- a later,
+                # shorter write partially overwrote a longer previous
+                # line, leaving its tail as garbage, and a separate spot
+                # lost content outright. Matches os.pread's already-
+                # correct explicit-position pattern used elsewhere in
+                # this file for reads.
+                os.pwrite(entry.fd, data, entry.position)
                 entry.position += n_bytes
             if lp_written:
                 memory.write32(lp_written, n_bytes)

@@ -362,7 +362,7 @@ kernel_structures.initialize_kernel_structures(stack_base, stack_limit, crt_stat
 # invocation is deferred this far rather than running inline there.
 _failed_static_dllmains = [
     _pending_dll.name for _pending_dll in _pending_dllmain_dlls
-    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll)
+    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll, _dll_loader_ref, win32_handlers)
 ]
 if _failed_static_dllmains:
     logger.warn(
@@ -977,7 +977,10 @@ def _make_createinstancelic_probe(label: str):
         )
     return _probe
 # cpu.add_logpoint(0x008f580c, _make_createinstancelic_probe("dbvariant-call"))
-cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
+# 2026-08-28: disabled -- resolved BSTR milestone bug, and this specific
+# probe's own comments below already document it as self-inflicted-
+# garbage-prone (double-dispatch artifact). Was burning a logpoint slot.
+# cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
 
 # 2026-08-26 (cont'd): local_44's real address confirmed live == EBP-0x44 ==
 # 0x082bfa60 this run (matched bstr_ptr exactly). Watching that concrete
@@ -1042,69 +1045,186 @@ def _make_createinstancelic_return_probe(label: str):
         logger.error("com", f"[createinstancelic-{label}-return] HRESULT=0x{eax:x} ({signed})")
     return _probe
 # cpu.add_logpoint(0x008f5816, _make_createinstancelic_return_probe("dbvariant"))
-cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
+# 2026-08-28: disabled, same reason as its -call sibling above.
+# cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
 
-# 2026-08-26: SysAllocString (Ordinal_2) returned NULL. Real oleaut32.dll's
-# SysAllocStringLen NULLs out on first-ever-call-on-this-thread lazy COM
-# state init (FUN_77125311 in oleaut32.dll @ preferred base 0x77120000,
-# runtime base 0x11000000 this run -- delta -0x66120000) failing at any of:
-# CoGetMalloc, TlsSetValue, or CoSetState. Logging args in / return out for
-# each, at their real call sites inside oleaut32.dll's own code (not their
-# real callee entry points, since CoGetMalloc/TlsSetValue are external
-# imports and CoSetState resolves to a local in-module thunk).
-def _cogetmalloc_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: DBParamQuery::DBParamQuery's DAOParameters::get_Count call
+# (vtable slot 0x1c on the interface obtained from get_Parameters) is where
+# "could not get param count; does table really exist?" comes from --
+# confirmed by full decompile of the constructor at 0x00995970 (three
+# COMPUTED_CALLs: 0x00995b1c=get_Parameters, 0x00995c7b=get_Count,
+# 0x00995ed7=per-param DBParam ctor loop). Probing the two calls right
+# before this one to identify which real DLL's vtable is actually being
+# called (get_Count's implementation lives wherever local_28's object came
+# from -- likely expsrv.dll or dao350.dll, not yet confirmed) and the
+# HRESULT it returns.
+def _dbparamquery_getcount_pre_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    dw_mem_context = _read32_raw(memory, memory_size, esp + 0)
-    ppmalloc = _read32_raw(memory, memory_size, esp + 4)
-    logger.error("com", f"[cogetmalloc-call] dwMemContext=0x{dw_mem_context or 0:x} ppMalloc=0x{ppmalloc or 0:x}")
-cpu.add_logpoint(0x11005500, _cogetmalloc_call_probe)
+    this_ptr = _read32_raw(memory, memory_size, esp + 0)
+    vtable_ptr = _read32_raw(memory, memory_size, this_ptr) if this_ptr else None
+    func_ptr = _read32_raw(memory, memory_size, vtable_ptr + 0x1c) if vtable_ptr else None
+    # dao350.dll's get_Count is a thin thunk (FUN_0447dfe2, confirmed via
+    # Ghidra decompile): (**(code**)(**(int**)(this+8) + 0x24))(param_2) --
+    # forwards to the *real* inner object at [this+8], vtable slot 0x24.
+    # Same "tear-off wrapper delegates to real implementer" shape as the
+    # earlier Fields.Count investigation's FUN_0447dc1c -- follow it one
+    # level deeper to find the real, non-thunk implementer.
+    inner_this = _read32_raw(memory, memory_size, this_ptr + 8) if this_ptr else None
+    inner_vtable = _read32_raw(memory, memory_size, inner_this) if inner_this else None
+    inner_func = _read32_raw(memory, memory_size, inner_vtable + 0x24) if inner_vtable else None
+    logger.error(
+        "com",
+        f"[dbparamquery-getcount-call] this=0x{this_ptr or 0:x} "
+        f"vtable=0x{vtable_ptr or 0:x} func=0x{func_ptr or 0:x} "
+        f"inner_this=0x{inner_this or 0:x} inner_vtable=0x{inner_vtable or 0:x} "
+        f"inner_func=0x{inner_func or 0:x}",
+    )
+cpu.add_logpoint(0x00995c7b, _dbparamquery_getcount_pre_probe)
 
-def _cogetmalloc_return_probe(eip, regs, memory, memory_size):
+def _dbparamquery_getcount_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
-    logger.error("com", f"[cogetmalloc-return] HRESULT=0x{eax:x} ({signed})")
-cpu.add_logpoint(0x11005506, _cogetmalloc_return_probe)
+    logger.error("com", f"[dbparamquery-getcount-return] HRESULT=0x{eax:x} ({signed})")
+cpu.add_logpoint(0x00995c7e, _dbparamquery_getcount_return_probe)
 
-def _tlssetvalue_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: dao350.dll FUN_0447dc1c (the real, non-thunk get_Count
+# implementer -- same function the earlier Fields.Count investigation
+# found) calls FUN_044d26ce(iVar1) as its "refresh gate" -- iVar1 =
+# *(int*)(inner_this+8), i.e. a third layer of indirection past the
+# outer DAOParameters thunk. FUN_044d26ce dispatches through a type-
+# indexed function table (DAT_044770b0[*(int*)(iVar1+0x10)]) to the
+# real per-type "populate the count" handler, only when not already
+# cached. Its return value becomes our observed HRESULT's low 16 bits
+# (0x800a0000 | ret == 0x800a0c03 == DAO error 3075). Capturing the
+# type index and target handler address to find which one is failing.
+def _refresh_gate_entry_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    dw_tls_index = _read32_raw(memory, memory_size, esp + 0)
-    lp_tls_value = _read32_raw(memory, memory_size, esp + 4)
-    logger.error("com", f"[tlssetvalue-call] dwTlsIndex=0x{dw_tls_index or 0:x} lpTlsValue=0x{lp_tls_value or 0:x}")
-cpu.add_logpoint(0x1100553f, _tlssetvalue_call_probe)
+    param_1 = _read32_raw(memory, memory_size, esp + 4)
+    type_idx = _read32_raw(memory, memory_size, param_1 + 0x10) if param_1 else None
+    handler = (
+        _read32_raw(memory, memory_size, 0x044770b0 + type_idx * 4)
+        if type_idx is not None else None
+    )
+    count_field = _read32_raw(memory, memory_size, param_1 + 0x2c) if param_1 else None
+    logger.error(
+        "com",
+        f"[refresh-gate-entry] param_1=0x{param_1 or 0:x} type_idx={type_idx} "
+        f"handler=0x{handler or 0:x} count_field_raw=0x{count_field or 0:x}",
+    )
+cpu.add_logpoint(0x044d26ce, _refresh_gate_entry_probe)
 
-def _tlssetvalue_return_probe(eip, regs, memory, memory_size):
-    eax = regs[EAX]
-    logger.error("com", f"[tlssetvalue-return] BOOL={eax}")
-cpu.add_logpoint(0x11005541, _tlssetvalue_return_probe)
+def _read_cstr_raw(memory, memory_size, addr, max_len=200):
+    if not addr or addr + max_len >= memory_size:
+        return "<invalid>"
+    out = []
+    for i in range(max_len):
+        c = memory[addr + i]
+        if c == 0:
+            break
+        out.append(chr(c) if 32 <= c < 127 else f"\\x{c:02x}")
+    return "".join(out)
 
-def _cosetstate_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: FUN_044c69bc (the real per-type "populate Parameters.Count"
+# handler, dispatched via FUN_044d26ce's type table for type_idx=25) has
+# two candidate failure points: a generic "no compiled statement" error
+# (FUN_044d44c2 @ call site 0x044c6a40, fixed sentinel arg -- same shape
+# regardless of query content) vs FUN_044d525b (call site 0x044c6ac2),
+# which takes the query's own text as an LPCSTR (4th arg) -- much more
+# likely to be the content-specific failure. Probing both entries to see
+# which one actually fires for StockAssembly_SelectAPT, and reading the
+# LPCSTR live to see exactly what text is being parsed at failure time.
+def _generic_error_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    pv = _read32_raw(memory, memory_size, esp + 0)
-    logger.error("com", f"[cosetstate-call] pv=0x{pv or 0:x}")
-cpu.add_logpoint(0x1100557e, _cosetstate_call_probe)
+    sentinel = _read32_raw(memory, memory_size, esp + 4)
+    logger.error("com", f"[fun-044d44c2-entry] sentinel=0x{sentinel & 0xffffffff:x}")
+# 2026-08-28: confirmed this path never fires for StockAssembly_SelectAPT
+# (ruled out) -- disabled to free a logpoint slot.
+# cpu.add_logpoint(0x044d44c2, _generic_error_probe)
 
-def _cosetstate_return_probe(eip, regs, memory, memory_size):
+def _param_lookup_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    lpcstr = _read32_raw(memory, memory_size, esp + 16)
+    text = _read_cstr_raw(memory, memory_size, lpcstr) if lpcstr else "<null>"
+    logger.error("com", f"[fun-044d525b-entry] lpcstr=0x{lpcstr or 0:x} text={text!r}")
+cpu.add_logpoint(0x044d525b, _param_lookup_probe)
+
+# The two branches inside FUN_044d525b (param_5==-1 selects which dynamically-
+# bound msjet35.dll function pointer gets called) converge on the same
+# "if (-1 < iVar2) success else translate-and-return-error" check. Probing
+# EAX right after each call returns to get the RAW Jet-native error code
+# before FUN_044d418f translates it into our observed OLE HRESULT.
+def _jet_lookup_returnA_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[jet-lookup-branchA-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
+# 2026-08-28: confirmed neither branch fires (allocator fails before this
+# point) -- disabled to free a logpoint slot.
+cpu.add_logpoint(0x044d529f, _jet_lookup_returnA_probe)
+
+def _jet_lookup_returnB_probe(eip, regs, memory, memory_size):
+    # DAT_044e52c8 is a plain dao350.dll global (a dynamically-resolved
+    # function pointer into whichever DLL owns it) -- reading its current
+    # value directly rather than spending another logpoint slot on the
+    # call site itself, to identify which real DLL actually computed -3100.
+    resolved_fn = _read32_raw(memory, memory_size, 0x044e52c8)
+    logger.error(
+        "com",
+        f"[jet-lookup-branchB-return] EAX=0x{regs[EAX] & 0xffffffff:x} "
+        f"DAT_044e52c8=0x{resolved_fn or 0:x}",
+    )
+cpu.add_logpoint(0x044d52be, _jet_lookup_returnB_probe)
+
+# 2026-08-28: FUN_044e2b5c is dao350.dll's own custom free-list
+# sub-allocator (param_1 = pool object, param_2 = requested size). Neither
+# of FUN_044d525b's two dynamically-bound-lookup branches fired for the
+# failing StockAssembly_SelectAPT call, meaning this allocator itself
+# returned NULL for the request (0x44 bytes) -- the two ways that happens:
+# (a) param_2 > param_1[8] (pool's configured max size) -- an immediate
+# early-exit before any real allocation work, or (b) the free-list has no
+# suitable block and the pool's outer chunk source (FUN_044e2b10 or an
+# indirect vtable call through *param_1) itself returns NULL. Reading the
+# pool object's own fields at entry to see which.
+def _pool_allocator_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    param_1 = _read32_raw(memory, memory_size, esp + 4)
+    param_2 = _read32_raw(memory, memory_size, esp + 8)
+    if not param_1:
+        logger.error("com", f"[pool-alloc-entry] param_1=NULL param_2={param_2}")
+        return
+    p3 = _read32_raw(memory, memory_size, param_1 + 0xc)
+    p4 = _read32_raw(memory, memory_size, param_1 + 0x10)
+    p6 = _read32_raw(memory, memory_size, param_1 + 0x18)
+    p7 = _read32_raw(memory, memory_size, param_1 + 0x1c)
+    p8 = _read32_raw(memory, memory_size, param_1 + 0x20)
+    p9 = _read32_raw(memory, memory_size, param_1 + 0x24)
+    logger.error(
+        "com",
+        f"[pool-alloc-entry] pool=0x{param_1:x} size_req={param_2} "
+        f"[3]=0x{p3 or 0:x} [4](freelist)=0x{p4 or 0:x} [6]=0x{p6 or 0:x} "
+        f"[7]=0x{p7 or 0:x} [8](maxsize)=0x{p8 or 0:x} [9]=0x{p9 or 0:x}",
+    )
+cpu.add_logpoint(0x044e2b5c, _pool_allocator_entry_probe)
+
+# Entry alone doesn't say success/failure -- the pool keeps serving many
+# more allocations right after ours in the log, which cuts against "the
+# allocator itself is broken." Reading its real return value directly at
+# the instruction right after its CALL site inside FUN_044d525b (0x044d526c
+# + 5-byte E8 rel32 = 0x044d5271) to settle it.
+def _pool_allocator_return_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[pool-alloc-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
+cpu.add_logpoint(0x044d5271, _pool_allocator_return_probe)
+
+def _dbparamquery_getcount_local18_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
-    logger.error("com", f"[cosetstate-return] HRESULT=0x{eax:x} ({signed})")
-cpu.add_logpoint(0x11005583, _cosetstate_return_probe)
+    logger.error("com", f"[dbparamquery-getcount-local18@995c88] EAX=0x{eax:x} ({signed})")
+# 2026-08-28: redundant -- always matches getcount-return exactly
+# (confirmed live, __RTC_CheckEsp doesn't touch EAX). Disabled.
+# cpu.add_logpoint(0x00995c88, _dbparamquery_getcount_local18_probe)
 
-# 2026-08-26 (cont'd): dwTlsIndex was always 0xFFFFFFFF (TLS_OUT_OF_INDEXES)
-# at every TlsSetValue call above -- oleaut32.dll's own module-global slot
-# index (DAT_771a1000, static base) is only ever written by TlsAlloc() in
-# FUN_77121f36 (its one-time process-init routine). Logging that call+return
-# directly: call site 0x77121f47, return 0x77121f4d (static) -> runtime
-# 0x11001f47 / 0x11001f4d (same -0x66120000 delta as the other oleaut32
-# probes above). TlsAlloc takes no args; EAX on return is the TLS index
-# (0xFFFFFFFF = TlsAlloc itself failed).
-def _tlsalloc_call_probe(eip, regs, memory, memory_size):
-    logger.error("com", "[tlsalloc-call] TlsAlloc()")
-cpu.add_logpoint(0x11001f47, _tlsalloc_call_probe)
-
-def _tlsalloc_return_probe(eip, regs, memory, memory_size):
-    eax = regs[EAX]
-    logger.error("com", f"[tlsalloc-return] index=0x{eax:x}{' (TLS_OUT_OF_INDEXES)' if eax == 0xFFFFFFFF else ''}")
-cpu.add_logpoint(0x11001f4d, _tlsalloc_return_probe)
+# 2026-08-28: removed the resolved 2026-08-26 CoGetMalloc/TlsSetValue/
+# CoSetState/TlsAlloc probe block (oleaut32.dll lazy-COM-state-init
+# investigation, fixed and merged in the DllMain milestone work) -- was
+# eating 6 of the 8 available logpoint slots (see below), silently
+# starving this session's own probes with no error.
 
 # 2026-08-25 (cont'd x14): clean function-boundary trace, redirected upstream
 # per Molly's request -- print params in / return out for the actual COM

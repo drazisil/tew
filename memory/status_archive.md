@@ -4,6 +4,22 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-28, cont'd x37) — DB init now runs for real; new blocker is a genuine DAO/Jet query-parameter gap in `expsrv.dll`, not a missing Win32 handler.
+
+**Five handler/bug fixes tonight, each verified by a fresh full re-run before moving to the next blocker**:
+
+1. **`kernel32.dll!LoadLibraryA` full-path calls to our own Python-simulated-only DLLs never resolved** (`kernel32_handlers.py::_load_dll_by_path`) -- `stubs.get_stub_dll_handle(basename)` was only ever checked as a fallback *inside* `if real_path is not None:` (i.e. only when a real file was found on disk but failed to parse as a PE), never when `find_file_ci` legitimately found no real file at all. Hit at ~60s: real `OLEAUT32.dll`'s own NLS-cache-version helper (`FUN_7713c8d9`, decompiled in Ghidra to confirm) calls `LoadLibraryA("<cached SYSTEM32 dir>\kernel32.dll")` defensively; `kernel32.dll` has no real file backing it (Python-simulated only), so this fell through to the interactive-missing-file prompt and crashed into an unregistered trampoline slot on non-interactive stdin. Fixed by checking the stub-handle fallback in the not-found path too.
+2. **Real bug found while fixing #1**: `os.path.basename()` is POSIX-only and silently doesn't split on `\` -- switched `_load_dll_by_path`'s basename extractions to `ntpath.basename()`.
+3. **`advapi32.dll!RegNotifyChangeKeyValue` unimplemented** -- since `registry.json` is only ever written by the guest process itself, a watched key never changes out from under it. Async mode registers and returns success without ever signaling; sync mode initially returned immediate success too, later fixed (see PR review follow-up below) to really block via the scheduler.
+4. **`kernel32.dll!WaitForMultipleObjects` was a bare `_halt` stub** despite `WaitForMultipleObjectsEx` right next to it having a complete implementation -- factored the shared logic into `_wait_for_multiple_common(cpu, arg_bytes)`.
+5. **`kernel32.dll!GetStringTypeExW` and `msvcrt.dll!wcsncmp` unimplemented** -- straightforward siblings of `GetStringTypeW`/`strncmp`.
+
+**Post-PR review follow-up (same session)**: an independent review of PR #5 found two real issues, both fixed:
+- `RegNotifyChangeKeyValue`'s synchronous form was fabricating immediate success -- fixed to route through the scheduler's handle-block machinery (parked on a permanently-unsignaled sentinel event).
+- `_lseek`/`_llseek` clamped position against `len(entry.data)`, always 0 for fd-backed handles -- silently reset any nonzero seek to 0. Added `file_entry_size()` using `os.fstat`. Confirmed NOT the cause of the `StockAssembly_SelectAPT` blocker (identical halt before/after) but a real, independently-worth-fixing bug.
+
+**Run reached ~80.5s** and hit a real, unhandled `INT3` inside `MCity_d.exe` itself: `nfspc.c(1164) NFS_abortmsg callback 'AMF=166 DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?'`. Molly confirmed the `StockAssembly` table genuinely exists and is populated -- rules out "missing/malformed table." PR #5 merged (`bba9324`); investigation continued on `investigate/dao-jet-query-params`.
+
 ## Previous status (2026-08-27, cont'd x36) — `SearchPathW`/`wcsncpy` blockers from x35 both resolved (parallel work while waiting on quota reset -- not fully reflected in this file until now); found and fixed two more real-file-I/O gaps (`_llseek`, `_lread`); run now reaches 156s+ with real DirectSound/window-message activity.
 
 **Housekeeping note**: `kernel32.dll!SearchPathA`/`SearchPathW` (standard Win32 search sequence) and `msvcrt.dll!wcsncpy` were already fixed and merged into `main` by the time this session picked back up -- this file's x35 entry still listed `wcsncpy` as the open blocker, which was stale. Confirmed both work correctly in a fresh run tonight.
