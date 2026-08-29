@@ -1,7 +1,9 @@
 """Crash analysis and diagnostic reporting for the emulator."""
 
 from __future__ import annotations
+import json
 import re
+from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
@@ -13,25 +15,39 @@ if TYPE_CHECKING:
 
 LogFn = Callable[[str, str], None]
 
+# Structured crash dump written by diagnose_fault/diagnose_halt, consumed by
+# tools/crashlog_reader.py instead of re-parsing /tmp/emu.log for DLL table /
+# register / stack / EBP-chain data. Overwritten every run, same path always
+# (matches /tmp/emu.log convention).
+CRASH_LOG_PATH = Path("/tmp/emu_crash.json")
+
+# Static address ranges outside any loaded DLL. Order matters -- checked
+# top to bottom, first match wins (ranges don't overlap today, but keep the
+# order stable in case that ever changes). end=None means "no upper bound".
+_MEMORY_REGIONS: list[tuple[int, int | None, str]] = [
+    (0x00400000, 0x02200000, "exe"),         # full PE image range
+    (0x00200000, 0x00220000, "stub"),
+    (0x7FFF0000, None, "main stack"),
+    (0x08000000, 0x09000000, "thread stack"),
+    (0x04000000, 0x08000000, "heap"),
+    (0x40000000, None, "VirtualAlloc"),
+]
+
+
+def _classify_static_region(value: int) -> str | None:
+    for start, end, label in _MEMORY_REGIONS:
+        if value >= start and (end is None or value < end):
+            return label
+    return None
+
 
 def _annotate_address(value: int, import_resolver: "ImportResolver | None") -> str:
     if import_resolver:
         dll = import_resolver.find_dll_for_address(value)
         if dll:
             return f"  ← {dll['name']}+0x{value - dll['base_address']:x}"
-    if 0x00400000 <= value < 0x02200000:   # full PE image range
-        return "  ← exe"
-    if 0x00200000 <= value < 0x00220000:
-        return "  ← stub"
-    if 0x7FFF0000 <= value:
-        return "  ← main stack"
-    if 0x08000000 <= value < 0x09000000:
-        return "  ← thread stack"
-    if 0x04000000 <= value < 0x08000000:
-        return "  ← heap"
-    if 0x40000000 <= value:
-        return "  ← VirtualAlloc"
-    return ""
+    region = _classify_static_region(value)
+    return f"  ← {region}" if region else ""
 
 
 def _walk_ebp_chain(
@@ -107,10 +123,108 @@ def _dump_cpu_state(
     _walk_ebp_chain(cpu, import_resolver, ebp, log_fn, category)
 
 
+def _collect_register_dump(cpu: "CPU", annotate_validity: bool = False) -> dict:
+    regs = {}
+    for i in range(8):
+        val = cpu.regs[i] & 0xFFFFFFFF
+        entry = {"value": val}
+        if annotate_validity:
+            entry["valid"] = cpu.memory.is_valid_address(val)
+        regs[REG_NAMES[i]] = entry
+    return regs
+
+
+def _collect_stack_dump(cpu: "CPU", import_resolver: "ImportResolver | None", stack_slots: int) -> list[dict]:
+    esp = cpu.regs[ESP] & 0xFFFFFFFF
+    slots = []
+    for i in range(stack_slots):
+        slot_addr = esp + i * 4
+        try:
+            value = cpu.memory.read32(slot_addr) & 0xFFFFFFFF
+        except Exception:
+            slots.append({"offset": i * 4, "error": "read error"})
+            break
+        slots.append({
+            "offset": i * 4,
+            "value": value,
+            "annotation": _annotate_address(value, import_resolver).strip(" ←") or None,
+        })
+    return slots
+
+
+def _collect_ebp_chain(cpu: "CPU", import_resolver: "ImportResolver | None", ebp_val: int, max_frames: int = 32) -> list[dict]:
+    frames = []
+    frame_ebp = ebp_val
+    depth = 0
+    seen = set()
+    while depth < max_frames and frame_ebp and cpu.memory.is_valid_address(frame_ebp):
+        if frame_ebp in seen:
+            frames.append({"depth": depth, "ebp": frame_ebp, "cycle": True})
+            break
+        seen.add(frame_ebp)
+        try:
+            saved_ebp = cpu.memory.read32(frame_ebp) & 0xFFFFFFFF
+            ret_addr = cpu.memory.read32(frame_ebp + 4) & 0xFFFFFFFF
+        except Exception:
+            frames.append({"depth": depth, "ebp": frame_ebp, "error": "read error"})
+            break
+        frames.append({
+            "depth": depth,
+            "ebp": frame_ebp,
+            "ret": ret_addr,
+            "annotation": _annotate_address(ret_addr, import_resolver).strip(" ←") or None,
+        })
+        frame_ebp = saved_ebp
+        depth += 1
+    return frames
+
+
+def _collect_dll_table(import_resolver: "ImportResolver | None") -> list[dict]:
+    if not import_resolver:
+        return []
+    return [
+        {"name": m["dll_name"], "base": m["base_address"], "end": m["end_address"]}
+        for m in import_resolver.get_address_mappings()
+    ]
+
+
+def _write_crash_log(kind: str, cpu: "CPU", import_resolver: "ImportResolver | None", extra: dict | None = None) -> Path:
+    """Writes the structured crash dump consumed by tools/crashlog_reader.py.
+
+    Always overwrites CRASH_LOG_PATH -- one crash file per run, matching the
+    /tmp/emu.log convention of a single fixed path across a session.
+    """
+    esp = cpu.regs[ESP] & 0xFFFFFFFF
+    ebp = cpu.regs[EBP] & 0xFFFFFFFF
+    stack_slots = 64 if kind == "fault" else 16
+    data = {
+        "kind": kind,
+        "eip": cpu.eip & 0xFFFFFFFF,
+        "eip_annotation": _annotate_address(cpu.eip & 0xFFFFFFFF, import_resolver).strip(" ←") or None,
+        "esp": esp,
+        "ebp": ebp,
+        "registers": _collect_register_dump(cpu, annotate_validity=(kind == "fault")),
+        "stack_dump": _collect_stack_dump(cpu, import_resolver, stack_slots),
+        "ebp_chain": _collect_ebp_chain(cpu, import_resolver, ebp),
+        "dll_table": _collect_dll_table(import_resolver),
+        "static_memory_map": [
+            {"start": start, "end": end, "label": label}
+            for start, end, label in _MEMORY_REGIONS
+        ],
+    }
+    if extra:
+        data.update(extra)
+    CRASH_LOG_PATH.write_text(json.dumps(data, indent=2))
+    return CRASH_LOG_PATH
+
+
 def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
     """
     Called after the run loop detects cpu.faulted == True.
-    Produces a diagnostic report with memory access info, CPU state, and DLL ranges.
+
+    Logs a short human-readable summary; the full memory-access diagnostics,
+    register dump, stack dump, EBP chain, and DLL table go to CRASH_LOG_PATH
+    (see tools/crashlog_reader.py) instead of the main log.
     """
     error = cpu.last_error
     if error is not None:
@@ -118,59 +232,37 @@ def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None
     else:
         logger.error("exception", f"CPU faulted (no Python error — likely unhandled opcode or bad memory access at EIP=0x{cpu.eip:08x} opcode=0x{cpu.memory.read8(cpu.eip):02x})")
 
-    # Extract address from error message
+    extra: dict = {}
+
     match = re.search(r"0x([0-9a-fA-F]+)", str(error))
     if match:
         addr = int(match.group(1), 16)
-        logger.error("exception", "--- Memory Access Diagnostics ---")
-        logger.error("exception", f"Attempted address: 0x{addr:08x}")
-
         bounds = cpu.memory.get_bounds()
-        logger.error(
-            "exception",
-            f"Valid memory range: 0x{bounds['start']:08x}-0x{bounds['end']:08x} "
-            f"({bounds['size'] // (1024 * 1024)}MB)",
-        )
-
-        if addr > 0x40000000:
-            logger.error("exception", "Address is outside normal DLL range - likely segment-relative (e.g., FS:[offset])")
-            fs_base = 0x7FFDD000
-            potential_offset = addr - fs_base
-            logger.error("exception", f"  If FS base is 0x{fs_base:08x}: offset would be 0x{potential_offset:08x}")
-            logger.error("exception", "  Common TEB/PEB fields: ExceptionList=FS:[0x00], StackBase=FS:[0x04], StackLimit=FS:[0x08]")
-
+        memory_access: dict = {
+            "attempted_address": addr,
+            "valid_memory_range": {"start": bounds["start"], "end": bounds["end"], "size": bounds["size"]},
+        }
         if import_resolver:
             dll = import_resolver.find_dll_for_address(addr)
             if dll:
-                logger.error("exception", f"Address is in {dll['name']}")
-                logger.error("exception", f"  Range: 0x{dll['base_address']:08x}-0x{dll['base_address'] + dll['size'] - 1:08x}")
-                logger.error("exception", f"  Offset in DLL: 0x{addr - dll['base_address']:08x}")
+                memory_access["in_dll"] = {
+                    "name": dll["name"],
+                    "base": dll["base_address"],
+                    "end": dll["base_address"] + dll["size"] - 1,
+                    "offset": addr - dll["base_address"],
+                }
             else:
-                logger.error("exception", "Address is NOT in any loaded DLL")
-                if addr < 0x00100000:
-                    logger.error("exception", "Address looks like an UNRESOLVED IMPORT (value not filled in IAT / NULL pointer)")
-                    logger.error("exception", "  Possible causes: missing DLL, missing export, or circular import")
-                logger.error("exception", "Loaded DLL ranges:")
-                for mapping in import_resolver.get_address_mappings():
-                    logger.error(
-                        "exception",
-                        f"  0x{mapping['base_address']:08x}-0x{mapping['end_address']:08x} {mapping['dll_name']}",
-                    )
-
-    logger.error("exception", "--- CPU State ---")
-    logger.error("exception", f"EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
+                memory_access["in_dll"] = None
+                memory_access["looks_like_unresolved_import"] = addr < 0x00100000
+        extra["memory_access"] = memory_access
 
     if import_resolver:
         current_dll = import_resolver.find_dll_for_address(cpu.eip)
-        if current_dll:
-            logger.error("exception", f"Location: {current_dll['name']}")
-        else:
-            logger.error("exception", "Location: Main executable")
-            if cpu.eip < 0x00100000:
-                logger.error("exception", "LIKELY UNRESOLVED IMPORT: EIP < 1MB, indirect call through unfilled IAT entry")
+        extra["eip_location"] = current_dll["name"] if current_dll else "Main executable"
+        extra["eip_likely_unresolved_import"] = (not current_dll) and cpu.eip < 0x00100000
 
-    _dump_cpu_state(cpu, import_resolver, logger.error, "exception", stack_slots=64, annotate_validity=True)
-
+    path = _write_crash_log("fault", cpu, import_resolver, extra=extra)
+    logger.error("exception", f"Crash details written to {path}")
     logger.error("exception", "Execution stopped.")
 
 
@@ -178,22 +270,21 @@ def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
     """
     Called after the run loop detects cpu.halted == True without a CPU fault.
 
-    Prints the register state and a shallow stack walk so the cause of the
-    halt (usually an unimplemented Win32 handler) can be traced back to the
-    calling game code.
+    Logs EIP + location so the halt is visible at a glance in the main log;
+    the register/stack/EBP-chain dump used to trace the calling game code
+    goes to CRASH_LOG_PATH instead (see tools/crashlog_reader.py).
     """
     logger.error("exception", "--- Halt Diagnostic ---")
     logger.error("exception", f"EIP: 0x{cpu.eip & 0xFFFFFFFF:08x}")
 
+    extra: dict = {}
     if import_resolver:
         dll = import_resolver.find_dll_for_address(cpu.eip)
         if dll:
-            logger.error(
-                "exception",
-                f"Location: {dll['name']}+0x{cpu.eip - dll['base_address']:x}",
-            )
+            logger.error("exception", f"Location: {dll['name']}+0x{cpu.eip - dll['base_address']:x}")
 
-    _dump_cpu_state(cpu, import_resolver, logger.error, "exception", stack_slots=16)
+    path = _write_crash_log("halt", cpu, import_resolver, extra=extra)
+    logger.error("exception", f"Crash details written to {path}")
 
 
 def diagnose_thread_end(

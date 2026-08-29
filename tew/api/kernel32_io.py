@@ -2556,7 +2556,8 @@ def register_kernel32_io_handlers(
     _RESOLVABLE_LOCALES = {
         0x0400: 0x0409,
         0x0800: 0x0409,
-    }  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT -> en-US
+        0x007F: 0x0409,
+    }  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT, LOCALE_INVARIANT -> en-US
 
     def _resolve_locale(locale: int) -> int:
         return _RESOLVABLE_LOCALES.get(locale, locale)
@@ -2572,7 +2573,7 @@ def register_kernel32_io_handlers(
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if not _locale_is_valid(locale):
-            logger.debug(
+            logger.error(
                 "handlers",
                 f"CompareStringA(locale=0x{locale:08x}) -> 0 (invalid locale)",
             )
@@ -2610,7 +2611,7 @@ def register_kernel32_io_handlers(
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if not _locale_is_valid(locale):
-            logger.debug(
+            logger.error(
                 "handlers",
                 f"CompareStringW(locale=0x{locale:08x}) -> 0 (invalid locale)",
             )

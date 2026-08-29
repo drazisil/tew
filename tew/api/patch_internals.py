@@ -21,8 +21,18 @@ from tew.api.win32_handlers import (
     DLLMAIN_HANDLE_STORE,
 )
 from tew.api._state import CRTState, read_cstring
-from tew.api.msvcrt_handlers import _sprintf_format
+from tew.api.msvcrt_handlers import _sprintf_format, _write_cstring
+from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
 from tew.logger import logger, DEBUG
+
+# __pfnReportHook (0x020ee23c): global written by the game's own real,
+# unpatched _CrtSetReportHook (0x009f92e0 -- `MOV [0x020ee23c], ECX`,
+# confirmed via Ghidra disassembly). HookCrtLibraryErrorReports installs a
+# hook here at startup; real MSVC debug CRT calls whatever's stored here
+# from _CrtDbgReport before its own default handling. Read dynamically
+# (never hardcode the installed hook's address) so this keeps working if
+# the game ever re-installs a different hook.
+_CRT_REPORT_HOOK_PTR = 0x020ee23c
 
 
 def patch_crt_internals(
@@ -164,6 +174,30 @@ def patch_crt_internals(
             # Dumping objects -> / one line per block) -- informational
             # noise, not something worth WARN-level attention.
             logger.debug("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")
+
+            # Forward to the game's own registered report hook (see
+            # _CRT_REPORT_HOOK_PTR above), exactly like real MSVC debug CRT
+            # does before its own default handling. This is what actually
+            # drives HookCrtLibraryErrorReports's memleaksCRT.txt output
+            # (crtReportHookCallback -> AppendToCRTLeaksFile) -- a real,
+            # per-block memory-leak report we'd otherwise have to
+            # reconstruct with ad hoc probes. Scoped to _CRT_WARN only:
+            # _CRT_ERROR/_CRT_ASSERT below hit `swi(3)`/INT3 inside the real
+            # hook, which would fight with the fatal halt already forced
+            # for those two types.
+            hook_addr = memory.read32(_CRT_REPORT_HOOK_PTR)
+            if hook_addr:
+                msg_ptr = state.simple_alloc(len(fmt) + 1)
+                _write_cstring(msg_ptr, fmt, memory)
+                retval_ptr = state.simple_alloc(4)
+                memory.write32(retval_ptr, 0)
+                _invoke_emulated_proc(
+                    cpu, memory, hook_addr,
+                    [report_type, msg_ptr, retval_ptr],
+                    _get_dialog_sentinel(state, memory),
+                    scheduler=state.scheduler,
+                )
+
             cpu.regs[EAX] = 0  # 0 = don't trigger debugbreak
         else:
             logger.error("exception", f"_CrtDbgReport [{type_name}] {filename}:{line_number} — {fmt}")

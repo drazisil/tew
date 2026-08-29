@@ -1569,7 +1569,7 @@ def _vardatefromstr_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
     logger.error("com", f"[VarDateFromStr-return] EAX=0x{eax & 0xffffffff:x} ({signed})")
-cpu.add_logpoint(0x1004dfd7, _vardatefromstr_return_probe)
+# cpu.add_logpoint(0x1004dfd7, _vardatefromstr_return_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
 
 # 2026-08-28: VarDateFromStr confirmed to genuinely return
 # DISP_E_TYPEMISMATCH (0x80020005) on clean input with zero tew
@@ -1921,7 +1921,7 @@ def _fun_77145656_entry_probe(eip, regs, memory, memory_size):
         f"[FUN_77145656-entry] this=0x{this_ptr:x} lcid=0x{p1_lcid or 0:x} "
         f"flags=0x{p2_flags or 0:x} param_3=0x{p3 or 0:x}",
     )
-cpu.add_logpoint(0x10025656, _fun_77145656_entry_probe)
+# cpu.add_logpoint(0x10025656, _fun_77145656_entry_probe)  # 2026-08-29: GetLocaleInfoW/VarDateFromStr confirmed fixed, freeing slot
 
 # 2026-08-28: Molly wants absolute proof, not inference -- probing
 # FUN_7713cee1's own entry directly (the function that unconditionally
@@ -1934,7 +1934,7 @@ def _fun_7713cee1_entry_probe(eip, regs, memory, memory_size):
     lctype = _read32_raw(memory, memory_size, esp + 8)
     logger.error("com", f"[FUN_7713cee1-entry] lcid=0x{lcid or 0:x} lctype=0x{lctype or 0:x}")
 # cpu.add_logpoint(0x1001cee1, _fun_7713cee1_entry_probe)  # 2026-08-29: GetLocaleInfoW confirmed fixed, freeing slot
-cpu.add_logpoint(0x1004dd7d, _addr_7716dd7d_probe)
+# cpu.add_logpoint(0x1004dd7d, _addr_7716dd7d_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
 
 def _read_wstr_raw(memory, memory_size, addr, max_len=40):
     if not addr or addr + max_len * 2 >= memory_size:
@@ -2050,12 +2050,107 @@ def _fun_7716bde4_entry_probe(eip, regs, memory, memory_size):
         f"[ESP+8](param_2)=0x{p_param2 or 0:x} *param_1(text_ptr)=0x{text_ptr or 0:x} "
         f"preview={_read_wstr_raw(memory, memory_size, text_ptr or 0)!r} raw={' '.join(raw_wchars)}",
     )
-cpu.add_logpoint(0x1004bde4, _fun_7716bde4_entry_probe)
+# cpu.add_logpoint(0x1004bde4, _fun_7716bde4_entry_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
 
 def _fun_7716bde4_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     logger.error("com", f"[FUN_7716bde4-return] EIP=0x{eip:x} EAX(local_8)=0x{eax:x} ({eax})")
-cpu.add_logpoint(0x1004d9a0, _fun_7716bde4_return_probe)
+# cpu.add_logpoint(0x1004d9a0, _fun_7716bde4_return_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
+
+# 2026-08-29: EIP=0x1901d9eb SEH fault (expsrv.dll+0x1d9eb) -- CALL [EAX+0xC]
+# faults because *param_2 (should be a vtable pointer) is 0x1. Traced back
+# through FUN_0f9dd9a7 (crash site, tew addr 0x1901d9a7) <- FUN_0f9dd3d9
+# (call site tew addr 0x1901d418, passes its own param_3 through unchanged)
+# <- constructor FUN_0f9ddd11 (tew addr 0x1901dd11), which unconditionally
+# sets *param_1 = &UNK_0fa041c0 (RVA 0x401c0 -> tew addr 0x190401c0) -- a
+# fixed, non-instance-dependent vtable pointer (not real per-activation COM,
+# just a private C++-vtable singleton: _DAT_0fa10044 stores the one
+# instance). Since the constructor is unconditional, the ONLY legitimate
+# value the object's first DWORD can ever hold is 0x190401c0 -- so instead
+# of needing to learn "what should be there" from a live run, we already
+# know it and just need to catch the write that clobbers it (or confirm
+# the constructor never ran for this instance). Native watchpoint is
+# single-slot and normally needs TEW_WATCH_ADDR known in advance from a
+# prior run (see below) -- setting it dynamically here from the
+# constructor's own entry avoids needing two runs.
+def _fun_0f9ddd11_ctor_entry_probe(eip, regs, memory, memory_size):
+    obj_ptr = regs[ECX]  # __fastcall: param_1 in ECX
+    logger.error("com", f"[FUN_0f9ddd11-ctor] constructed object @ 0x{obj_ptr:x} -- arming watchpoint on its vtable slot")
+    global _tew_watch_addr_int
+    _tew_watch_addr_int = obj_ptr
+    cpu.set_watchpoint(obj_ptr)
+cpu.add_logpoint(0x1901dd11, _fun_0f9ddd11_ctor_entry_probe)
+
+# 2026-08-29: watchpoint above confirmed the singleton (constructed once,
+# vtable never clobbered afterward) is NOT the crashing object. Traced the
+# crash's own EBP chain frame[1] (MSJET35.DLL+0x61d87) to FUN_7a8a1c78
+# (tew addr 0x17061c78), whose call at tew addr 0x17061d84 --
+# `(**(code**)(*local_210+0x24))(local_210,*param_4,uVar6,param_3,local_1e0,
+# local_22c)` -- passes local_210 (the singleton, confirmed fine) but
+# `uVar6` as the 3rd arg, which becomes FUN_0f9dd3d9's crashing param_3.
+# uVar6 is either param_4[3] directly, or *(local_218 + param_4[3]*0x1c) --
+# a lookup into a per-connection table (local_218, aka Molly's "s1" --
+# believed to be the locale table) indexed by param_4[3]. Probing the call
+# site itself (args already pushed, call not yet executed) to see which
+# branch fires and what's actually in that table slot. Args pushed
+# right-to-left so at this EIP: [ESP+0]=local_210 [ESP+4]=*param_4
+# [ESP+8]=uVar6(crashing obj) [ESP+12]=param_3 [ESP+16]=local_1e0
+# [ESP+20]=local_22c.
+#
+# First attempt read param_1/param_4 via [EBP+8]/[EBP+0x14] (standard cdecl
+# frame) and got garbage (param_1 came back as a thread-stack address) --
+# FUN_7a8a1c78's own first instruction is a plain MOV, not PUSH EBP, so it
+# never establishes that frame; EBP at the callsite still belongs to
+# whatever caller last set it up. Fixed by capturing param_4 at the
+# function's TRUE entry instead, via ESP (always correct regardless of
+# whether the callee ever sets up EBP): at entry, before any prologue runs,
+# [ESP+0]=retaddr [ESP+4]=param_1 [ESP+8]=param_2 [ESP+0xc]=param_3
+# [ESP+0x10]=param_4.
+_fun_7a8a1c78_args = [None, None, None, None]  # param_1..param_4, from true entry
+def _fun_7a8a1c78_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    _fun_7a8a1c78_args[0] = _read32_raw(memory, memory_size, esp + 4)
+    _fun_7a8a1c78_args[1] = _read32_raw(memory, memory_size, esp + 8)
+    _fun_7a8a1c78_args[2] = _read32_raw(memory, memory_size, esp + 0xc)
+    _fun_7a8a1c78_args[3] = _read32_raw(memory, memory_size, esp + 0x10)
+cpu.add_logpoint(0x17061c78, _fun_7a8a1c78_entry_probe)
+
+_PTR_7A9362C0_TEW = 0x170F62C0  # msjet35.dll+0xF62C0 -- a POINTER variable (Molly's
+# analysis names it PTR_7a9362c0, not DAT_), so it must be read once to get
+# the real table-of-tables base before adding the per-connection offset --
+# the less-analyzed decompile this probe was drafted from inlined that
+# dereference away (`DAT_7a9362c0 + local_214 + 0x6d8`), which would have
+# been silently wrong (one dereference short).
+def _fun_7a8a1c78_callsite_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    param_1 = _fun_7a8a1c78_args[0]
+    param_4_ptr = _fun_7a8a1c78_args[3]
+    param_4_2 = _read32_raw(memory, memory_size, param_4_ptr + 8) if param_4_ptr else None
+    param_4_3 = _read32_raw(memory, memory_size, param_4_ptr + 0xc) if param_4_ptr else None
+    this_obj = _read32_raw(memory, memory_size, esp)
+    crashing_obj = _read32_raw(memory, memory_size, esp + 8)
+    crashing_obj_vtable = _read32_raw(memory, memory_size, crashing_obj) if crashing_obj else None
+    table_entry = None
+    table_base = None
+    if param_4_2 == 0 and param_1 is not None and param_4_3 is not None:
+        local_214 = (param_1 * 0x708) & 0xFFFFFFFF
+        table_of_tables_base = _read32_raw(memory, memory_size, _PTR_7A9362C0_TEW)
+        table_base_ptr = (
+            _read32_raw(memory, memory_size, (table_of_tables_base + local_214 + 0x6d8) & 0xFFFFFFFF)
+            if table_of_tables_base else None
+        )
+        if table_base_ptr:
+            table_base = table_base_ptr
+            table_entry = _read32_raw(memory, memory_size, (table_base_ptr + param_4_3 * 0x1c) & 0xFFFFFFFF)
+    logger.error(
+        "com",
+        f"[FUN_7a8a1c78-callsite] param_1=0x{param_1 or 0:x} "
+        f"param_4=0x{param_4_ptr or 0:x} param_4[2]={param_4_2} param_4[3]={param_4_3} "
+        f"this_obj=0x{this_obj or 0:x} crashing_obj=0x{crashing_obj or 0:x} "
+        f"crashing_obj_vtable=0x{crashing_obj_vtable or 0:x} "
+        f"locale_table_base=0x{table_base or 0:x} locale_table_entry=0x{table_entry or 0:x}",
+    )
+cpu.add_logpoint(0x17061d84, _fun_7a8a1c78_callsite_probe)
 
 # 2026-08-28: FUN_7a852ef4 (call site 0x7a86388f inside FUN_7a8635de) is
 # the real "Tables" catalog lookup by name for THIS invocation's node's

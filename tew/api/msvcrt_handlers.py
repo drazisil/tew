@@ -637,6 +637,27 @@ def register_msvcrt_handlers(
 
     stubs.register_handler("msvcrt.dll", "fwrite", _fwrite)
 
+    # fputs(const char* str, FILE* stream) -> int [cdecl]
+    # Real fputs returns a non-negative value on success, EOF (-1) on error;
+    # we always succeed once we've routed the text somewhere.
+    def _fputs(cpu: "CPU") -> None:
+        str_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        stream  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        text = read_cstring(str_ptr, memory)
+        entry = state.file_handle_map.get(stream)
+        if entry is not None and entry.writable and entry.fd >= 0:
+            import os as _os
+            data = text.encode("latin-1", errors="replace")
+            _os.write(entry.fd, data)
+            entry.position += len(data)
+        else:
+            # stdout/stderr or unknown handle — route to logger
+            if text:
+                logger.info("handlers", f"[fputs] {text.rstrip(chr(10))}")
+        cpu.regs[EAX] = 0
+
+    stubs.register_handler("msvcrt.dll", "fputs", _fputs)
+
     # fseek(FILE* stream, long offset, int whence) -> int [cdecl]
     def _fseek(cpu: "CPU") -> None:
         stream = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -1099,6 +1120,17 @@ def register_msvcrt_handlers(
         cpu.regs[EAX] = 0
 
     stubs.register_handler("msvcrt.dll", "wcsncmp", _wcsncmp)
+
+    # _wcsicmp(const wchar_t* s1, const wchar_t* s2) -> int [cdecl]
+    # Case-insensitive, whole-string (no length arg, unlike wcsncmp above).
+    def _wcsicmp(cpu: "CPU") -> None:
+        s1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        s2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        a = read_wide_string(s1, memory).upper()
+        b = read_wide_string(s2, memory).upper()
+        cpu.regs[EAX] = (1 if a > b else (0xFFFFFFFF if a < b else 0)) & 0xFFFFFFFF
+
+    stubs.register_handler("msvcrt.dll", "_wcsicmp", _wcsicmp)
 
     # strcat(char* dst, const char* src) -> char* [cdecl]
     def _strcat(cpu: "CPU") -> None:
