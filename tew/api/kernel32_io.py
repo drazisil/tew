@@ -2145,8 +2145,13 @@ def register_kernel32_io_handlers(
             memory.write8(lp_returned + i, b)
         memory.write8(lp_returned + len(encoded), 0)
 
+        # Own category ("inifile"), not "handlers" -- this fires once per
+        # .ini key read, which during a directory-scan loop (e.g. every
+        # track's info.ini) can be dozens of near-identical lines per run,
+        # drowning out other "handlers" signal. Exclude "inifile" from
+        # LOG_CATEGORIES to cut this noise without losing anything else.
         logger.debug(
-            "handlers",
+            "inifile",
             f"GetPrivateProfileStringA({app_name!r}, {key_name!r}, "
             f"file={file_name!r}) -> {value!r}",
         )
@@ -2658,10 +2663,6 @@ def register_kernel32_io_handlers(
         cpu.regs[EAX] = 1 if locale == 0x0409 else 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _get_locale_info_w(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
-        cleanup_stdcall(cpu, memory, 16)
-
     stubs.register_handler("kernel32.dll", "CompareStringA", _compare_string_a)
     stubs.register_handler("kernel32.dll", "CompareStringW", _compare_string_w)
     stubs.register_handler("kernel32.dll", "GetStringTypeA", _halt("GetStringTypeA"))
@@ -2677,7 +2678,6 @@ def register_kernel32_io_handlers(
     stubs.register_handler(
         "kernel32.dll", "EnumSystemLocalesA", _halt("EnumSystemLocalesA")
     )
-    stubs.register_handler("kernel32.dll", "GetLocaleInfoW", _get_locale_info_w)
     stubs.register_handler(
         "kernel32.dll", "SetConsoleCtrlHandler", _halt("SetConsoleCtrlHandler")
     )

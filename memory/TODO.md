@@ -6,43 +6,42 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## UPDATED (2026-08-28, cont'd x38): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- traced deep into real Jet SQL-compiler internals, still open
+## RESOLVED (2026-08-28, cont'd x39): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- root cause was `GetLocaleInfoW` unimplemented, not a Jet SQL-compiler bug
 
-Full call chain now confirmed live via probes correlated against the exact
-failing call (see status.md "cont'd x38" for the complete trace with
-addresses): `DBParamQuery::get_Count` -> `dao350.dll`'s real `get_Count`
-implementer (`FUN_0447dc1c`) -> type-indexed refresh gate (`FUN_044d26ce`,
-Parameters type) -> per-type populate handler (`FUN_044c69bc`, its own
-allocation confirmed to succeed) -> name-based lookup (`FUN_044d525b`,
-given `"StockAssembly_SelectAPT"` directly) -> dynamically-bound call into
-real `msjet35.dll` (confirmed: two earlier calls through the identical
-pointer succeeded for other queries this same run, ruling out a structural
-code-path bug) -> real msjet35.dll dispatch (`FUN_7a89ff40` ->
-`FUN_7a89fd45`) -> the real Jet SQL execution-plan compiler
-(`FUN_7a862215`, same `JETSHOWPLAN` code path the earlier
-`StockVehicleAttributes_SelectAll2`/`Fields.Count` investigation also
-reached) -> raw internal error `-3100`, translated into DAO error 3075.
+Full root cause and fix in status.md "cont'd x39" and changelog.md's
+matching entry. Short version: `kernel32.dll!GetLocaleInfoW` was a bare
+"always fail, zero logging" stub; real `oleaut32.dll` code calls it while
+building its global, process-wide locale-info cache, and its silent
+failure meant that cache got permanently poisoned with a near-empty struct
+(no LCID, no calendar type, no date separator) the very first time
+anything in the process asked for locale info -- served to every later
+`VarDateFromStr` call regardless of which query needed it. Fixed:
+implemented `GetLocaleInfoW` for real in `kernel32_locale.py`, alongside
+two related mask/lookup bugs found while wiring it up (`LOCALE_NOUSEROVERRIDE`
+not stripped from LCTYPE; several LCTYPEs need a string-form fallback from
+the numeric table). `StockAssembly_SelectAPT`'s specific `FUN_7a862215`/
+`FUN_7a85e7e1` Jet-compiler internals (flagged unresolved in the prior
+x38 entry) turned out to be entirely correct and irrelevant -- confirmed
+dead ends via live probes that never fired.
 
-Ruled out along the way (all confirmed live, not guesses): the pool
-allocator returning NULL (false lead, itself caused by the logpoint-cap
-bug below); the `CreateErrorInfo`/`SetErrorInfo`/`GetErrorInfo` plumbing
-(already implemented/working from an earlier session -- `Error.Description`
-is a real, validly-allocated, genuinely-zero-length BSTR, not a plumbing
-gap); two real, independently-fixed bugs found while investigating
-(`GetEnvironmentStrings(W)`'s garbage pointer, `DllMain`-before-IAT-patch
-ordering, `WriteFile`/`_write`'s wrong-fd-position bug) -- none of them
-change the outcome.
+**New, much simpler blocker opened immediately downstream**: `msvcrt.dll!_wtoi`
+unimplemented -- real oleaut32.dll code needs it to convert a locale-query
+digit string to an int. Straightforward wide-string-to-int conversion,
+pick this up first next session.
 
-**Not yet located**: `FUN_7a862215`'s return traces to
-`local_44 = FUN_7a85e7e1(local_18, local_1c, local_14[0x1f])`, not yet
-live-probed. Genuine, deep, undocumented Jet SQL-compiler internals.
-`StockAssembly_SelectAPT` never appears as its own top-level plan in
-`showplan.out`, consistent with compilation failing before a plan gets
-written. Same shape as the still-unresolved Fields.Count investigation's
-own conclusion (multi-table `Table.Column`-qualified-reference tokenization,
-upstream of where either investigation has reached) -- may be the same
-underlying compile-time defect manifesting on parameters instead of
-columns; not confirmed.
+## NEW (2026-08-28, cont'd x39): `FUN_77121505` (oleaut32.dll's hand-crafted `__chkesp`-style helper) suspected of swallowing a real error on its own failure path -- unconfirmed, from an earlier (pre-compaction) session observation
+
+Molly recalled an earlier "[a] thread went splat" incident and suspected
+`FUN_77121505` was involved -- specifically, that it "nommed the exception
+and moved on" rather than propagating it. Confirmed this session that
+`FUN_77121505` reliably passes through whatever's in `EAX` on its NO-ERROR
+path (that's what makes `FUN_7713cee1`'s Ghidra-misidentified `void`
+return type actually work correctly for GetLocaleInfoW's success case) --
+but its behavior on an actual error path was not examined. The original
+incident isn't in this session's own logs (`LOG_CATEGORIES` never included
+`thread` this session) -- next session should re-run with `thread` logging
+enabled to find the original occurrence before deciding whether/how to
+fix.
 
 ## NEW (2026-08-28, cont'd x38): `cpu_add_logpoint` silently drops registrations past its 8-slot cap -- violates this project's own fail-loudly standard
 
