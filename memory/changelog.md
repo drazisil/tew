@@ -4,6 +4,20 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-29 (cont'd x42) — MILESTONE: MCity_d.exe gets real database records back end-to-end for the first time ever. Implemented `CreateFileMappingA`/`MapViewOfFile`/`UnmapViewOfFile`; replaced `CompareStringA`/`CompareStringW`'s locale allowlist with unconditional acceptance after a third distinct real LCID (`0x0009`) turned out to be wrongly rejected
+
+**Context**: x41 fixed the `EIP=0x1901d9eb` fault's first trigger (`LOCALE_INVARIANT` rejection) and immediately hit two new, unrelated gaps downstream: `msvcrt.dll!_wcsicmp` (fixed that session) then `kernel32.dll!CreateFileMappingA`.
+
+**`CreateFileMappingA`**: genuinely unimplemented (a `_halt` stub, like `CreateFileMappingW`/`OpenFileMappingA/W` still are). Implemented for real, along with `MapViewOfFile`/`UnmapViewOfFile` — implementing only `CreateFileMappingA` would have just traded this halt for the very next `MapViewOfFile` call, same lesson as `fputs` last session. File-backed mappings read real bytes from the underlying host file at map time (`os.pread` for fd-backed handles, an `entry.data` slice otherwise — mirrors `_fread`'s existing branching) and writable views are flushed back to the real file on unmap (`os.pwrite`/`entry.data` splice), matching the "do real I/O" approach `WriteFile`/`fwrite` already use elsewhere in this module. Anonymous (page-file-backed) mappings just rely on `simple_alloc`'s already-zeroed bump memory. New `FileMappingHandle`/`MappedView` dataclasses in `_state.py`; `CloseHandle` updated to release mapping handles too.
+
+**The `EIP=0x1901d9eb` crash pattern recurred a second time**, this time via `CompareStringA(locale=0x00000009)` — `MAKELANGID(LANG_ENGLISH, SUBLANG_NEUTRAL)`, a real, legitimate LCID. This is the third distinct locale value the old allowlist-based `_locale_is_valid` wrongly rejected (`0x0400`/`0x0800` in an earlier session, `LOCALE_INVARIANT` `0x007F` in x41, now `0x0009`). Root cause of the *design*, not just the individual value: real `CompareStringA`/`W` essentially never fails for a plausible LCID, and this handler's "valid" comparison path was only ever doing an ordinal `.upper()` comparison regardless of locale anyway — there was never a real behavioral reason to reject unrecognized values in the first place. **Fixed**: removed `_locale_is_valid`/`_resolve_locale`/`_RESOLVABLE_LOCALES` entirely; both functions now compare unconditionally for any locale. Added `_log_locale_once` (shared, `debug` level) so each distinct non-en-US locale is still recorded the first time it's seen, without the spam a per-call log would cause (confirmed live: some values fire 70+ times in under a second).
+
+**Confirmed live**: with both fixes in place, execution runs further than any prior session, and `dblog.txt` (MSJET35.DLL's own `-dbEnableLog` trace) shows real database records actually coming back — the first time this has happened in tew. This effectively closes out the `EIP=0x1901d9eb` fault family and the broader multi-session DAO/Jet query-execution investigation.
+
+**New blocker, found immediately after**: the heap allocator (`simple_alloc`, a bump allocator with no `free()` support) ran out of its 64MB region and self-detected the collision with `THREAD_STACK_BASE` rather than silently aliasing live thread-stack memory — a deliberate safety check working correctly, not a bug to patch over. Not yet investigated whether this is simply "ran deep enough to hit the known ceiling" or an abnormal leak; next session's starting point, on a fresh branch.
+
+---
+
 ## 2026-08-29 (cont'd x41) — RESOLVED: the `EIP=0x1901d9eb` unhandled SEH fault (expsrv.dll+0x1d9eb) from x40. Root cause was `CompareStringA`/`CompareStringW` rejecting `LOCALE_INVARIANT` (`0x007F`) as invalid — a real Windows LCID, not garbage
 
 **Context**: x40 fixed the `classify_wide_string` date-tokenizer bug and immediately hit a new, unrelated unhandled SEH fault at `EIP=0x1901d9eb`, unhandled by any SEH frame — a `CALL [EAX+0xC]` vtable dispatch with `EAX=1`, i.e. a near-null read where a real vtable pointer belonged.

@@ -71,6 +71,23 @@ class FileHandleEntry:
     readable: bool = False
 
 
+@dataclass
+class FileMappingHandle:
+    file_handle: Optional[int]  # underlying HANDLE from CreateFile, or None for an
+                                 # anonymous (page-file-backed) mapping
+    protect: int                # flProtect (PAGE_READONLY / PAGE_READWRITE / ...)
+    max_size: int                # 0 means "size of the underlying file"
+
+
+@dataclass
+class MappedView:
+    base_addr: int
+    size: int
+    mapping_handle: int
+    file_offset: int
+    writable: bool
+
+
 def file_entry_size(entry: "FileHandleEntry") -> int:
     """Return the real length of a file handle's backing data.
 
@@ -342,6 +359,10 @@ class CRTState:
         # ── File handles ──────────────────────────────────────────────────
         self.file_handle_map: dict[int, FileHandleEntry] = {}
         self.next_file_handle: int = 0x5000
+
+        # ── File mappings (CreateFileMappingA / MapViewOfFile) ─────────────
+        self.file_mapping_map: dict[int, FileMappingHandle] = {}
+        self.mapped_views: dict[int, MappedView] = {}  # keyed by view base address
 
         # ── Find handles (FindFirstFileA / FindNextFileA) ──────────────
         # Each entry: list of (filename: str, attrs: int) tuples, current index

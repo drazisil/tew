@@ -33,6 +33,8 @@ from tew.api._state import (
     CRTState,
     MutexHandle,
     EventHandle,
+    FileMappingHandle,
+    MappedView,
     file_entry_size,
     find_file_ci,
     read_cstring,
@@ -142,6 +144,7 @@ def register_kernel32_io_handlers(
                     state.file_locks[entry.path] = remaining
         state.file_handle_map.pop(h, None)
         state.kernel_handle_map.pop(h, None)
+        state.file_mapping_map.pop(h, None)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -770,12 +773,148 @@ def register_kernel32_io_handlers(
     stubs.register_handler("kernel32.dll", "OpenEventW", _halt("OpenEventW"))
     stubs.register_handler("kernel32.dll", "SetEvent", _set_event)
     stubs.register_handler("kernel32.dll", "ResetEvent", _reset_event)
-    stubs.register_handler(
-        "kernel32.dll", "CreateFileMappingA", _halt("CreateFileMappingA")
-    )
+    # CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttrs, DWORD flProtect,
+    #                     DWORD dwMaxSizeHigh, DWORD dwMaxSizeLow, LPCSTR lpName) -> HANDLE [stdcall]
+    # hFile == 0 or INVALID_HANDLE_VALUE (0xFFFFFFFF) means an anonymous,
+    # page-file-backed mapping (no real file behind it); anything else must
+    # already be a live handle from CreateFile(A/W).
+    _PAGE_READWRITE = 0x04
+    _INVALID_HANDLE_VALUE = 0xFFFFFFFF
+
+    def _create_file_mapping_a(cpu: "CPU") -> None:
+        sp = cpu.regs[ESP]
+        h_file        = memory.read32((sp + 4)  & 0xFFFFFFFF)
+        fl_protect    = memory.read32((sp + 12) & 0xFFFFFFFF)
+        max_size_high = memory.read32((sp + 16) & 0xFFFFFFFF)
+        max_size_low  = memory.read32((sp + 20) & 0xFFFFFFFF)
+        max_size = (max_size_high << 32) | max_size_low
+
+        anonymous = h_file in (0, _INVALID_HANDLE_VALUE)
+        if not anonymous and h_file not in state.file_handle_map:
+            logger.warn("fileio", f"CreateFileMappingA(hFile=0x{h_file:x}) -> NULL (invalid handle)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+        if anonymous and max_size == 0:
+            logger.warn("fileio", "CreateFileMappingA(anonymous, size=0) -> NULL (invalid parameter)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        handle = state.next_kernel_handle
+        state.next_kernel_handle += 1
+        state.file_mapping_map[handle] = FileMappingHandle(
+            file_handle=None if anonymous else h_file,
+            protect=fl_protect,
+            max_size=max_size,
+        )
+        logger.debug(
+            "fileio",
+            f"CreateFileMappingA(hFile=0x{h_file:x}, protect=0x{fl_protect:x}, "
+            f"max_size={max_size}) -> 0x{handle:x}",
+        )
+        cpu.regs[EAX] = handle
+        cleanup_stdcall(cpu, memory, 24)
+
+    stubs.register_handler("kernel32.dll", "CreateFileMappingA", _create_file_mapping_a)
     stubs.register_handler(
         "kernel32.dll", "CreateFileMappingW", _halt("CreateFileMappingW")
     )
+
+    # MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
+    #               DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+    #               SIZE_T dwNumberOfBytesToMap) -> LPVOID [stdcall]
+    _FILE_MAP_WRITE = 0x0002
+    _FILE_MAP_ALL_ACCESS = 0x000F001F
+
+    def _map_view_of_file(cpu: "CPU") -> None:
+        sp = cpu.regs[ESP]
+        h_map          = memory.read32((sp + 4)  & 0xFFFFFFFF)
+        desired_access = memory.read32((sp + 8)  & 0xFFFFFFFF)
+        offset_high    = memory.read32((sp + 12) & 0xFFFFFFFF)
+        offset_low     = memory.read32((sp + 16) & 0xFFFFFFFF)
+        num_bytes      = memory.read32((sp + 20) & 0xFFFFFFFF)
+        offset = (offset_high << 32) | offset_low
+
+        mapping = state.file_mapping_map.get(h_map)
+        if mapping is None:
+            logger.warn("fileio", f"MapViewOfFile(0x{h_map:x}) -> NULL (invalid handle)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_HANDLE))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 20)
+            return
+
+        file_entry = state.file_handle_map.get(mapping.file_handle) if mapping.file_handle else None
+        size = num_bytes
+        if size == 0:
+            if mapping.max_size:
+                size = mapping.max_size - offset
+            elif file_entry is not None:
+                size = file_entry_size(file_entry) - offset
+        if size <= 0:
+            logger.warn("fileio", f"MapViewOfFile(0x{h_map:x}) -> NULL (zero-size view)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 20)
+            return
+
+        base = state.simple_alloc(size)
+        if file_entry is not None:
+            if file_entry.fd is not None:
+                data = os.pread(file_entry.fd, size, offset)
+            else:
+                data = file_entry.data[offset:offset + size]
+            if data:
+                memory.load(base & 0xFFFFFFFF, data)
+        # else: anonymous mapping -- simple_alloc's bump memory is already zeroed
+
+        writable = (mapping.protect == _PAGE_READWRITE) and bool(
+            desired_access & (_FILE_MAP_WRITE | _FILE_MAP_ALL_ACCESS)
+        )
+        state.mapped_views[base] = MappedView(
+            base_addr=base, size=size, mapping_handle=h_map, file_offset=offset, writable=writable
+        )
+        logger.debug("fileio", f"MapViewOfFile(0x{h_map:x}, offset={offset}, size={size}) -> 0x{base:x}")
+        cpu.regs[EAX] = base
+        cleanup_stdcall(cpu, memory, 20)
+
+    stubs.register_handler("kernel32.dll", "MapViewOfFile", _map_view_of_file)
+
+    # UnmapViewOfFile(LPCVOID lpBaseAddress) -> BOOL [stdcall]
+    # Writable, file-backed views are flushed back to the real host file --
+    # same "do real I/O" philosophy as WriteFile/fwrite elsewhere in this module.
+    def _unmap_view_of_file(cpu: "CPU") -> None:
+        base = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        view = state.mapped_views.pop(base, None)
+        if view is None:
+            logger.warn("fileio", f"UnmapViewOfFile(0x{base:x}) -> FALSE (not a mapped view)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 4)
+            return
+        if view.writable:
+            mapping = state.file_mapping_map.get(view.mapping_handle)
+            file_entry = (
+                state.file_handle_map.get(mapping.file_handle)
+                if mapping is not None and mapping.file_handle else None
+            )
+            if file_entry is not None:
+                data = memory.read_bytes(base & 0xFFFFFFFF, view.size)
+                if file_entry.fd is not None:
+                    os.pwrite(file_entry.fd, data, view.file_offset)
+                else:
+                    end = view.file_offset + len(data)
+                    if end > len(file_entry.data):
+                        file_entry.data = file_entry.data.ljust(end, b"\x00")
+                    file_entry.data = (
+                        file_entry.data[:view.file_offset] + data + file_entry.data[end:]
+                    )
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 4)
+
+    stubs.register_handler("kernel32.dll", "UnmapViewOfFile", _unmap_view_of_file)
     stubs.register_handler(
         "kernel32.dll", "OpenFileMappingA", _halt("OpenFileMappingA")
     )
@@ -2553,17 +2692,26 @@ def register_kernel32_io_handlers(
     # "equal", regardless of actual string content. Root cause of Fields.Count
     # reading 1 instead of 10 for 3-table-join QueryDefs: every column after
     # the first got misidentified as a duplicate of it and silently skipped.
-    _RESOLVABLE_LOCALES = {
-        0x0400: 0x0409,
-        0x0800: 0x0409,
-        0x007F: 0x0409,
-    }  # LOCALE_USER_DEFAULT, LOCALE_SYSTEM_DEFAULT, LOCALE_INVARIANT -> en-US
+    # 2026-08-29: _locale_is_valid used to reject anything but 0x0409
+    # (post-resolution) as "invalid locale" -- three real, legitimate LCIDs
+    # (LOCALE_USER_DEFAULT/SYSTEM_DEFAULT 0x0400/0x0800, LOCALE_INVARIANT
+    # 0x007F, and MAKELANGID(LANG_ENGLISH, SUBLANG_NEUTRAL) 0x0009) have now
+    # each caused a real bug this way -- real CompareStringA/W essentially
+    # never fails for a plausible LCID, and this handler was only ever doing
+    # ordinal comparison regardless of locale anyway, so there was never any
+    # behavioral reason to reject unrecognized values. Comparing
+    # unconditionally now; still logging each distinct non-en-US locale
+    # once (not every call -- confirmed live some values fire 70+ times in
+    # under a second, which would make even debug-level logging spammy).
+    _logged_locales: set[int] = set()
 
-    def _resolve_locale(locale: int) -> int:
-        return _RESOLVABLE_LOCALES.get(locale, locale)
-
-    def _locale_is_valid(locale: int) -> bool:
-        return _resolve_locale(locale) == 0x0409
+    def _log_locale_once(fn_name: str, locale: int) -> None:
+        if locale != 0x0409 and locale not in _logged_locales:
+            _logged_locales.add(locale)
+            logger.debug(
+                "handlers",
+                f"{fn_name}: comparing with locale=0x{locale:08x} (non-en-US, first occurrence this run)",
+            )
 
     def _compare_string_a(cpu: "CPU") -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -2572,15 +2720,7 @@ def register_kernel32_io_handlers(
         cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
-        if not _locale_is_valid(locale):
-            logger.error(
-                "handlers",
-                f"CompareStringA(locale=0x{locale:08x}) -> 0 (invalid locale)",
-            )
-            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
-            cpu.regs[EAX] = 0
-            cleanup_stdcall(cpu, memory, 24)
-            return
+        _log_locale_once("CompareStringA", locale)
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
@@ -2610,15 +2750,7 @@ def register_kernel32_io_handlers(
         cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
-        if not _locale_is_valid(locale):
-            logger.error(
-                "handlers",
-                f"CompareStringW(locale=0x{locale:08x}) -> 0 (invalid locale)",
-            )
-            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
-            cpu.regs[EAX] = 0
-            cleanup_stdcall(cpu, memory, 24)
-            return
+        _log_locale_once("CompareStringW", locale)
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
         ignore_case = bool(dw_flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE))
