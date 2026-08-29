@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, file_entry_size, read_cstring, THREAD_SENTINEL
+from tew.api._state import CRTState, file_entry_size, read_cstring, read_wide_string, THREAD_SENTINEL
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────
@@ -1374,6 +1374,55 @@ def register_msvcrt_handlers(
         cpu.regs[EAX] = val
 
     stubs.register_handler("msvcrt.dll", "atoi", _atoi)
+
+    # _wtoi(const wchar_t* str) -> int [cdecl]
+    def _wtoi(cpu: "CPU") -> None:
+        s = read_wide_string(memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF), memory)
+        i = 0
+        n = len(s)
+        while i < n and s[i] in " \t\n\r\v\f":
+            i += 1
+        sign = 1
+        if i < n and s[i] in "+-":
+            if s[i] == "-":
+                sign = -1
+            i += 1
+        start = i
+        while i < n and s[i].isdigit():
+            i += 1
+        val = sign * int(s[start:i]) if start != i else 0
+        cpu.regs[EAX] = val & 0xFFFFFFFF
+
+    stubs.register_handler("msvcrt.dll", "_wtoi", _wtoi)
+
+    _DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    def _int_to_base(value: int, radix: int) -> str:
+        if value == 0:
+            return "0"
+        digits = []
+        while value:
+            value, rem = divmod(value, radix)
+            digits.append(_DIGITS[rem])
+        return "".join(reversed(digits))
+
+    # _itoa(int value, char* str, int radix) -> char* (== str) [cdecl]
+    def _itoa(cpu: "CPU") -> None:
+        raw = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        str_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        radix = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        # Real _itoa treats `value` as signed only for radix 10 (a leading
+        # '-' is possible); every other radix formats the raw unsigned bits.
+        if radix == 10 and raw >= 0x80000000:
+            text = "-" + _int_to_base(0x100000000 - raw, 10)
+        else:
+            text = _int_to_base(raw, radix)
+        for i, ch in enumerate(text):
+            memory.write8(str_ptr + i, ord(ch))
+        memory.write8(str_ptr + len(text), 0)
+        cpu.regs[EAX] = str_ptr
+
+    stubs.register_handler("msvcrt.dll", "_itoa", _itoa)
 
     # atol(const char* str) -> long [cdecl]
     def _atol(cpu: "CPU") -> None:

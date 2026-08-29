@@ -82,6 +82,12 @@ def register_kernel32_locale_handlers(
     # ── String conversion ─────────────────────────────────────────────────────
 
     def _multi_byte_to_wide(cpu: "CPU") -> None:
+        # 2026-08-29: this handler had zero logging on any path -- the same
+        # silent-stub blind spot already found and fixed for GetLocaleInfoW
+        # (see its comment above). A call here left no trace in the log
+        # regardless of LOG_LEVEL/LOG_CATEGORIES, so "no log line" could
+        # never be used as evidence of "never called" -- confirmed live
+        # this needed settling while investigating VarDateFromStr.
         lp_mb  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         cb_mb  = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp_wc  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -93,9 +99,11 @@ def register_kernel32_locale_handlers(
             for i in range(count):
                 memory.write16(lp_wc + i * 2, memory.read8(lp_mb + i))
             cpu.regs[EAX] = count
+        logger.debug("handlers", f"MultiByteToWideChar(cb_mb={cb_mb}, cch_wc={cch_wc}) -> {cpu.regs[EAX]}")
         cleanup_stdcall(cpu, memory, 24)
 
     def _wide_to_multi_byte(cpu: "CPU") -> None:
+        # 2026-08-29: same silent-stub gap as _multi_byte_to_wide above.
         lp_wc  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         cch_wc = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp_mb  = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -108,6 +116,7 @@ def register_kernel32_locale_handlers(
                 wc = memory.read16(lp_wc + i * 2)
                 memory.write8(lp_mb + i, wc if wc <= 255 else 0x3F)
             cpu.regs[EAX] = count
+        logger.debug("handlers", f"WideCharToMultiByte(cch_wc={cch_wc}, cb_mb={cb_mb}) -> {cpu.regs[EAX]}")
         cleanup_stdcall(cpu, memory, 32)
 
     def _get_string_type_w(cpu: "CPU") -> None:
@@ -214,6 +223,26 @@ def register_kernel32_locale_handlers(
         0x0020: "dddd, MMMM dd, yyyy",        # LOCALE_SLONGDATE
         0x0028: "AM",                         # LOCALE_S1159
         0x0029: "PM",                         # LOCALE_S2359
+        # 2026-08-29: 0x0038 was previously mislabeled here as
+        # LOCALE_SYEARMONTH ("MMMM, yyyy") -- that constant is actually
+        # 0x1006. The real 0x0038-0x0044 range is LOCALE_SMONTHNAME1..13
+        # (long month names; 13th is empty for the Gregorian calendar,
+        # which has only 12 months). Corrected after live confirmation
+        # that oleaut32.dll queries 0x44 directly, which only makes sense
+        # as part of this contiguous 13-entry month-name array.
+        0x0038: "January",                    # LOCALE_SMONTHNAME1
+        0x0039: "February",                   # LOCALE_SMONTHNAME2
+        0x003A: "March",                      # LOCALE_SMONTHNAME3
+        0x003B: "April",                      # LOCALE_SMONTHNAME4
+        0x003C: "May",                        # LOCALE_SMONTHNAME5
+        0x003D: "June",                       # LOCALE_SMONTHNAME6
+        0x003E: "July",                       # LOCALE_SMONTHNAME7
+        0x003F: "August",                     # LOCALE_SMONTHNAME8
+        0x0040: "September",                  # LOCALE_SMONTHNAME9
+        0x0041: "October",                    # LOCALE_SMONTHNAME10
+        0x0042: "November",                   # LOCALE_SMONTHNAME11
+        0x0043: "December",                   # LOCALE_SMONTHNAME12
+        0x0044: "",                           # LOCALE_SMONTHNAME13 (Gregorian: none)
         0x0050: "",                           # LOCALE_SPOSITIVESIGN
         0x0051: "-",                          # LOCALE_SNEGATIVESIGN
         0x1001: "English",                    # LOCALE_SENGLANGUAGE
@@ -395,6 +424,137 @@ def register_kernel32_locale_handlers(
         logger.debug("handlers", f"GetLocaleInfoW(lctype=0x{lctype:x}) -> {text!r}")
         cleanup_stdcall(cpu, memory, 16)
 
+    # CAL_GREGORIAN (Calendar ID 1) real Windows XP en-US CALTYPE data.
+    # GetCalendarInfoW is a distinct, newer (Win2000+) API from
+    # GetLocaleInfoW -- real callers use it via GetProcAddress rather than
+    # a static import, so it must be *registered* (not just implemented)
+    # for that existence probe to succeed. Confirmed live 2026-08-29:
+    # GetProcAddress("kernel32.dll", "GetCalendarInfoW") -> NULL was
+    # steering oleaut32.dll onto a different fallback path than real
+    # Windows XP (which does export this function) would take.
+    CAL_RETURN_NUMBER = 0x20000000
+    CAL_NOUSEROVERRIDE = 0x80000000
+    CAL_USE_CP_ACP = 0x40000000
+    CAL_GREGORIAN = 1
+
+    _CAL_STRINGS: dict[int, str] = {
+        0x02: "Gregorian Calendar",           # CAL_SCALNAME
+        0x05: "M/d/yyyy",                     # CAL_SSHORTDATE
+        0x06: "dddd, MMMM dd, yyyy",          # CAL_SLONGDATE
+        0x07: "Sunday",                       # CAL_SDAYNAME1 (Sun=first)
+        0x08: "Monday",                       # CAL_SDAYNAME2
+        0x09: "Tuesday",                      # CAL_SDAYNAME3
+        0x0A: "Wednesday",                    # CAL_SDAYNAME4
+        0x0B: "Thursday",                     # CAL_SDAYNAME5
+        0x0C: "Friday",                       # CAL_SDAYNAME6
+        0x0D: "Saturday",                     # CAL_SDAYNAME7
+        0x0E: "Sun",                          # CAL_SABBREVDAYNAME1
+        0x0F: "Mon",                          # CAL_SABBREVDAYNAME2
+        0x10: "Tue",                          # CAL_SABBREVDAYNAME3
+        0x11: "Wed",                          # CAL_SABBREVDAYNAME4
+        0x12: "Thu",                          # CAL_SABBREVDAYNAME5
+        0x13: "Fri",                          # CAL_SABBREVDAYNAME6
+        0x14: "Sat",                          # CAL_SABBREVDAYNAME7
+        0x15: "January",                      # CAL_SMONTHNAME1
+        0x16: "February",                     # CAL_SMONTHNAME2
+        0x17: "March",                        # CAL_SMONTHNAME3
+        0x18: "April",                        # CAL_SMONTHNAME4
+        0x19: "May",                          # CAL_SMONTHNAME5
+        0x1A: "June",                         # CAL_SMONTHNAME6
+        0x1B: "July",                         # CAL_SMONTHNAME7
+        0x1C: "August",                       # CAL_SMONTHNAME8
+        0x1D: "September",                    # CAL_SMONTHNAME9
+        0x1E: "October",                      # CAL_SMONTHNAME10
+        0x1F: "November",                     # CAL_SMONTHNAME11
+        0x20: "December",                     # CAL_SMONTHNAME12
+        0x21: "",                             # CAL_SMONTHNAME13 (Gregorian: none)
+        0x22: "Jan",                          # CAL_SABBREVMONTHNAME1
+        0x23: "Feb",                          # CAL_SABBREVMONTHNAME2
+        0x24: "Mar",                          # CAL_SABBREVMONTHNAME3
+        0x25: "Apr",                          # CAL_SABBREVMONTHNAME4
+        0x26: "May",                          # CAL_SABBREVMONTHNAME5
+        0x27: "Jun",                          # CAL_SABBREVMONTHNAME6
+        0x28: "Jul",                          # CAL_SABBREVMONTHNAME7
+        0x29: "Aug",                          # CAL_SABBREVMONTHNAME8
+        0x2A: "Sep",                          # CAL_SABBREVMONTHNAME9
+        0x2B: "Oct",                          # CAL_SABBREVMONTHNAME10
+        0x2C: "Nov",                          # CAL_SABBREVMONTHNAME11
+        0x2D: "Dec",                          # CAL_SABBREVMONTHNAME12
+        0x2E: "",                             # CAL_SABBREVMONTHNAME13
+        0x2F: "MMMM, yyyy",                   # CAL_SYEARMONTH
+    }
+    _CAL_NUMBERS: dict[int, int] = {
+        0x01: 1,          # CAL_ICALINTVALUE (Gregorian localized calendar)
+        0x30: 2029,       # CAL_ITWODIGITYEARMAX
+    }
+
+    def _get_calendar_info_w(cpu: "CPU") -> None:
+        locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        calendar = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        caltype_raw = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        lp_data = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        cch_data = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        lp_value = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+
+        resolved = _RESOLVABLE_LOCALES_INFO.get(locale, locale)
+        want_number = (caltype_raw & CAL_RETURN_NUMBER) != 0
+        caltype = caltype_raw & ~(CAL_RETURN_NUMBER | CAL_NOUSEROVERRIDE | CAL_USE_CP_ACP)
+
+        if resolved != 0x0409 or calendar != CAL_GREGORIAN:
+            logger.warn("handlers",
+                f"GetCalendarInfoW(locale=0x{locale:x}, calendar={calendar}, caltype=0x{caltype_raw:x}) "
+                "-> 0 (unsupported locale/calendar)")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        if want_number:
+            value = _CAL_NUMBERS.get(caltype)
+            if value is None:
+                logger.warn("handlers",
+                    f"GetCalendarInfoW(caltype=0x{caltype:x}|NUMBER) -> 0 (unimplemented CALTYPE)")
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 24)
+                return
+            memory.write32(lp_value, value & 0xFFFFFFFF)
+            logger.debug("handlers", f"GetCalendarInfoW(caltype=0x{caltype:x}|NUMBER) -> {value}")
+            cpu.regs[EAX] = 1
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        text = _CAL_STRINGS.get(caltype)
+        if text is None:
+            logger.warn("handlers",
+                f"GetCalendarInfoW(caltype=0x{caltype:x}) -> 0 (unimplemented CALTYPE)")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        needed = len(text) + 1
+        if cch_data == 0:
+            cpu.regs[EAX] = needed
+        elif needed > cch_data:
+            cpu.regs[EAX] = 0
+        else:
+            for i, ch in enumerate(text):
+                memory.write16(lp_data + i * 2, ord(ch))
+            memory.write16(lp_data + len(text) * 2, 0)
+            cpu.regs[EAX] = needed
+        logger.debug("handlers", f"GetCalendarInfoW(caltype=0x{caltype:x}) -> {text!r}")
+        cleanup_stdcall(cpu, memory, 24)
+
+    # NlsGetCacheUpdateCount() -- WINAPI, 0 params. Undocumented but real
+    # kernel32.dll export: a counter incremented whenever the process-wide
+    # NLS cache is invalidated (locale/codepage changed), so callers can
+    # tell whether their own cached copy is stale. tew's locale data is
+    # static for the whole process lifetime -- it never gets invalidated --
+    # so 0 ("never invalidated since process start") is the honest, correct
+    # answer, not an approximation.
+    def _nls_get_cache_update_count(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 0
+
+    stubs.register_handler("kernel32.dll", "NlsGetCacheUpdateCount", _nls_get_cache_update_count)
+
     stubs.register_handler("kernel32.dll", "MultiByteToWideChar",  _multi_byte_to_wide)
     stubs.register_handler("kernel32.dll", "WideCharToMultiByte",  _wide_to_multi_byte)
     stubs.register_handler("kernel32.dll", "GetStringTypeW",       _get_string_type_w)
@@ -402,6 +562,7 @@ def register_kernel32_locale_handlers(
     stubs.register_handler("kernel32.dll", "LCMapStringW",         _lc_map_string_w)
     stubs.register_handler("kernel32.dll", "GetLocaleInfoA",       _get_locale_info_a)
     stubs.register_handler("kernel32.dll", "GetLocaleInfoW",       _get_locale_info_w)
+    stubs.register_handler("kernel32.dll", "GetCalendarInfoW",     _get_calendar_info_w)
 
     # ── Fiber local storage (unimplemented — halt loudly) ─────────────────────
 

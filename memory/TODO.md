@@ -6,42 +6,43 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## RESOLVED (2026-08-28, cont'd x39): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- root cause was `GetLocaleInfoW` unimplemented, not a Jet SQL-compiler bug
+## RESOLVED (2026-08-29, cont'd x40): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- FULLY FIXED end to end
 
-Full root cause and fix in status.md "cont'd x39" and changelog.md's
-matching entry. Short version: `kernel32.dll!GetLocaleInfoW` was a bare
-"always fail, zero logging" stub; real `oleaut32.dll` code calls it while
-building its global, process-wide locale-info cache, and its silent
-failure meant that cache got permanently poisoned with a near-empty struct
-(no LCID, no calendar type, no date separator) the very first time
-anything in the process asked for locale info -- served to every later
-`VarDateFromStr` call regardless of which query needed it. Fixed:
-implemented `GetLocaleInfoW` for real in `kernel32_locale.py`, alongside
-two related mask/lookup bugs found while wiring it up (`LOCALE_NOUSEROVERRIDE`
-not stripped from LCTYPE; several LCTYPEs need a string-form fallback from
-the numeric table). `StockAssembly_SelectAPT`'s specific `FUN_7a862215`/
-`FUN_7a85e7e1` Jet-compiler internals (flagged unresolved in the prior
-x38 entry) turned out to be entirely correct and irrelevant -- confirmed
-dead ends via live probes that never fired.
+Full root cause and fix in status.md "cont'd x40" and changelog.md's
+matching entry. x39 fixed `GetLocaleInfoW` and a cascade of exposed
+locale/calendar table gaps (`_wtoi`, `_itoa`, a mislabeled
+`LOCALE_SMONTHNAME1..13` entry, `GetCalendarInfoW`, `NlsGetCacheUpdateCount`,
+a silent-stub logging gap in `MultiByteToWideChar`/`WideCharToMultiByte`).
+With those closed, `VarDateFromStr` still failed -- traced to
+`classify_wide_string` (`char_type.py`) leaving its output buffer
+unwritten when asked to classify a null-terminated "string" whose first
+character IS the terminator (a zero-length classification), which let a
+caller read back stale leftover data (a `DIGIT` flag from the character
+tested just before) and made a date-string tokenizer wrongly treat two
+null bytes as still-a-digit, overshooting the true end of a number by 2
+WCHARs. Fixed by always writing a real classification for the terminator
+in that case. Confirmed live end-to-end: `StockAssembly_SelectAPT`'s error
+no longer appears anywhere in `stdout.txt`; the game runs straight past
+the whole query.
 
-**New, much simpler blocker opened immediately downstream**: `msvcrt.dll!_wtoi`
-unimplemented -- real oleaut32.dll code needs it to convert a locale-query
-digit string to an int. Straightforward wide-string-to-int conversion,
-pick this up first next session.
+**New, completely unrelated blocker opened immediately downstream**: an
+unhandled SEH fault at `EIP=0x1901d9eb` (0x19xxxxxx range -- a different
+DLL entirely). Not yet investigated at all -- pick this up first next
+session.
 
-## NEW (2026-08-28, cont'd x39): `FUN_77121505` (oleaut32.dll's hand-crafted `__chkesp`-style helper) suspected of swallowing a real error on its own failure path -- unconfirmed, from an earlier (pre-compaction) session observation
+## RESOLVED (2026-08-29, cont'd x40): `FUN_77121505` "thread splat" suspicion -- ruled out, real cause was the already-documented `THREAD_SENTINEL` collision
 
-Molly recalled an earlier "[a] thread went splat" incident and suspected
-`FUN_77121505` was involved -- specifically, that it "nommed the exception
-and moved on" rather than propagating it. Confirmed this session that
-`FUN_77121505` reliably passes through whatever's in `EAX` on its NO-ERROR
-path (that's what makes `FUN_7713cee1`'s Ghidra-misidentified `void`
-return type actually work correctly for GetLocaleInfoW's success case) --
-but its behavior on an actual error path was not examined. The original
-incident isn't in this session's own logs (`LOG_CATEGORIES` never included
-`thread` this session) -- next session should re-run with `thread` logging
-enabled to find the original occurrence before deciding whether/how to
-fix.
+Reran with `thread` added to `LOG_CATEGORIES` per the plan from x39;
+`FUN_77121505` never fires at all in the relevant window. What DOES fire
+early in every run is the already-documented (see the `THREAD_SENTINEL`
+entry below, "NEW (2026-08-26)") spurious "thread died" event from
+`OLEAUT32.dll`'s real `DllMain` static initializer sharing `THREAD_SENTINEL`
+with real thread completion -- non-fatal, `_invoke_emulated_proc` catches
+it and continues normally. This is almost certainly what Molly's original
+"thread went splat" recollection actually was. `FUN_77121505` itself is
+confirmed, separately and conclusively, to be a correct, real stack-cookie
+check (`__chkesp`-style) with clean success/`TerminateProcess`-on-mismatch
+semantics -- not a bug, not involved.
 
 ## NEW (2026-08-28, cont'd x38): `cpu_add_logpoint` silently drops registrations past its 8-slot cap -- violates this project's own fail-loudly standard
 

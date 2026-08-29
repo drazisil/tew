@@ -1797,7 +1797,7 @@ def _fun_7716c455_callsite_probe(eip, regs, memory, memory_size):
 def _addr_7713ceec_probe(eip, regs, memory, memory_size):
     val = _read32_raw(memory, memory_size, 0x10081030)
     logger.error("com", f"[addr-7713ceec] DAT_771a1030=0x{val if val is not None else -1:x} (0=WideChar path, nonzero=Ansi path)")
-cpu.add_logpoint(0x1001ceec, _addr_7713ceec_probe)
+# cpu.add_logpoint(0x1001ceec, _addr_7713ceec_probe)  # 2026-08-29: GetLocaleInfoW confirmed fixed, freeing slot
 
 # 2026-08-28: two more reads of [EBP+0x10] (the uVar4/year spill slot)
 # found in the raw bytes between the date_order==0 branch (0x7716c644)
@@ -1933,7 +1933,129 @@ def _fun_7713cee1_entry_probe(eip, regs, memory, memory_size):
     lcid = _read32_raw(memory, memory_size, esp + 4)
     lctype = _read32_raw(memory, memory_size, esp + 8)
     logger.error("com", f"[FUN_7713cee1-entry] lcid=0x{lcid or 0:x} lctype=0x{lctype or 0:x}")
-cpu.add_logpoint(0x1001cee1, _fun_7713cee1_entry_probe)
+# cpu.add_logpoint(0x1001cee1, _fun_7713cee1_entry_probe)  # 2026-08-29: GetLocaleInfoW confirmed fixed, freeing slot
+cpu.add_logpoint(0x1004dd7d, _addr_7716dd7d_probe)
+
+def _read_wstr_raw(memory, memory_size, addr, max_len=40):
+    if not addr or addr + max_len * 2 >= memory_size:
+        return "<invalid>"
+    out = []
+    for i in range(max_len):
+        c = _read16_raw(memory, memory_size, addr + i * 2)
+        if not c:
+            break
+        out.append(chr(c) if 32 <= c < 127 else f"\\u{c:04x}")
+    return "".join(out)
+
+# 2026-08-29: FUN_7716d2ff's decompile is unreliable -- it reads a locale-
+# struct pointer through `unaff_EBX`, a register Ghidra hasn't attached to
+# any real parameter (the same VC6 register-calling-convention blind spot
+# hit repeatedly this session), and its caller (FUN_7716d562) is decompiled
+# passing 3 explicit stack args while the callee only declares 2 + an
+# implicit `this` -- a caller/callee mismatch that means the real register/
+# stack mapping can't be trusted from decompile alone. Reading raw
+# registers and the tokenizer's current-position pointer live at entry,
+# before anything gets clobbered, to see what's actually being classified
+# on each of the two token==4 calls (VarDateFromStr's second token, "/",
+# is the one in question -- state 3, token_type=4).
+def _fun_7716d2ff_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    ecx = regs[ECX]
+    ebx = regs[EBX]
+    edx = regs[EDX]
+    p_esp4 = _read32_raw(memory, memory_size, esp + 4)
+    p_esp8 = _read32_raw(memory, memory_size, esp + 8)
+    p_esp12 = _read32_raw(memory, memory_size, esp + 12)
+    # local_58 in the tokenizer (FUN_7716d562) holds the current text
+    # pointer being classified -- try every plausible register/stack slot
+    # as a guest pointer and preview what's there as a wide string.
+    # One extra level of indirection: the decompile shows `local_58 =
+    # *param_1` at entry -- param_1 is a pointer TO the real text pointer,
+    # not the text pointer itself, so [ESP+4]/[ESP+8] need to be
+    # dereferenced once more before treating them as string addresses.
+    esp4_deref = _read32_raw(memory, memory_size, p_esp4) if p_esp4 else None
+    esp8_deref = _read32_raw(memory, memory_size, p_esp8) if p_esp8 else None
+    previews = {
+        "ecx": _read_wstr_raw(memory, memory_size, ecx),
+        "ecx_deref": _read_wstr_raw(memory, memory_size, _read32_raw(memory, memory_size, ecx) or 0),
+        "ebx": _read_wstr_raw(memory, memory_size, ebx),
+        "esp4_deref": _read_wstr_raw(memory, memory_size, esp4_deref or 0),
+        "esp8_deref": _read_wstr_raw(memory, memory_size, esp8_deref or 0),
+    }
+    logger.error(
+        "com",
+        f"[FUN_7716d2ff-entry] EIP=0x{eip:x} ECX=0x{ecx:x} EBX=0x{ebx:x} EDX=0x{edx:x} "
+        f"[ESP+4]=0x{p_esp4 or 0:x} [ESP+8]=0x{p_esp8 or 0:x} [ESP+12]=0x{p_esp12 or 0:x} "
+        f"previews={previews!r}",
+    )
+# cpu.add_logpoint(0x1004d2ff, _fun_7716d2ff_entry_probe)  # 2026-08-29: confirmed EAX always 0 (never matches) -- red herring, freeing slot
+
+# 2026-08-29: FUN_7716d2ff is decompiled as void, but its caller
+# (FUN_7716d562) treats its result as an int (`iVar4 = FUN_7716d2ff(...)`,
+# compared against 1/2/3) -- the same "Ghidra loses the real EAX through a
+# branch" blind spot already confirmed for FUN_77121505/FUN_7713cee1 this
+# session. Call site confirmed via dump_bytes: CALL at 0x7716d6c2 (E8 38 FC
+# FF FF, 5 bytes) targets 0x7716d2ff, so the return address -- where the
+# real EAX value lands -- is 0x7716d6c2+5 = 0x7716d6c7 (runtime 0x1004d6c7).
+# 0x82bdf88 is the live-confirmed address of the OUT slot (&local_50,
+# passed via ECX/`this`) for this specific run -- hardcoded here as a
+# diagnostic-only convenience since it's stable across all 3 calls within
+# one VarDateFromStr invocation's stack frame, not a general offset.
+def _fun_7716d2ff_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    out_val = _read32_raw(memory, memory_size, 0x082bdf88)
+    out_preview = _read_wstr_raw(memory, memory_size, out_val or 0) if out_val and out_val < 0x80000000 else None
+    logger.error(
+        "com",
+        f"[FUN_7716d2ff-return] EIP=0x{eip:x} EAX=0x{eax:x} ({eax if eax < 0x80000000 else eax - 0x100000000}) "
+        f"*local_50=0x{out_val or 0:x} preview={out_preview!r}",
+    )
+# cpu.add_logpoint(0x1004d6c7, _fun_7716d2ff_return_probe)  # 2026-08-29: confirmed EAX always 0, freeing slot
+
+# 2026-08-29: FUN_7716d2ff ruled out (always returns 0, never matches --
+# every token falls through to the SAME generic digit-classification code
+# regardless of digit count). The real divergence between "1" (call 1&2,
+# classified type 4) and "2010" (call 3, stays unclassified sentinel 0xb)
+# must be in FUN_7716bde4 -- called once per digit-run at the single call
+# site 0x7716d99b (confirmed via dump_bytes: `PUSH EAX; MOV EAX,EBX; CALL`
+# -- EBX, the locale-struct pointer, is deliberately moved into EAX right
+# before the call, matching Ghidra's `in_EAX` in the callee; not a stray
+# register). Return address after the 5-byte CALL is 0x7716d9a0. Per
+# decompile, param_1 (&local_50) points at the position right AFTER the
+# just-collected digit run -- for "2010" (the last token), that should be
+# the string's null terminator, which the decompile's own first branch
+# (`if (*pWVar5 == L'\0') { local_8 = 1; ...}`) would classify as return
+# value 1 (not the observed 0xb sentinel) -- checking live whether that's
+# really what happens, or whether Ghidra's `in_EAX` claim breaks down here
+# too.
+def _fun_7716bde4_entry_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    esp = regs[ESP]
+    p_param1 = _read32_raw(memory, memory_size, esp + 4)
+    p_param2 = _read32_raw(memory, memory_size, esp + 8)
+    text_ptr = _read32_raw(memory, memory_size, p_param1) if p_param1 else None
+    # 2026-08-29: dumping raw WCHARs starting 8 bytes (4 WCHARs) BEFORE
+    # text_ptr too -- if this is the "2010" overshoot call, this range
+    # covers the real null terminator's expected position and the 2 extra
+    # WCHARs the digit-loop wrongly consumed past it, regardless of how
+    # classify_ctype1/GetStringTypeExW interpreted them.
+    raw_wchars = []
+    if text_ptr:
+        for off in range(-8, 6, 2):
+            v = _read16_raw(memory, memory_size, text_ptr + off)
+            raw_wchars.append(f"{off:+d}:0x{v if v is not None else -1:04x}")
+    logger.error(
+        "com",
+        f"[FUN_7716bde4-entry] EIP=0x{eip:x} in_EAX=0x{eax:x} [ESP+4](param_1)=0x{p_param1 or 0:x} "
+        f"[ESP+8](param_2)=0x{p_param2 or 0:x} *param_1(text_ptr)=0x{text_ptr or 0:x} "
+        f"preview={_read_wstr_raw(memory, memory_size, text_ptr or 0)!r} raw={' '.join(raw_wchars)}",
+    )
+cpu.add_logpoint(0x1004bde4, _fun_7716bde4_entry_probe)
+
+def _fun_7716bde4_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[FUN_7716bde4-return] EIP=0x{eip:x} EAX(local_8)=0x{eax:x} ({eax})")
+cpu.add_logpoint(0x1004d9a0, _fun_7716bde4_return_probe)
 
 # 2026-08-28: FUN_7a852ef4 (call site 0x7a86388f inside FUN_7a8635de) is
 # the real "Tables" catalog lookup by name for THIS invocation's node's
