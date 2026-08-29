@@ -2697,12 +2697,19 @@ def register_kernel32_io_handlers(
     # (LOCALE_USER_DEFAULT/SYSTEM_DEFAULT 0x0400/0x0800, LOCALE_INVARIANT
     # 0x007F, and MAKELANGID(LANG_ENGLISH, SUBLANG_NEUTRAL) 0x0009) have now
     # each caused a real bug this way -- real CompareStringA/W essentially
-    # never fails for a plausible LCID, and this handler was only ever doing
-    # ordinal comparison regardless of locale anyway, so there was never any
-    # behavioral reason to reject unrecognized values. Comparing
-    # unconditionally now; still logging each distinct non-en-US locale
-    # once (not every call -- confirmed live some values fire 70+ times in
-    # under a second, which would make even debug-level logging spammy).
+    # never fails for a plausible nonzero LCID, and this handler was only
+    # ever doing ordinal comparison regardless of locale anyway.
+    #
+    # locale == 0 is the ONE exception that MUST keep failing: msjet35.dll's
+    # own default-collating-order fallback (FUN_7a84c830, see changelog
+    # 2026-08-22) deliberately probes CompareStringA(0, ...) to detect "no
+    # locale specified" and substitute a safe default -- real (NT4/2000/XP-
+    # era) Windows genuinely rejects LCID 0 via IsValidLocale, so this one
+    # rejection is load-bearing, not part of the bug the other fixes above
+    # addressed. Comparing unconditionally for every OTHER value; still
+    # logging each distinct non-en-US locale once (not every call --
+    # confirmed live some values fire 70+ times in under a second, which
+    # would make even debug-level logging spammy).
     _logged_locales: set[int] = set()
 
     def _log_locale_once(fn_name: str, locale: int) -> None:
@@ -2720,6 +2727,12 @@ def register_kernel32_io_handlers(
         cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        if locale == 0:
+            logger.debug("handlers", "CompareStringA(locale=0x0) -> 0 (invalid locale — msjet35.dll's default-collating-order probe relies on this)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
         _log_locale_once("CompareStringA", locale)
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010
@@ -2750,6 +2763,12 @@ def register_kernel32_io_handlers(
         cch1 = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         lp2 = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         cch2 = memory.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
+        if locale == 0:
+            logger.debug("handlers", "CompareStringW(locale=0x0) -> 0 (invalid locale — msjet35.dll's default-collating-order probe relies on this)")
+            memory.write32(TEB_BASE + 0x34, int(Win32Error.ERROR_INVALID_PARAMETER))
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
         _log_locale_once("CompareStringW", locale)
         NORM_IGNORECASE = 0x00000001
         LINGUISTIC_IGNORECASE = 0x00000010

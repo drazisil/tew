@@ -6,6 +6,18 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-08-29): a scheduler mock/test helper is worth building at some point
+
+Noted by Molly: real async coverage (queues, packet handling) is coming up,
+and testing that against the full `ZigScheduler` (as `test_invoke_emulated_proc_thread_death.py`
+and friends do today) is heavier than most tests need. A lightweight mock
+scheduler double, usable wherever a test only needs to control
+`current_idx`/thread status without a real cooperative scheduler, would
+make that work easier to test in isolation. Not started -- no immediate
+blocker yet, just flagged before the queue/packet work begins.
+
+---
+
 ## RESOLVED (2026-08-29, cont'd x40): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- FULLY FIXED end to end
 
 Full root cause and fix in status.md "cont'd x40" and changelog.md's

@@ -1,14 +1,22 @@
-"""Tests for kernel32.dll!CompareStringA/CompareStringW's locale validation.
+"""Tests for kernel32.dll!CompareStringA/CompareStringW's locale handling.
 
 Root cause this guards against: neither handler used to read the Locale
 argument at all, so ANY value (including 0, "no locale specified") silently
-"succeeded" with a real string comparison. Real Windows validates the
-locale identifier and fails (returns 0) for one that isn't recognized --
-found live: msjet35.dll's own default-collating-order fallback logic
-deliberately probes CompareStringA with an unspecified locale specifically
-to detect failure and substitute a safe default; tew's always-succeeds
-behavior meant that probe never failed, so a database opened with no
-explicit locale ended up with no valid collating-order id at all.
+"succeeded" with a real string comparison. Found live: msjet35.dll's own
+default-collating-order fallback logic (FUN_7a84c830) deliberately probes
+CompareStringA(0, ...) specifically to detect failure and substitute a safe
+default; tew's always-succeeds behavior meant that probe never failed, so a
+database opened with no explicit locale ended up with no valid
+collating-order id at all.
+
+locale == 0 is genuinely invalid on real (NT4/2000/XP-era) Windows via
+IsValidLocale, so it's the one value that must still fail here -- but an
+earlier, narrower fix over-corrected by rejecting every locale except
+0x0409, which broke three separate real, legitimate LCIDs found live over
+several sessions (0x0400/0x0800 LOCALE_USER/SYSTEM_DEFAULT, 0x007F
+LOCALE_INVARIANT, 0x0009 MAKELANGID(LANG_ENGLISH, SUBLANG_NEUTRAL)). Real
+CompareStringA/W essentially never fails for a plausible nonzero LCID, so
+every nonzero value now succeeds; only 0 is rejected.
 """
 from __future__ import annotations
 
@@ -125,12 +133,18 @@ class TestCompareStringAInvalidLocale:
         call(stubs, cpu, mem, "CompareStringA", [0, 0, BUF_A, 1, BUF_B, 1])
         assert mem.read32(TEB_BASE + 0x34) == int(Win32Error.ERROR_INVALID_PARAMETER)
 
-    def test_unrelated_nonzero_locale_also_fails(self, env):
+    def test_unrelated_nonzero_locale_succeeds(self, env):
+        """Real, non-en-US LCIDs must NOT fail -- only locale 0 is special
+        (see module docstring / msjet35.dll's default-collating-order probe).
+        0x0400/0x0800 (LOCALE_USER/SYSTEM_DEFAULT), 0x007F (LOCALE_INVARIANT),
+        and 0x0009 (MAKELANGID(LANG_ENGLISH, SUBLANG_NEUTRAL)) each turned
+        out to be real LCIDs an earlier, narrower allowlist wrongly rejected
+        -- de-DE (0x0407) is just as real and must succeed too."""
         cpu, mem, stubs = env
         write_ansi(mem, BUF_A, "x")
         write_ansi(mem, BUF_B, "x")
         call(stubs, cpu, mem, "CompareStringA", [0x0407, 0, BUF_A, 1, BUF_B, 1])  # de-DE
-        assert cpu.regs[EAX] == 0
+        assert cpu.regs[EAX] == 2  # CSTR_EQUAL — real comparison, not a rejection
 
     def test_invalid_locale_still_cleans_up_stack(self, env):
         cpu, mem, stubs = env
