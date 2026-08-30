@@ -2287,50 +2287,43 @@ def _dbparamquery_getcount_local18_probe(eip, regs, memory, memory_size):
 # (confirmed live, __RTC_CheckEsp doesn't touch EAX). Disabled.
 # cpu.add_logpoint(0x00995c88, _dbparamquery_getcount_local18_probe)
 
-# 2026-08-30: memleaksCRT.txt investigation. AppendToCRTLeaksFile's real,
-# unpatched fopen("at")/fputs/fclose chain (0x40c9d7, called from
-# crtReportHookCallback's 3 banner-writing call sites 0x6880ad/0x6880bc/
-# 0x6880cb) succeeds at fopen (real CreateFile confirmed live) but the file
-# stays empty and only ONE _fopen ever happens -- banner call sites 2 and 3,
-# and the return point right after call site 1 (0x6880b2), NEVER fire.
-# Bisected step by step (fclose -> __flush -> __write_lk -> _fputs's own
-# _iobuf-struct dump -> the 3 banner call sites -> the call-1 return point ->
-# _malloc_dbg -> __heap_alloc_dbg -> __heap_alloc_base -> ___sbh_alloc_block
-# vs. __heap_alloc_base's own direct HeapAlloc call site 0xa05e43) down to
-# an exact, narrow point: execution reaches the CALL HeapAlloc instruction
-# at 0xa05e43 with a completely normal, previously-successful heap handle
-# (h_heap=0x9001, reused from dozens of earlier successful allocations
-# throughout the same run), dw_flags=0, size=4144 -- and neither
-# _heap_alloc's success log line nor either of its two error branches
-# (invalid heap / unsupported flags) ever fires. Within ~1ms, execution is
-# running _CrtMemDumpAllObjectsSince's own "Dumping objects ->" report
-# instead, which itself hits crtReportHookCallback's `swi(3)` fallback
-# (bIsLeakReport still 0, since banner-1 never got to set it) -- the INT3
-# that's been closing every run this session, caught cleanly by
-# _dump_crt_memory_leaks's own except block (no session crash).
-#
-# This is the first-ever exercise of the debug CRT's private-heap allocation
-# path: __getbuf's lazy stdio-buffer allocation, only triggered by a
-# stream's first-ever write (every OTHER _fputs call this whole session
-# already had a buffer from a prior write to the same stream, hence never
-# touching _malloc_dbg/__heap_alloc_base at all). Next session: this needs
-# either a native-level (gdb on the Zig cpu.run() call) or Python-level
-# trace across the HeapAlloc dispatch boundary itself -- logpoints alone
-# can't distinguish "handler ran but didn't log" from "handler never
-# dispatched at all". See status.md "cont'd x43" for the full writeup.
-# All probes below confirmed and freed; kept commented for the addresses,
-# not re-added without new evidence to bisect further.
+# 2026-08-30: memleaksCRT.txt investigation, RESOLVED. AppendToCRTLeaksFile's
+# first banner write never completed because state.simple_alloc() (tew/api/
+# _state.py) hit its own heap-ceiling check (the x42 THREAD_STACK_BASE
+# blocker -- still unfixed, just newly reached via a different path: this
+# was the first-ever exercise of the debug CRT's private-heap allocation,
+# __getbuf's lazy stdio-buffer allocation on a stream's first-ever write)
+# and raised a plain RuntimeError from deep inside a nested
+# _invoke_emulated_proc call. That exception was a real, genuine architecture
+# bug on tew's own side, independent of the heap-ceiling issue itself: any
+# Python exception raised inside a Win32 handler runs as a ctypes callback
+# (_c_int_dispatch in cpu_zig.py) and cannot cross back through the C call
+# boundary -- it landed in CPU.handle_exception, which used to just set
+# cpu.halted (silently cleared by _invoke_emulated_proc's own cleanup on any
+# not-genuinely-completed nested call) and never logged anything at all.
+# Fixed in cpu_zig.py: handle_exception now always logs the caught exception
+# and sets fatal_halt (not just halted), matching every other genuinely
+# fatal condition in the codebase -- fatal_halt is terminal and never gets
+# cleared by restore_state. Bisected step by step down to this (11+ logpoint
+# probes, then a manual single-step trace via cpu.run(1) from inside a
+# logpoint callback -- confirmed EIP lands exactly on the HeapAlloc
+# trampoline's RET with cpu.halted already True and EAX never updated,
+# pointing straight at a swallowed exception rather than a dispatch failure)
+# before Molly recognized the shape of the bug directly. Full writeup:
+# status.md "cont'd x44"/changelog.md. All probes below freed; kept
+# commented for the addresses in case a similar investigation needs them.
 # cpu.add_logpoint(0x009f2f80, ...)   # _fclose -- never reached, confirmed irrelevant
 # cpu.add_logpoint(0x009f6240, ...)   # _fputs entry -- confirmed reached once, real/valid _iobuf struct
-# cpu.add_logpoint(0x006880ad, ...)   # banner call site 1 -- confirmed reached
-# cpu.add_logpoint(0x006880bc, ...)   # banner call site 2 -- confirmed NEVER reached
+# cpu.add_logpoint(0x006880ad, ...)   # crtReportHookCallback banner call site 1 -- confirmed reached
+# cpu.add_logpoint(0x006880bc, ...)   # banner call site 2 -- confirmed NEVER reached (call 1 never returns)
 # cpu.add_logpoint(0x006880cb, ...)   # banner call site 3 -- confirmed NEVER reached
 # cpu.add_logpoint(0x006880b2, ...)   # return point after call site 1 -- confirmed NEVER reached
 # cpu.add_logpoint(0x009f6390, ...)   # _malloc_dbg entry -- confirmed reached reliably
 # cpu.add_logpoint(0x009f6460, ...)   # __heap_alloc_dbg entry -- confirmed reached reliably
 # cpu.add_logpoint(0x00a05de0, ...)   # __heap_alloc_base entry -- confirmed reached
 # cpu.add_logpoint(0x00a06910, ...)   # ___sbh_alloc_block -- confirmed correctly SKIPPED (size above threshold)
-# cpu.add_logpoint(0x00a05e43, ...)   # __heap_alloc_base's own HeapAlloc call site -- confirmed REACHED, h_heap=0x9001 (valid), dw_flags=0, size=4144 -- yet no success/error log ever fires
+# cpu.add_logpoint(0x00a05e43, ...)   # __heap_alloc_base's own CALL HeapAlloc site -- confirmed reached with fully valid args; single-step trace from here found the swallowed-exception halt
+# cpu.add_logpoint(0x009f6602, ...)   # __heap_alloc_base's return point -- confirmed NEVER reached (the exception fires before this)
 # cpu.add_logpoint(0x009f6030, ...)   # __flush -- never reached, confirmed irrelevant
 # cpu.add_logpoint(0x009f9f40, ...)   # __write_lk -- never reached, confirmed irrelevant
 

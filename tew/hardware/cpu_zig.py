@@ -720,9 +720,35 @@ class ZigCPU:
             raise RuntimeError(f"Unhandled interrupt: INT 0x{int_num:02x}")
 
     def handle_exception(self, error: Exception) -> None:
+        """Catch-all for any Python exception raised inside a Win32 handler
+        running as a ctypes callback (_c_int_dispatch) -- such an exception
+        cannot propagate back through the C call boundary, so this is the
+        only chance to ever see it.
+
+        Confirmed live 2026-08-30: a plain exception (e.g. simple_alloc's
+        heap-ceiling RuntimeError) raised from deep inside a nested
+        _invoke_emulated_proc call used to vanish completely here -- logged
+        nowhere, and cpu.last_error only ever gets read by diagnose_fault's
+        own top-level reporting, which had already run by the time a nested
+        call's exception landed. Worse, only setting cpu.halted (not
+        fatal_halt) meant even a caller that DID notice the halt would see
+        it silently cleared: _invoke_emulated_proc's cleanup unconditionally
+        does cpu.restore_state(saved); cpu.halted = False on any
+        not-genuinely-completed nested call, so the whole failure would just
+        evaporate and execution would carry on in unrelated guest code as if
+        nothing had happened -- exactly what made this class of bug so hard
+        to trace. Fixed to always log here (the one chokepoint every such
+        exception passes through, regardless of nesting depth) and to set
+        fatal_halt too, matching every other "this cannot be silently
+        continued past" condition in the codebase (fatal_halt is terminal
+        and never cleared by restore_state, unlike halted)."""
+        logger.error("exception",
+            f"Unhandled exception inside a Win32 handler callback at "
+            f"EIP=0x{self.eip & 0xFFFFFFFF:08x}: {error!r}")
         self.last_error = error
         self._py_faulted = True
         _lib.cpu_set_halted(self._state)
+        _lib.cpu_set_fatal_halt(self._state)
 
     # ── Save / restore ────────────────────────────────────────────────────────
 

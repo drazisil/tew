@@ -260,6 +260,30 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
     logger.info("exception",
         "Invoking guest _CrtDumpMemoryLeaks before finalizing this fault -- "
         "real per-block leak lines (if any) follow at DEBUG under [exception].")
+
+    # x44 (2026-08-30): logs the debug CRT's private-heap lock state right
+    # before invoking the dump. Originally added to test a reentrancy-guard/
+    # contested-critical-section theory for why AppendToCRTLeaksFile's first
+    # write never completed -- confirmed live that theory was wrong
+    # (__locktable[9], `_HEAP_LOCK`, was genuinely free: LockCount=-1, no
+    # owner). The real cause turned out to be state.simple_alloc() hitting
+    # its own heap-ceiling check and raising an exception that CPU.
+    # handle_exception (cpu_zig.py) used to silently swallow -- fixed there.
+    # Kept here since it's cheap and gives real signal for any future
+    # heap/lock-related crash investigation, not just this one.
+    try:
+        __crtheap = memory.read32(0x020EE08C)
+        _heap_lock_cs = memory.read32(0x01280A3C + 9 * 4)
+        _heap_lock_owner = memory.read32((_heap_lock_cs + 0x0C) & 0xFFFFFFFF) if _heap_lock_cs else None
+        _heap_lock_count = memory.read32((_heap_lock_cs + 0x04) & 0xFFFFFFFF) if _heap_lock_cs else None
+        _current_tid = state.tls_current_thread_id()
+        logger.info("exception",
+            f"[lock-diag] __crtheap=0x{__crtheap:08x} _HEAP_LOCK cs=0x{_heap_lock_cs:08x} "
+            f"owner_tid={f'0x{_heap_lock_owner:08x}' if _heap_lock_owner is not None else None} "
+            f"lock_count={_heap_lock_count} current_tid=0x{_current_tid:08x}")
+    except Exception as e:
+        logger.warn("exception", f"[lock-diag] failed to read lock state: {e}")
+
     try:
         # Default max_steps=5_000_000 is sized for per-frame callbacks that
         # must never hang the emulator; this call is a one-shot diagnostic

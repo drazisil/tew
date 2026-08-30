@@ -4,6 +4,22 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-30 (cont'd x45) — RESOLVED: `CPU.handle_exception` was silently swallowing any Python exception raised inside a nested Win32-handler callback, no log and no fatal-halt propagation — that's what turned x44's `crtReportHookCallback` `INT 3` investigation into a multi-hour mystery. Fixed; the real cause was the already-known x42 heap-exhaustion ceiling, now impossible to miss
+
+**Context**: x44 bisected `AppendToCRTLeaksFile`'s never-returning first write down to the exact `HeapAlloc` call site inside `__heap_alloc_base` — reached with fully valid arguments, but neither the success log nor either error branch ever fired, and execution silently ended up running unrelated code a moment later.
+
+**Root cause**: `state.simple_alloc()` (`tew/api/_state.py`) raises a plain `RuntimeError` when the bump allocator's cursor would push past `THREAD_STACK_BASE` (the x42 heap-exhaustion blocker) — this time hit for the first time via a brand-new code path, the debug CRT's private-heap allocation (`__getbuf`'s lazy stdio-buffer allocation on a stream's first-ever write, never exercised before x43's leak-dump feature existed). That exception is raised deep inside a Win32 handler running as a ctypes callback (`_c_int_dispatch`, `cpu_zig.py`), which cannot let a Python exception cross back through the C call boundary — it landed in `CPU.handle_exception`, which used to just set `cpu.halted` (silently cleared by `_invoke_emulated_proc`'s own cleanup on any not-genuinely-completed nested call) and log nothing regardless of what the exception actually was. Confirmed via 13 `cpu_add_logpoint` probes across the session plus a manual instruction-by-instruction single-step trace (`cpu.run(1)` called directly from inside a logpoint callback) that pinpointed the exact moment: the `HeapAlloc` trampoline dispatches correctly, but by its own `RET` instruction the CPU is already halted with `EAX` never updated — the handler ran and hit this halt before reaching its own success path. A live check of the debug CRT's `_HEAP_LOCK` critical section (owner thread, lock count) ruled out a competing reentrancy-guard/contested-lock theory along the way — the lock was genuinely free.
+
+**Fixed** (`tew/hardware/cpu_zig.py`, `CPU.handle_exception`): now always logs the caught exception (`"Unhandled exception inside a Win32 handler callback at EIP=0x...: {error!r}"`) and sets `fatal_halt` in addition to `halted`, matching every other genuinely-fatal condition already in the codebase — `fatal_halt` is terminal and never gets cleared by `restore_state`, unlike `halted`. Confirmed live: the same run that used to silently drift into unrelated code now stops cleanly with the full original error message printed at the exact point of failure, every time.
+
+**What this means going forward**: the x42 heap-exhaustion ceiling is no longer a rare, hard-to-catch mystery — it will now visibly and reliably stop any sufficiently long run (confirmed hit at two different allocation sizes across two different runs tonight). That's real progress, but it means the ceiling itself still needs an actual fix (real `free()`/reclaim support, a larger heap region, or something else) before any run can get past ~85-100s of gameplay.
+
+**Also fixed** (real, but confirmed inert for `AppendToCRTLeaksFile`'s own call chain, which bypasses the `msvcrt.dll` IAT entirely via direct internal addresses): `_fopen`'s handler always used `CREATE_ALWAYS` disposition regardless of mode, silently truncating append-mode opens — fixed to `OPEN_ALWAYS` + seek-to-EOF. Registered the missing underscore-prefixed `_fputs`/`_fclose` handlers.
+
+**Test coverage**: full suite passing (1183 tests) after each fix tonight.
+
+---
+
 ## 2026-08-30 (cont'd x44) — Fixed a real D3D8/Vulkan instance-extension bug that was silently breaking every live run past window creation; with it cleared, traced the `crtReportHookCallback` `INT 3` down to an exact point inside the debug CRT's first-ever-exercised private-heap allocation path
 
 **Context**: x43 wired a real guest-side `_CrtDumpMemoryLeaks` call into the crash path and got a measured leak picture by temporarily disabling the game's own CRT report hook to dodge an `INT 3`. This session's task was to re-enable the hook and find out whether that `INT 3` was a genuine emulation gap.
