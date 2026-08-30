@@ -284,6 +284,15 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
     except Exception as e:
         logger.warn("exception", f"[lock-diag] failed to read lock state: {e}")
 
+    # x45 (2026-08-30): see DIAGNOSTIC_HEAP_RESERVE in _state.py. The dump
+    # needs to allocate its own small amount of memory (a debug-CRT stdio
+    # buffer per AppendToCRTLeaksFile call) to write real content to
+    # memleaksCRT.txt, and it's most valuable exactly when the heap is
+    # already near exhaustion -- which is also when its own allocations
+    # would otherwise hit the same ceiling as ordinary gameplay and fail
+    # before writing anything. Scoped tightly around just this call so
+    # ordinary allocations elsewhere never see the relaxed ceiling.
+    state.diagnostic_dump_active = True
     try:
         # Default max_steps=5_000_000 is sized for per-frame callbacks that
         # must never hang the emulator; this call is a one-shot diagnostic
@@ -310,6 +319,8 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
         raise
     except Exception as e:
         logger.warn("exception", f"_CrtDumpMemoryLeaks call for crash diagnostics failed: {e}")
+    finally:
+        state.diagnostic_dump_active = False
 
 
 def diagnose_fault(

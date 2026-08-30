@@ -296,6 +296,32 @@ THREAD_STACK_BASE = 0x08000000
 THREAD_STACK_SIZE = 256 * 1024
 THREAD_SENTINEL   = 0x001FE000
 
+# x45 (2026-08-30): reserved headroom for exception_diagnostics.py's crash-
+# triggered _CrtDumpMemoryLeaks call. That dump needs to allocate its own
+# small amount of memory (a debug-CRT stdio buffer per AppendToCRTLeaksFile
+# call, ~4KB each -- confirmed live) to write real content to
+# memleaksCRT.txt, and it's most valuable exactly when the heap is already
+# near THREAD_STACK_BASE (a heap-exhaustion crash is the whole reason the
+# dump is running). Without this, the dump's own allocations would hit the
+# same ceiling as ordinary gameplay allocations and the dump would fail
+# before writing anything. simple_alloc() enforces the tighter
+# (THREAD_STACK_BASE - DIAGNOSTIC_HEAP_RESERVE) ceiling for ordinary
+# allocations, and the full THREAD_STACK_BASE ceiling only while
+# CRTState.diagnostic_dump_active is set (see _dump_crt_memory_leaks).
+#
+# This does NOT guarantee a *complete* dump: nothing in this allocator ever
+# reclaims memory (HeapFree/free()/operator delete are documented no-ops),
+# so a dump reporting many thousands of leaked blocks -- each involving its
+# own AppendToCRTLeaksFile call and therefore its own ~4KB buffer -- can
+# still exhaust even this reserve partway through. What it does guarantee:
+# real content reliably starts landing in memleaksCRT.txt before that
+# happens, and if the reserve does run out, simple_alloc's own RuntimeError
+# (now correctly surfaced by CPU.handle_exception, see cpu_zig.py) reports
+# it loudly rather than silently. 4MB covers roughly a thousand blocks'
+# worth of buffer churn -- generous for a partial dump, still a small slice
+# (~6%) of the full 64MB heap.
+DIAGNOSTIC_HEAP_RESERVE = 4 * 1024 * 1024
+
 
 # ── CRTState ──────────────────────────────────────────────────────────────────
 
@@ -317,6 +343,11 @@ class CRTState:
 
         # ── Heap allocator ────────────────────────────────────────────────
         self.next_heap_alloc: int = 0x04000000
+        # See DIAGNOSTIC_HEAP_RESERVE above: set (by exception_diagnostics.py's
+        # _dump_crt_memory_leaks) only for the duration of a crash-triggered
+        # leak-dump call, so that dump's own small allocations can use the
+        # headroom ordinary gameplay allocations are kept out of.
+        self.diagnostic_dump_active: bool = False
         self.heap_alloc_sizes: dict[int, int] = {}   # addr → user size
         self.heap_alloc_owner: dict[int, int] = {}   # addr → heap handle
         self.heap_handles: set[int] = set()
@@ -490,15 +521,23 @@ class CRTState:
         """Bump-allocator for HeapAlloc/malloc/etc. Cursor math is done by
         libcpu.so's bump_alloc_next (cpu/src/alloc.zig); the cursor itself
         and the size-tracking dict stay Python-owned, same split as
-        ZigMemory leaving the buffer Python-owned in memory_zig.py."""
+        ZigMemory leaving the buffer Python-owned in memory_zig.py.
+
+        See DIAGNOSTIC_HEAP_RESERVE above: ordinary allocations are kept out
+        of the top DIAGNOSTIC_HEAP_RESERVE bytes of the heap, reserved for a
+        crash-triggered leak dump's own small bookkeeping allocations, which
+        run with diagnostic_dump_active set and get the full ceiling."""
         addr = self.next_heap_alloc
         new_cursor = bump_alloc_next(self.next_heap_alloc, size)
-        if new_cursor > THREAD_STACK_BASE:
+        ceiling = THREAD_STACK_BASE if self.diagnostic_dump_active else (
+            THREAD_STACK_BASE - DIAGNOSTIC_HEAP_RESERVE)
+        if new_cursor > ceiling:
             raise RuntimeError(
-                f"heap allocator ran into THREAD_STACK_BASE: alloc of {size} bytes at "
-                f"0x{addr:x} would push the heap cursor to 0x{new_cursor:x}, past "
-                f"THREAD_STACK_BASE (0x{THREAD_STACK_BASE:x}) -- this would silently "
-                f"alias live thread-stack memory instead of failing"
+                f"heap allocator ran into "
+                f"{'THREAD_STACK_BASE' if self.diagnostic_dump_active else 'its reserved-headroom ceiling'}"
+                f": alloc of {size} bytes at 0x{addr:x} would push the heap cursor to "
+                f"0x{new_cursor:x}, past 0x{ceiling:x} -- this would silently alias "
+                f"live thread-stack memory instead of failing"
             )
         self.next_heap_alloc = new_cursor
         self.heap_alloc_sizes[addr] = size
