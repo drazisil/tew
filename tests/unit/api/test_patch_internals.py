@@ -281,15 +281,31 @@ class TestCrtDbgReport:
         patched(stubs, CRT_DBG_REPORT)(cpu)
         assert any("code=42" in line for line in captured_logs)
 
-    def test_percent_present_but_not_s_or_d_is_passthrough(self, env, captured_logs):
+    def test_hex_specifier_is_substituted(self, env, captured_logs):
+        # Regression guard for the 2026-08-29 fix: substitution now goes
+        # through the shared _sprintf_format engine (same one msvcrt's
+        # printf/sprintf use) instead of a %s-or-%d-only special case, so
+        # %x/%08X/%u/%hs/etc. from the debug CRT's own report strings (e.g.
+        # _CrtDumpMemoryLeaks's "normal block at 0x%08X, %u bytes long.")
+        # now substitute correctly instead of appearing literally.
         cpu, mem, state, stubs = env
         cpu.regs[ESP] = STACK
         fmt_ptr = 0x300000
-        write_cstring(mem, fmt_ptr, "value=%x")  # neither %s nor %d
+        write_cstring(mem, fmt_ptr, "value=%x")
         self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
         mem.write32(STACK + 24, 0)
         patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
-        assert any("value=%x" in line for line in captured_logs)
+        assert any("value=0" in line for line in captured_logs)
+
+    def test_unrecognized_specifier_is_passthrough(self, env, captured_logs):
+        cpu, mem, state, stubs = env
+        cpu.regs[ESP] = STACK
+        fmt_ptr = 0x300000
+        write_cstring(mem, fmt_ptr, "value=%q")  # not a real conversion
+        self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
+        mem.write32(STACK + 24, 0)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
+        assert any("value=%q" in line for line in captured_logs)
 
     def test_unreadable_filename_pointer_does_not_crash(self, env):
         cpu, mem, state, stubs = env
@@ -305,25 +321,36 @@ class TestCrtDbgReport:
         patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
         assert cpu.halted is False
 
-    def test_unreadable_percent_s_arg_pointer_uses_bad_ptr_fallback(self, env, captured_logs):
+    def test_unreadable_percent_s_arg_pointer_does_not_crash(self, env, captured_logs):
+        # The shared _sprintf_format engine (2026-08-29) has no per-call
+        # bad-pointer fallback of its own -- an unreadable %s pointer raises
+        # inside read_cstring, which _crt_dbg_report now catches around the
+        # whole substitution call, logging the failure and falling back to
+        # the raw, unsubstituted format string rather than crashing.
         cpu, mem, state, stubs = env
         cpu.regs[ESP] = STACK
         fmt_ptr = 0x300000
         write_cstring(mem, fmt_ptr, "bad: %s")
         self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
         mem.write32(STACK + 24, 0xFFFFFFF0)
-        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise
-        assert any("<bad ptr" in line for line in captured_logs)
+        patched(stubs, CRT_DBG_REPORT)(cpu)  # must not raise -- the failure is
+        # only logged at DEBUG (filtered out under this fixture's default
+        # level), so check the fallback behavior visible at the report's own
+        # level instead: the raw, unsubstituted format string.
+        assert any("bad: %s" in line for line in captured_logs)
 
-    def test_null_ish_percent_s_arg_pointer_stays_null(self, env, captured_logs):
+    def test_null_percent_s_arg_pointer_substitutes_empty_string(self, env, captured_logs):
+        # _sprintf_format's own %s handling (shared with printf/sprintf)
+        # treats exactly NULL as an empty string, not the literal "(null)"
+        # tew's old bespoke substitution used for any near-null pointer.
         cpu, mem, state, stubs = env
         cpu.regs[ESP] = STACK
         fmt_ptr = 0x300000
         write_cstring(mem, fmt_ptr, "val: %s")
         self._set_args(mem, STACK, report_type=1, format_ptr=fmt_ptr)
-        mem.write32(STACK + 24, 0)  # arg_ptr <= 0x1000 -- skip the read entirely
+        mem.write32(STACK + 24, 0)
         patched(stubs, CRT_DBG_REPORT)(cpu)
-        assert any("val: (null)" in line for line in captured_logs)
+        assert any("val: " in line and "val: (null)" not in line for line in captured_logs)
 
 
 @pytest.fixture(autouse=True)

@@ -4,6 +4,22 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-29 (cont'd x43) — Wired a real guest-side `_CrtDumpMemoryLeaks` call into the crash path; got the first real measured leak picture (43.47MB/10,943 blocks) for the x42 heap-exhaustion blocker, but the single 42MB block responsible for 96% of it is still unattributed
+
+**Context**: x42 closed the `EIP=0x1901d9eb` fault family and immediately hit a new architectural blocker — the bump allocator (`simple_alloc`) exhausting its 64MB heap since `free()`/`operator delete` are documented no-ops. This session went after "what's actually eating the heap" directly, using the real game's own debug-CRT leak reporting instead of guessing.
+
+**Built**: `tew/kernel/exception_diagnostics.py`'s `diagnose_fault` (called from `run_exe.py` with `memory=mem, state=crt_state` now supplied) calls the guest's real `_CrtDumpMemoryLeaks` (`0x009F81B0`) via a nested `_invoke_emulated_proc` right before finalizing an unhandled fault — MCity_d.exe statically links the debug CRT and every `new` in the binary already goes through the 4-arg debug-tracked overload, so a real dump carries real file/line attribution per block. `patch_internals.py`'s `_crt_dbg_report` (already logging every `_CRT_WARN` report) had its format substitution rewritten to use the shared `_sprintf_format` engine instead of a bespoke single-`%s`/`%d` substitution, since real leak-dump lines use `%hs`/`%08X`/`%u`/`%ld`.
+
+**`INT 3` workaround, not a fix**: the game's own registered CRT report hook (`crtReportHookCallback`, `0x006881a0`) ends in a bare `INT 3` outside an active leak-report burst; invoking the dump from tew's crash path tripped it. Worked around by zeroing `_CRT_REPORT_HOOK_PTR` (`0x020ee23c`) for the duration of the call, since tew's own log line doesn't need the guest hook to fire. Flagged for the next session: whether this is real CRT behavior or tew's own emulation of the report-hook state machine diverging from real Windows — see status.md "cont'd x43".
+
+**Also added**: caller-address logging to every allocation-type handler (`malloc`/`_malloc_crt`/`calloc`/`realloc`/`operator new` in `msvcrt_handlers.py`, `HeapAlloc` in `kernel32_memory.py`), attempting to correlate the leak dump's unattributed 42MB block back to a call site by address/size. Did not succeed at identifying it.
+
+**Confirmed live**: a clean full leak dump — 10,943 leaked blocks, 45,578,803 bytes (43.47MB) of the 64MB heap. One block, 44,040,192 bytes (42MB, allocation #522), plain `malloc()` with no file/line — 96% of all leaked bytes, plausibly a legitimate long-lived arena rather than a bug (possibly `_MEM_init`'s engine arena, size doesn't match exactly, not confirmed). The real bug signal: `dbcode.c(4024)`, 10,426 separate 16-byte allocations never freed (95%+ of leaked block count); also smaller leaks at `DBQuery.c`/`DBApt.c` matching the DAO `DBParamQuery`/`DBRecordset` COM-lifecycle leak theory. Full detail in `memory/heap_and_message_pools.md`.
+
+**Test coverage**: `tests/unit/api/test_patch_internals.py` updated (3 tests) plus 1 new regression test for the `_sprintf_format` substitution change. Full suite: 1183 passed.
+
+---
+
 ## 2026-08-29 (cont'd x42) — MILESTONE: MCity_d.exe gets real database records back end-to-end for the first time ever. Implemented `CreateFileMappingA`/`MapViewOfFile`/`UnmapViewOfFile`; narrowed `CompareStringA`/`CompareStringW`'s locale allowlist to a single, load-bearing rejection (locale `0`) after a third distinct real nonzero LCID (`0x0009`) turned out to be wrongly rejected
 
 **Context**: x41 fixed the `EIP=0x1901d9eb` fault's first trigger (`LOCALE_INVARIANT` rejection) and immediately hit two new, unrelated gaps downstream: `msvcrt.dll!_wcsicmp` (fixed that session) then `kernel32.dll!CreateFileMappingA`.

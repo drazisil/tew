@@ -478,40 +478,62 @@ def register_msvcrt_handlers(
     # ── Heap allocators ───────────────────────────────────────────────────────
 
     # malloc(size_t size) -> void* [cdecl]
+    #
+    # Unlike operator new (always the debug-instrumented 4-arg overload in
+    # this binary, carrying real file/line for _CrtDumpMemoryLeaks to
+    # report), plain malloc() calls have no such tracking -- the debug heap
+    # only ever sees a bare allocation-sequence number for them. Logging
+    # size/address/caller here at the handler boundary is the only way to
+    # identify who made one of these calls after the fact (2026-08-29: this
+    # is exactly why the one 42MB leaked block in a real leak dump came back
+    # with no file/line attribution at all).
     def _malloc(cpu: "CPU") -> None:
-        size = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        addr   = state.simple_alloc(size) if size > 0 else 0
+        logger.debug("handlers", f"malloc({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+        cpu.regs[EAX] = addr
 
     stubs.register_handler("msvcrt.dll", "malloc", _malloc)
 
     # _malloc_crt(size_t size) -> void* [cdecl] — alias for malloc
     def _malloc_crt(cpu: "CPU") -> None:
-        size = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        addr   = state.simple_alloc(size) if size > 0 else 0
+        logger.debug("handlers", f"_malloc_crt({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+        cpu.regs[EAX] = addr
 
     stubs.register_handler("msvcrt.dll", "_malloc_crt", _malloc_crt)
 
     # calloc(size_t num, size_t size) -> void* [cdecl]
     # simpleAlloc memory is already zeroed by the bump allocator.
     def _calloc(cpu: "CPU") -> None:
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         num  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         total = (num * size) & 0xFFFFFFFF
-        cpu.regs[EAX] = state.simple_alloc(total) if total > 0 else 0
+        addr = state.simple_alloc(total) if total > 0 else 0
+        logger.debug("handlers", f"calloc({num}, {size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+        cpu.regs[EAX] = addr
 
     stubs.register_handler("msvcrt.dll", "calloc", _calloc)
 
     # realloc(void* ptr, size_t size) -> void* [cdecl]
     def _realloc(cpu: "CPU") -> None:
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         ptr  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if ptr == 0:
-            cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+            addr = state.simple_alloc(size) if size > 0 else 0
+            logger.debug("handlers", f"realloc(NULL, {size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+            cpu.regs[EAX] = addr
             return
         if size == 0:
             cpu.regs[EAX] = 0
             return
         new_ptr  = state.simple_alloc(size)
+        logger.debug("handlers", f"realloc(0x{ptr:08x}, {size}) -> 0x{new_ptr:08x}  called from 0x{caller:08x}")
         old_size = state.heap_alloc_sizes.get(ptr, 0)
         copy_len = min(old_size, size)
         if copy_len > 0:
@@ -529,9 +551,20 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "free", _free)
 
     # operator new(size_t size) -> void* [cdecl]  (MSVC mangled name)
+    #
+    # The only operator new msvcrt.dll actually exports. Every debug-tracked
+    # `new(_NORMAL_BLOCK, file, line)` call seen throughout this binary's
+    # decompiles is a guest-side wrapper (statically linked into MCity_d.exe
+    # itself, doing its own debug-heap bookkeeping) that ultimately calls
+    # down into this same primitive for the real memory -- so this is the
+    # single chokepoint for every `new` expression, tracked or not. See
+    # _malloc above for why this caller/size logging matters.
     def _operator_new(cpu: "CPU") -> None:
-        size = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        cpu.regs[EAX] = state.simple_alloc(size) if size > 0 else 0
+        caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        addr   = state.simple_alloc(size) if size > 0 else 0
+        logger.debug("handlers", f"operator new({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+        cpu.regs[EAX] = addr
 
     stubs.register_handler("msvcrt.dll", "??2@YAPAXI@Z", _operator_new)
 

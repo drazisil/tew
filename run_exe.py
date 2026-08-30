@@ -2748,7 +2748,7 @@ if cpu.watchpoint_hit:
         f"  (first byte of write to watchpoint address)")
     diagnose_halt(cpu, exe.import_resolver)
 elif cpu.faulted:
-    diagnose_fault(cpu, exe.import_resolver)
+    diagnose_fault(cpu, exe.import_resolver, memory=mem, state=crt_state)
 elif cpu.halted:
     diagnose_halt(cpu, exe.import_resolver)
 

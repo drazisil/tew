@@ -64,6 +64,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = state.process_heap
 
     def _heap_alloc(cpu: "CPU") -> None:
+        caller   = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         h_heap   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dw_bytes = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -82,6 +83,7 @@ def register_kernel32_memory_handlers(
         size = dw_bytes or 1
         addr = state.simple_alloc(size)
         state.heap_alloc_owner[addr] = h_heap
+        logger.debug("handlers", f"HeapAlloc({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
         if dw_flags & _HEAP_ZERO_MEMORY:
             for i in range(size):
                 memory.write8(addr + i, 0)
