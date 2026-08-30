@@ -36,12 +36,12 @@ from tew.api._state import (
     FileMappingHandle,
     MappedView,
     file_entry_size,
-    find_file_ci,
     read_cstring,
     read_wide_string,
     TEB_BASE,
 )
 from tew.api.kernel32_system import _fire_due_timers
+from tew.fs import find_file_ci
 from tew.logger import logger
 
 # ── Environment variable store ────────────────────────────────────────────────

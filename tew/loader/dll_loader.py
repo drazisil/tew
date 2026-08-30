@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Callable, TYPE_CHECKING
 
 from tew.logger import logger
-from tew.api._state import find_file_ci
+from tew.fs import find_file_ci
 from tew.hardware.cpu_zig import FatalHaltError
 
 if TYPE_CHECKING:

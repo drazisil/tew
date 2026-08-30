@@ -24,8 +24,9 @@ from tew.api.win32_handlers import (
     Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE,
     unimplemented_halt as _halt,
 )
-from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
+from tew.api._state import CRTState, DynamicModule, read_cstring, read_wide_string
 from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+from tew.fs import find_file_ci
 from tew.logger import logger
 
 
