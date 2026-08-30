@@ -238,28 +238,29 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
 
     Real per-block leak lines land in the main log at DEBUG under
     [exception] -- patch_internals.py's _crt_dbg_report handler already logs
-    every block _CrtMemDumpAllObjectsSince reports, unconditionally, before
-    it even considers forwarding to the game's own registered report hook.
+    every block _CrtMemDumpAllObjectsSince reports, before it even considers
+    forwarding to the game's own registered report hook.
 
-    That hook forward is deliberately skipped here (see the save/zero/restore
-    of _CRT_REPORT_HOOK_PTR below): the hook is `crtReportHookCallback`
-    (0x006881a0 in MCity_d.exe), and live-verified 2026-08-29, its own
-    fallback path ends in a bare `INT 3` whenever it isn't actively mid a
-    single leak-report burst (its own static bIsLeakReport flag) -- real
-    MSVC debug-CRT-hook behavior, not a bug in the guest, but exactly the
-    kind of nested real-guest-code side effect this diagnostic call has no
-    business triggering. tew's own log line doesn't need the hook to fire at
-    all, so the clean fix is to just not let this call reach it, rather than
-    chase the exact nested-call/report_type interaction that trips it.
+    x43 investigation (2026-08-29): this used to also zero
+    _CRT_REPORT_HOOK_PTR for the call's duration, to dodge an `INT 3` inside
+    the game's own registered hook (`crtReportHookCallback`, 0x006881a0 --
+    its fallback path is a bare `swi(3)` whenever its static `bIsLeakReport`
+    flag is 0, real Ghidra decompile confirmed). That INT 3 is not
+    inherently fatal in tew: `win32_handlers.py`'s INT3 dispatcher first
+    tries the game's own SEH chain (`_CLayer_CatchSEH`, since this debug
+    build hardcodes `_Nfs_DebuggerIsPresent=1` and uses INT3 as its real
+    assertion mechanism everywhere) before treating it as a fatal halt. The
+    hook is deliberately left live now, on the theory that the same "real
+    guest code, real SEH dispatch" path that already handles ~1,780 other
+    INT3 assertion sites in this binary ought to handle this one too, given
+    a real chance -- if it doesn't, that gap (not this dump call) is the
+    actual bug worth understanding.
     """
-    from tew.api.patch_internals import _CRT_REPORT_HOOK_PTR
     from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
-    saved_hook_addr = memory.read32(_CRT_REPORT_HOOK_PTR)
+    logger.info("exception",
+        "Invoking guest _CrtDumpMemoryLeaks before finalizing this fault -- "
+        "real per-block leak lines (if any) follow at DEBUG under [exception].")
     try:
-        memory.write32(_CRT_REPORT_HOOK_PTR, 0)
-        logger.info("exception",
-            "Invoking guest _CrtDumpMemoryLeaks before finalizing this fault -- "
-            "real per-block leak lines (if any) follow at DEBUG under [exception].")
         # Default max_steps=5_000_000 is sized for per-frame callbacks that
         # must never hang the emulator; this call is a one-shot diagnostic
         # action after the run loop has already exited (nothing else is
@@ -276,8 +277,6 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
         )
     except Exception as e:
         logger.warn("exception", f"_CrtDumpMemoryLeaks call for crash diagnostics failed: {e}")
-    finally:
-        memory.write32(_CRT_REPORT_HOOK_PTR, saved_hook_addr)
 
 
 def diagnose_fault(
