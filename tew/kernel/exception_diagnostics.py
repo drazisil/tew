@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
-from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
+from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP, FatalHaltError
 from tew.logger import logger
 
 if TYPE_CHECKING:
@@ -299,6 +299,15 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
             max_steps=500_000_000,
             scheduler=state.scheduler,
         )
+    except FatalHaltError:
+        # fatal_halt means the whole emulator session must stop -- swallowing
+        # it here as "the dump failed" (the broad except below) would
+        # silently downgrade a fatal condition to a per-call warning and let
+        # diagnose_fault carry on as if the dump had merely failed to run.
+        # Let it propagate to wherever it's actually meant to be handled (see
+        # FatalHaltError's docstring, cpu_zig.py; same pattern as
+        # dll_loader.py's DLLLoader.load_dll).
+        raise
     except Exception as e:
         logger.warn("exception", f"_CrtDumpMemoryLeaks call for crash diagnostics failed: {e}")
 
