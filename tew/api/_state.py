@@ -528,6 +528,17 @@ class CRTState:
         crash-triggered leak dump's own small bookkeeping allocations, which
         run with diagnostic_dump_active set and get the full ceiling."""
         addr = self.next_heap_alloc
+        # bump_alloc_next's u32 arithmetic ((current + size + 15) & ~15,
+        # cpu/src/alloc.zig) traps and aborts the whole process on overflow
+        # rather than wrapping or raising a catchable exception -- must be
+        # rejected here, in Python, before size ever crosses the FFI
+        # boundary. A size this large could never be satisfied by a real
+        # Win32 allocator either way.
+        if size > 0xFFFFFFFF - addr - 15:
+            raise RuntimeError(
+                f"heap allocator rejected alloc of {size} bytes at 0x{addr:x}: "
+                f"would overflow the allocator's 32-bit cursor arithmetic"
+            )
         new_cursor = bump_alloc_next(self.next_heap_alloc, size)
         ceiling = THREAD_STACK_BASE if self.diagnostic_dump_active else (
             THREAD_STACK_BASE - DIAGNOSTIC_HEAP_RESERVE)
