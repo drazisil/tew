@@ -152,19 +152,23 @@ def patch_crt_internals(
             except Exception as e:
                 logger.debug("exception", f"_CrtDbgReport: read_cstring(fmt) failed: {e}")
 
-        # Substitute first variadic arg if format contains %s or %d
+        # Substitute variadic args with the shared printf engine (handles
+        # %hs/%ld/%u/%08X/etc., not just a single %s or %d -- needed for the
+        # debug CRT's own multi-specifier report strings, e.g. the per-block
+        # leak-dump lines _CrtDumpMemoryLeaks produces ("%hs(%d) : ",
+        # "normal block at 0x%08X, %u bytes long.").
         if '%' in fmt:
-            arg_ptr = memory.read32((sp + 24) & 0xFFFFFFFF)
-            if '%s' in fmt:
-                val = "(null)"
-                if arg_ptr > 0x1000:
-                    try:
-                        val = read_cstring(arg_ptr, memory)
-                    except Exception:
-                        val = f"<bad ptr {arg_ptr:#010x}>"
-                fmt = fmt.replace('%s', val, 1)
-            elif '%d' in fmt:
-                fmt = fmt.replace('%d', str(arg_ptr), 1)
+            next_arg_addr = [(sp + 24) & 0xFFFFFFFF]
+
+            def _next_report_arg() -> int:
+                val = memory.read32(next_arg_addr[0])
+                next_arg_addr[0] = (next_arg_addr[0] + 4) & 0xFFFFFFFF
+                return val
+
+            try:
+                fmt = _sprintf_format(fmt, _next_report_arg, memory)
+            except Exception as e:
+                logger.debug("exception", f"_CrtDbgReport: _sprintf_format failed: {e}")
 
         # _CRT_WARN (0) is informational — log and continue.
         # _CRT_ERROR (1) and _CRT_ASSERT (2) are fatal — halt.

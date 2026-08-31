@@ -1125,13 +1125,13 @@ def _dbparamquery_getcount_pre_probe(eip, regs, memory, memory_size):
         f"inner_this=0x{inner_this or 0:x} inner_vtable=0x{inner_vtable or 0:x} "
         f"inner_func=0x{inner_func or 0:x}",
     )
-cpu.add_logpoint(0x00995c7b, _dbparamquery_getcount_pre_probe)
+# cpu.add_logpoint(0x00995c7b, _dbparamquery_getcount_pre_probe)  # 2026-08-30: DAO/Jet param-count investigation resolved in x40, freeing slot for AppendToCRTLeaksFile flush-chain probes
 
 def _dbparamquery_getcount_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
     logger.error("com", f"[dbparamquery-getcount-return] HRESULT=0x{eax:x} ({signed})")
-cpu.add_logpoint(0x00995c7e, _dbparamquery_getcount_return_probe)
+# cpu.add_logpoint(0x00995c7e, _dbparamquery_getcount_return_probe)  # 2026-08-30: DAO/Jet param-count investigation resolved in x40, freeing slot
 
 # 2026-08-28: dao350.dll FUN_0447dc1c (the real, non-thunk get_Count
 # implementer -- same function the earlier Fields.Count investigation
@@ -1278,7 +1278,7 @@ def _jet_lookup_returnB_probe(eip, regs, memory, memory_size):
     logger.error("com", f"[jet-lookup-branchB-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
     for line in _walk_ebp_chain_raw(memory, memory_size, regs[EBP] & 0xFFFFFFFF):
         logger.error("com", f"[jet-lookup-branchB-return] {line}")
-cpu.add_logpoint(0x044d52be, _jet_lookup_returnB_probe)
+# cpu.add_logpoint(0x044d52be, _jet_lookup_returnB_probe)  # 2026-08-30: DAO/Jet investigation resolved in x40, freeing slot
 
 # 2026-08-28: does FUN_044d525b propagate iVar2 (-3100) raw, or the
 # formatted return from FUN_044d418f(iVar2,...)? Per decompile it's the
@@ -2079,7 +2079,7 @@ def _fun_0f9ddd11_ctor_entry_probe(eip, regs, memory, memory_size):
     global _tew_watch_addr_int
     _tew_watch_addr_int = obj_ptr
     cpu.set_watchpoint(obj_ptr)
-cpu.add_logpoint(0x1901dd11, _fun_0f9ddd11_ctor_entry_probe)
+# cpu.add_logpoint(0x1901dd11, _fun_0f9ddd11_ctor_entry_probe)  # 2026-08-30: EIP=0x1901d9eb fault chain resolved in x41, freeing slot
 
 # 2026-08-29: watchpoint above confirmed the singleton (constructed once,
 # vtable never clobbered afterward) is NOT the crashing object. Traced the
@@ -2113,7 +2113,7 @@ def _fun_7a8a1c78_entry_probe(eip, regs, memory, memory_size):
     _fun_7a8a1c78_args[1] = _read32_raw(memory, memory_size, esp + 8)
     _fun_7a8a1c78_args[2] = _read32_raw(memory, memory_size, esp + 0xc)
     _fun_7a8a1c78_args[3] = _read32_raw(memory, memory_size, esp + 0x10)
-cpu.add_logpoint(0x17061c78, _fun_7a8a1c78_entry_probe)
+# cpu.add_logpoint(0x17061c78, _fun_7a8a1c78_entry_probe)  # 2026-08-30: EIP=0x1901d9eb fault chain resolved in x41, freeing slot
 
 _PTR_7A9362C0_TEW = 0x170F62C0  # msjet35.dll+0xF62C0 -- a POINTER variable (Molly's
 # analysis names it PTR_7a9362c0, not DAT_), so it must be read once to get
@@ -2150,7 +2150,7 @@ def _fun_7a8a1c78_callsite_probe(eip, regs, memory, memory_size):
         f"crashing_obj_vtable=0x{crashing_obj_vtable or 0:x} "
         f"locale_table_base=0x{table_base or 0:x} locale_table_entry=0x{table_entry or 0:x}",
     )
-cpu.add_logpoint(0x17061d84, _fun_7a8a1c78_callsite_probe)
+# cpu.add_logpoint(0x17061d84, _fun_7a8a1c78_callsite_probe)  # 2026-08-30: EIP=0x1901d9eb fault chain resolved in x41, freeing slot
 
 # 2026-08-28: FUN_7a852ef4 (call site 0x7a86388f inside FUN_7a8635de) is
 # the real "Tables" catalog lookup by name for THIS invocation's node's
@@ -2286,6 +2286,46 @@ def _dbparamquery_getcount_local18_probe(eip, regs, memory, memory_size):
 # 2026-08-28: redundant -- always matches getcount-return exactly
 # (confirmed live, __RTC_CheckEsp doesn't touch EAX). Disabled.
 # cpu.add_logpoint(0x00995c88, _dbparamquery_getcount_local18_probe)
+
+# 2026-08-30: memleaksCRT.txt investigation, RESOLVED. AppendToCRTLeaksFile's
+# first banner write never completed because state.simple_alloc() (tew/api/
+# _state.py) hit its own heap-ceiling check (the x42 THREAD_STACK_BASE
+# blocker -- still unfixed, just newly reached via a different path: this
+# was the first-ever exercise of the debug CRT's private-heap allocation,
+# __getbuf's lazy stdio-buffer allocation on a stream's first-ever write)
+# and raised a plain RuntimeError from deep inside a nested
+# _invoke_emulated_proc call. That exception was a real, genuine architecture
+# bug on tew's own side, independent of the heap-ceiling issue itself: any
+# Python exception raised inside a Win32 handler runs as a ctypes callback
+# (_c_int_dispatch in cpu_zig.py) and cannot cross back through the C call
+# boundary -- it landed in CPU.handle_exception, which used to just set
+# cpu.halted (silently cleared by _invoke_emulated_proc's own cleanup on any
+# not-genuinely-completed nested call) and never logged anything at all.
+# Fixed in cpu_zig.py: handle_exception now always logs the caught exception
+# and sets fatal_halt (not just halted), matching every other genuinely
+# fatal condition in the codebase -- fatal_halt is terminal and never gets
+# cleared by restore_state. Bisected step by step down to this (11+ logpoint
+# probes, then a manual single-step trace via cpu.run(1) from inside a
+# logpoint callback -- confirmed EIP lands exactly on the HeapAlloc
+# trampoline's RET with cpu.halted already True and EAX never updated,
+# pointing straight at a swallowed exception rather than a dispatch failure)
+# before Molly recognized the shape of the bug directly. Full writeup:
+# status.md "cont'd x44"/changelog.md. All probes below freed; kept
+# commented for the addresses in case a similar investigation needs them.
+# cpu.add_logpoint(0x009f2f80, ...)   # _fclose -- never reached, confirmed irrelevant
+# cpu.add_logpoint(0x009f6240, ...)   # _fputs entry -- confirmed reached once, real/valid _iobuf struct
+# cpu.add_logpoint(0x006880ad, ...)   # crtReportHookCallback banner call site 1 -- confirmed reached
+# cpu.add_logpoint(0x006880bc, ...)   # banner call site 2 -- confirmed NEVER reached (call 1 never returns)
+# cpu.add_logpoint(0x006880cb, ...)   # banner call site 3 -- confirmed NEVER reached
+# cpu.add_logpoint(0x006880b2, ...)   # return point after call site 1 -- confirmed NEVER reached
+# cpu.add_logpoint(0x009f6390, ...)   # _malloc_dbg entry -- confirmed reached reliably
+# cpu.add_logpoint(0x009f6460, ...)   # __heap_alloc_dbg entry -- confirmed reached reliably
+# cpu.add_logpoint(0x00a05de0, ...)   # __heap_alloc_base entry -- confirmed reached
+# cpu.add_logpoint(0x00a06910, ...)   # ___sbh_alloc_block -- confirmed correctly SKIPPED (size above threshold)
+# cpu.add_logpoint(0x00a05e43, ...)   # __heap_alloc_base's own CALL HeapAlloc site -- confirmed reached with fully valid args; single-step trace from here found the swallowed-exception halt
+# cpu.add_logpoint(0x009f6602, ...)   # __heap_alloc_base's return point -- confirmed NEVER reached (the exception fires before this)
+# cpu.add_logpoint(0x009f6030, ...)   # __flush -- never reached, confirmed irrelevant
+# cpu.add_logpoint(0x009f9f40, ...)   # __write_lk -- never reached, confirmed irrelevant
 
 # 2026-08-28: removed the resolved 2026-08-26 CoGetMalloc/TlsSetValue/
 # CoSetState/TlsAlloc probe block (oleaut32.dll lazy-COM-state-init
@@ -2748,7 +2788,7 @@ if cpu.watchpoint_hit:
         f"  (first byte of write to watchpoint address)")
     diagnose_halt(cpu, exe.import_resolver)
 elif cpu.faulted:
-    diagnose_fault(cpu, exe.import_resolver)
+    diagnose_fault(cpu, exe.import_resolver, memory=mem, state=crt_state)
 elif cpu.halted:
     diagnose_halt(cpu, exe.import_resolver)
 

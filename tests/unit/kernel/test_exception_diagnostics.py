@@ -8,11 +8,15 @@ import json
 
 import pytest
 
+from tew.api._state import CRTState
+from tew.api.win32_handlers import Win32Handlers
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ESP, EBP
+from tew.hardware.cpu_zig import ZigCPU, EAX, ESP, EBP, FatalHaltError
 from tew.kernel import exception_diagnostics as ed
 
 MEM_SIZE = 0x00400000
+DUMP_MEM_SIZE = 0x06000000  # covers _CRT_DUMP_MEMORY_LEAKS_ADDR (~0x009F81B0) and
+                             # the heap base (0x04000000) _get_dialog_sentinel allocates from
 
 
 class _FakeImportResolver:
@@ -153,3 +157,40 @@ class TestWriteCrashLog:
 
         assert first["eip"] != second["eip"]
         assert second["eip"] == 0x00600000
+
+
+class TestDumpCrtMemoryLeaksFatalHalt:
+    def test_propagates_fatal_halt_from_nested_call(self):
+        # Regression test for _dump_crt_memory_leaks's bare `except Exception`
+        # around its nested _invoke_emulated_proc call swallowing FatalHaltError
+        # instead of letting it propagate -- see
+        # tests/unit/api/test_invoke_emulated_proc_fatal_halt.py for the same
+        # invariant one layer down, at _invoke_emulated_proc itself.
+        mem = Memory(size_bytes=DUMP_MEM_SIZE)
+        state = CRTState()  # constructs state.scheduler with a main thread already
+
+        cpu = ZigCPU(mem)
+        cpu.regs[ESP] = 0x00200000
+
+        stubs = Win32Handlers(mem)
+
+        def _fake_unimplemented(c: "ZigCPU") -> None:
+            c.halted = True
+            c.fatal_halt = True
+
+        stubs.register_handler("test", "FakeUnimplemented", _fake_unimplemented)
+        stubs.install(cpu)
+
+        halt_addr = stubs.get_handler_address("test", "FakeUnimplemented")
+        assert halt_addr is not None
+
+        # mov edx, halt_addr ; call edx -- guest's _CrtDumpMemoryLeaks jumps
+        # straight into the fatally-halting handler instead of doing real work.
+        proc = bytes([0xBA]) + halt_addr.to_bytes(4, "little") + bytes([0xFF, 0xD2])
+        for i, b in enumerate(proc):
+            mem.write8(ed._CRT_DUMP_MEMORY_LEAKS_ADDR + i, b)
+
+        with pytest.raises(FatalHaltError):
+            ed._dump_crt_memory_leaks(cpu, mem, state)
+
+        assert cpu.fatal_halt is True

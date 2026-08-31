@@ -4,6 +4,66 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-31 (cont'd x46) — Fixed `_dump_crt_memory_leaks` silently swallowing `FatalHaltError` from its nested `_CrtDumpMemoryLeaks` call, found during PR #8 review
+
+**Context**: PR #8 bundles x45's exception-swallowing fix (`CPU.handle_exception`) with the D3D8/Vulkan fix and the real `_CrtDumpMemoryLeaks` wiring. A code review of that PR caught a second, related instance of the same swallowing pattern one layer up, in the very diagnostic code x45 added.
+
+**Root cause**: `_dump_crt_memory_leaks` (`tew/kernel/exception_diagnostics.py`) wrapped its nested `_invoke_emulated_proc` call in a bare `except Exception`, which also caught `FatalHaltError` -- the exception `cpu.run()`/`cpu.step()` raise the instant `cpu.fatal_halt` newly becomes true (`cpu_zig.py`). That's a documented, tested invariant (`tests/unit/api/test_invoke_emulated_proc_fatal_halt.py`) meant to always propagate, not be caught: if the guest's own leak-dump call itself hits a fatal condition (e.g. the heap-ceiling `RuntimeError`), the exception was downgraded to a warning and `diagnose_fault` continued as if the dump had merely failed, while `cpu.restore_state` never ran.
+
+**Fixed**: added `except FatalHaltError: raise` before the broad `except Exception`, matching the identical pattern already established in `loader/dll_loader.py`'s `DLLLoader.load_dll`.
+
+**Test coverage**: new regression test `TestDumpCrtMemoryLeaksFatalHalt::test_propagates_fatal_halt_from_nested_call` (`tests/unit/kernel/test_exception_diagnostics.py`), written test-first -- red confirmed the swallowing before the fix. Full suite: 1184 passed.
+
+---
+
+## 2026-08-30 (cont'd x45) — RESOLVED: `CPU.handle_exception` was silently swallowing any Python exception raised inside a nested Win32-handler callback, no log and no fatal-halt propagation — that's what turned x44's `crtReportHookCallback` `INT 3` investigation into a multi-hour mystery. Fixed; the real cause was the already-known x42 heap-exhaustion ceiling, now impossible to miss
+
+**Context**: x44 bisected `AppendToCRTLeaksFile`'s never-returning first write down to the exact `HeapAlloc` call site inside `__heap_alloc_base` — reached with fully valid arguments, but neither the success log nor either error branch ever fired, and execution silently ended up running unrelated code a moment later.
+
+**Root cause**: `state.simple_alloc()` (`tew/api/_state.py`) raises a plain `RuntimeError` when the bump allocator's cursor would push past `THREAD_STACK_BASE` (the x42 heap-exhaustion blocker) — this time hit for the first time via a brand-new code path, the debug CRT's private-heap allocation (`__getbuf`'s lazy stdio-buffer allocation on a stream's first-ever write, never exercised before x43's leak-dump feature existed). That exception is raised deep inside a Win32 handler running as a ctypes callback (`_c_int_dispatch`, `cpu_zig.py`), which cannot let a Python exception cross back through the C call boundary — it landed in `CPU.handle_exception`, which used to just set `cpu.halted` (silently cleared by `_invoke_emulated_proc`'s own cleanup on any not-genuinely-completed nested call) and log nothing regardless of what the exception actually was. Confirmed via 13 `cpu_add_logpoint` probes across the session plus a manual instruction-by-instruction single-step trace (`cpu.run(1)` called directly from inside a logpoint callback) that pinpointed the exact moment: the `HeapAlloc` trampoline dispatches correctly, but by its own `RET` instruction the CPU is already halted with `EAX` never updated — the handler ran and hit this halt before reaching its own success path. A live check of the debug CRT's `_HEAP_LOCK` critical section (owner thread, lock count) ruled out a competing reentrancy-guard/contested-lock theory along the way — the lock was genuinely free.
+
+**Fixed** (`tew/hardware/cpu_zig.py`, `CPU.handle_exception`): now always logs the caught exception (`"Unhandled exception inside a Win32 handler callback at EIP=0x...: {error!r}"`) and sets `fatal_halt` in addition to `halted`, matching every other genuinely-fatal condition already in the codebase — `fatal_halt` is terminal and never gets cleared by `restore_state`, unlike `halted`. Confirmed live: the same run that used to silently drift into unrelated code now stops cleanly with the full original error message printed at the exact point of failure, every time.
+
+**What this means going forward**: the x42 heap-exhaustion ceiling is no longer a rare, hard-to-catch mystery — it will now visibly and reliably stop any sufficiently long run (confirmed hit at two different allocation sizes across two different runs tonight). That's real progress, but it means the ceiling itself still needs an actual fix (real `free()`/reclaim support, a larger heap region, or something else) before any run can get past ~85-100s of gameplay.
+
+**Also fixed** (real, but confirmed inert for `AppendToCRTLeaksFile`'s own call chain, which bypasses the `msvcrt.dll` IAT entirely via direct internal addresses): `_fopen`'s handler always used `CREATE_ALWAYS` disposition regardless of mode, silently truncating append-mode opens — fixed to `OPEN_ALWAYS` + seek-to-EOF. Registered the missing underscore-prefixed `_fputs`/`_fclose` handlers.
+
+**Test coverage**: full suite passing (1183 tests) after each fix tonight.
+
+---
+
+## 2026-08-30 (cont'd x44) — Fixed a real D3D8/Vulkan instance-extension bug that was silently breaking every live run past window creation; with it cleared, traced the `crtReportHookCallback` `INT 3` down to an exact point inside the debug CRT's first-ever-exercised private-heap allocation path
+
+**Context**: x43 wired a real guest-side `_CrtDumpMemoryLeaks` call into the crash path and got a measured leak picture by temporarily disabling the game's own CRT report hook to dodge an `INT 3`. This session's task was to re-enable the hook and find out whether that `INT 3` was a genuine emulation gap.
+
+**The real blocker turned out to be unrelated**: `_platform_vulkan_extensions()` (`tew/api/d3d8/idirect3d8.py`) unconditionally enabled both `VK_KHR_xlib_surface` and `VK_KHR_wayland_surface` on the `VkInstance` whenever `WAYLAND_DISPLAY` was set (i.e. always). This gave the Vulkan loader's `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` an internal Xlib-surface-recreation fallback path for what is actually a correctly-created native Wayland surface — that path calls `XGetXCBConnection()` on a `Display*` that never existed, an immediate `SIGSEGV`. Confirmed via a stock `vkcube` run (same driver, same WSI path, clean) that the NVIDIA driver itself was never at fault, despite matching a 2026-08-14 archived diagnosis that concluded exactly that. Fixed to enable only the extension matching `SDL_GetCurrentVideoDriver()`'s real, live answer instead of guessing from the env var. This had been silently blocking window/D3D8-device creation in every live run all along — unblocks all future live-run investigation, not just this one.
+
+**With that fixed, finally exercised the `INT 3` question for real**: confirmed SEH dispatch genuinely walks real frames (same handler chain as a separate real access-violation fault in the same run) and correctly finds nothing that handles `STATUS_BREAKPOINT` at `crtReportHookCallback`'s `swi(3)` fallback — because `bIsLeakReport` never gets set. The first `AppendToCRTLeaksFile` call (real, unpatched CRT code) never returns. Bisected with 11 `cpu_add_logpoint` probes down to an exact point: execution reaches `__heap_alloc_base`'s own `CALL HeapAlloc` with a normal, previously-successful heap handle, valid flags, and a real size — and neither the handler's success log nor either error branch ever fires; ~1ms later, unrelated code is executing instead. This is the first-ever exercise of the debug CRT's private-heap allocation path (`__getbuf`'s lazy stdio-buffer allocation on a stream's first write). Not root-caused further — needs native or Python-level tracing across the `HeapAlloc` dispatch boundary itself. Report hook left enabled (fails gracefully now, provides real diagnostic value) rather than reverting to the old disable-workaround.
+
+**Also fixed** (real bugs, confirmed inert for this specific call chain since it bypasses `register_handler` entirely via direct internal addresses): `_fopen`'s handler always used `CREATE_ALWAYS` disposition regardless of mode, silently truncating `fopen(path, "a")` instead of `OPEN_ALWAYS` + seek-to-EOF. Registered the missing underscore-prefixed `_fputs`/`_fclose` handlers (mirroring the existing `fopen`/`_fopen` pair).
+
+**Environment note**: two real environment blockers hit and resolved/root-caused along the way tonight — a wedged-compositor hang (traced to the known `kill -9`-wedges-KWin failure mode) whose previously-documented fix (`kwin_wayland --replace`/`systemctl restart`) now crashes the entire user session instead of recovering it (see `emu32` skill v2.1, and the corrected Housekeeping note in `status.md`); and the Vulkan segfault above, initially mistaken for a driver regression before being root-caused as tew's own bug. Full narrative in `status_archive.md`, "Previous status (2026-08-29/30, cont'd x43)".
+
+**Test coverage**: full suite passing (1183 tests) after each of the three code fixes (Vulkan extensions, `fopen` disposition, `fputs`/`fclose` registration).
+
+---
+
+## 2026-08-29 (cont'd x43) — Wired a real guest-side `_CrtDumpMemoryLeaks` call into the crash path; got the first real measured leak picture (43.47MB/10,943 blocks) for the x42 heap-exhaustion blocker, but the single 42MB block responsible for 96% of it is still unattributed
+
+**Context**: x42 closed the `EIP=0x1901d9eb` fault family and immediately hit a new architectural blocker — the bump allocator (`simple_alloc`) exhausting its 64MB heap since `free()`/`operator delete` are documented no-ops. This session went after "what's actually eating the heap" directly, using the real game's own debug-CRT leak reporting instead of guessing.
+
+**Built**: `tew/kernel/exception_diagnostics.py`'s `diagnose_fault` (called from `run_exe.py` with `memory=mem, state=crt_state` now supplied) calls the guest's real `_CrtDumpMemoryLeaks` (`0x009F81B0`) via a nested `_invoke_emulated_proc` right before finalizing an unhandled fault — MCity_d.exe statically links the debug CRT and every `new` in the binary already goes through the 4-arg debug-tracked overload, so a real dump carries real file/line attribution per block. `patch_internals.py`'s `_crt_dbg_report` (already logging every `_CRT_WARN` report) had its format substitution rewritten to use the shared `_sprintf_format` engine instead of a bespoke single-`%s`/`%d` substitution, since real leak-dump lines use `%hs`/`%08X`/`%u`/`%ld`.
+
+**`INT 3` workaround, not a fix**: the game's own registered CRT report hook (`crtReportHookCallback`, `0x006881a0`) ends in a bare `INT 3` outside an active leak-report burst; invoking the dump from tew's crash path tripped it. Worked around by zeroing `_CRT_REPORT_HOOK_PTR` (`0x020ee23c`) for the duration of the call, since tew's own log line doesn't need the guest hook to fire. Flagged for the next session: whether this is real CRT behavior or tew's own emulation of the report-hook state machine diverging from real Windows — see status.md "cont'd x43".
+
+**Also added**: caller-address logging to every allocation-type handler (`malloc`/`_malloc_crt`/`calloc`/`realloc`/`operator new` in `msvcrt_handlers.py`, `HeapAlloc` in `kernel32_memory.py`), attempting to correlate the leak dump's unattributed 42MB block back to a call site by address/size. Did not succeed at identifying it.
+
+**Confirmed live**: a clean full leak dump — 10,943 leaked blocks, 45,578,803 bytes (43.47MB) of the 64MB heap. One block, 44,040,192 bytes (42MB, allocation #522), plain `malloc()` with no file/line — 96% of all leaked bytes, plausibly a legitimate long-lived arena rather than a bug (possibly `_MEM_init`'s engine arena, size doesn't match exactly, not confirmed). The real bug signal: `dbcode.c(4024)`, 10,426 separate 16-byte allocations never freed (95%+ of leaked block count); also smaller leaks at `DBQuery.c`/`DBApt.c` matching the DAO `DBParamQuery`/`DBRecordset` COM-lifecycle leak theory. Full detail in `memory/heap_and_message_pools.md`.
+
+**Test coverage**: `tests/unit/api/test_patch_internals.py` updated (3 tests) plus 1 new regression test for the `_sprintf_format` substitution change. Full suite: 1183 passed.
+
+---
+
 ## 2026-08-29 (cont'd x42) — MILESTONE: MCity_d.exe gets real database records back end-to-end for the first time ever. Implemented `CreateFileMappingA`/`MapViewOfFile`/`UnmapViewOfFile`; narrowed `CompareStringA`/`CompareStringW`'s locale allowlist to a single, load-bearing rejection (locale `0`) after a third distinct real nonzero LCID (`0x0009`) turned out to be wrongly rejected
 
 **Context**: x41 fixed the `EIP=0x1901d9eb` fault's first trigger (`LOCALE_INVARIANT` rejection) and immediately hit two new, unrelated gaps downstream: `msvcrt.dll!_wcsicmp` (fixed that session) then `kernel32.dll!CreateFileMappingA`.

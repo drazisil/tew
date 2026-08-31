@@ -147,7 +147,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         import ctypes
         import vulkan as vk
         from vulkan import ffi
-        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND
+        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion
         from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
@@ -212,10 +212,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         # on this machine despite WAYLAND_DISPLAY being set.
         try:
             wm_info = SDL_SysWMinfo()
-            wm_info.version.major = 2
-            wm_info.version.minor = 0
-            wm_info.version.patch = 0
-            SDL_GetWindowWMInfo(sdl_window, ctypes.byref(wm_info))
+            # SDL_GetWindowWMInfo refuses to fill the Wayland union members
+            # (added in 2.0.6) unless the caller declares at least that ABI
+            # version -- confirmed live 2026-08-30: hardcoding 2.0.0 here
+            # made every call fail with SDL_GetError() == "Version must be
+            # 2.0.6 or newer", leaving wm_info.subsystem at its zeroed
+            # SDL_SYSWM_UNKNOWN default. That silently took the else (Xlib)
+            # branch below on every real Wayland run, which is what the
+            # unconditional-both-extensions design (see
+            # _platform_vulkan_extensions's history above) had been masking:
+            # vkCreateXlibSurfaceKHR was still resolvable, so it "worked" by
+            # creating the wrong kind of surface. Use the actual linked
+            # library's version instead of a hardcoded literal -- the same
+            # thing the C SDL_VERSION() macro does, and the only way this
+            # stays correct across an SDL2 upgrade.
+            SDL_GetVersion(ctypes.byref(wm_info.version))
+            _wminfo_ok = SDL_GetWindowWMInfo(sdl_window, ctypes.byref(wm_info))
+            if not _wminfo_ok:
+                from sdl2 import SDL_GetError
+                logger.error("d3d8",
+                    f"CreateDevice: SDL_GetWindowWMInfo failed: {SDL_GetError()!r}")
 
             if wm_info.subsystem == SDL_SYSWM_WAYLAND:
                 vkCreateSurface = vk.vkGetInstanceProcAddr(
@@ -251,7 +267,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 SDL_PumpEvents()
         except Exception as exc:
             logger.error("d3d8",
-                f"CreateDevice: VkSurface creation failed: {exc} — halting")
+                f"CreateDevice: VkSurface creation failed: {exc!r} — halting")
             cpu.halted = True
             cpu.fatal_halt = True
             return
@@ -572,18 +588,53 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 def _platform_vulkan_extensions() -> list[str]:
     """Return the Vulkan instance extensions required for surface creation on this host.
 
-    On Linux, include both xlib and wayland extensions so the instance is usable
-    regardless of which backend SDL selected. SDL_Vulkan_CreateSurface (called in
-    CreateDevice) picks the correct one at runtime.
+    On Linux, enable ONLY the extension matching whichever backend SDL actually
+    initialised (SDL_GetCurrentVideoDriver()) -- the same ground-truth signal
+    CreateDevice's own surface-creation code already uses instead of trusting
+    WAYLAND_DISPLAY (see its comment: NVIDIA's driver commonly falls back to
+    X11/XWayland even with WAYLAND_DISPLAY set). This function used to enable
+    both VK_KHR_xlib_surface and VK_KHR_wayland_surface together "so the
+    instance is usable regardless of which backend SDL selected" -- confirmed
+    live 2026-08-30 that's exactly backwards: enabling both unconditionally is
+    what let the Vulkan loader's own vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+    terminator take an internal Xlib-surface-recreation fallback path
+    (wsi_unwrap_icd_surface -> wsi_CreateXlibSurfaceKHR) for a real, correctly-
+    created *Wayland* surface -- that path calls XGetXCBConnection() on a
+    Display* that was never actually created, an immediate SIGSEGV (confirmed
+    via Ghidra: XGetXCBConnection is a bare double-pointer-dereference on its
+    argument, no null check). A stock Vulkan app (vkcube) enabling only its
+    one real WSI extension does not hit this at all -- reproduced identically
+    against both the real NVIDIA ICD and a forced lavapipe software ICD, so
+    this is a loader-dispatch ambiguity from the extension list, not a
+    driver-specific bug.
+
+    Direct3DCreate8 (the only caller) always runs after some window has
+    already triggered WindowManager.initialize() in this codebase's actual
+    boot order, so SDL_GetCurrentVideoDriver() is reliably non-null here; the
+    WAYLAND_DISPLAY-env-var check is kept only as a last-resort fallback for
+    the (currently unreached) case where SDL genuinely isn't initialised yet.
     """
     import os
+    from sdl2 import SDL_GetCurrentVideoDriver
     from sdl2.platform import SDL_GetPlatform
 
     platform = SDL_GetPlatform().decode()
     if platform == "Linux":
-        extensions = ["VK_KHR_surface", "VK_KHR_xlib_surface"]
-        if os.environ.get("WAYLAND_DISPLAY"):
-            extensions.append("VK_KHR_wayland_surface")
+        driver = SDL_GetCurrentVideoDriver()
+        driver = driver.decode() if driver else None
+        if driver == "wayland":
+            is_wayland = True
+        elif driver == "x11":
+            is_wayland = False
+        else:
+            # SDL not initialised yet (or an unfamiliar driver name) -- best
+            # effort, same heuristic this function used exclusively before.
+            logger.warn("d3d8",
+                f"[Direct3DCreate8] SDL_GetCurrentVideoDriver()={driver!r} "
+                "before any window exists -- falling back to WAYLAND_DISPLAY env check")
+            is_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+        extensions = ["VK_KHR_surface"]
+        extensions.append("VK_KHR_wayland_surface" if is_wayland else "VK_KHR_xlib_surface")
         return extensions
     elif platform == "Windows":
         return ["VK_KHR_surface", "VK_KHR_win32_surface"]

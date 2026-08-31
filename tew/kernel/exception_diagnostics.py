@@ -6,12 +6,26 @@ import re
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
-from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP
+from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP, FatalHaltError
 from tew.logger import logger
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
+    from tew.hardware.memory import Memory
+    from tew.api._state import CRTState
     from tew.loader.import_resolver import ImportResolver
+
+# Real address of the debug CRT's _CrtDumpMemoryLeaks in MCity_d.exe (confirmed
+# via Ghidra decompile 2026-08-29 -- statically linked debug CRT, present and
+# real, not a stub). Calling it walks the debug heap's block list and reports
+# every still-live allocation via _CrtDbgReport, which patch_internals.py's
+# _crt_dbg_report handler already logs/forwards for the _CRT_WARN report type
+# -- that's the same mechanism that normally only fires on a clean process
+# exit (the CRT's own atexit-driven leak check). Invoking it here gets a real,
+# per-block leak report (with source file+line, since every operator new call
+# seen in this binary already uses the debug-instrumented 4-arg overload) at
+# the moment of an unhandled fault instead, where no clean exit ever happens.
+_CRT_DUMP_MEMORY_LEAKS_ADDR = 0x009F81B0
 
 LogFn = Callable[[str, str], None]
 
@@ -218,14 +232,107 @@ def _write_crash_log(kind: str, cpu: "CPU", import_resolver: "ImportResolver | N
     return CRASH_LOG_PATH
 
 
-def diagnose_fault(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
+def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> None:
+    """Calls the guest's own _CrtDumpMemoryLeaks (see _CRT_DUMP_MEMORY_LEAKS_ADDR
+    above) via a nested emulated call, right before a fault is finalized.
+
+    Real per-block leak lines land in the main log at DEBUG under
+    [exception] -- patch_internals.py's _crt_dbg_report handler already logs
+    every block _CrtMemDumpAllObjectsSince reports, before it even considers
+    forwarding to the game's own registered report hook.
+
+    x43 investigation (2026-08-29): this used to also zero
+    _CRT_REPORT_HOOK_PTR for the call's duration, to dodge an `INT 3` inside
+    the game's own registered hook (`crtReportHookCallback`, 0x006881a0 --
+    its fallback path is a bare `swi(3)` whenever its static `bIsLeakReport`
+    flag is 0, real Ghidra decompile confirmed). That INT 3 is not
+    inherently fatal in tew: `win32_handlers.py`'s INT3 dispatcher first
+    tries the game's own SEH chain (`_CLayer_CatchSEH`, since this debug
+    build hardcodes `_Nfs_DebuggerIsPresent=1` and uses INT3 as its real
+    assertion mechanism everywhere) before treating it as a fatal halt. The
+    hook is deliberately left live now, on the theory that the same "real
+    guest code, real SEH dispatch" path that already handles ~1,780 other
+    INT3 assertion sites in this binary ought to handle this one too, given
+    a real chance -- if it doesn't, that gap (not this dump call) is the
+    actual bug worth understanding.
+    """
+    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+    logger.info("exception",
+        "Invoking guest _CrtDumpMemoryLeaks before finalizing this fault -- "
+        "real per-block leak lines (if any) follow at DEBUG under [exception].")
+
+    # x44 (2026-08-30): logs the debug CRT's private-heap lock state right
+    # before invoking the dump. Originally added to test a reentrancy-guard/
+    # contested-critical-section theory for why AppendToCRTLeaksFile's first
+    # write never completed -- confirmed live that theory was wrong
+    # (__locktable[9], `_HEAP_LOCK`, was genuinely free: LockCount=-1, no
+    # owner). The real cause turned out to be state.simple_alloc() hitting
+    # its own heap-ceiling check and raising an exception that CPU.
+    # handle_exception (cpu_zig.py) used to silently swallow -- fixed there.
+    # Kept here since it's cheap and gives real signal for any future
+    # heap/lock-related crash investigation, not just this one.
+    try:
+        __crtheap = memory.read32(0x020EE08C)
+        _heap_lock_cs = memory.read32(0x01280A3C + 9 * 4)
+        _heap_lock_owner = memory.read32((_heap_lock_cs + 0x0C) & 0xFFFFFFFF) if _heap_lock_cs else None
+        _heap_lock_count = memory.read32((_heap_lock_cs + 0x04) & 0xFFFFFFFF) if _heap_lock_cs else None
+        _current_tid = state.tls_current_thread_id()
+        logger.info("exception",
+            f"[lock-diag] __crtheap=0x{__crtheap:08x} _HEAP_LOCK cs=0x{_heap_lock_cs:08x} "
+            f"owner_tid={f'0x{_heap_lock_owner:08x}' if _heap_lock_owner is not None else None} "
+            f"lock_count={_heap_lock_count} current_tid=0x{_current_tid:08x}")
+    except Exception as e:
+        logger.warn("exception", f"[lock-diag] failed to read lock state: {e}")
+
+    try:
+        # Default max_steps=5_000_000 is sized for per-frame callbacks that
+        # must never hang the emulator; this call is a one-shot diagnostic
+        # action after the run loop has already exited (nothing else is
+        # waiting on it), and live-verified 2026-08-29 that a real dump with
+        # a few hundred leaked blocks already exhausts the default budget
+        # partway through -- same reasoning as the increased budgets used
+        # elsewhere for calls into real, substantial guest code rather than
+        # a short callback.
+        _invoke_emulated_proc(
+            cpu, memory, _CRT_DUMP_MEMORY_LEAKS_ADDR, [],
+            _get_dialog_sentinel(state, memory),
+            max_steps=500_000_000,
+            scheduler=state.scheduler,
+        )
+    except FatalHaltError:
+        # fatal_halt means the whole emulator session must stop -- swallowing
+        # it here as "the dump failed" (the broad except below) would
+        # silently downgrade a fatal condition to a per-call warning and let
+        # diagnose_fault carry on as if the dump had merely failed to run.
+        # Let it propagate to wherever it's actually meant to be handled (see
+        # FatalHaltError's docstring, cpu_zig.py; same pattern as
+        # dll_loader.py's DLLLoader.load_dll).
+        raise
+    except Exception as e:
+        logger.warn("exception", f"_CrtDumpMemoryLeaks call for crash diagnostics failed: {e}")
+
+
+def diagnose_fault(
+    cpu: "CPU",
+    import_resolver: "ImportResolver | None",
+    memory: "Memory | None" = None,
+    state: "CRTState | None" = None,
+) -> None:
     """
     Called after the run loop detects cpu.faulted == True.
 
     Logs a short human-readable summary; the full memory-access diagnostics,
     register dump, stack dump, EBP chain, and DLL table go to CRASH_LOG_PATH
     (see tools/crashlog_reader.py) instead of the main log.
+
+    When memory/state are provided, also triggers a real guest-side
+    _CrtDumpMemoryLeaks call first (see _dump_crt_memory_leaks) -- both are
+    optional and skipped together so existing callers that don't have them
+    handy keep working unchanged.
     """
+    if memory is not None and state is not None:
+        _dump_crt_memory_leaks(cpu, memory, state)
+
     error = cpu.last_error
     if error is not None:
         logger.error("exception", str(error))
