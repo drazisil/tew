@@ -6,9 +6,74 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## NEW (2026-08-28): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count; does table really exist?"
+## NEW (2026-08-29): a scheduler mock/test helper is worth building at some point
 
-With DB init now genuinely working (see `RESOLVED` entry below, superseding the old "Database initialization failure" entry) the run reaches ~80.5s and hits a real, unhandled `INT3` inside `MCity_d.exe` itself. `~/.emu32/MCity/stdout.txt`'s own stated reason: `nfspc.c(1164) NFS_abortmsg callback 'AMF=166 DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?'`. Molly confirmed 2026-08-28 the `StockAssembly` table genuinely exists and is populated in the shipped DB -- rules out a missing/malformed table. Real gap is somewhere in tew's DAO/Jet query-parameter emulation (`expsrv.dll`/`MSJET35.DLL`/`vbajet32.dll`, all now running as real code rather than Python stubs since the x34/x35 `DllMain` fix). Not yet investigated -- next session should start here. See status.md "cont'd x37" for the exact call chain (`OLEAUT32.dll+0x1c619`/`+0x1c5bd`/`+0x1c26e`/`+0x2f12f` <- `MSJET35.DLL+0x62863`).
+Noted by Molly: real async coverage (queues, packet handling) is coming up,
+and testing that against the full `ZigScheduler` (as `test_invoke_emulated_proc_thread_death.py`
+and friends do today) is heavier than most tests need. A lightweight mock
+scheduler double, usable wherever a test only needs to control
+`current_idx`/thread status without a real cooperative scheduler, would
+make that work easier to test in isolation. Not started -- no immediate
+blocker yet, just flagged before the queue/packet work begins.
+
+---
+
+## RESOLVED (2026-08-29, cont'd x40): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- FULLY FIXED end to end
+
+Full root cause and fix in status.md "cont'd x40" and changelog.md's
+matching entry. x39 fixed `GetLocaleInfoW` and a cascade of exposed
+locale/calendar table gaps (`_wtoi`, `_itoa`, a mislabeled
+`LOCALE_SMONTHNAME1..13` entry, `GetCalendarInfoW`, `NlsGetCacheUpdateCount`,
+a silent-stub logging gap in `MultiByteToWideChar`/`WideCharToMultiByte`).
+With those closed, `VarDateFromStr` still failed -- traced to
+`classify_wide_string` (`char_type.py`) leaving its output buffer
+unwritten when asked to classify a null-terminated "string" whose first
+character IS the terminator (a zero-length classification), which let a
+caller read back stale leftover data (a `DIGIT` flag from the character
+tested just before) and made a date-string tokenizer wrongly treat two
+null bytes as still-a-digit, overshooting the true end of a number by 2
+WCHARs. Fixed by always writing a real classification for the terminator
+in that case. Confirmed live end-to-end: `StockAssembly_SelectAPT`'s error
+no longer appears anywhere in `stdout.txt`; the game runs straight past
+the whole query.
+
+**New, completely unrelated blocker opened immediately downstream**: an
+unhandled SEH fault at `EIP=0x1901d9eb` (0x19xxxxxx range -- a different
+DLL entirely). Not yet investigated at all -- pick this up first next
+session.
+
+## RESOLVED (2026-08-29, cont'd x40): `FUN_77121505` "thread splat" suspicion -- ruled out, real cause was the already-documented `THREAD_SENTINEL` collision
+
+Reran with `thread` added to `LOG_CATEGORIES` per the plan from x39;
+`FUN_77121505` never fires at all in the relevant window. What DOES fire
+early in every run is the already-documented (see the `THREAD_SENTINEL`
+entry below, "NEW (2026-08-26)") spurious "thread died" event from
+`OLEAUT32.dll`'s real `DllMain` static initializer sharing `THREAD_SENTINEL`
+with real thread completion -- non-fatal, `_invoke_emulated_proc` catches
+it and continues normally. This is almost certainly what Molly's original
+"thread went splat" recollection actually was. `FUN_77121505` itself is
+confirmed, separately and conclusively, to be a correct, real stack-cookie
+check (`__chkesp`-style) with clean success/`TerminateProcess`-on-mismatch
+semantics -- not a bug, not involved.
+
+## NEW (2026-08-28, cont'd x38): `cpu_add_logpoint` silently drops registrations past its 8-slot cap -- violates this project's own fail-loudly standard
+
+`cpu/src/core.zig`: `lp_eip: [8]u32`/`lp_cb: [8]?LogpointFn`, fixed-size
+arrays in the FFI-shared `CpuState` struct (same pattern as the breakpoint
+table, `bp_table: [8]u32` -- not derived from any real hardware limit,
+just a round number picked when this was built). `kernel.zig`'s
+`cpu_add_logpoint` loops the 8 slots looking for an empty one and just
+`return`s with no signal at all if none is free -- the new registration is
+silently discarded, and the caller has no way to know. Bit this
+investigation live 2026-08-28: 9-10 active logpoints (several stale, from
+already-resolved earlier investigations) meant two newly-added probes
+never fired, producing a real false lead (see the DAO/Jet entry above)
+before the cap was noticed and probes were pruned. Not yet fixed --
+`cpu_add_logpoint` should return a bool (or otherwise signal) on failure,
+and the Python `add_logpoint` wrapper (`cpu_zig.py`) should raise/log
+loudly when registration fails, matching this project's own "fail loudly
+or not at all" standard. Deferred by Molly ("stay on the trace, come back
+to it after") -- pick this up next.
 
 ## NEW (2026-08-28): `WaitForMultipleObjects(Ex)`'s `bAlertable` param is a no-op -- fine today, must be wired in if APCs ever get modeled
 

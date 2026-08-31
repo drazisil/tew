@@ -238,7 +238,8 @@ def register_kernel32_sync_handlers(
             cpu.regs[EAX] = 0
             cleanup_stdcall(cpu, memory, 4)
             return
-        cpu.regs[EAX] = memory.read32(TEB_BASE + 0xE0 + idx * 4)
+        tid = state.tls_current_thread_id()
+        cpu.regs[EAX] = state.tls_thread_store(tid).get(idx, 0)
         cleanup_stdcall(cpu, memory, 4)
 
     def _tls_free(cpu: "CPU") -> None:

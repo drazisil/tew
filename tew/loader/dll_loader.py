@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Callable, TYPE_CHECKING
 
 from tew.logger import logger
-from tew.api._state import find_file_ci
+from tew.fs import find_file_ci
 from tew.hardware.cpu_zig import FatalHaltError
 
 if TYPE_CHECKING:
@@ -459,9 +459,11 @@ class DLLLoader:
                 f"  patching {dll_name}: {count} import(s) from {imported_dll_name}",
             )
 
-        patched_count = 0
-        real_count = 0
-        auto_handler_count = 0
+        # Per-dll_name breakdown -- a single call here can cover more than one
+        # DLL's entries at once (see docstring above), so one aggregate count
+        # across all of them would blur which DLL actually had unimplemented
+        # imports.
+        per_dll_counts: dict[str, dict[str, int]] = {}
         for entry in new_entries:
             alias = _LEGACY_DLL_ALIASES.get(entry.imported_dll_name)
             imported_dll = self._loaded_dlls.get(entry.imported_dll_name)
@@ -470,18 +472,23 @@ class DLLLoader:
                 memory, win32_handlers, entry.iat_addr,
                 entry.imported_dll_name, entry.func_name, real_addr=real_addr, alias=alias,
             )
-            if outcome == "handler":
-                patched_count += 1
-            elif outcome == "real":
-                real_count += 1
-            elif outcome == "auto":
-                auto_handler_count += 1
+            counts = per_dll_counts.setdefault(entry.dll_name, {"handler": 0, "real": 0, "auto": 0})
+            counts[outcome] += 1
 
-        logger.info(
-            "loader",
-            f"Patched {patched_count}/{len(new_entries)} new DLL IAT entries with stubs "
-            f"({real_count} real DLL exports, {auto_handler_count} auto-stubs for unimplemented imports)",
-        )
+        for dll_name, counts in per_dll_counts.items():
+            handler_count = counts["handler"]
+            real_count = counts["real"]
+            auto_handler_count = counts["auto"]
+            total = handler_count + real_count + auto_handler_count
+            # "with stubs" covers both a registered Python handler and an
+            # auto-generated fatal-halt stub -- both are real stubs, unlike a
+            # "real" outcome (the IAT slot points at genuine DLL code).
+            stub_count = handler_count + auto_handler_count
+            logger.info(
+                "loader",
+                f"Patched {stub_count}/{total} {dll_name} IAT entries with stubs "
+                f"({real_count} real DLL exports, {auto_handler_count} auto-stubs for unimplemented imports)",
+            )
 
     def patch_dll_exports(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
         """Patch DLL export addresses in-place with INT 0xFE; RET trampolines."""

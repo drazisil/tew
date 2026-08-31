@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 from tew.hardware.cpu_zig import ESP
-from tew.logger import logger
+from tew.logger import logger, set_current_handler
 from tew.api.nt_syscall import NtSyscallDispatcher
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -385,20 +385,30 @@ class Win32Handlers:
             raise RuntimeError(f"Unknown Win32 stub at 0x{handler_addr:08x}")
 
 
-        # Log the stub call; deduplicate consecutive identical calls with a counter
-        log_entry = f"{entry.name} @ 0x{handler_addr:x}"
-        if not any(s in entry.name for s in _TRACE_SUPPRESS):
-            logger.trace("calls", log_entry)
-        if self._call_log and self._call_log[-1].startswith(log_entry):
-            last = self._call_log[-1]
-            count_match = re.search(r" x(\d+)$", last)
-            count = (int(count_match.group(1)) + 1) if count_match else 2
-            self._call_log[-1] = f"{log_entry} x{count}"
-        else:
-            self._call_log.append(log_entry)
-            if len(self._call_log) > self._call_log_size:
-                self._call_log.pop(0)
+        # set_current_handler lets LOG_CATEGORIES target this specific
+        # function (e.g. "handlers.CompareStringA" or "calls.CompareStringA")
+        # for the full duration of this call, including the trace line
+        # below -- save/restore rather than a plain set/clear so a handler
+        # that itself triggers a nested dispatched call doesn't leave the
+        # wrong name active once the inner call returns.
+        previous_handler = set_current_handler(entry.func_name)
+        try:
+            # Log the stub call; deduplicate consecutive identical calls with a counter
+            log_entry = f"{entry.name} @ 0x{handler_addr:x}"
+            if not any(s in entry.name for s in _TRACE_SUPPRESS):
+                logger.trace("calls", log_entry)
+            if self._call_log and self._call_log[-1].startswith(log_entry):
+                last = self._call_log[-1]
+                count_match = re.search(r" x(\d+)$", last)
+                count = (int(count_match.group(1)) + 1) if count_match else 2
+                self._call_log[-1] = f"{log_entry} x{count}"
+            else:
+                self._call_log.append(log_entry)
+                if len(self._call_log) > self._call_log_size:
+                    self._call_log.pop(0)
 
-        # Execute the Python handler
-        # EIP already points at RET, so the CPU will execute RET next
-        entry.handler(cpu)
+            # Execute the Python handler
+            # EIP already points at RET, so the CPU will execute RET next.
+            entry.handler(cpu)
+        finally:
+            set_current_handler(previous_handler)

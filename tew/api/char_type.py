@@ -196,6 +196,24 @@ def classify_wide_string(mem: WideMemory, args: GetStringTypeArgs) -> bool:
         else args.cch_src
     )
 
+    # 2026-08-29: a null-terminated (cchSrc=-1) request whose very first
+    # character IS the terminator classifies zero characters, leaving
+    # out_ptr completely unwritten -- confirmed live this let a caller
+    # read back stale leftover data from a PRIOR, unrelated classification
+    # call sharing the same stack slot. oleaut32.dll's FUN_7713cf60
+    # deliberately classifies a lone null terminator this way (querying a
+    # 2-WCHAR [char, 0] buffer to test `char` itself) while tokenizing a
+    # date string, and needs a real, deterministic result for it -- not an
+    # unwritten buffer. Root-caused via VarDateFromStr("1/1/2010"): the
+    # stale leftover DIGIT flag from testing the prior '0' character made
+    # the string's own null terminator (and a second stray null right
+    # after it in the string's heap allocation) look like "still a digit",
+    # overshooting the tokenizer's position by 2 WCHARs into unrelated
+    # memory.
+    if count == 0 and args.cch_src == 0xFFFFFFFF:
+        mem.write16(args.out_ptr & 0xFFFFFFFF, classify_ctype1(0))
+        return True
+
     for i in range(count):
         cp = mem.read16((args.src_ptr + i * 2) & 0xFFFFFFFF)
         flags = classify_ctype1(cp)

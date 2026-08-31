@@ -14,6 +14,7 @@ Environment variables:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import signal
@@ -24,7 +25,7 @@ from os.path import dirname
 from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, REG_NAMES, FatalHaltError
 from tew.kernel.kernel_structures import KernelStructures
-from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt, _dump_cpu_state
+from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt, _dump_cpu_state, _annotate_address
 from tew.pe.exe_file import EXEFile
 from tew.api.win32_handlers import Win32Handlers
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
@@ -362,7 +363,7 @@ kernel_structures.initialize_kernel_structures(stack_base, stack_limit, crt_stat
 # invocation is deferred this far rather than running inline there.
 _failed_static_dllmains = [
     _pending_dll.name for _pending_dll in _pending_dllmain_dlls
-    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll)
+    if not _invoke_dependency_dllmain(cpu, mem, crt_state, _pending_dll, _dll_loader_ref, win32_handlers)
 ]
 if _failed_static_dllmains:
     logger.warn(
@@ -950,6 +951,51 @@ def _read32_raw(memory, memory_size, addr: int) -> int | None:
         return None
     return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
 
+def _walk_ebp_chain_raw(memory, memory_size, ebp_val: int, max_frames: int = 25) -> list[str]:
+    """Same logic as exception_diagnostics._walk_ebp_chain, reimplemented
+    against the raw ctypes memory a logpoint callback actually receives
+    (that function needs a full cpu.memory object, which logpoints don't
+    get) -- reuses _annotate_address (imported from that same module) for
+    module+offset resolution, so results match the existing halt-diagnostic
+    "EBP chain (call frames)" dumps exactly."""
+    lines = []
+    frame_ebp = ebp_val
+    seen = set()
+    depth = 0
+    while depth < max_frames and frame_ebp and frame_ebp not in seen and frame_ebp + 7 < memory_size:
+        seen.add(frame_ebp)
+        saved_ebp = _read32_raw(memory, memory_size, frame_ebp)
+        ret_addr = _read32_raw(memory, memory_size, frame_ebp + 4)
+        if saved_ebp is None or ret_addr is None:
+            lines.append(f"  frame[{depth}] EBP=0x{frame_ebp:08x} (read error)")
+            break
+        lines.append(
+            f"  frame[{depth}] EBP=0x{frame_ebp:08x} ret=0x{ret_addr:08x}"
+            f"{_annotate_address(ret_addr, exe.import_resolver)}"
+        )
+        frame_ebp = saved_ebp
+        depth += 1
+    return lines
+
+def _scan_memory_for(memory, memory_size, needle: bytes, start: int, end: int):
+    """Bulk-search a guest memory range for a byte string, via a single
+    ctypes.string_at() read (fast, one real memcpy) instead of a
+    per-byte Python loop. Returns a list of matching guest addresses."""
+    end = min(end, memory_size)
+    if start >= end:
+        return []
+    base_addr = ctypes.cast(memory, ctypes.c_void_p).value
+    raw = ctypes.string_at(base_addr + start, end - start)
+    hits = []
+    idx = 0
+    while True:
+        idx = raw.find(needle, idx)
+        if idx == -1:
+            break
+        hits.append(start + idx)
+        idx += 1
+    return hits
+
 def _make_createinstancelic_probe(label: str):
     def _probe(eip, regs, memory, memory_size):
         esp = regs[ESP]
@@ -977,7 +1023,10 @@ def _make_createinstancelic_probe(label: str):
         )
     return _probe
 # cpu.add_logpoint(0x008f580c, _make_createinstancelic_probe("dbvariant-call"))
-cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
+# 2026-08-28: disabled -- resolved BSTR milestone bug, and this specific
+# probe's own comments below already document it as self-inflicted-
+# garbage-prone (double-dispatch artifact). Was burning a logpoint slot.
+# cpu.add_logpoint(0x008f59b3, _make_createinstancelic_probe("sysallocstring-call"))
 
 # 2026-08-26 (cont'd): local_44's real address confirmed live == EBP-0x44 ==
 # 0x082bfa60 this run (matched bstr_ptr exactly). Watching that concrete
@@ -1042,69 +1091,1207 @@ def _make_createinstancelic_return_probe(label: str):
         logger.error("com", f"[createinstancelic-{label}-return] HRESULT=0x{eax:x} ({signed})")
     return _probe
 # cpu.add_logpoint(0x008f5816, _make_createinstancelic_return_probe("dbvariant"))
-cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
+# 2026-08-28: disabled, same reason as its -call sibling above.
+# cpu.add_logpoint(0x008f59c0, _make_createinstancelic_return_probe("sysallocstring"))
 
-# 2026-08-26: SysAllocString (Ordinal_2) returned NULL. Real oleaut32.dll's
-# SysAllocStringLen NULLs out on first-ever-call-on-this-thread lazy COM
-# state init (FUN_77125311 in oleaut32.dll @ preferred base 0x77120000,
-# runtime base 0x11000000 this run -- delta -0x66120000) failing at any of:
-# CoGetMalloc, TlsSetValue, or CoSetState. Logging args in / return out for
-# each, at their real call sites inside oleaut32.dll's own code (not their
-# real callee entry points, since CoGetMalloc/TlsSetValue are external
-# imports and CoSetState resolves to a local in-module thunk).
-def _cogetmalloc_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: DBParamQuery::DBParamQuery's DAOParameters::get_Count call
+# (vtable slot 0x1c on the interface obtained from get_Parameters) is where
+# "could not get param count; does table really exist?" comes from --
+# confirmed by full decompile of the constructor at 0x00995970 (three
+# COMPUTED_CALLs: 0x00995b1c=get_Parameters, 0x00995c7b=get_Count,
+# 0x00995ed7=per-param DBParam ctor loop). Probing the two calls right
+# before this one to identify which real DLL's vtable is actually being
+# called (get_Count's implementation lives wherever local_28's object came
+# from -- likely expsrv.dll or dao350.dll, not yet confirmed) and the
+# HRESULT it returns.
+def _dbparamquery_getcount_pre_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    dw_mem_context = _read32_raw(memory, memory_size, esp + 0)
-    ppmalloc = _read32_raw(memory, memory_size, esp + 4)
-    logger.error("com", f"[cogetmalloc-call] dwMemContext=0x{dw_mem_context or 0:x} ppMalloc=0x{ppmalloc or 0:x}")
-cpu.add_logpoint(0x11005500, _cogetmalloc_call_probe)
+    this_ptr = _read32_raw(memory, memory_size, esp + 0)
+    vtable_ptr = _read32_raw(memory, memory_size, this_ptr) if this_ptr else None
+    func_ptr = _read32_raw(memory, memory_size, vtable_ptr + 0x1c) if vtable_ptr else None
+    # dao350.dll's get_Count is a thin thunk (FUN_0447dfe2, confirmed via
+    # Ghidra decompile): (**(code**)(**(int**)(this+8) + 0x24))(param_2) --
+    # forwards to the *real* inner object at [this+8], vtable slot 0x24.
+    # Same "tear-off wrapper delegates to real implementer" shape as the
+    # earlier Fields.Count investigation's FUN_0447dc1c -- follow it one
+    # level deeper to find the real, non-thunk implementer.
+    inner_this = _read32_raw(memory, memory_size, this_ptr + 8) if this_ptr else None
+    inner_vtable = _read32_raw(memory, memory_size, inner_this) if inner_this else None
+    inner_func = _read32_raw(memory, memory_size, inner_vtable + 0x24) if inner_vtable else None
+    logger.error(
+        "com",
+        f"[dbparamquery-getcount-call] this=0x{this_ptr or 0:x} "
+        f"vtable=0x{vtable_ptr or 0:x} func=0x{func_ptr or 0:x} "
+        f"inner_this=0x{inner_this or 0:x} inner_vtable=0x{inner_vtable or 0:x} "
+        f"inner_func=0x{inner_func or 0:x}",
+    )
+cpu.add_logpoint(0x00995c7b, _dbparamquery_getcount_pre_probe)
 
-def _cogetmalloc_return_probe(eip, regs, memory, memory_size):
+def _dbparamquery_getcount_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
-    logger.error("com", f"[cogetmalloc-return] HRESULT=0x{eax:x} ({signed})")
-cpu.add_logpoint(0x11005506, _cogetmalloc_return_probe)
+    logger.error("com", f"[dbparamquery-getcount-return] HRESULT=0x{eax:x} ({signed})")
+cpu.add_logpoint(0x00995c7e, _dbparamquery_getcount_return_probe)
 
-def _tlssetvalue_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: dao350.dll FUN_0447dc1c (the real, non-thunk get_Count
+# implementer -- same function the earlier Fields.Count investigation
+# found) calls FUN_044d26ce(iVar1) as its "refresh gate" -- iVar1 =
+# *(int*)(inner_this+8), i.e. a third layer of indirection past the
+# outer DAOParameters thunk. FUN_044d26ce dispatches through a type-
+# indexed function table (DAT_044770b0[*(int*)(iVar1+0x10)]) to the
+# real per-type "populate the count" handler, only when not already
+# cached. Its return value becomes our observed HRESULT's low 16 bits
+# (0x800a0000 | ret == 0x800a0c03 == DAO error 3075). Capturing the
+# type index and target handler address to find which one is failing.
+def _refresh_gate_entry_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    dw_tls_index = _read32_raw(memory, memory_size, esp + 0)
-    lp_tls_value = _read32_raw(memory, memory_size, esp + 4)
-    logger.error("com", f"[tlssetvalue-call] dwTlsIndex=0x{dw_tls_index or 0:x} lpTlsValue=0x{lp_tls_value or 0:x}")
-cpu.add_logpoint(0x1100553f, _tlssetvalue_call_probe)
+    param_1 = _read32_raw(memory, memory_size, esp + 4)
+    type_idx = _read32_raw(memory, memory_size, param_1 + 0x10) if param_1 else None
+    handler = (
+        _read32_raw(memory, memory_size, 0x044770b0 + type_idx * 4)
+        if type_idx is not None else None
+    )
+    count_field = _read32_raw(memory, memory_size, param_1 + 0x2c) if param_1 else None
+    logger.error(
+        "com",
+        f"[refresh-gate-entry] param_1=0x{param_1 or 0:x} type_idx={type_idx} "
+        f"handler=0x{handler or 0:x} count_field_raw=0x{count_field or 0:x}",
+    )
+# 2026-08-28: confirmed (type_idx=25=Parameters, handler=0x44c69bc for our
+# call) and no longer needed -- this is a hot shared path fired for every
+# DAO collection refresh in the whole run, not just ours; disabled, was
+# pure log noise past this point in the investigation.
+# cpu.add_logpoint(0x044d26ce, _refresh_gate_entry_probe)
 
-def _tlssetvalue_return_probe(eip, regs, memory, memory_size):
+def _read_cstr_raw(memory, memory_size, addr, max_len=200):
+    if not addr or addr + max_len >= memory_size:
+        return "<invalid>"
+    out = []
+    for i in range(max_len):
+        c = memory[addr + i]
+        if c == 0:
+            break
+        out.append(chr(c) if 32 <= c < 127 else f"\\x{c:02x}")
+    return "".join(out)
+
+# 2026-08-28: FUN_044c69bc (the real per-type "populate Parameters.Count"
+# handler, dispatched via FUN_044d26ce's type table for type_idx=25) has
+# two candidate failure points: a generic "no compiled statement" error
+# (FUN_044d44c2 @ call site 0x044c6a40, fixed sentinel arg -- same shape
+# regardless of query content) vs FUN_044d525b (call site 0x044c6ac2),
+# which takes the query's own text as an LPCSTR (4th arg) -- much more
+# likely to be the content-specific failure. Probing both entries to see
+# which one actually fires for StockAssembly_SelectAPT, and reading the
+# LPCSTR live to see exactly what text is being parsed at failure time.
+def _generic_error_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    sentinel = _read32_raw(memory, memory_size, esp + 4)
+    logger.error("com", f"[fun-044d44c2-entry] sentinel=0x{sentinel & 0xffffffff:x}")
+# 2026-08-28: confirmed this path never fires for StockAssembly_SelectAPT
+# (ruled out) -- disabled to free a logpoint slot.
+# cpu.add_logpoint(0x044d44c2, _generic_error_probe)
+
+def _param_lookup_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p1 = _read32_raw(memory, memory_size, esp + 4)
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    p3 = _read32_raw(memory, memory_size, esp + 12)
+    lpcstr = _read32_raw(memory, memory_size, esp + 16)
+    p5 = _read32_raw(memory, memory_size, esp + 20)
+    p6 = _read32_raw(memory, memory_size, esp + 24)
+    text = _read_cstr_raw(memory, memory_size, lpcstr) if lpcstr else "<null>"
+    logger.error(
+        "com",
+        f"[fun-044d525b-entry] param_1=0x{p1 or 0:x} param_2=0x{p2 or 0:x} "
+        f"param_3=0x{p3 or 0:x} param_4(lpcstr)=0x{lpcstr or 0:x} text={text!r} "
+        f"param_5=0x{p5 or 0:x} param_6=0x{p6 or 0:x}",
+    )
+# cpu.add_logpoint(0x044d525b, _param_lookup_probe)  # 2026-08-28: confirmed clean/identical args across all 4 queries
+
+# 2026-08-28: the query is a compiled/stored function in MSysQueries, not
+# plain text -- searching live memory for the literal date TEXT was never
+# going to find anything (confirmed: 0 hits). Redirected to tracing the
+# real deserialize/compile call chain instead: FUN_7a862215 (msjet35.dll's
+# SQL execution-plan compiler) -> FUN_7a862942 -> FUN_7a862cd4, which
+# checks the catalog object-type of our query name via FUN_7a858c87 into
+# a local `short` -- 0 triggers an explicit abort/raise-error path, 5 is
+# Jet's real "Query" object type (one branch), anything else non-zero
+# takes a different branch. Probing that return value live for our
+# specific failing call to see which path it actually takes.
+def _catalog_type_check_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
-    logger.error("com", f"[tlssetvalue-return] BOOL={eax}")
-cpu.add_logpoint(0x11005541, _tlssetvalue_return_probe)
+    signed = eax - 0x10000 if eax & 0xFFFF >= 0x8000 else eax & 0xFFFF
+    logger.error("com", f"[catalog-type-check] EAX=0x{eax & 0xffffffff:x} (as int16: {signed})")
+# 2026-08-28: confirmed EAX=5 (Jet's real "Query" object type) -- ruled
+# out, no longer needed.
+# cpu.add_logpoint(0x17022d55, _catalog_type_check_probe)
 
-def _cosetstate_call_probe(eip, regs, memory, memory_size):
+# 2026-08-28: per the earlier DAO-3075 investigation's own hard-won lesson
+# ("Ghidra's positional parameter names do NOT reliably track the same
+# real value across different functions... wide-scan live registers + a
+# broad stack range at each hop and match by actual content, never trust
+# name continuity alone") -- rather than keep trusting decompiled param_N
+# labels, wide-dumping FUN_7a8635de's real args plus a raw hex/ASCII
+# window around its node pointer (param_2) at every invocation. This is
+# the real recursive statement/node compiler -- fires once per node,
+# recursively, for every query compiled all run, so this will be noisy;
+# correlate by timestamp against the known dbparamquery-getcount-call/
+# return window like every other probe this session.
+_last_node_ptr = [None]  # shared with _table_lookup_return_probe below
+
+def _node_compiler_entry_probe(eip, regs, memory, memory_size):
     esp = regs[ESP]
-    pv = _read32_raw(memory, memory_size, esp + 0)
-    logger.error("com", f"[cosetstate-call] pv=0x{pv or 0:x}")
-cpu.add_logpoint(0x1100557e, _cosetstate_call_probe)
+    param_1 = _read32_raw(memory, memory_size, esp + 4)
+    param_2 = _read32_raw(memory, memory_size, esp + 8)
+    param_3 = _read32_raw(memory, memory_size, esp + 12)
+    _last_node_ptr[0] = param_2
+    logger.error(
+        "com",
+        f"[node-compiler-entry] param_1=0x{param_1 or 0:x} param_2(node)=0x{param_2 or 0:x} "
+        f"param_3=0x{param_3 or 0:x}",
+    )
+    if param_2:
+        base_addr = ctypes.cast(memory, ctypes.c_void_p).value
+        window_end = min(memory_size, param_2 + 0xE0)
+        if param_2 < window_end:
+            raw = ctypes.string_at(base_addr + param_2, window_end - param_2)
+            printable = "".join(chr(b) if 32 <= b < 127 else "." for b in raw)
+            hexdump = raw.hex()
+            logger.error("com", f"[node-compiler-entry]   node bytes: {hexdump}")
+            logger.error("com", f"[node-compiler-entry]   node ascii: {printable!r}")
+# cpu.add_logpoint(0x170235de, _node_compiler_entry_probe)  # 2026-08-28: disabled to free a slot -- relationship to FUN_7a893ba6's real path still unconfirmed
 
-def _cosetstate_return_probe(eip, regs, memory, memory_size):
+# The two branches inside FUN_044d525b (param_5==-1 selects which dynamically-
+# bound msjet35.dll function pointer gets called) converge on the same
+# "if (-1 < iVar2) success else translate-and-return-error" check. Probing
+# EAX right after each call returns to get the RAW Jet-native error code
+# before FUN_044d418f translates it into our observed OLE HRESULT.
+def _jet_lookup_returnA_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[jet-lookup-branchA-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
+# 2026-08-28: confirmed neither branch fires (allocator fails before this
+# point) -- disabled to free a logpoint slot.
+# 2026-08-28: confirmed branch A never fires (param_5 != -1 for this
+# query) -- disabled to free a logpoint slot.
+# cpu.add_logpoint(0x044d529f, _jet_lookup_returnA_probe)
+
+def _jet_lookup_returnB_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[jet-lookup-branchB-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
+    for line in _walk_ebp_chain_raw(memory, memory_size, regs[EBP] & 0xFFFFFFFF):
+        logger.error("com", f"[jet-lookup-branchB-return] {line}")
+cpu.add_logpoint(0x044d52be, _jet_lookup_returnB_probe)
+
+# 2026-08-28: does FUN_044d525b propagate iVar2 (-3100) raw, or the
+# formatted return from FUN_044d418f(iVar2,...)? Per decompile it's the
+# latter -- probing the real RET site (0x044d5309, right after the
+# FUN_044d418f call at 0x044d52fd) to see what it actually returns.
+def _fun_044d525b_final_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
     signed = eax - 0x100000000 if eax >= 0x80000000 else eax
-    logger.error("com", f"[cosetstate-return] HRESULT=0x{eax:x} ({signed})")
-cpu.add_logpoint(0x11005583, _cosetstate_return_probe)
+    logger.error("com", f"[fun-044d525b-final-return] EAX=0x{eax & 0xffffffff:x} ({signed})")
+# cpu.add_logpoint(0x044d5309, _fun_044d525b_final_return_probe)  # 2026-08-28: confirmed 3075, no longer needed
 
-# 2026-08-26 (cont'd): dwTlsIndex was always 0xFFFFFFFF (TLS_OUT_OF_INDEXES)
-# at every TlsSetValue call above -- oleaut32.dll's own module-global slot
-# index (DAT_771a1000, static base) is only ever written by TlsAlloc() in
-# FUN_77121f36 (its one-time process-init routine). Logging that call+return
-# directly: call site 0x77121f47, return 0x77121f4d (static) -> runtime
-# 0x11001f47 / 0x11001f4d (same -0x66120000 delta as the other oleaut32
-# probes above). TlsAlloc takes no args; EAX on return is the TLS index
-# (0xFFFFFFFF = TlsAlloc itself failed).
-def _tlsalloc_call_probe(eip, regs, memory, memory_size):
-    logger.error("com", "[tlsalloc-call] TlsAlloc()")
-cpu.add_logpoint(0x11001f47, _tlsalloc_call_probe)
-
-def _tlsalloc_return_probe(eip, regs, memory, memory_size):
+# 2026-08-28: FUN_7a85e7e1 (call site 0x7a8624fc inside FUN_7a862215) is
+# what FUN_7a862215 directly `return`s -- confirmed via decompile it's the
+# tail: `local_44 = FUN_7a85e7e1(...); ...; return local_44;`. Everything
+# in the node-compile chain before this point (FUN_7a8635de's self-lookup
+# + binding-resolve) is now confirmed clean for all 4 distinct queries
+# this run, including ours -- so this is where -3100 most likely actually
+# originates. Reading its REAL args at entry (not assuming param_2 ==
+# our node pointer just because a decompiled variable name suggests it).
+# 2026-08-28 (Molly's correction): FUN_7a85e7e1's own hardcoded early-exit
+# codes (0xbd8 = 3032) are in the 3xxx range, not -3100 -- so its own
+# fallback returns can't be the source of our observed -3100. The real
+# error value has to come from one of the two inner calls on its main
+# path: FUN_7a885bea(param_1,param_2) at call site 0x7a85e876, returning
+# to 0x7a85e87b (TEST EAX,EAX immediately after) -- probe that return
+# point directly for FUN_7a885bea's REAL return value, instead of
+# inferring it from the outer function's final result.
+# 2026-08-28: confirmed dead end -- neither of these ever fires for the
+# failing StockAssembly_SelectAPT call (FUN_7a862215/FUN_7a85e7e1 is never
+# entered at all; the real -3100 return site is 0x044d52be, several layers
+# below this, reached via the DAT_044e52a8 indirect call, not this chain).
+# Disabled to free logpoint slots.
+def _inner_call1_return_probe(eip, regs, memory, memory_size):
     eax = regs[EAX]
-    logger.error("com", f"[tlsalloc-return] index=0x{eax:x}{' (TLS_OUT_OF_INDEXES)' if eax == 0xFFFFFFFF else ''}")
-cpu.add_logpoint(0x11001f4d, _tlsalloc_return_probe)
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[inner-call1-return FUN_7a885bea] EAX=0x{eax & 0xffffffff:x} ({signed})")
+# cpu.add_logpoint(0x1701e87b, _inner_call1_return_probe)
+
+def _final_stage_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[final-stage-return] EAX=0x{eax & 0xffffffff:x} ({signed})")
+# cpu.add_logpoint(0x17022501, _final_stage_return_probe)
+
+# 2026-08-28: 0x044d52be (EAX=0xfffff3e4=-3100, live-confirmed) is the
+# return of the indirect CALL at 0x044d52b8 -- CALL DAT_044e52a8. Reading
+# full register state + the 6 pushed stack args + DAT_044e52a8's own raw
+# value (the actual resolved call target) right before that CALL executes,
+# for the failing call specifically.
+def _dat_044e52a8_call_site_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    target = _read32_raw(memory, memory_size, 0x044e52a8)
+    a0 = _read32_raw(memory, memory_size, esp + 0)
+    a1 = _read32_raw(memory, memory_size, esp + 4)
+    a2 = _read32_raw(memory, memory_size, esp + 8)
+    a3 = _read32_raw(memory, memory_size, esp + 12)
+    a4 = _read32_raw(memory, memory_size, esp + 16)
+    a5 = _read32_raw(memory, memory_size, esp + 20)
+    logger.error(
+        "com",
+        f"[dat-044e52a8-call-site] target=0x{target or 0:x} ESP=0x{esp:x} "
+        f"EAX=0x{regs[EAX]:x} EBX=0x{regs[EBX]:x} ECX=0x{regs[ECX]:x} "
+        f"EDX=0x{regs[EDX]:x} ESI=0x{regs[ESI]:x} EDI=0x{regs[EDI]:x} "
+        f"EBP=0x{regs[EBP]:x}",
+    )
+    logger.error(
+        "com",
+        f"[dat-044e52a8-call-site] args(local_4)=0x{a0 or 0:x} (0x44)=0x{a1 or 0:x} "
+        f"(puVar1)=0x{a2 or 0:x} (param_4)=0x{a3 or 0:x} (param_6)=0x{a4 or 0:x} "
+        f"(param_2)=0x{a5 or 0:x}",
+    )
+# cpu.add_logpoint(0x044d52b8, _dat_044e52a8_call_site_probe)  # 2026-08-28: confirmed stable target 0x17053ba6 + args across all 4 queries
+
+# 2026-08-28: FUN_7a893ba6 (confirmed live DAT_044e52a8 target) calls
+# FUN_7a89fd45 at call site 0x7a893bfa. Inside it: `if (param_3 == 0)
+# FUN_7a862215(...) else FUN_7a8a0d65(...)`. FUN_7a862215's return-site
+# never fired in any run, so the live path is likely the FUN_7a8a0d65
+# branch (param_3 != 0) -- verifying param_3 live instead of assuming.
+def _fun_7a89fd45_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p1 = _read32_raw(memory, memory_size, esp + 4)
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    p3 = _read32_raw(memory, memory_size, esp + 12)
+    p4 = _read32_raw(memory, memory_size, esp + 16)
+    logger.error(
+        "com",
+        f"[fun-7a89fd45-entry] param_1=0x{p1 or 0:x} param_2=0x{p2 or 0:x} "
+        f"param_3=0x{p3 or 0:x} param_4=0x{p4 or 0:x}",
+    )
+# cpu.add_logpoint(0x1759fd45, _fun_7a89fd45_entry_probe)  # 2026-08-28: confirmed 0 hits across all 4 queries
+
+# 2026-08-28: Ghidra's static call graph for FUN_7a893ba6 isn't trustworthy
+# (its own body includes disconnected far tail chunks at 0x7a8d6960+, same
+# pattern as FUN_7a85e7e1/FUN_7a89fd45) -- and its listed callee
+# FUN_7a89fd45 is confirmed never entered live. Live-stepping the real
+# function instead: entry, then the 3 TEST/JZ decision points right after
+# its first 3 calls (each TEST doubles as reading that call's real return
+# value), then a sanity probe right after the CALL at 0x7a893bfa (listed
+# callee FUN_7a89fd45) to independently confirm whether that call site
+# itself is ever reached at all (rules out a translation bug on our end
+# for the entry probe that just came back empty).
+# cpu.add_logpoint(0x17053ba6, _fun_7a893ba6_entry_probe)  # 2026-08-28: superseded -- went straight to the literal producer instead
+def _fun_7a893ba6_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p1 = _read32_raw(memory, memory_size, esp + 4)
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    logger.error("com", f"[fun-7a893ba6-entry] param_1=0x{p1 or 0:x} param_2=0x{p2 or 0:x}")
+
+# cpu.add_logpoint(0x17053bbf, _fun_7a893ba6_decision1_probe)
+def _fun_7a893ba6_decision1_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[fun-7a893ba6-decision1 (post FUN_7a848e20)] EAX=0x{eax & 0xffffffff:x} taken={eax == 0}")
+
+# cpu.add_logpoint(0x17053bd1, _fun_7a893ba6_decision2_probe)
+def _fun_7a893ba6_decision2_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[fun-7a893ba6-decision2 (post FUN_7a8536a6)] EAX=0x{eax & 0xffffffff:x} taken={eax == 0}")
+
+# cpu.add_logpoint(0x17053be0, _fun_7a893ba6_decision3_probe)
+def _fun_7a893ba6_decision3_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[fun-7a893ba6-decision3 (post FUN_7a85375e)] EAX=0x{eax & 0xffffffff:x} taken={eax == 0}")
+
+# cpu.add_logpoint(0x17053bff, _fun_7a893ba6_post_7a89fd45call_probe)
+def _fun_7a893ba6_post_7a89fd45call_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[fun-7a893ba6-post-fun7a89fd45-call] EAX=0x{eax & 0xffffffff:x} ({signed})")
+
+# 2026-08-28: found the literal producer via raw byte scan (Ghidra's
+# decompile/instruction-listing for FUN_7a8beaad was itself fragmented
+# with address gaps, same disconnected-tail issue). Exact bytes at
+# 0x7a8beb6e: B8 E4 F3 FF FF = MOV EAX,0xfffff3e4, right after
+# CALL FUN_7a854cd0 (args verified against the decompile's error-report
+# call: esi, [ebp-0x158], 0, 0, 0xffffe0bb, ...). This function shares its
+# caller's frame directly (unaff_EBP everywhere, no own prologue) so
+# EBP-relative reads here are real live values, not garbage. Reading the
+# token pointer at [EBP-0x158] (the string FUN_7a854cd0 reports as the
+# offending token) plus the surrounding offset fields.
+def _literal_producer_probe(eip, regs, memory, memory_size):
+    ebp = regs[EBP]
+    token_ptr = _read32_raw(memory, memory_size, ebp - 0x158)
+    token_text = _read_cstr_raw(memory, memory_size, token_ptr) if token_ptr else "<null>"
+    off14 = _read32_raw(memory, memory_size, ebp - 0x14)
+    off2c = _read32_raw(memory, memory_size, ebp - 0x2c)
+    off28 = _read32_raw(memory, memory_size, ebp - 0x28)
+    off30 = _read32_raw(memory, memory_size, ebp - 0x30)
+    off8 = _read32_raw(memory, memory_size, ebp - 8)
+    logger.error(
+        "com",
+        f"[literal-producer FUN_7a8beaad] EBP=0x{ebp:x} token_ptr=0x{token_ptr or 0:x} "
+        f"token_text={token_text!r} [ebp-0x14]=0x{off14 or 0:x} [ebp-0x2c]=0x{off2c or 0:x} "
+        f"[ebp-0x28]=0x{off28 or 0:x} [ebp-0x30](errflag)=0x{off30 or 0:x} [ebp-8]=0x{off8 or 0:x}",
+    )
+# cpu.add_logpoint(0x174beb6e, _literal_producer_probe)  # 2026-08-28: confirmed 0 hits -- not the live producer
+
+# 2026-08-28: Molly found 8 total sites in msjet35.dll that load the
+# 0xfffff3e4 (-3100) literal. 7a8beb6e (above) is confirmed dead. Testing
+# the next batch of candidates -- just need to know which EIP is actually
+# reached for the failing call, not decode each instruction's operands.
+def _make_literal_candidate_probe(label):
+    def _probe(eip, regs, memory, memory_size):
+        logger.error("com", f"[literal-candidate-hit] {label} EBP=0x{regs[EBP]:x} EIP=0x{eip:x}")
+    return _probe
+# cpu.add_logpoint(0x17026ed0, ...)  # 2026-08-28: ruled out -- FUN_7a869ced@7a8c6d6c is the live hit
+# cpu.add_logpoint(0x17066695, ...)  # ruled out
+# cpu.add_logpoint(0x17086d6c, _make_literal_candidate_probe(...))  # 2026-08-28: confirmed hit, superseded below
+
+# 2026-08-28: right before this (0x7a8c6d67), FUN_7a869ced calls
+# FUN_7a854cd0(param_1,param_2,(char*)param_3,(char*)0x0,0xffffe0bc,
+# local_c,local_8,local_10) -- local_10 is the real detailed Jet error
+# subcode from FUN_7a86756b's out-param (the specific *DAT_7a93aafc=0x27xx
+# site that fired inside that giant parser). Reading all 8 pushed cdecl
+# args at the call site itself (before CALL executes, so ESP is stable):
+# args pushed right-to-left means [esp+0]=param_1 ... [esp+0x1c]=local_10.
+def _fun_7a854cd0_callsite_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    vals = [_read32_raw(memory, memory_size, esp + i * 4) for i in range(8)]
+    names = ["param_1", "param_2", "param_3(token)", "0", "resid(0xffffe0bc)", "local_c", "local_8", "local_10(errcode)"]
+    parts = " ".join(f"{n}=0x{(v or 0):x}" for n, v in zip(names, vals))
+    logger.error("com", f"[fun-7a854cd0-callsite] {parts}")
+# cpu.add_logpoint(0x17086d67, _fun_7a854cd0_callsite_probe)  # 2026-08-28: confirmed errcode=0x2711
+# cpu.add_logpoint(0x1709d8c2, ...)  # ruled out
+# cpu.add_logpoint(0x170cc7a0, ...)  # ruled out
+
+# 2026-08-28: FUN_7a869ced is real, clean code (proper params, no unaff_
+# register garbage) -- calls the actual converter
+# FUN_7a86756b(iVar3,param_5,local_34,param_3,param_4,&local_10) and on
+# failure reports param_3 (the raw token bytes) via FUN_7a854cd0 before
+# returning -0xc1c. Reading param_3/param_4 (the real offending token +
+# length) live at entry, for the failing call specifically.
+def _fun_7a869ced_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    p3 = _read32_raw(memory, memory_size, esp + 12)
+    p4 = _read32_raw(memory, memory_size, esp + 16)
+    p2_text = _read_cstr_raw(memory, memory_size, p2) if p2 else "<null>"
+    p3_text = _read_cstr_raw(memory, memory_size, p3) if p3 else "<null>"
+    logger.error(
+        "com",
+        f"[fun-7a869ced-entry] param_2(ctx)=0x{p2 or 0:x} {p2_text!r} "
+        f"param_3(token)=0x{p3 or 0:x} {p3_text!r} param_4(len)=0x{p4 or 0:x}",
+    )
+# cpu.add_logpoint(0x17029ced, _fun_7a869ced_entry_probe)  # 2026-08-28: confirmed token text, no longer needed
+
+# 2026-08-28: FUN_7a8a7db3(param_1,param_2) is the actual date-literal
+# closing-'#'-scanner (case 0x23 in the tokenizer FUN_7a8685de) -- trivial
+# loop: scan forward from *param_1 for a '#' byte, fail with errcode=0x2711
+# if it reaches param_2 (end-of-buffer) first. The real stored SQL
+# (confirmed via mdbtools) clearly has a closing '#' right after "2010",
+# so either the scan starts from the wrong position or param_2 (the
+# boundary) is wrong. Reading both live, plus the text in between.
+def _fun_7a8a7db3_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p1_ptr = _read32_raw(memory, memory_size, esp + 4)
+    scan_start = _read32_raw(memory, memory_size, p1_ptr) if p1_ptr else None
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    remaining = (p2 - scan_start) if (scan_start and p2) else None
+    span_text = None
+    if scan_start and p2 and 0 < remaining < 200 and scan_start + remaining < memory_size:
+        n = min(remaining, 100)
+        span_text = "".join(
+            chr(b) if 32 <= b < 127 else f"\\x{b:02x}"
+            for b in (memory[scan_start + i] for i in range(n))
+        )
+    logger.error(
+        "com",
+        f"[fun-7a8a7db3-entry] scan_start=0x{scan_start or 0:x} param_2(end)=0x{p2 or 0:x} "
+        f"remaining_bytes={remaining} span={span_text!r}",
+    )
+# cpu.add_logpoint(0x17067db3, _fun_7a8a7db3_entry_probe)  # 2026-08-28: confirmed clean (found closing '#' fine)
+
+# 2026-08-28: Molly identified the real culprit -- real oleaut32.dll's own
+# VarDateFromStr (Ordinal #94, called from msjet35.dll @ 7a8a28a7) has a
+# conditional DBCS-reprocessing branch gated on *(int*)(local_10+0x8f0)!=0
+# (local_10 = a locale-info struct from FUN_77144da9). For real en-US
+# (lcid=0x409) this should be false/0 -- if it's somehow true, real
+# VarDateFromStr calls MultiByteToWideChar, a real kernel32 API tew
+# emulates via INT 0xFE (the "wide string functions we just added").
+# image_base=0x77120000 runtime_base=0x10000000 (confirmed via PE header).
+# Entry: read real lcid/dwFlags args. Decision point (0x7716dadb, right
+# after `MOV EAX,[EBP-0xC]` loads local_10, before `CMP [EAX+0x8F0],EBX`):
+# read EAX (local_10 ptr) and dereference [EAX+0x8F0] directly.
+# 2026-08-28: dbcs_branch_taken confirmed False, and zero GetLocaleInfoA/W
+# (or any kernel32 NLS) calls occur anywhere in this whole run -- so
+# VarDateFromStr's own state machine runs entirely on real code with no
+# tew intervention. Ruled that theory out. Next: verify the actual wide
+# BSTR content live -- if tew's earlier ANSI->wide BSTR construction for
+# this literal put anything wrong in memory (extra chars, bad length,
+# missing/misplaced null), real VarDateFromStr would legitimately fail on
+# genuinely bad input even though its own code is untouched.
+def _vardatefromstr_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    strin = _read32_raw(memory, memory_size, esp + 4)
+    lcid = _read32_raw(memory, memory_size, esp + 8)
+    dwflags = _read32_raw(memory, memory_size, esp + 12)
+    chars = []
+    if strin:
+        addr = strin
+        for _ in range(40):
+            b0 = memory[addr] if addr < memory_size else None
+            b1 = memory[addr + 1] if addr + 1 < memory_size else None
+            if b0 is None or b1 is None:
+                break
+            code = b0 | (b1 << 8)
+            if code == 0:
+                break
+            chars.append(chr(code) if 32 <= code < 127 else f"\\u{code:04x}")
+            addr += 2
+    wide_text = "".join(chars)
+    # BSTR length prefix lives at strin-4 (real OLE BSTR layout)
+    bstr_len = _read32_raw(memory, memory_size, strin - 4) if strin else None
+    logger.error(
+        "com",
+        f"[VarDateFromStr-entry] strIn=0x{strin or 0:x} lcid=0x{lcid or 0:x} dwFlags=0x{dwflags or 0:x} "
+        f"bstr_byte_len={bstr_len} wide_text={wide_text!r}",
+    )
+# cpu.add_logpoint(0x1004da97, _vardatefromstr_entry_probe)  # 2026-08-28: confirmed clean input, no longer needed
+
+# 2026-08-28: input is confirmed clean (bstr_byte_len=16, wide_text=
+# '1/1/2010', correct lcid/dwFlags). Need to know: does VarDateFromStr
+# itself actually return success or failure for this call? Its real
+# internal code uses FLD/FSTP (x87 FPU) for date-serial math near its
+# single RET (0x7716dfd7) -- if tew's FPU emulation has a subtle bug
+# (same shape as the DAO-3075 root cause: a CPU-instruction-emulation
+# bug, not a Jet logic bug), that's exactly where it'd surface.
+def _vardatefromstr_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[VarDateFromStr-return] EAX=0x{eax & 0xffffffff:x} ({signed})")
+# cpu.add_logpoint(0x1004dfd7, _vardatefromstr_return_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
+
+# 2026-08-28: VarDateFromStr confirmed to genuinely return
+# DISP_E_TYPEMISMATCH (0x80020005) on clean input with zero tew
+# involvement. Tracing its internal table-driven state machine to see
+# exactly where it rejects "1/1/2010" -- local_8 (state) at [EBP-4],
+# local_54 (token type from FUN_7716d562) at [EBP-0x50], both confirmed
+# via raw byte decode. Probing the computed jump at 0x7716dc6e (dispatches
+# on local_54, gated by local_8<=0xc) to trace each iteration.
+def _vardatefromstr_state_probe(eip, regs, memory, memory_size):
+    ebp = regs[EBP]
+    state = _read32_raw(memory, memory_size, ebp - 4)
+    token_type = _read32_raw(memory, memory_size, ebp - 0x50)
+    logger.error(
+        "com",
+        f"[VarDateFromStr-state] state(local_8)=0x{(state or 0) & 0xff:x} "
+        f"token_type(local_54)=0x{(token_type or 0) & 0xff:x}",
+    )
+# cpu.add_logpoint(0x1004dc6e, _vardatefromstr_state_probe)  # 2026-08-28: confirmed token_type=4 is correct, no longer needed
+
+# 2026-08-28: token_type=4 turned out to be CORRECT (number+separator
+# classification for "1/", per FUN_7716bde4's real logic) -- not a bug,
+# and the single probe hit doesn't mean immediate failure; later states
+# likely route through the specialized field-parser states (0xe-0x11,
+# calling FUN_7716c53f/c6ca/c85f/c8bf) which bypass this exact jump.
+# FUN_771357da is VarDateFromStr's own final validator, called only on a
+# clean finish (state==0, token_type==0, i.e. end-of-string reached
+# cleanly). If it never fires, the loop errored out mid-parse in one of
+# those field-parser states instead. Probing its entry for the real
+# accumulated UDATE fields (year/month/day/hour/min/sec) it receives.
+def _final_date_validator_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    udate_ptr = _read32_raw(memory, memory_size, esp + 4)
+    fields = None
+    if udate_ptr:
+        raw = [_read32_raw(memory, memory_size, udate_ptr + i * 4) for i in range(3)]
+        fields = raw
+    logger.error(
+        "com",
+        f"[FUN_771357da-entry (final date validator)] udate_ptr=0x{udate_ptr or 0:x} raw_dwords={fields}",
+    )
+# cpu.add_logpoint(0x100157da, _final_date_validator_entry_probe)  # 2026-08-28: confirmed never reached
+
+# 2026-08-28: parse dies mid-way after the first token (number+separator
+# "1/"), never reaching the final validator. The specialized field-parser
+# states (0xe-0x11 in VarDateFromStr's outer switch) call one of these 4
+# functions via a function pointer: FUN_7716c53f, FUN_7716c6ca,
+# FUN_7716c85f, FUN_7716c8bf -- each takes (&local_80,&local_3c,local_10,
+# dwFlags) and a 0 return means failure (goto switchD_7716dd8a_caseD_d).
+# Shared hit-probe: just need to know which one fires and its return.
+# 2026-08-28: FUN_7716c53f's own decompile shows `iVar3 =
+# *(int*)((int)param_3+0x10);` -- a 3-way switch (0/1/2) on the locale
+# struct's +0x10 field, matching real LOCALE_IDATE semantics (0=M/D/Y,
+# 1=D/M/Y, 2=Y/M/D). param_3 is local_10 (the locale struct), passed as
+# the 3rd call arg -- reading it directly + dereferencing +0x10 live.
+def _make_field_parser_probe(label, entry_addr):
+    def _entry(eip, regs, memory, memory_size):
+        esp = regs[ESP]
+        param1 = _read32_raw(memory, memory_size, esp + 4)  # &local_80 in VarDateFromStr
+        local_10 = _read32_raw(memory, memory_size, esp + 12)
+        date_order = _read32_raw(memory, memory_size, local_10 + 0x10) if local_10 else None
+        this_00_val = _read32_raw(memory, memory_size, param1 + 4) if param1 else None
+        this_val = _read32_raw(memory, memory_size, param1 + 8) if param1 else None
+        # 2026-08-28: Molly's request -- re-verify caltype(+0xd7e) and the
+        # date-separator string(+0x44) from the SAME local_10 instance, at
+        # the SAME instant, to settle whether the earlier "caltype=0 but
+        # separator works" observation was a real contradiction or just
+        # two facts pulled from different runs/instances.
+        caltype = _read16_raw(memory, memory_size, local_10 + 0xd7e) if local_10 else None
+        # 2026-08-28: Molly asked whether we're seeing a genuinely-tagged
+        # struct that failed to populate, or one that was never tagged at
+        # all -- reading the struct's own internal LCID field (+0x8, set
+        # via `*(LCID*)(this+8)=param_1;` in FUN_77145656) to settle it.
+        struct_lcid = _read32_raw(memory, memory_size, local_10 + 8) if local_10 else None
+        sep_chars = []
+        if local_10:
+            addr = local_10 + 0x44
+            for _ in range(8):
+                c = _read16_raw(memory, memory_size, addr)
+                if not c:
+                    break
+                sep_chars.append(chr(c) if 32 <= c < 127 else f"\\u{c:04x}")
+                addr += 2
+        sep_text = "".join(sep_chars)
+        logger.error(
+            "com",
+            f"[field-parser-entry] {label} EIP=0x{eip:x} local_10=0x{local_10 or 0:x} "
+            f"date_order(+0x10)={date_order} param3_slot_addr=0x{esp + 12:x} "
+            f"param1(&local_80)=0x{param1 or 0:x} this_00_addr=0x{(param1 or 0)+4:x} "
+            f"this_00_val=0x{this_00_val if this_00_val is not None else -1:x} "
+            f"this_addr=0x{(param1 or 0)+8:x} this_val=0x{this_val if this_val is not None else -1:x} "
+            f"caltype(+0xd7e)={caltype} date_sep(+0x44)={sep_text!r} "
+            f"struct_lcid(+0x8)=0x{struct_lcid if struct_lcid is not None else -1:x}",
+        )
+    return _entry
+# cpu.add_logpoint(0x1004c53f, _make_field_parser_probe("FUN_7716c53f", 0x1004c53f))  # 2026-08-28: root cause found upstream, freeing slot
+# cpu.add_logpoint(0x1004c6ca, ...)  # 2026-08-28: confirmed FUN_7716c53f is the one that fires, freeing these 3
+# cpu.add_logpoint(0x1004c85f, ...)
+# cpu.add_logpoint(0x1004c8bf, ...)
+
+# 2026-08-28: FUN_7716c53f fires, VarDateFromStr returns failure 1ms
+# later, nothing else in between -- but FUN_7716c53f's own decompile only
+# shows ONE visible RET (0x7716c600, the `return 0` failure path right
+# after XOR EAX,EAX); the success path is a disconnected tail elsewhere.
+# Simpler from the caller's side: VarDateFromStr reads the real return
+# value right after its indirect call (0x7716de91 CALL -> 0x7716de93
+# TEST EAX,EAX). Probing there directly settles success/failure cleanly.
+def _field_parser_callsite_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[field-parser-callsite-return] EAX=0x{eax & 0xffffffff:x} (0=failure)")
+# cpu.add_logpoint(0x1004de93, _field_parser_callsite_return_probe)  # 2026-08-28: confirmed succeeds both times, freeing slot
+
+# 2026-08-28: Molly wants 0x7716dd61 logged -- part of the `case 2: case
+# 4:` handling in the outer switch(local_8) (`if (local_54==2 ||
+# local_54==5) {...}`), a code path our one observed state transition
+# (state=0,token=4) doesn't obviously lead through. Checking live rather
+# than assuming it's unreached.
+def _addr_7716dd61_probe(eip, regs, memory, memory_size):
+    ebp = regs[EBP]
+    state = _read32_raw(memory, memory_size, ebp - 4)
+    token_type = _read32_raw(memory, memory_size, ebp - 0x50)
+    logger.error(
+        "com",
+        f"[addr-7716dd61] EIP=0x{eip:x} state(local_8)=0x{(state or 0) & 0xff:x} "
+        f"token_type(local_54)=0x{(token_type or 0) & 0xff:x} EAX=0x{regs[EAX]:x}",
+    )
+# cpu.add_logpoint(0x1004dd61, _addr_7716dd61_probe)  # 2026-08-28: confirmed unrelated to local_54, freeing slot
+
+def _read16_raw(memory, memory_size, addr):
+    addr &= 0xFFFFFFFF
+    if addr + 1 >= memory_size:
+        return None
+    return memory[addr] | (memory[addr + 1] << 8)
+
+def _addr_7716dd7d_probe(eip, regs, memory, memory_size):
+    ebp = regs[EBP]
+    state = _read32_raw(memory, memory_size, ebp - 4)
+    token_type = _read32_raw(memory, memory_size, ebp - 0x50)
+    # local_3c (UDATE.st) fields, offsets confirmed via raw byte decode of
+    # the init block at 0x7716dbf0-dc07 (matches real SYSTEMTIME layout,
+    # wDayOfWeek at -0x34 unwritten/skipped).
+    wyear = _read16_raw(memory, memory_size, ebp - 0x38)
+    wmonth = _read16_raw(memory, memory_size, ebp - 0x36)
+    wday = _read16_raw(memory, memory_size, ebp - 0x32)
+    whour = _read16_raw(memory, memory_size, ebp - 0x30)
+    wmin = _read16_raw(memory, memory_size, ebp - 0x2E)
+    wsec = _read16_raw(memory, memory_size, ebp - 0x2C)
+    logger.error(
+        "com",
+        f"[addr-7716dd7d] EIP=0x{eip:x} state(local_8)=0x{(state or 0) & 0xff:x} "
+        f"token_type(local_54)=0x{(token_type or 0) & 0xff:x} EAX=0x{regs[EAX]:x} "
+        f"udate: Y=0x{wyear if wyear is not None else -1:x} M=0x{wmonth if wmonth is not None else -1:x} "
+        f"D=0x{wday if wday is not None else -1:x} h=0x{whour if whour is not None else -1:x} "
+        f"m=0x{wmin if wmin is not None else -1:x} s=0x{wsec if wsec is not None else -1:x}",
+    )
+# cpu.add_logpoint(0x1004dd7d, _addr_7716dd7d_probe)  # 2026-08-28: state sequence well established, freeing slot
+
+# 2026-08-28: 0x7716dd7d is `CMP [EBP-4],0x16` (local_8 vs 0x16), followed
+# by JA at 0x7716dd81 -> target 0x7716dfc3 (rel32 0x23c, computed:
+# 0x7716dd87+0x23c). Fallthrough-on-not-taken lands at 0x7716dd87 (loads
+# EAX=local_8 for the real jump table at 0x7716dd8a). Probing both to
+# settle live whether JA is ever actually taken for our 4 observed states
+# (0,3,0xe,0xd -- all <=0x16, so it shouldn't be, but verifying not assuming).
+def _addr_7716dd87_probe(eip, regs, memory, memory_size):
+    state = _read32_raw(memory, memory_size, regs[EBP] - 4)
+    logger.error("com", f"[addr-7716dd87 (JA-not-taken)] state(local_8)=0x{(state or 0) & 0xff:x}")
+# cpu.add_logpoint(0x1004dd87, _addr_7716dd87_probe)  # 2026-08-28: confirmed pattern, freeing slot to stay under cap
+
+def _addr_7716dfc3_probe(eip, regs, memory, memory_size):
+    state = _read32_raw(memory, memory_size, regs[EBP] - 4)
+    logger.error("com", f"[addr-7716dfc3 (JA-taken, state>0x16)] state(local_8)=0x{(state or 0) & 0xff:x}")
+# cpu.add_logpoint(0x1004dfc3, _addr_7716dfc3_probe)  # 2026-08-28: confirmed shared default/fail handler, freeing slot
+
+def _addr_7716dc8e_probe(eip, regs, memory, memory_size):
+    state = _read32_raw(memory, memory_size, regs[EBP] - 4)
+    logger.error(
+        "com",
+        f"[addr-7716dc8e] state(local_8)=0x{(state or 0) & 0xff:x} "
+        f"EAX=0x{regs[EAX]:x} ECX=0x{regs[ECX]:x} EDX=0x{regs[EDX]:x}",
+    )
+# cpu.add_logpoint(0x1004dc8e, _addr_7716dc8e_probe)  # 2026-08-28: confirmed 0 hits, freeing slot
+
+# 2026-08-28: tracing where the "year"=0x101 value in local_3c actually
+# comes from -- FUN_77165b74 (called from FUN_7716c53f as `uVar4 =
+# FUN_77165b74(param_4)`) calls real GetLocalTime() unconditionally at
+# its top, and on the simple path just returns `local_14.wYear` raw.
+# tew's own GetLocalTime handler (_get_local_time in kernel32_io.py) is
+# completely silent (no logger call at all) so grepping the log for it
+# proves nothing -- probing FUN_77165b74's real entry+return directly.
+def _fun_77165b74_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p1 = _read32_raw(memory, memory_size, esp + 4)
+    logger.error("com", f"[FUN_77165b74-entry] param_1(flags byte)=0x{(p1 or 0) & 0xff:x}")
+# cpu.add_logpoint(0x10045b74, _fun_77165b74_entry_probe)  # 2026-08-28: confirmed param_1=0, freeing slot
+
+def _fun_77165b74_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[FUN_77165b74-return] EAX(year)=0x{eax & 0xffffffff:x} ({eax & 0xffff})")
+# cpu.add_logpoint(0x10045c05, _fun_77165b74_return_probe)  # 2026-08-28: confirmed correct (2026), freeing slot
+
+# 2026-08-28: FUN_77165b74 confirmed returns the CORRECT year (0x7ea=2026)
+# but the value written into local_3c via FUN_7716c455 is 0x101. The
+# corruption happens somewhere between those two points, inside
+# FUN_7716c53f. Reading the real pushed args directly at the CALL site
+# (0x7716c6b8) settles it -- cdecl right-to-left push means at the CALL
+# instruction: [esp+0]=local_3c ptr, [esp+4]=uVar1(year), [esp+8]=
+# this_00(month), [esp+12]=uVar6(day).
+def _fun_7716c455_callsite_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    dst = _read32_raw(memory, memory_size, esp + 0)
+    year = _read32_raw(memory, memory_size, esp + 4)
+    month = _read32_raw(memory, memory_size, esp + 8)
+    day = _read32_raw(memory, memory_size, esp + 12)
+    logger.error(
+        "com",
+        f"[fun-7716c455-callsite] dst=0x{dst or 0:x} year=0x{(year or 0) & 0xffff:x} "
+        f"month=0x{(month or 0) & 0xffff:x} day=0x{(day or 0) & 0xffff:x}",
+    )
+# cpu.add_logpoint(0x1004c6b8, _fun_7716c455_callsite_probe)  # 2026-08-28: root cause found upstream, freeing slot
+
+# 2026-08-28: 0x7713ceec is `CMP dword[0x771a1030],0` inside FUN_7713cee1
+# -- falling through (JNZ not taken) goes straight to real GetLocaleInfoW
+# (CALL [0x77121160]); taken jumps to the GetLocaleInfoA path instead.
+# Reading DAT_771a1030's live value directly to confirm which branch,
+# rather than infer it.
+def _addr_7713ceec_probe(eip, regs, memory, memory_size):
+    val = _read32_raw(memory, memory_size, 0x10081030)
+    logger.error("com", f"[addr-7713ceec] DAT_771a1030=0x{val if val is not None else -1:x} (0=WideChar path, nonzero=Ansi path)")
+# cpu.add_logpoint(0x1001ceec, _addr_7713ceec_probe)  # 2026-08-29: GetLocaleInfoW confirmed fixed, freeing slot
+
+# 2026-08-28: two more reads of [EBP+0x10] (the uVar4/year spill slot)
+# found in the raw bytes between the date_order==0 branch (0x7716c644)
+# and the FUN_7716c455 call: `MOV EBX,[EBP+0x10]` at 0x7716c675, and
+# `PUSH [EBP+0x10]` at 0x7716c687. Watchpoint confirmed no WRITE happens
+# to this address between the correct spill and the corrupted use, so if
+# corruption exists it must show up in one of these READS. Probing both
+# live rather than trust the (possibly incomplete, same pattern as
+# FUN_7716c3a5's real signature elsewhere) decompile.
+def _addr_7716c675_probe(eip, regs, memory, memory_size):
+    ebx = regs[EBX]
+    logger.error("com", f"[addr-7716c675 (MOV EBX,[EBP+0x10])] EBX(after)=0x{ebx:x}")
+# cpu.add_logpoint(0x1004c678, _addr_7716c675_probe)  # 2026-08-28: confirmed 0 hits, path not taken -- freeing slot
+
+def _addr_7716c687_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    top_of_stack = _read32_raw(memory, memory_size, esp)
+    logger.error("com", f"[addr-7716c687 (PUSH [EBP+0x10])] value_pushed=0x{top_of_stack or 0:x}")
+# cpu.add_logpoint(0x1004c68a, _addr_7716c687_probe)  # 2026-08-28: confirmed 0 hits, path not taken -- freeing slot
+
+# 2026-08-28: neither prior guess about the branch path panned out --
+# instrumenting the real decision points directly instead of tracing
+# static bytes further. Two conditional jumps, each preceded by
+# TEST EAX,EAX (reading the just-called FUN_7716c3a5-style helper's
+# result): 0x7716c65f (JNZ -> 0x7716c5b9, after the FIRST helper call
+# using "this"/EDI) and 0x7716c681 (JZ -> 0x7716c68c, after the SECOND
+# helper call). Probing both to see live which way each actually goes.
+def _addr_7716c65f_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[addr-7716c65f (JNZ after 1st helper)] EAX=0x{eax:x} taken={eax != 0}")
+# cpu.add_logpoint(0x1004c65f, _addr_7716c65f_probe)  # 2026-08-28: confirmed not taken, freeing slot
+
+def _addr_7716c681_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[addr-7716c681 (JZ after 2nd helper)] EAX=0x{eax:x} taken={eax == 0}")
+# cpu.add_logpoint(0x1004c681, _addr_7716c681_probe)  # 2026-08-28: confirmed 0 hits, freeing slot
+
+# 2026-08-28: found the real shortcut -- 0x7716c697-c69d:
+# `PUSH 1; PUSH EDI; PUSH [EBP-4]; JMP 0x7716c6b5` lands right at the
+# FUN_7716c455 arg-push site. [EBP-4] is set way earlier at 0x7716c57d
+# (`MOV [EBP-4],EAX`, right after the SECOND FUN_7716c47d call) --
+# matching a DIFFERENT `uVar1=(undefined2)iVar3` assignment in the
+# decompile than the GetLocalTime-derived one. FUN_77165b74's correct
+# 2026 may just be dead/unused on this branch. Confirming live.
+def _addr_7716c580_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[addr-7716c580 (MOV [EBP-4],EAX after 2nd FUN_7716c47d)] EAX=0x{eax:x}")
+# cpu.add_logpoint(0x1004c580, _addr_7716c580_probe)  # 2026-08-28: confirmed matches c575's input, freeing slot
+
+# 2026-08-28: FUN_7716c47d is __thiscall(this=ECX) with an IMPLICIT
+# in_EAX input (Ghidra's "in_EAX" convention -- the real value comes from
+# whatever's in EAX at entry, set by the caller's `MOV EAX,EBX` at
+# 0x7716c571 right before this call, `MOV ECX,ESI` at 0x7716c573). this=
+# the locale struct. Checking Molly's locale hypothesis directly: read
+# EAX (the real input) and ECX (locale struct ptr), then dereference its
+# +0xd7e (calendar-type short) and +0xd78 (cached "current year" short)
+# fields -- these drive the century-windowing/calendar-conversion logic.
+def _addr_7716c575_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    ecx = regs[ECX]
+    caltype = _read16_raw(memory, memory_size, ecx + 0xd7e) if ecx else None
+    cached_year = _read16_raw(memory, memory_size, ecx + 0xd78) if ecx else None
+    logger.error(
+        "com",
+        f"[addr-7716c575 (call FUN_7716c47d)] in_EAX=0x{eax:x} this(locale)=0x{ecx:x} "
+        f"caltype(+0xd7e)={caltype} cached_year(+0xd78)={cached_year}",
+    )
+# cpu.add_logpoint(0x1004c575, _addr_7716c575_probe)  # 2026-08-28: confirmed input already 0x1010101, freeing slot
+
+# 2026-08-28: EBX gets loaded at 0x7716c54e (`MOV EBX,[ESI+8]` = "this",
+# decompile's *(param_1+8)) BEFORE the first FUN_7716c47d call at
+# 0x7716c560 -- but it's read again at 0x7716c571 (`MOV EAX,EBX`) AFTER
+# that call. If FUN_7716c47d doesn't preserve EBX properly, that's where
+# 1 could become 0x01010101. Checking the value right at the load, before
+# any call has a chance to touch it.
+def _addr_7716c551_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[addr-7716c551 (MOV EBX,[ESI+8]='this', pre-call)] EBX=0x{regs[EBX]:x}")
+# cpu.add_logpoint(0x1004c551, _addr_7716c551_probe)  # 2026-08-28: confirmed already-corrupted pre-call, freeing slot
+
+# 2026-08-28: FUN_7716cb38 is the real digit-string-to-integer converter
+# (`*param_3=iVar4; return 0;` at its single RET, 0x7716ce5a). Its own
+# logic looks completely correct for a simple "1" input. Checking live
+# whether IT already produces 0x01010101 (meaning the bug is inside this
+# function or its own execution) or a clean 1 (meaning the bug is in the
+# copy-into-accumulator step in FUN_7716d562 right after this returns).
+_cb38_last_param3 = [None]
+def _fun_7716cb38_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    p2 = _read32_raw(memory, memory_size, esp + 8)
+    p3 = _read32_raw(memory, memory_size, esp + 12)
+    _cb38_last_param3[0] = p3
+    text = _read_cstr_raw(memory, memory_size, p2) if p2 else "<null>"
+    logger.error(
+        "com",
+        f"[FUN_7716cb38-entry] param_2(digits)=0x{p2 or 0:x} text={text!r} param_3(out)=0x{p3 or 0:x}",
+    )
+# cpu.add_logpoint(0x1004cb38, _fun_7716cb38_entry_probe)  # 2026-08-28: confirmed correct, freeing slot
+
+def _fun_7716cb38_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    p3 = _cb38_last_param3[0]
+    out_val = _read32_raw(memory, memory_size, p3) if p3 else None
+    logger.error(
+        "com",
+        f"[FUN_7716cb38-return] EAX(hresult)=0x{eax:x} *param_3(computed int)=0x{out_val if out_val is not None else -1:x}",
+    )
+# cpu.add_logpoint(0x1004ce5a, _fun_7716cb38_return_probe)  # 2026-08-28: confirmed correct, freeing slot
+
+# 2026-08-28: Molly wants FUN_77145656's real live params -- it's
+# __thiscall, so `this` arrives in ECX at entry; param_1/2/3 (lcid,
+# flags, passthrough) are pushed on the stack normally (esp+4/+8/+12 at
+# entry, before this function's own prologue runs).
+def _fun_77145656_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    this_ptr = regs[ECX]
+    p1_lcid = _read32_raw(memory, memory_size, esp + 4)
+    p2_flags = _read32_raw(memory, memory_size, esp + 8)
+    p3 = _read32_raw(memory, memory_size, esp + 12)
+    logger.error(
+        "com",
+        f"[FUN_77145656-entry] this=0x{this_ptr:x} lcid=0x{p1_lcid or 0:x} "
+        f"flags=0x{p2_flags or 0:x} param_3=0x{p3 or 0:x}",
+    )
+# cpu.add_logpoint(0x10025656, _fun_77145656_entry_probe)  # 2026-08-29: GetLocaleInfoW/VarDateFromStr confirmed fixed, freeing slot
+
+# 2026-08-28: Molly wants absolute proof, not inference -- probing
+# FUN_7713cee1's own entry directly (the function that unconditionally
+# calls real GetLocaleInfoW/GetLocaleInfoA at its very top, no early-out
+# before that call). If this NEVER fires, it's definitive: nothing in
+# FUN_77145656 ever reaches even the first real locale-info query.
+def _fun_7713cee1_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    lcid = _read32_raw(memory, memory_size, esp + 4)
+    lctype = _read32_raw(memory, memory_size, esp + 8)
+    logger.error("com", f"[FUN_7713cee1-entry] lcid=0x{lcid or 0:x} lctype=0x{lctype or 0:x}")
+# cpu.add_logpoint(0x1001cee1, _fun_7713cee1_entry_probe)  # 2026-08-29: GetLocaleInfoW confirmed fixed, freeing slot
+# cpu.add_logpoint(0x1004dd7d, _addr_7716dd7d_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
+
+def _read_wstr_raw(memory, memory_size, addr, max_len=40):
+    if not addr or addr + max_len * 2 >= memory_size:
+        return "<invalid>"
+    out = []
+    for i in range(max_len):
+        c = _read16_raw(memory, memory_size, addr + i * 2)
+        if not c:
+            break
+        out.append(chr(c) if 32 <= c < 127 else f"\\u{c:04x}")
+    return "".join(out)
+
+# 2026-08-29: FUN_7716d2ff's decompile is unreliable -- it reads a locale-
+# struct pointer through `unaff_EBX`, a register Ghidra hasn't attached to
+# any real parameter (the same VC6 register-calling-convention blind spot
+# hit repeatedly this session), and its caller (FUN_7716d562) is decompiled
+# passing 3 explicit stack args while the callee only declares 2 + an
+# implicit `this` -- a caller/callee mismatch that means the real register/
+# stack mapping can't be trusted from decompile alone. Reading raw
+# registers and the tokenizer's current-position pointer live at entry,
+# before anything gets clobbered, to see what's actually being classified
+# on each of the two token==4 calls (VarDateFromStr's second token, "/",
+# is the one in question -- state 3, token_type=4).
+def _fun_7716d2ff_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    ecx = regs[ECX]
+    ebx = regs[EBX]
+    edx = regs[EDX]
+    p_esp4 = _read32_raw(memory, memory_size, esp + 4)
+    p_esp8 = _read32_raw(memory, memory_size, esp + 8)
+    p_esp12 = _read32_raw(memory, memory_size, esp + 12)
+    # local_58 in the tokenizer (FUN_7716d562) holds the current text
+    # pointer being classified -- try every plausible register/stack slot
+    # as a guest pointer and preview what's there as a wide string.
+    # One extra level of indirection: the decompile shows `local_58 =
+    # *param_1` at entry -- param_1 is a pointer TO the real text pointer,
+    # not the text pointer itself, so [ESP+4]/[ESP+8] need to be
+    # dereferenced once more before treating them as string addresses.
+    esp4_deref = _read32_raw(memory, memory_size, p_esp4) if p_esp4 else None
+    esp8_deref = _read32_raw(memory, memory_size, p_esp8) if p_esp8 else None
+    previews = {
+        "ecx": _read_wstr_raw(memory, memory_size, ecx),
+        "ecx_deref": _read_wstr_raw(memory, memory_size, _read32_raw(memory, memory_size, ecx) or 0),
+        "ebx": _read_wstr_raw(memory, memory_size, ebx),
+        "esp4_deref": _read_wstr_raw(memory, memory_size, esp4_deref or 0),
+        "esp8_deref": _read_wstr_raw(memory, memory_size, esp8_deref or 0),
+    }
+    logger.error(
+        "com",
+        f"[FUN_7716d2ff-entry] EIP=0x{eip:x} ECX=0x{ecx:x} EBX=0x{ebx:x} EDX=0x{edx:x} "
+        f"[ESP+4]=0x{p_esp4 or 0:x} [ESP+8]=0x{p_esp8 or 0:x} [ESP+12]=0x{p_esp12 or 0:x} "
+        f"previews={previews!r}",
+    )
+# cpu.add_logpoint(0x1004d2ff, _fun_7716d2ff_entry_probe)  # 2026-08-29: confirmed EAX always 0 (never matches) -- red herring, freeing slot
+
+# 2026-08-29: FUN_7716d2ff is decompiled as void, but its caller
+# (FUN_7716d562) treats its result as an int (`iVar4 = FUN_7716d2ff(...)`,
+# compared against 1/2/3) -- the same "Ghidra loses the real EAX through a
+# branch" blind spot already confirmed for FUN_77121505/FUN_7713cee1 this
+# session. Call site confirmed via dump_bytes: CALL at 0x7716d6c2 (E8 38 FC
+# FF FF, 5 bytes) targets 0x7716d2ff, so the return address -- where the
+# real EAX value lands -- is 0x7716d6c2+5 = 0x7716d6c7 (runtime 0x1004d6c7).
+# 0x82bdf88 is the live-confirmed address of the OUT slot (&local_50,
+# passed via ECX/`this`) for this specific run -- hardcoded here as a
+# diagnostic-only convenience since it's stable across all 3 calls within
+# one VarDateFromStr invocation's stack frame, not a general offset.
+def _fun_7716d2ff_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    out_val = _read32_raw(memory, memory_size, 0x082bdf88)
+    out_preview = _read_wstr_raw(memory, memory_size, out_val or 0) if out_val and out_val < 0x80000000 else None
+    logger.error(
+        "com",
+        f"[FUN_7716d2ff-return] EIP=0x{eip:x} EAX=0x{eax:x} ({eax if eax < 0x80000000 else eax - 0x100000000}) "
+        f"*local_50=0x{out_val or 0:x} preview={out_preview!r}",
+    )
+# cpu.add_logpoint(0x1004d6c7, _fun_7716d2ff_return_probe)  # 2026-08-29: confirmed EAX always 0, freeing slot
+
+# 2026-08-29: FUN_7716d2ff ruled out (always returns 0, never matches --
+# every token falls through to the SAME generic digit-classification code
+# regardless of digit count). The real divergence between "1" (call 1&2,
+# classified type 4) and "2010" (call 3, stays unclassified sentinel 0xb)
+# must be in FUN_7716bde4 -- called once per digit-run at the single call
+# site 0x7716d99b (confirmed via dump_bytes: `PUSH EAX; MOV EAX,EBX; CALL`
+# -- EBX, the locale-struct pointer, is deliberately moved into EAX right
+# before the call, matching Ghidra's `in_EAX` in the callee; not a stray
+# register). Return address after the 5-byte CALL is 0x7716d9a0. Per
+# decompile, param_1 (&local_50) points at the position right AFTER the
+# just-collected digit run -- for "2010" (the last token), that should be
+# the string's null terminator, which the decompile's own first branch
+# (`if (*pWVar5 == L'\0') { local_8 = 1; ...}`) would classify as return
+# value 1 (not the observed 0xb sentinel) -- checking live whether that's
+# really what happens, or whether Ghidra's `in_EAX` claim breaks down here
+# too.
+def _fun_7716bde4_entry_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    esp = regs[ESP]
+    p_param1 = _read32_raw(memory, memory_size, esp + 4)
+    p_param2 = _read32_raw(memory, memory_size, esp + 8)
+    text_ptr = _read32_raw(memory, memory_size, p_param1) if p_param1 else None
+    # 2026-08-29: dumping raw WCHARs starting 8 bytes (4 WCHARs) BEFORE
+    # text_ptr too -- if this is the "2010" overshoot call, this range
+    # covers the real null terminator's expected position and the 2 extra
+    # WCHARs the digit-loop wrongly consumed past it, regardless of how
+    # classify_ctype1/GetStringTypeExW interpreted them.
+    raw_wchars = []
+    if text_ptr:
+        for off in range(-8, 6, 2):
+            v = _read16_raw(memory, memory_size, text_ptr + off)
+            raw_wchars.append(f"{off:+d}:0x{v if v is not None else -1:04x}")
+    logger.error(
+        "com",
+        f"[FUN_7716bde4-entry] EIP=0x{eip:x} in_EAX=0x{eax:x} [ESP+4](param_1)=0x{p_param1 or 0:x} "
+        f"[ESP+8](param_2)=0x{p_param2 or 0:x} *param_1(text_ptr)=0x{text_ptr or 0:x} "
+        f"preview={_read_wstr_raw(memory, memory_size, text_ptr or 0)!r} raw={' '.join(raw_wchars)}",
+    )
+# cpu.add_logpoint(0x1004bde4, _fun_7716bde4_entry_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
+
+def _fun_7716bde4_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    logger.error("com", f"[FUN_7716bde4-return] EIP=0x{eip:x} EAX(local_8)=0x{eax:x} ({eax})")
+# cpu.add_logpoint(0x1004d9a0, _fun_7716bde4_return_probe)  # 2026-08-29: VarDateFromStr confirmed fixed, freeing slot for EIP=0x1901d9eb investigation
+
+# 2026-08-29: EIP=0x1901d9eb SEH fault (expsrv.dll+0x1d9eb) -- CALL [EAX+0xC]
+# faults because *param_2 (should be a vtable pointer) is 0x1. Traced back
+# through FUN_0f9dd9a7 (crash site, tew addr 0x1901d9a7) <- FUN_0f9dd3d9
+# (call site tew addr 0x1901d418, passes its own param_3 through unchanged)
+# <- constructor FUN_0f9ddd11 (tew addr 0x1901dd11), which unconditionally
+# sets *param_1 = &UNK_0fa041c0 (RVA 0x401c0 -> tew addr 0x190401c0) -- a
+# fixed, non-instance-dependent vtable pointer (not real per-activation COM,
+# just a private C++-vtable singleton: _DAT_0fa10044 stores the one
+# instance). Since the constructor is unconditional, the ONLY legitimate
+# value the object's first DWORD can ever hold is 0x190401c0 -- so instead
+# of needing to learn "what should be there" from a live run, we already
+# know it and just need to catch the write that clobbers it (or confirm
+# the constructor never ran for this instance). Native watchpoint is
+# single-slot and normally needs TEW_WATCH_ADDR known in advance from a
+# prior run (see below) -- setting it dynamically here from the
+# constructor's own entry avoids needing two runs.
+def _fun_0f9ddd11_ctor_entry_probe(eip, regs, memory, memory_size):
+    obj_ptr = regs[ECX]  # __fastcall: param_1 in ECX
+    logger.error("com", f"[FUN_0f9ddd11-ctor] constructed object @ 0x{obj_ptr:x} -- arming watchpoint on its vtable slot")
+    global _tew_watch_addr_int
+    _tew_watch_addr_int = obj_ptr
+    cpu.set_watchpoint(obj_ptr)
+cpu.add_logpoint(0x1901dd11, _fun_0f9ddd11_ctor_entry_probe)
+
+# 2026-08-29: watchpoint above confirmed the singleton (constructed once,
+# vtable never clobbered afterward) is NOT the crashing object. Traced the
+# crash's own EBP chain frame[1] (MSJET35.DLL+0x61d87) to FUN_7a8a1c78
+# (tew addr 0x17061c78), whose call at tew addr 0x17061d84 --
+# `(**(code**)(*local_210+0x24))(local_210,*param_4,uVar6,param_3,local_1e0,
+# local_22c)` -- passes local_210 (the singleton, confirmed fine) but
+# `uVar6` as the 3rd arg, which becomes FUN_0f9dd3d9's crashing param_3.
+# uVar6 is either param_4[3] directly, or *(local_218 + param_4[3]*0x1c) --
+# a lookup into a per-connection table (local_218, aka Molly's "s1" --
+# believed to be the locale table) indexed by param_4[3]. Probing the call
+# site itself (args already pushed, call not yet executed) to see which
+# branch fires and what's actually in that table slot. Args pushed
+# right-to-left so at this EIP: [ESP+0]=local_210 [ESP+4]=*param_4
+# [ESP+8]=uVar6(crashing obj) [ESP+12]=param_3 [ESP+16]=local_1e0
+# [ESP+20]=local_22c.
+#
+# First attempt read param_1/param_4 via [EBP+8]/[EBP+0x14] (standard cdecl
+# frame) and got garbage (param_1 came back as a thread-stack address) --
+# FUN_7a8a1c78's own first instruction is a plain MOV, not PUSH EBP, so it
+# never establishes that frame; EBP at the callsite still belongs to
+# whatever caller last set it up. Fixed by capturing param_4 at the
+# function's TRUE entry instead, via ESP (always correct regardless of
+# whether the callee ever sets up EBP): at entry, before any prologue runs,
+# [ESP+0]=retaddr [ESP+4]=param_1 [ESP+8]=param_2 [ESP+0xc]=param_3
+# [ESP+0x10]=param_4.
+_fun_7a8a1c78_args = [None, None, None, None]  # param_1..param_4, from true entry
+def _fun_7a8a1c78_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    _fun_7a8a1c78_args[0] = _read32_raw(memory, memory_size, esp + 4)
+    _fun_7a8a1c78_args[1] = _read32_raw(memory, memory_size, esp + 8)
+    _fun_7a8a1c78_args[2] = _read32_raw(memory, memory_size, esp + 0xc)
+    _fun_7a8a1c78_args[3] = _read32_raw(memory, memory_size, esp + 0x10)
+cpu.add_logpoint(0x17061c78, _fun_7a8a1c78_entry_probe)
+
+_PTR_7A9362C0_TEW = 0x170F62C0  # msjet35.dll+0xF62C0 -- a POINTER variable (Molly's
+# analysis names it PTR_7a9362c0, not DAT_), so it must be read once to get
+# the real table-of-tables base before adding the per-connection offset --
+# the less-analyzed decompile this probe was drafted from inlined that
+# dereference away (`DAT_7a9362c0 + local_214 + 0x6d8`), which would have
+# been silently wrong (one dereference short).
+def _fun_7a8a1c78_callsite_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    param_1 = _fun_7a8a1c78_args[0]
+    param_4_ptr = _fun_7a8a1c78_args[3]
+    param_4_2 = _read32_raw(memory, memory_size, param_4_ptr + 8) if param_4_ptr else None
+    param_4_3 = _read32_raw(memory, memory_size, param_4_ptr + 0xc) if param_4_ptr else None
+    this_obj = _read32_raw(memory, memory_size, esp)
+    crashing_obj = _read32_raw(memory, memory_size, esp + 8)
+    crashing_obj_vtable = _read32_raw(memory, memory_size, crashing_obj) if crashing_obj else None
+    table_entry = None
+    table_base = None
+    if param_4_2 == 0 and param_1 is not None and param_4_3 is not None:
+        local_214 = (param_1 * 0x708) & 0xFFFFFFFF
+        table_of_tables_base = _read32_raw(memory, memory_size, _PTR_7A9362C0_TEW)
+        table_base_ptr = (
+            _read32_raw(memory, memory_size, (table_of_tables_base + local_214 + 0x6d8) & 0xFFFFFFFF)
+            if table_of_tables_base else None
+        )
+        if table_base_ptr:
+            table_base = table_base_ptr
+            table_entry = _read32_raw(memory, memory_size, (table_base_ptr + param_4_3 * 0x1c) & 0xFFFFFFFF)
+    logger.error(
+        "com",
+        f"[FUN_7a8a1c78-callsite] param_1=0x{param_1 or 0:x} "
+        f"param_4=0x{param_4_ptr or 0:x} param_4[2]={param_4_2} param_4[3]={param_4_3} "
+        f"this_obj=0x{this_obj or 0:x} crashing_obj=0x{crashing_obj or 0:x} "
+        f"crashing_obj_vtable=0x{crashing_obj_vtable or 0:x} "
+        f"locale_table_base=0x{table_base or 0:x} locale_table_entry=0x{table_entry or 0:x}",
+    )
+cpu.add_logpoint(0x17061d84, _fun_7a8a1c78_callsite_probe)
+
+# 2026-08-28: FUN_7a852ef4 (call site 0x7a86388f inside FUN_7a8635de) is
+# the real "Tables" catalog lookup by name for THIS invocation's node's
+# table-name pointer (param_2[0x1e], offset 0x78 in the node dump above).
+# First pass hardcoded this run's specific pointer value, which only
+# happened to be right for the failing call and read stale/wrong memory
+# for the other three -- reading it fresh from _last_node_ptr (set by the
+# paired entry probe for THIS SAME invocation) instead, per the DAO-3075
+# lesson: match by actual content at each hop, don't assume a value stays
+# constant across different invocations.
+def _table_lookup_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    node_ptr = _last_node_ptr[0]
+    name_ptr = _read32_raw(memory, memory_size, node_ptr + 0x78) if node_ptr else None
+    ansi = _read_cstr_raw(memory, memory_size, name_ptr, max_len=64) if name_ptr else "<no node>"
+    wide = "<no node>"
+    if name_ptr:
+        base_addr = ctypes.cast(memory, ctypes.c_void_p).value
+        wide_raw = ctypes.string_at(base_addr + name_ptr, 64)
+        wide = wide_raw.decode("utf-16-le", errors="replace").split("\x00")[0]
+    logger.error(
+        "com",
+        f"[table-lookup-return] EAX=0x{eax & 0xffffffff:x} ({signed}) node=0x{node_ptr or 0:x} "
+        f"name_ptr=0x{name_ptr or 0:x} name_as_ansi={ansi!r} name_as_wide={wide!r}",
+    )
+# 2026-08-28: confirmed clean/universal for all queries -- disabled.
+# cpu.add_logpoint(0x17023894, _table_lookup_return_probe)
+
+# 2026-08-28: the table-name self-lookup just above is confirmed normal/
+# universal (identical for all 4 distinct queries this run, all succeed).
+# Next real step in FUN_7a8635de: FUN_7a85308c (call site 0x7a8638c8),
+# whose own return code (iVar5) triggers an immediate abort if negative,
+# and whose out-param (local_28) feeds the "(local_28 & 0xd0) == 0" error
+# check right after. Capturing iVar5 first -- a negative value here alone
+# would already explain everything, no need to chase local_28 yet.
+def _resolve_binding_return_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    node_ptr = _last_node_ptr[0]
+    logger.error(
+        "com",
+        f"[resolve-binding-return] node=0x{node_ptr or 0:x} EAX=0x{eax & 0xffffffff:x} ({signed})",
+    )
+# 2026-08-28: confirmed clean/universal for all queries -- disabled.
+# cpu.add_logpoint(0x170238cd, _resolve_binding_return_probe)
+
+# 2026-08-28: FUN_044e2b5c is dao350.dll's own custom free-list
+# sub-allocator (param_1 = pool object, param_2 = requested size). Neither
+# of FUN_044d525b's two dynamically-bound-lookup branches fired for the
+# failing StockAssembly_SelectAPT call, meaning this allocator itself
+# returned NULL for the request (0x44 bytes) -- the two ways that happens:
+# (a) param_2 > param_1[8] (pool's configured max size) -- an immediate
+# early-exit before any real allocation work, or (b) the free-list has no
+# suitable block and the pool's outer chunk source (FUN_044e2b10 or an
+# indirect vtable call through *param_1) itself returns NULL. Reading the
+# pool object's own fields at entry to see which.
+def _pool_allocator_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    param_1 = _read32_raw(memory, memory_size, esp + 4)
+    param_2 = _read32_raw(memory, memory_size, esp + 8)
+    if not param_1:
+        logger.error("com", f"[pool-alloc-entry] param_1=NULL param_2={param_2}")
+        return
+    p3 = _read32_raw(memory, memory_size, param_1 + 0xc)
+    p4 = _read32_raw(memory, memory_size, param_1 + 0x10)
+    p6 = _read32_raw(memory, memory_size, param_1 + 0x18)
+    p7 = _read32_raw(memory, memory_size, param_1 + 0x1c)
+    p8 = _read32_raw(memory, memory_size, param_1 + 0x20)
+    p9 = _read32_raw(memory, memory_size, param_1 + 0x24)
+    logger.error(
+        "com",
+        f"[pool-alloc-entry] pool=0x{param_1:x} size_req={param_2} "
+        f"[3]=0x{p3 or 0:x} [4](freelist)=0x{p4 or 0:x} [6]=0x{p6 or 0:x} "
+        f"[7]=0x{p7 or 0:x} [8](maxsize)=0x{p8 or 0:x} [9]=0x{p9 or 0:x}",
+    )
+# 2026-08-28: confirmed the pool allocator succeeds (EAX=0x7309c4c, a real
+# pointer) -- disabled entry+return probes to free logpoint slots.
+# cpu.add_logpoint(0x044e2b5c, _pool_allocator_entry_probe)
+
+# Entry alone doesn't say success/failure -- the pool keeps serving many
+# more allocations right after ours in the log, which cuts against "the
+# allocator itself is broken." Reading its real return value directly at
+# the instruction right after its CALL site inside FUN_044d525b (0x044d526c
+# + 5-byte E8 rel32 = 0x044d5271) to settle it.
+def _pool_allocator_return_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[pool-alloc-return] EAX=0x{regs[EAX] & 0xffffffff:x}")
+# cpu.add_logpoint(0x044d5271, _pool_allocator_return_probe)  # 2026-08-28: confirmed non-NULL (0x7309c4c) for the failing call too
+
+# 2026-08-28: msjter35.dll's real JetErrFormattedMessage (Ordinal #5,
+# static 0x04221088, runtime 0x1a001088 -- confirmed via DAT_044e51f8's
+# resolved GetProcAddress value) computes the final translated error
+# number TWICE: first from our raw -3100 (FUN_042211a7(param_1, ...)),
+# then -- only if a flag bit from the first call isn't set -- a SECOND
+# time from a different input (param_2[1]), OVERWRITING the first
+# result before it's ever used. Molly asked whether this is a date-
+# format/epoch issue; checking live whether the first computation
+# yields Jet error 2421 ("Syntax error in date") specifically, and
+# whether it then gets silently overridden by the second call to the
+# more generic 3075 -- rather than assuming either way.
+def _jeterr_first_calc_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[jeterr-first-calc] uVar1(EAX)=0x{regs[EAX] & 0xffffffff:x}")
+# 2026-08-28: confirmed/no longer needed, disabled to free logpoint slots.
+# cpu.add_logpoint(0x1a0010c8, _jeterr_first_calc_probe)
+
+def _jeterr_second_calc_probe(eip, regs, memory, memory_size):
+    logger.error("com", f"[jeterr-second-calc] uVar1(EAX)=0x{regs[EAX] & 0xffffffff:x}")
+# 2026-08-28: confirmed/no longer needed, disabled to free logpoint slots.
+# cpu.add_logpoint(0x1a0010e4, _jeterr_second_calc_probe)
+
+# 2026-08-28: neither FUN_04222652 nor FUN_042224f3 (the real message-
+# template-substitution engine) call CchLszOfId2 with id=2421 anywhere --
+# only once, with uVar1=3075. So the LoadStringA(id=2421) seen in the log
+# must come from a caller one level above what's already logged
+# ("caller=0x1b00145b" is CchLszOfId2's OWN address, confirmed by
+# decompiling it -- a thin one-line wrapper). Hooking CchLszOfId2's entry
+# directly to read its real caller's return address off the stack.
+def _cchlszofid2_entry_probe(eip, regs, memory, memory_size):
+    esp = regs[ESP]
+    ret_addr = _read32_raw(memory, memory_size, esp + 0)
+    string_id = _read32_raw(memory, memory_size, esp + 4)
+    logger.error(
+        "com",
+        f"[cchlszofid2-entry] id={string_id} real_caller=0x{ret_addr or 0:x}",
+    )
+# 2026-08-28: confirmed/no longer needed, disabled to free logpoint slots.
+# cpu.add_logpoint(0x1b00145b, _cchlszofid2_entry_probe)
+
+def _dbparamquery_getcount_local18_probe(eip, regs, memory, memory_size):
+    eax = regs[EAX]
+    signed = eax - 0x100000000 if eax >= 0x80000000 else eax
+    logger.error("com", f"[dbparamquery-getcount-local18@995c88] EAX=0x{eax:x} ({signed})")
+# 2026-08-28: redundant -- always matches getcount-return exactly
+# (confirmed live, __RTC_CheckEsp doesn't touch EAX). Disabled.
+# cpu.add_logpoint(0x00995c88, _dbparamquery_getcount_local18_probe)
+
+# 2026-08-28: removed the resolved 2026-08-26 CoGetMalloc/TlsSetValue/
+# CoSetState/TlsAlloc probe block (oleaut32.dll lazy-COM-state-init
+# investigation, fixed and merged in the DllMain milestone work) -- was
+# eating 6 of the 8 available logpoint slots (see below), silently
+# starving this session's own probes with no error.
 
 # 2026-08-25 (cont'd x14): clean function-boundary trace, redirected upstream
 # per Molly's request -- print params in / return out for the actual COM

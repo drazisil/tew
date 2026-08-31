@@ -1,5 +1,5 @@
 """
-Structured logger with level and category filtering.
+Structured logger with level, category, and per-function filtering.
 
 Control via environment variables:
   LOG_LEVEL=trace|debug|info|warn|error  (default: info)
@@ -8,6 +8,16 @@ Control via environment variables:
 Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
             graphics, fileio, registry, exception, startup, scheduler, winsock, calls,
             window, dialog, channel
+
+Each comma-separated LOG_CATEGORIES token may be prefixed with `+` (default,
+if omitted) or `-`, and may target a single Win32 function within a category
+via `category.FuncName` (the function's own name, e.g. `CompareStringA` --
+not the `dll!Func` form). Rules apply left to right, last match wins, so
+`+handlers,-handlers.CompareStringA` means "log everything in the handlers
+category except CompareStringA". A per-function rule only takes effect for
+logging done while that function's own registered handler is on the call
+stack (see set_current_handler / win32_handlers.py's dispatch loop) -- log
+lines from anywhere else only ever match on the bare category.
 """
 
 import os
@@ -41,14 +51,64 @@ def _parse_level(s: str | None) -> int:
         case _:       return INFO
 
 
-def _parse_categories(s: str | None) -> set[str] | None:
+# (include, category, subname) -- subname is the bare Win32 function name
+# (HandlerEntry.func_name, e.g. "CompareStringA"), or None for a whole-
+# category rule. Ordered: filtering applies rules left to right, last
+# match wins.
+CategoryRule = tuple[bool, str, str | None]
+
+
+def _parse_categories(s: str | None) -> list[CategoryRule] | None:
     if not s or s == "*":
-        return None  # None means all
-    return set(c.strip().lower() for c in s.split(","))
+        return None  # None means all, no filtering at all
+    rules: list[CategoryRule] = []
+    for raw in s.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        include = True
+        if tok[0] in "+-":
+            include = tok[0] == "+"
+            tok = tok[1:]
+        if "." in tok:
+            category, subname = tok.split(".", 1)
+        else:
+            category, subname = tok, None
+        rules.append((include, category.strip().lower(), subname.strip() if subname else None))
+    return rules
+
+
+def _category_active(rules: list[CategoryRule], category: str, current_handler: str | None) -> bool:
+    active = False
+    for include, rule_category, rule_subname in rules:
+        if rule_category != category:
+            continue
+        if rule_subname is not None and rule_subname != current_handler:
+            continue
+        active = include
+    return active
 
 
 _active_level: int = _parse_level(os.environ.get("LOG_LEVEL"))
-_active_categories: set[str] | None = _parse_categories(os.environ.get("LOG_CATEGORIES"))
+_active_categories: list[CategoryRule] | None = _parse_categories(os.environ.get("LOG_CATEGORIES"))
+
+# Name (HandlerEntry.func_name) of the Win32 handler currently executing, if
+# any -- set by win32_handlers.py's dispatch loop around each handler call so
+# per-function LOG_CATEGORIES rules (e.g. "handlers.CompareStringA") can be
+# evaluated against whichever handler is actually on the call stack right
+# now. None outside any dispatched handler call.
+_current_handler_name: str | None = None
+
+
+def set_current_handler(name: str | None) -> str | None:
+    """Set the currently-executing handler's name for per-function log
+    filtering; returns the PREVIOUS value so the caller can restore it
+    (important for a handler that itself triggers a nested dispatched
+    call -- the outer name must come back once the inner call returns)."""
+    global _current_handler_name
+    previous = _current_handler_name
+    _current_handler_name = name
+    return previous
 
 _LEVEL_PREFIX: dict[int, str] = {
     ERROR: "[ERROR]",
@@ -103,9 +163,9 @@ def _emit(level: int, category: str, msg: str, *, force: bool = False) -> None:
         # scope, the halt diagnostic that follows would have no reason attached.
         if (
             _active_categories is not None
-            and category not in _active_categories
             and category != "exception"
             and level != ERROR
+            and not _category_active(_active_categories, category, _current_handler_name)
         ):
             return
 
@@ -123,7 +183,9 @@ def _emit(level: int, category: str, msg: str, *, force: bool = False) -> None:
 def is_active(level: int, category: str) -> bool:
     if level > _active_level:
         return False
-    if _active_categories is not None and category not in _active_categories:
+    if _active_categories is not None and not _category_active(
+        _active_categories, category, _current_handler_name
+    ):
         return False
     return True
 

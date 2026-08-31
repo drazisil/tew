@@ -33,7 +33,8 @@ class _FakeCPU:
         self.halted = False
 
 
-MEM_SIZE = 4 * 1024 * 1024
+MEM_SIZE = 128 * 1024 * 1024  # must exceed the heap base (simple_alloc starts at 0x04000000) --
+                               # GetEnvironmentStrings(A/W) allocates its env block there
 STACK    = 0x200000
 BUF_A    = 0x300000
 BUF_B    = 0x310000
@@ -304,7 +305,10 @@ class TestEnvironmentStrings:
     def test_get_environment_strings_w(self, env):
         cpu, mem, state, stubs = env
         call(stubs, cpu, mem, "GetEnvironmentStringsW", [])
-        assert cpu.regs[EAX] == 0x002100F0
+        # Real heap allocation (simple_alloc) since the "Fix GetEnvironmentStrings
+        # garbage pointer" commit -- a fresh CRTState's first heap alloc always
+        # lands at next_heap_alloc's initial value.
+        assert cpu.regs[EAX] == 0x04000000
 
     def test_free_environment_strings_w(self, env):
         cpu, mem, state, stubs = env
@@ -314,7 +318,8 @@ class TestEnvironmentStrings:
     def test_get_environment_strings_a(self, env):
         cpu, mem, state, stubs = env
         call(stubs, cpu, mem, "GetEnvironmentStrings", [])
-        assert cpu.regs[EAX] == 0x002100F8
+        # See test_get_environment_strings_w's comment -- real heap allocation now.
+        assert cpu.regs[EAX] == 0x04000000
 
     def test_free_environment_strings_a(self, env):
         cpu, mem, state, stubs = env

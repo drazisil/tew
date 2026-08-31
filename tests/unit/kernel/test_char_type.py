@@ -303,10 +303,14 @@ class TestClassifyWideString:
         assert mem.read16(OUT) == 0
 
     def test_null_terminated_empty_string(self, mem):
-        # Write only a null terminator at SRC — length is zero.
+        # Write only a null terminator at SRC — length is zero. Unlike
+        # test_empty_count_writes_nothing (explicit cch_src=0), the
+        # null-terminated convention (cch_src=-1) must still classify the
+        # terminator character itself -- classify_ctype1(0) is CNTRL only,
+        # never DIGIT (see char_type.py's 2026-08-29 fix).
         mem.write16(SRC, 0)
         args = GetStringTypeArgs(
             info_type=CT_CTYPE1, src_ptr=SRC, cch_src=0xFFFFFFFF, out_ptr=OUT
         )
         assert classify_wide_string(mem, args) is True
-        assert mem.read16(OUT) == 0
+        assert mem.read16(OUT) == int(Ctype1.CNTRL)

@@ -24,8 +24,9 @@ from tew.api.win32_handlers import (
     Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE,
     unimplemented_halt as _halt,
 )
-from tew.api._state import CRTState, DynamicModule, find_file_ci, read_cstring, read_wide_string
+from tew.api._state import CRTState, DynamicModule, read_cstring, read_wide_string
 from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+from tew.fs import find_file_ci
 from tew.logger import logger
 
 
@@ -51,6 +52,7 @@ def _load_dll_with_dllmain(
 
 def _invoke_dependency_dllmain(
     cpu: "CPU", memory: "Memory", state: CRTState, loaded,
+    dll_loader: Optional["DLLLoader"] = None, stubs: Optional["Win32Handlers"] = None,
 ) -> bool:
     """Synchronously run a dependency DLL's own DllMain(DLL_PROCESS_ATTACH).
 
@@ -76,7 +78,24 @@ def _invoke_dependency_dllmain(
     its "my own HINSTANCE" global stayed at its zero default, and its own
     exported code later handed that NULL to LoadStringA, silently failing
     every Jet error-message resource lookup.
+
+    Real, confirmed bug found 2026-08-28 while fixing the one above: this
+    function is invoked from load_dll's own recursive descriptor-walking
+    loop (dll_loader.py:361), BEFORE patch_dll_iats has ever run on the
+    dependency's own freshly-added IAT entries (that only happens as a
+    separate later pass). So DllMain's calls into kernel32.dll/etc. (e.g.
+    msjint35.dll's CRT startup calling GetVersion) went through unpatched
+    IAT slots -- not our registered Python handlers -- executing whatever
+    garbage machine code (or nothing at all) happened to be there instead,
+    and "genuinely completing" almost instantly with a leftover EAX that
+    looked like a real FALSE return. patch_dll_iats is cursor-based
+    (_iat_patch_cursor) and only processes entries added since its last
+    call, so calling it here -- before invoking DllMain -- is cheap and
+    safe even though the top-level load sequence will call it again later
+    for the same batch.
     """
+    if dll_loader is not None and stubs is not None:
+        dll_loader.patch_dll_iats(memory, stubs)
     handle = loaded.base_address & 0xFFFFFFFF
     sentinel = _get_dialog_sentinel(state, memory)
     logger.debug("handlers",
@@ -253,7 +272,8 @@ def register_kernel32_handlers(
                     was_loaded = dll_loader.get_dll(basename) is not None
                     loaded = dll_loader.load_dll(
                         basename, memory,
-                        lambda dep: _invoke_dependency_dllmain(cpu, memory, state, dep))
+                        lambda dep: _invoke_dependency_dllmain(
+                            cpu, memory, state, dep, dll_loader, stubs))
                     if loaded:
                         dll_loader.patch_dll_iats(memory, stubs)
                         handle = loaded.base_address & 0xFFFFFFFF
@@ -344,7 +364,8 @@ def register_kernel32_handlers(
             was_loaded = dll_loader.get_dll(name) is not None
             loaded = dll_loader.load_dll(
                 name, memory,
-                lambda dep: _invoke_dependency_dllmain(cpu, memory, state, dep))
+                lambda dep: _invoke_dependency_dllmain(
+                    cpu, memory, state, dep, dll_loader, stubs))
             if loaded:
                 dll_loader.patch_dll_iats(memory, stubs)
                 handle = loaded.base_address & 0xFFFFFFFF

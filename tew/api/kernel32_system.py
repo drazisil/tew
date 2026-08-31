@@ -298,16 +298,41 @@ def register_kernel32_system_handlers(
     stubs.register_handler("kernel32.dll", "UnhandledExceptionFilter",     _unhandled_ex)
 
     # ── Environment strings ───────────────────────────────────────────────────
+    # No environment variables are configured in this emulator (matching
+    # msvcrt.dll's getenv, which always returns NULL -- see msvcrt_handlers.py).
+    # A real (if empty) double-null-terminated block is still required: real
+    # Windows programs, and the MSVC CRT startup itself (_CRT_INIT's
+    # __crtGetEnvironmentStringsA-equivalent), scan the returned pointer
+    # looking for that terminator. Confirmed live 2026-08-28 as a real bug:
+    # these two previously just returned a hardcoded address (0x002100F0 /
+    # 0x002100F8) with nothing ever written there -- both addresses fall
+    # inside the live INT-0xFE trampoline dispatch table (0x00200000-
+    # 0x0021FFFF, see win32_handlers.py's HANDLER_SIZE/MAX_HANDLERS), so the
+    # CRT was scanning real Win32-handler dispatch machine code as if it
+    # were UTF-16/ANSI string data. Root-caused as the reason MSJINT35.dll's
+    # DllMain(DLL_PROCESS_ATTACH) returned FALSE (its own CRT init's env-
+    # string step failed on the garbage, which cascades to _CRT_INIT
+    # returning 0, which fails the whole DllMain) -- see TODO.md.
+    _env_block_w: int | None = None
+    _env_block_a: int | None = None
 
     def _get_env_strings_w(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x002100F0
+        nonlocal _env_block_w
+        if _env_block_w is None:
+            _env_block_w = state.simple_alloc(2)
+            memory.write16(_env_block_w, 0)
+        cpu.regs[EAX] = _env_block_w
 
     def _free_env_strings_w(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
     def _get_env_strings(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0x002100F8
+        nonlocal _env_block_a
+        if _env_block_a is None:
+            _env_block_a = state.simple_alloc(1)
+            memory.write8(_env_block_a, 0)
+        cpu.regs[EAX] = _env_block_a
 
     def _free_env_strings_a(cpu: "CPU") -> None:
         cpu.regs[EAX] = 1

@@ -4,6 +4,232 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-08-29, cont'd x41) — RESOLVED: the `EIP=0x1901d9eb` unhandled SEH fault (expsrv.dll+0x1d9eb) from x40. Root cause was `CompareStringA`/`CompareStringW` rejecting `LOCALE_INVARIANT` (`0x007F`) as "invalid locale" — a real, legitimate Windows LCID, not garbage. New, unrelated blocker found immediately downstream: `msvcrt.dll!_wcsicmp` (fixed) then `kernel32.dll!CreateFileMappingA` (open, not yet implemented).
+
+**Traced live from the crash backward**, not from decompile alone: `CALL [EAX+0xC]` faulted with `EAX=1` (a boolean-looking value sitting where a vtable pointer belongs). Created `FUN_0f9dd9a7`/`FUN_0f9dd3d9`/`FUN_0f9ddd11` in Ghidra (none were auto-recognized) to find the chain: `FUN_0f9dd9a7`'s crashing `param_2` is `FUN_0f9dd3d9`'s `param_3`, passed through unchanged. `FUN_0f9dd3d9` is itself a private (non-COM-activated) C++ vtable method at slot `+0x24` of a session singleton (`_DAT_0fa10044`, constructed once by `FUN_0f9ddd11`). A dynamic single-slot watchpoint armed from the constructor's own entry probe (`cpu.set_watchpoint`, address only known at runtime) confirmed the singleton's vtable is written correctly once and never touched again — ruling it out. The crash's own EBP chain (frame[1], `MSJET35.DLL+0x61d87`) led to the real caller, `FUN_7a8a1c78` (msjet35.dll), whose call `(**(*local_210+0x24))(local_210,*param_4,uVar6,param_3,local_1e0,local_22c)` passes `uVar6` as the crashing arg. A first probe reading `uVar6`'s inputs via `[EBP+...]` returned garbage (a thread-stack address for what should've been a small session index) — `FUN_7a8a1c78`'s first instruction is a plain `MOV`, not `PUSH EBP`, so it never sets up the frame my probe assumed. Fixed by capturing args at the function's true entry via `ESP` instead (reliable regardless of whether the callee ever uses `EBP`). That confirmed the actual crashing value: `uVar6 == 0xFFFFFFFF`, a sentinel/invalid-handle, not a garbage pointer.
+
+**Traced `0xFFFFFFFF`'s origin to `kernel32.dll!CompareStringA(locale=0x0000007f)`**, logged (at `debug`, easy to miss) as `-> 0 (invalid locale)` throughout the run — Molly caught this from a single pasted log line and correctly refused to accept it as "just another instance of the already-known-normal invalid-locale noise" (see `_RESOLVABLE_LOCALES`'s own comment history: `LOCALE_USER_DEFAULT`/`LOCALE_SYSTEM_DEFAULT` caused an near-identical bug once already). `0x007F` is `LOCALE_INVARIANT`, a real Windows sentinel for culture-invariant comparisons — `_locale_is_valid` (`kernel32_io.py`) only ever accepted `0x0409` (post-resolution), so every `LOCALE_INVARIANT` call was rejected as invalid, `EAX=0`, `ERROR_INVALID_PARAMETER`. Something downstream (likely `msjet35.dll`'s default-collation/parameter-table lookup, not yet pinned to an exact call site) reads that failure as "no match" and falls back to an uninitialized/sentinel `-1` handle, which is what eventually reached `FUN_7a8a1c78` as `uVar6`.
+
+**Fixed**: added `0x007F: 0x0409` to `_RESOLVABLE_LOCALES` (`kernel32_io.py`) — same pattern as the existing `LOCALE_USER_DEFAULT`/`LOCALE_SYSTEM_DEFAULT` entries. Also bumped both "invalid locale" log lines from `debug` to `error` — this exact code path has now caused two real, hard-to-spot bugs; it shouldn't be able to hide at debug level a third time. Confirmed live: the `0x1901d9eb` fault is completely gone, execution runs further than ever before.
+
+**New downstream blocker, `msvcrt.dll!_wcsicmp`**: a genuinely unimplemented handler (not a logic bug) — real cdecl case-insensitive wide-string compare, added to `msvcrt_handlers.py` mirroring the existing `wcsncmp` pattern (reuses `read_wide_string` + `.upper()`, same approach `CompareStringA`'s ignore-case path already uses). Confirmed live: execution runs past it too, further still.
+
+**Next new blocker, `kernel32.dll!CreateFileMappingA`**: genuinely unimplemented, halts immediately after being called. Not yet investigated — next session (or later this one) should start here.
+
+**Also shipped this session, unrelated to the fault chain above**:
+- **Structured crash-log file**: `diagnose_fault`/`diagnose_halt` (`tew/kernel/exception_diagnostics.py`) now write a full DLL table + register/stack/EBP-chain dump to `/tmp/emu_crash.json` (overwritten every run) instead of dumping it all inline into `/tmp/emu.log`; a short "Crash details written to ..." line replaces the old inline block. New `tools/crashlog_reader.py` reads it back and can additionally resolve arbitrary ad-hoc addresses against that crash's own recorded DLL table + static memory map — reuses `_annotate_address`'s real classification logic (refactored into `_classify_static_region` + a `_MEMORY_REGIONS` table) rather than re-implementing the address ranges. Along the way, confirmed `DAO350.DLL` loads at `0x04470000` this run — inside what the old hardcoded "heap" range would have mis-labeled, harmless only because the DLL-table lookup is checked first.
+- **CRT report-hook forwarding**: `_crt_dbg_report` (`patch_internals.py`) now reads `__pfnReportHook` (`0x020ee23c`, confirmed via disassembly of the real, unpatched `_CrtSetReportHook`) and forwards every `_CRT_WARN` message to the guest's own registered hook via `_invoke_emulated_proc` (same reentry mechanism as timers/dialogs) — this is what would route the CRT's own memory-leak dump into `HookCrtLibraryErrorReports`'s `memleaksCRT.txt` on disk, instead of only ever reaching tew's own debug log. Scoped to `_CRT_WARN` only; `_CRT_ERROR`/`_CRT_ASSERT` still halt exactly as before. This also surfaced a real, separate gap it depends on: `msvcrt.dll!fputs` was entirely unimplemented (only `fwrite` existed) — added. Not yet exercised live: the CRT's leak dump only runs on a clean process exit, and no run this session reached one (always crashes or halts first).
+
+## Previous status (2026-08-29, cont'd x40) — RESOLVED: `StockAssembly_SelectAPT` (and every date-literal-containing query) now succeeds end to end. Root cause was a `classify_wide_string`/`GetStringTypeExW` edge case that made the date-string tokenizer overshoot the end of a numeric token by 2 WCHARs. New, unrelated blocker opened immediately downstream: an unhandled SEH fault at `EIP=0x1901d9eb`.
+
+**Picking up from x39's `_wtoi` gap**, fixed a chain of small, real gaps one at a time, each confirmed live before moving to the next: `msvcrt.dll!_wtoi`/`_itoa` (both genuinely unimplemented, now real cdecl implementations in `msvcrt_handlers.py`), a mislabeled locale-string-table entry (`0x0038` was wrongly recorded as `LOCALE_SYEARMONTH` — it's actually the start of the `LOCALE_SMONTHNAME1..13` range, `0x0038`-`0x0044`; corrected and filled in the whole range in `kernel32_locale.py`), `kernel32.dll!GetCalendarInfoW` (a distinct, GetProcAddress-resolved API entirely missing before — real CAL_GREGORIAN CALTYPE table added), and `kernel32.dll!NlsGetCacheUpdateCount` (undocumented but real 0-param export; returns `0` since tew's locale data never gets invalidated). Also closed a `GetLocaleInfoW`-style silent-stub gap in `_multi_byte_to_wide`/`_wide_to_multi_byte` (`kernel32_locale.py`) — neither had ever logged on any path, so "no log line" could never be trusted as "never called"; both now log.
+
+**With every locale/calendar gap closed, `VarDateFromStr("1/1/2010")` still failed** (`EAX=0x80020005`, `DISP_E_TYPEMISMATCH`). Traced live via a chain of entry/return probes (working around Ghidra's repeated inability to identify real `EAX` passthrough on stack-frame-omitted VC6 functions — `FUN_77121505`, `FUN_7716d2ff`, `FUN_7716bde4`, `FUN_7713cf60` are all declared `void` by Ghidra despite genuinely returning a value through untouched `EAX`, confirmed live each time rather than trusted from decompile):
+
+```
+VarDateFromStr's own state machine (switch(local_8) at 0x7716dd7d) went
+0 -> 3 -> 5 -> 0xd, where 0xd has no case and falls to the function's
+terminal-failure `return local_14` (still DISP_E_TYPEMISMATCH, nothing
+along this path ever set it to 0).
+
+Traced why token 3 (the 4-digit year "2010", the LAST token in
+"1/1/2010") never got classified: the tokenizer's digit-collection loop
+(inside FUN_7716d562) determines "still a digit" via FUN_7713cf60 ->
+FUN_7713cfd6 -> real GetStringTypeExW (confirmed live DAT_771a1030==0
+selects the Wide path) -> tew's classify_wide_string (char_type.py).
+
+FUN_7713cf60 tests ONE character at a time via a 2-WCHAR buffer
+[char, 0] with cchSrc=-1 (null-terminated convention). When the character
+BEING TESTED is itself the string's own null terminator, that buffer's
+own effective length is 0 -- classify_wide_string's loop ran 0
+iterations and left the output flags WORD completely unwritten. The
+caller then read back whatever was ALREADY in that stack slot: the
+leftover DIGIT flag from testing the real digit '0' immediately before
+it. Confirmed live via raw memory dumps (run_exe.py's
+_fun_7716bde4_entry_probe, extended to dump raw WCHARs around the
+tokenizer's position pointer): for "1/1/2010", the real null terminator
+sits at a known, correctly-predicted address (cross-checked against
+where tokens 1 and 2 correctly landed on "/") -- but the digit loop
+consumed it AND a second stray null right after it (heap padding) before
+finally hitting real garbage 2 WCHARs later, which correctly stopped it.
+That left the tokenizer's position pointer 2 WCHARs past the true end of
+string, so the NEXT classification step (FUN_7716bde4, checking what
+follows the number) saw garbage instead of end-of-string, never returned
+its "end of string" code (1), and the token stayed at its unset default
+sentinel -- routing the outer FSM straight into the terminal failure
+state.
+```
+
+**Fixed**: `classify_wide_string` (`tew/api/char_type.py`) now special-cases a null-terminated (`cch_src=-1`) request whose computed length is 0 — it writes a real classification word for the terminator character itself (`classify_ctype1(0)`, correctly `CNTRL` only, never `DIGIT`) instead of leaving the output buffer untouched. Confirmed live: the third token's tokenizer position now lands exactly on the real null terminator (`text_ptr=0x76ae854`, matching the address predicted from tokens 1/2's known-good positions), `FUN_7716bde4` correctly returns `1` (end of string), and `VarDateFromStr` returns `EAX=0x0` (success) for `"1/1/2010"`.
+
+**Confirmed end to end**: `stdout.txt`'s `"could not get param count"` / `StockAssembly_SelectAPT` DBQuery error no longer appears anywhere in a fresh run. The game now runs straight past the entire query into new territory and hits a genuinely different, unrelated halt: an unhandled SEH fault at `EIP=0x1901d9eb` (0x19xxxxxx range — a different DLL entirely). Not yet investigated — next session should start here.
+
+**Resolved (was open in x39)**: Molly's `FUN_77121505` "thread splat" suspicion — reran with `thread` added to `LOG_CATEGORIES` and it never fires at all. What DOES fire early in every run is the already-documented `THREAD_SENTINEL` collision (`TODO.md`, "NEW (2026-08-26)"): `OLEAUT32.dll`'s real `DllMain` runs a static initializer via `_call_guest_void`, which shares `THREAD_SENTINEL` with real thread completion, spuriously marking the calling thread dead. Non-fatal (`_invoke_emulated_proc` catches it, returns 0, execution proceeds normally) — almost certainly what Molly actually recalled, not `FUN_77121505` (confirmed, separately, to be a real, correct stack-cookie check with clean success/failure semantics).
+
+**Also fixed, unrelated cleanup found along the way**: `dll_loader.py`'s `patch_dll_iats` summary log line undercounted -- its "Patched X/N ... with stubs" numerator only counted `"handler"` outcomes, excluding `"auto"` (auto-generated fatal-halt) outcomes despite those also being real stubs; harmless when both counts happened to be 0 but wrong in general. Now sums both, and logs per-DLL (previously one aggregate line could blur which of several DLLs loaded in one batch had the gap).
+
+Repro: `cd /data/Code/tew && TEW_FIXED_HEARTBEAT_MS=100 TEW_MAX_STEPS=5000000000 LOG_LEVEL=debug LOG_CATEGORIES=cpu,startup,loader,com,handlers timeout 300 .venv/bin/python run_exe.py`. `run_exe.py`'s investigation-probe infrastructure is left in place, commented out with dated explanatory notes at each resolved checkpoint (grep for `2026-08-29`) -- re-enable selectively rather than re-deriving addresses from scratch. The 8-logpoint-slot cap (`cpu_add_logpoint`, still silently drops past capacity, see `TODO.md`) was hit and worked around repeatedly this session the same way as x38/x39.
+
+**Housekeeping, still live from earlier sessions**:
+- ClickHouse execution-history capture (`~/pe-walker/history-poc` docker-compose) does **not** survive a reboot/power-cut -- needs `docker compose up -d` again (schema/data persist on the bind-mounted volume, just the container needs restarting). Same for `ghidra-mcp.service`'s project state -- survives service restart via systemd, but needs a fresh MCP handshake (new session ID) and re-opening the project/program.
+- `CreateThread`'s log line (`tew/api/kernel32_io.py`) downgraded from `info` to `debug` -- was disproportionately noisy for a routine per-spawn event at `info` level.
+- Ghidra's full auto-analysis crashes on `expsrv.dll` but works fine on `msjet35.dll` -- both are in the `mcity` project (separate from this project's own default, `debug_clean`; remember to switch back and forth as needed, and to switch back to `debug_clean` when done so `mcity` isn't left locked).
+
+## Previous status (2026-08-28, cont'd x39) — ROOT CAUSE FOUND AND FIXED: `StockAssembly_SelectAPT` (and every other date-literal-containing query) was failing because `GetLocaleInfoW` was a bare "always fail, zero logging" stub; real fix in place, one new (unrelated, trivial) gap found immediately after: `msvcrt.dll!_wtoi` unimplemented.
+
+**The chain, traced live end-to-end from the DAO-3075-style HRESULT all the way down into real oleaut32.dll internals** (continuing past where cont'd x38 left off, `FUN_7a862215`'s `FUN_7a85e7e1`):
+
+```
+FUN_7a85e7e1 (msjet35.dll's real SQL execution-plan compiler tail) does NOT
+produce -3100 itself (its own hardcoded fallback codes are all in the 3xxx
+range, e.g. 0xbd8=3032) -- confirmed a dead end, live probes on it and its
+neighbors (FUN_7a8c18ed/FUN_7a8c190b) never fired at all for the failing call.
+
+Real producer found via a Ghidra byte-search across msjet35.dll for the raw
+0xfffff3e4 (-3100) immediate (`B8 E4 F3 FF FF`), live-confirmed against 8
+candidate sites: FUN_7a869ced (call site 0x7a8c6d67) is the one that fires --
+its entry captured the REAL WHERE-clause token live:
+  '(((BrandedPart.MfgDate)<>#1/1/2010#) AND ((PartType.AbstractPartTypeID)=[apt]))'
+(confirmed byte-for-byte against mdbtools' `mdb-queries` dump of the real
+stored SQL -- not corrupted, not misread).
+
+FUN_7a869ced -> FUN_7a86756b (msjet35.dll's real expression tokenizer/parser,
+a genuine hand-written recursive-descent state machine) -> tokenizes "1/"
+correctly (locale date-separator match against the REAL locale-info struct
+succeeds) -> FUN_7716c53f (real OLEAUT32.DLL, not msjet35 -- the whole
+compiled expression eventually reaches real VarDateFromStr, Ordinal #94,
+called from msjet35.dll's own VariantChangeType-style dispatcher,
+FUN_7a8a27dc case 7/VT_DATE) resolves month=1/day=1 correctly, but the
+THIRD field ("this", the locale struct's month/day/year accumulator slot
+that should hold the year candidate) was NEVER populated by our own
+tokenizer for this call -- confirmed live it's genuinely stale/uninitialized
+stack memory left over from an unrelated EARLIER call ~17s prior in the
+same run, not corrupted by anything in this call chain.
+
+That stale value (0x01010101) gets fed into FUN_77165b74 (a
+GetLocalTime-based "default missing year to current year" fallback) via
+FUN_7716c47d (a real century-windowing/calendar-conversion helper) -- BOTH
+confirmed live to be computing/passing through their inputs completely
+correctly (FUN_77165b74's own GetLocalTime call correctly returns 2026).
+The REAL culprit is upstream of all of this: the locale-info struct
+VarDateFromStr consults for EVERYTHING (date separator, calendar type,
+first-day-of-week, month names, era tables -- a ~3484-byte OLEAUT32-internal
+cache, NOT the small UDATE result struct) was itself never properly built.
+
+Traced via a static global pointer (`DAT_771a10c8`, the head of oleaut32's
+process-wide locale-struct cache list) watched from run start: it's NULL
+for the ENTIRE run until exactly one write, live-correlated to our failing
+query's own VarDateFromStr call. That write happens in FUN_77145563
+(oleaut32's locale-struct cache manager) -- confirmed via RAW ASSEMBLY (not
+just decompile, per Molly's explicit request) that it calls the real
+struct-builder (FUN_77145656) and then UNCONDITIONALLY caches + reports
+success regardless of that builder's own return value -- there is
+genuinely no CMP/TEST on it anywhere in the instruction stream between the
+CALL and the cache-list write.
+
+FUN_77145656 (confirmed live: called with the CORRECT lcid=0x409,
+flags=0x80000000 -- no bad-argument story here) fails on its very FIRST
+real locale query (LOCALE_IDATE via FUN_771454bc -> FUN_7713cee1, which
+unconditionally calls real GetLocaleInfoW on the Wide code path -- live-
+confirmed DAT_771a1030==0 selects that path). `kernel32.dll!GetLocaleInfoW`
+was a bare stub: `EAX=0; cleanup_stdcall(...)` -- no logic, no logging at
+all, which is exactly why "zero log lines" earlier in this same
+investigation was wrongly read as "never called" (FUN_7713cee1 IS called,
+twice, confirmed via a direct entry probe -- its own downstream real API
+call was just silent). GetLocaleInfoW's honest failure return propagates
+correctly through FUN_771454bc's retry-then-E_FAIL logic, and
+FUN_77145656 bails at its very first query -- meaning the LCID field
+itself, the calendar-type clamp, the date separator, and everything else
+in the struct past that first call point never get set, staying at their
+zero-initialized allocation defaults. FUN_77145563 (see above) then caches
+this broken struct globally, permanently, for the rest of the process's
+life -- serving it to every subsequent locale-info request from any
+thread, regardless of what locale they actually asked for.
+```
+
+**Fixed**: `GetLocaleInfoW` (`kernel32.dll`) had never been properly implemented -- moved out of `kernel32_io.py`'s bare stub into `kernel32_locale.py` alongside `_get_locale_info_a`, sharing its `_LOCALE_STRINGS`/`_LOCALE_NUMBERS` tables (writes UTF-16 instead of ANSI bytes, `cch_data` counted in WCHARs per real TCHAR convention). Two more real bugs found and fixed while wiring it up: (1) the LCTYPE mask only stripped `LOCALE_RETURN_NUMBER` (`0x20000000`), not the separate `LOCALE_NOUSEROVERRIDE` (`0x80000000`) modifier flag that real callers OR in — `0x80000021` was failing table lookup for what should just be `0x21`; (2) several LCTYPEs (e.g. `LOCALE_IDATE`) are queried by real code *without* `LOCALE_RETURN_NUMBER` and expect the plain decimal-digit **string** form even though tew only had them in the numeric table — added a `_locale_string_for()` fallback that returns `str(value)` from `_LOCALE_NUMBERS` when `_LOCALE_STRINGS` has no entry, instead of duplicating every numeric constant into both tables.
+
+**Confirmed live, post-fix**: all 4 real `GetLocaleInfoW` calls this chain makes now succeed with the *correct* real values (`LOCALE_IDATE='0'`, `LOCALE_IFIRSTDAYOFWEEK='6'`, `LOCALE_IFIRSTWEEKOFYEAR='0'`, `LOCALE_ICALENDARTYPE='1'`) — execution proceeds further into `FUN_77145656` than ever before and hits a **new, unrelated, trivial** gap: `[UNIMPLEMENTED] msvcrt.dll!_wtoi — halting` (real oleaut32.dll code converting the calendar-type digit string to an int). Not yet implemented -- straightforward wide-string-to-int, next session should start here.
+
+**Separately confirmed real, independently fixed, not the root cause**: `TlsGetValue` (`kernel32_sync.py`) had no per-thread isolation at all — `_tls_set_value` wrote to both a shared `TEB_BASE`-relative memory slot AND a per-thread `state.tls_thread_store(tid)` dict, but `_tls_get_value` only ever read the shared slot, meaning any two threads sharing a TLS index would clobber each other's values. Fixed to read from the per-thread store. Confirmed via rerun this doesn't change the outcome for this specific investigation (no cross-thread TLS contention on this call path) but is a real, general correctness bug worth keeping fixed.
+
+**Open, unconfirmed suspicion flagged by Molly at the time, later ruled out (see cont'd x40)**: `FUN_77121505` (oleaut32.dll's hand-crafted `__chkesp`-style stack-check/cleanup helper — confirmed live it reliably passes through whatever's in `EAX` when there's no error, which is what makes `FUN_7713cee1`'s Ghidra-misidentified `void` return type actually work correctly for the success path) was suspected of swallowing a real exception on its own error path, possibly related to an earlier (pre-compaction) observation of a thread "going splat".
+
+**Also confirmed NOT the bug, via the earlier-session (2026-08-25/26-ish) `DumpErrors`/`Error.Description` investigation**: the `CreateErrorInfo`/`SetErrorInfo`/`GetErrorInfo` OLE rich-error-info plumbing (`oleaut32.dll` ordinals 201/202) was already implemented in a prior session and confirmed working -- but `Error.Description` for this error class comes back as a real, validly-allocated, genuinely zero-length BSTR (not a plumbing bug, that's what real Jet actually produces for DAO-3075). `DBParamQuery`'s own `get_Count` failure branch doesn't even call `GetErrorInfo` anyway -- it aborts with a hardcoded format string directly.
+
+---
+
+## Previous status (2026-08-28, cont'd x38) — `StockAssembly_SelectAPT`'s `Parameters.Count` failure traced all the way into real Jet SQL-compiler internals (`expsrv.dll`/`msjet35.dll`); two more real bugs found and fixed along the way, neither is the root cause; still open.
+
+**Two real fixes this session, both independently verified, neither resolves the actual blocker**:
+
+1. **`kernel32.dll!GetEnvironmentStringsW`/`GetEnvironmentStrings` returned hardcoded addresses (`0x002100F0`/`0x002100F8`) that were never written to** -- both addresses fall inside the live INT-0xFE trampoline dispatch table (`0x00200000`-`0x0021FFFF`), so any real CRT code reading them back (e.g. `_CRT_INIT`'s env-block scan) read Win32-handler dispatch machine code as if it were string data. Root-caused as why `MSJINT35.dll`'s `DllMain` was returning FALSE. Fixed: both now lazily allocate real memory (via `state.simple_alloc`) and write a valid, empty (`\0`) double-null-terminated block.
+2. **`_invoke_dependency_dllmain` (the mechanism that runs a recursively-loaded dependency DLL's own `DllMain`) fires *before* `patch_dll_iats` has patched that DLL's own IAT** -- `dll_loader.py`'s recursive `load_dll` walk calls the dependency-DllMain callback mid-walk, but `patch_dll_iats` only runs as a separate, later pass. So `MSJINT35.dll`'s `DllMain` called `GetVersion`/`GetCommandLineA`/etc. through unpatched (garbage/zero) IAT slots instead of our registered handlers, "genuinely completing" almost instantly with a leftover `EAX` that looked like a real `FALSE` return. Fixed: `_invoke_dependency_dllmain` now calls `dll_loader.patch_dll_iats(memory, stubs)` on entry (cheap/safe -- it's cursor-based, only processes newly-added entries) before invoking `DllMain`. Confirmed live: `MSJINT35.dll`'s `DllMain` now returns `1`/TRUE, `LoadStringA` returns real resource text (`"Syntax error in date"`, DAO-3075's `"|1 in query expression '|2'."`) instead of empty strings.
+3. **`kernel32.dll!WriteFile` and `msvcrt.dll!_write`'s non-overlapped path used `os.write(entry.fd, data)` (implicit, kernel-fd-tracked position) instead of `entry.position`** -- `_llseek`/`_lseek`/`SetFilePointer` only ever update `entry.position`, they never call `os.lseek()` on the real fd, so the moment any seek happens on a handle, a subsequent plain `WriteFile`/`_write` silently lands wherever the real fd's own kernel cursor happens to be, not where `entry.position` says it should. Confirmed live via `~/.emu32/showplan.out` (JETSHOWPLAN diagnostic output, real Jet SQL-compiler plan dump): a later, shorter write partially overwrote a longer earlier line, leaving a garbled fragment (`edPart.PartTypeID`, the tail of `BrandedPart.PartTypeID` with its first 5 bytes clobbered); a separate spot lost an entire query's own `--- QueryName ---` header + index-stats lines outright. Fixed: both now use `os.pwrite(entry.fd, data, entry.position)`, matching the already-correct explicit-position pattern reads use elsewhere in this codebase. Re-verified: `showplan.out` is now clean for every write in a fresh run (old pre-fix corruption at the top of the file persists since the file isn't truncated between runs -- separate, minor, not investigated).
+
+**Neither fix touches the actual `StockAssembly_SelectAPT` blocker** -- confirmed via live re-run after each: identical `HRESULT=0x800a0c03` (DAO error 3075), identical halt.
+
+**Full mechanism traced end-to-end, via a chain of live probes correlated against the exact failing call's timestamp window** (retracing the same technique the earlier `StockVehicleAttributes_SelectAll2`/`Fields.Count` investigation used):
+
+```
+DBParamQuery::DBParamQuery (MCity_d.exe 0x00995970) -- three vtable calls:
+  0x00995b1c = get_Parameters (succeeds, this out-param confirmed via decompile)
+  0x00995c7b = get_Count (FAILS here, HRESULT=0x800a0c03)
+ → dao350.dll thunk (FUN_0447dfe2): forwards to *(this+8)'s vtable slot 0x24
+ → real get_Count implementer (FUN_0447dc1c) -- same function the Fields.Count
+   investigation already found; reads a raw `+0x2c` count field
+ → refresh gate (FUN_044d26ce) -- type-indexed dispatch table (DAT_044770b0),
+   type_idx=25=Parameters, only calls the real handler when count not cached
+ → per-type populate handler (FUN_044c69bc) -- allocates a 68-byte buffer from
+   dao350.dll's own free-list pool allocator (FUN_044e2b5c); confirmed live the
+   allocation SUCCEEDS (ruling out an earlier false lead -- see below)
+ → name-based lookup (FUN_044d525b), given the query's own name directly:
+   lpcstr='StockAssembly_SelectAPT'
+ → dynamically-bound call into real msjet35.dll (DAT_044e52c8 = 0x1705ff40,
+   confirmed live -- two EARLIER calls through this exact same pointer for
+   OTHER queries succeeded (EAX=0) this same run, ruling out a structural
+   code-path bug)
+ → real msjet35.dll dispatcher (FUN_7a89ff40) -- name validation passes
+   (FUN_7a8536a6 succeeds), reaches the real dispatch target
+ → FUN_7a89fd45 → FUN_7a862215, the real Jet SQL execution-plan compiler
+   (same JETSHOWPLAN code path, reads SOFTWARE\Microsoft\Jet\3.5\Engines\Debug)
+ → returns raw internal error -3100 (0xfffff3e4)
+ → FUN_044d418f (dao350.dll's real DAOError-formatting plumbing, confirmed
+   NOT a plumbing bug -- see below) translates -3100 into DAO error 3075 via
+   MSJTER35.DLL's real ordinal #5, producing the observed HRESULT
+```
+
+**False lead ruled out live**: initially suspected `FUN_044e2b5c` (the pool allocator) was returning NULL for the 68-byte request. Live probe confirmed it succeeds (`EAX=0x7309c4c`, a real pointer) -- the pool keeps serving many more allocations immediately after ours in the same run. The earlier "neither dynamically-bound branch fires" observation that led to this false lead was itself an artifact of the **8-logpoint-slot cap silently dropping registrations past the limit** (`cpu/src/core.zig`: `lp_eip: [8]u32`/`lp_cb: [8]?LogpointFn`, fixed-size FFI-struct arrays; `cpu_add_logpoint` in `kernel.zig` just returns with no error when all 8 slots are full) -- had 9-10 active logpoints at the time from stacking new probes on top of stale ones from earlier, already-resolved investigations (`CoGetMalloc`/`TlsSetValue`/`CoSetState`/`TlsAlloc` from the 2026-08-26 DllMain milestone work, `createinstancelic-*` from the original BSTR bug). Pruned to 5-8 active at any time going forward. **Not yet fixed**: `cpu_add_logpoint` should fail loudly (return a bool / log) when full instead of silently discarding -- flagged, deferred, see `TODO.md`.
+
+**Also confirmed NOT the bug, via the earlier-session (2026-08-25/26-ish) `DumpErrors`/`Error.Description` investigation**: the `CreateErrorInfo`/`SetErrorInfo`/`GetErrorInfo` OLE rich-error-info plumbing (`oleaut32.dll` ordinals 201/202) was already implemented in a prior session and confirmed working -- but `Error.Description` for this error class comes back as a real, validly-allocated, genuinely zero-length BSTR (not a plumbing bug, that's what real Jet actually produces for DAO-3075). `DBParamQuery`'s own `get_Count` failure branch doesn't even call `GetErrorInfo` anyway -- it aborts with a hardcoded format string directly.
+
+**Open, next session should continue here**: `FUN_7a862215`'s real return value traces to `local_44 = FUN_7a85e7e1(local_18, local_1c, local_14[0x1f])` -- not yet live-probed. This is genuine, deep, undocumented Microsoft Jet SQL-compiler internals now (hundreds of lines, dozens of sub-calls, several early-return branches on negative sub-results) -- same `JETSHOWPLAN` code path the `StockVehicleAttributes_SelectAll2`/`Fields.Count` investigation also reached, which concluded its own root cause was upstream in multi-table `Table.Column`-qualified-reference tokenization, never fully located. `StockAssembly_SelectAPT` never appears as its own top-level plan in `showplan.out` (even after the write-corruption fix) -- consistent with compilation failing before a plan gets written, i.e. before `FUN_7a862215` would call whatever writes the `--- QueryName ---` header.
+
+Repro: `cd /data/Code/tew && TEW_FIXED_HEARTBEAT_MS=100 TEW_MAX_STEPS=5000000000 LOG_LEVEL=debug LOG_CATEGORIES=cpu,startup,loader,com,handlers timeout 300 .venv/bin/python run_exe.py`. Active `run_exe.py` logpoints for this investigation (5 of 8 slots): `_dbparamquery_getcount_pre_probe` (0x00995c7b), `_dbparamquery_getcount_return_probe` (0x00995c7e), `_refresh_gate_entry_probe` (0x044d26ce), `_param_lookup_probe` (0x044d525b), `_pool_allocator_entry_probe`+`_pool_allocator_return_probe` (0x044e2b5c/0x044d5271) -- plus `_jet_lookup_returnA_probe`/`_jet_lookup_returnB_probe` (0x044d529f/0x044d52be) currently also active, at exactly 8. Grep `run_exe.py` for `2026-08-28` for the full trail with addresses and reasoning.
+
+**Housekeeping, still live from earlier sessions**:
+- ClickHouse execution-history capture (`~/pe-walker/history-poc` docker-compose) does **not** survive a reboot/power-cut -- needs `docker compose up -d` again (schema/data persist on the bind-mounted volume, just the container needs restarting). Same for `ghidra-mcp.service`'s project state -- survives service restart via systemd, but needs a fresh MCP handshake (new session ID) and re-opening the project/program.
+- `CreateThread`'s log line (`tew/api/kernel32_io.py`) downgraded from `info` to `debug` -- was disproportionately noisy for a routine per-spawn event at `info` level.
+- Ghidra's full auto-analysis crashes on `expsrv.dll` but works fine on `msjet35.dll` -- both are in the `mcity` project (separate from this project's own default, `debug_clean`; remember to switch back and forth as needed, and to switch back to `debug_clean` when done so `mcity` isn't left locked).
+
+---
+
+## Previous status (2026-08-28, cont'd x37) — DB init now runs for real; new blocker is a genuine DAO/Jet query-parameter gap in `expsrv.dll`, not a missing Win32 handler.
+
+**Five handler/bug fixes tonight, each verified by a fresh full re-run before moving to the next blocker**:
+
+1. **`kernel32.dll!LoadLibraryA` full-path calls to our own Python-simulated-only DLLs never resolved** (`kernel32_handlers.py::_load_dll_by_path`) -- `stubs.get_stub_dll_handle(basename)` was only ever checked as a fallback *inside* `if real_path is not None:` (i.e. only when a real file was found on disk but failed to parse as a PE), never when `find_file_ci` legitimately found no real file at all. Hit at ~60s: real `OLEAUT32.dll`'s own NLS-cache-version helper (`FUN_7713c8d9`, decompiled in Ghidra to confirm) calls `LoadLibraryA("<cached SYSTEM32 dir>\kernel32.dll")` defensively; `kernel32.dll` has no real file backing it (Python-simulated only), so this fell through to the interactive-missing-file prompt and crashed into an unregistered trampoline slot on non-interactive stdin. Fixed by checking the stub-handle fallback in the not-found path too.
+2. **Real bug found while fixing #1**: `os.path.basename()` is POSIX-only and silently doesn't split on `\` -- switched `_load_dll_by_path`'s basename extractions to `ntpath.basename()`.
+3. **`advapi32.dll!RegNotifyChangeKeyValue` unimplemented** -- since `registry.json` is only ever written by the guest process itself, a watched key never changes out from under it. Async mode registers and returns success without ever signaling; sync mode initially returned immediate success too, later fixed (see PR review follow-up below) to really block via the scheduler.
+4. **`kernel32.dll!WaitForMultipleObjects` was a bare `_halt` stub** despite `WaitForMultipleObjectsEx` right next to it having a complete implementation -- factored the shared logic into `_wait_for_multiple_common(cpu, arg_bytes)`.
+5. **`kernel32.dll!GetStringTypeExW` and `msvcrt.dll!wcsncmp` unimplemented** -- straightforward siblings of `GetStringTypeW`/`strncmp`.
+
+**Post-PR review follow-up (same session)**: an independent review of PR #5 found two real issues, both fixed:
+- `RegNotifyChangeKeyValue`'s synchronous form was fabricating immediate success -- fixed to route through the scheduler's handle-block machinery (parked on a permanently-unsignaled sentinel event).
+- `_lseek`/`_llseek` clamped position against `len(entry.data)`, always 0 for fd-backed handles -- silently reset any nonzero seek to 0. Added `file_entry_size()` using `os.fstat`. Confirmed NOT the cause of the `StockAssembly_SelectAPT` blocker (identical halt before/after) but a real, independently-worth-fixing bug.
+
+**Run reached ~80.5s** and hit a real, unhandled `INT3` inside `MCity_d.exe` itself: `nfspc.c(1164) NFS_abortmsg callback 'AMF=166 DBQuery.c(997) DB ERROR: query StockAssembly_SelectAPT; could not get param count; does table really exist?'`. Molly confirmed the `StockAssembly` table genuinely exists and is populated -- rules out "missing/malformed table." PR #5 merged (`bba9324`); investigation continued on `investigate/dao-jet-query-params`.
+
 ## Previous status (2026-08-27, cont'd x36) — `SearchPathW`/`wcsncpy` blockers from x35 both resolved (parallel work while waiting on quota reset -- not fully reflected in this file until now); found and fixed two more real-file-I/O gaps (`_llseek`, `_lread`); run now reaches 156s+ with real DirectSound/window-message activity.
 
 **Housekeeping note**: `kernel32.dll!SearchPathA`/`SearchPathW` (standard Win32 search sequence) and `msvcrt.dll!wcsncpy` were already fixed and merged into `main` by the time this session picked back up -- this file's x35 entry still listed `wcsncpy` as the open blocker, which was stale. Confirmed both work correctly in a fresh run tonight.
