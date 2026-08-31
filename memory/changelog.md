@@ -4,6 +4,18 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-31 (cont'd x46) — Fixed `_dump_crt_memory_leaks` silently swallowing `FatalHaltError` from its nested `_CrtDumpMemoryLeaks` call, found during PR #8 review
+
+**Context**: PR #8 bundles x45's exception-swallowing fix (`CPU.handle_exception`) with the D3D8/Vulkan fix and the real `_CrtDumpMemoryLeaks` wiring. A code review of that PR caught a second, related instance of the same swallowing pattern one layer up, in the very diagnostic code x45 added.
+
+**Root cause**: `_dump_crt_memory_leaks` (`tew/kernel/exception_diagnostics.py`) wrapped its nested `_invoke_emulated_proc` call in a bare `except Exception`, which also caught `FatalHaltError` -- the exception `cpu.run()`/`cpu.step()` raise the instant `cpu.fatal_halt` newly becomes true (`cpu_zig.py`). That's a documented, tested invariant (`tests/unit/api/test_invoke_emulated_proc_fatal_halt.py`) meant to always propagate, not be caught: if the guest's own leak-dump call itself hits a fatal condition (e.g. the heap-ceiling `RuntimeError`), the exception was downgraded to a warning and `diagnose_fault` continued as if the dump had merely failed, while `cpu.restore_state` never ran.
+
+**Fixed**: added `except FatalHaltError: raise` before the broad `except Exception`, matching the identical pattern already established in `loader/dll_loader.py`'s `DLLLoader.load_dll`.
+
+**Test coverage**: new regression test `TestDumpCrtMemoryLeaksFatalHalt::test_propagates_fatal_halt_from_nested_call` (`tests/unit/kernel/test_exception_diagnostics.py`), written test-first -- red confirmed the swallowing before the fix. Full suite: 1184 passed.
+
+---
+
 ## 2026-08-30 (cont'd x45) — RESOLVED: `CPU.handle_exception` was silently swallowing any Python exception raised inside a nested Win32-handler callback, no log and no fatal-halt propagation — that's what turned x44's `crtReportHookCallback` `INT 3` investigation into a multi-hour mystery. Fixed; the real cause was the already-known x42 heap-exhaustion ceiling, now impossible to miss
 
 **Context**: x44 bisected `AppendToCRTLeaksFile`'s never-returning first write down to the exact `HeapAlloc` call site inside `__heap_alloc_base` — reached with fully valid arguments, but neither the success log nor either error branch ever fired, and execution silently ended up running unrelated code a moment later.
