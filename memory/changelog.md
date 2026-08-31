@@ -4,6 +4,18 @@ Entries are newest-first.
 
 ---
 
+## 2026-08-31 (cont'd x47) — Fixed `simple_alloc` u32 wraparound on an oversized guest allocation size crashing the whole process, found during PR #9 review
+
+**Context**: PR #9 (stacked on #8) adds `DIAGNOSTIC_HEAP_RESERVE`, tightening `simple_alloc`'s ceiling for ordinary allocations. Review of that PR flagged that `size` was passed to `bump_alloc_next` with no upper-bound check.
+
+**Root cause**: `bump_alloc_next`'s u32 arithmetic (`(current + size + 15) & ~15`, `cpu/src/alloc.zig`) is a Zig-level operation that traps on overflow rather than wrapping into a corrupted-but-valid cursor as first suspected, or raising a catchable Python exception -- a size like `malloc(0xFFFFFFF0)` aborts the entire Python process (`Fatal Python error: Aborted`) inside `libcpu.so`, unreachable by any `try/except`. Confirmed live via the new regression test crashing the test process before the fix was written.
+
+**Fixed**: `simple_alloc` (`tew/api/_state.py`) now rejects a `size` that would overflow the u32 cursor arithmetic in Python, before it ever crosses the FFI boundary into the native call -- no real Win32 allocator could satisfy a request that large anyway.
+
+**Test coverage**: new regression test `TestSimpleAllocWraparound::test_huge_size_raises_instead_of_wrapping` (`tests/unit/kernel/test_heap.py`), written test-first. Full suite: 1184 passed.
+
+---
+
 ## 2026-08-30 (cont'd x45) — RESOLVED: `CPU.handle_exception` was silently swallowing any Python exception raised inside a nested Win32-handler callback, no log and no fatal-halt propagation — that's what turned x44's `crtReportHookCallback` `INT 3` investigation into a multi-hour mystery. Fixed; the real cause was the already-known x42 heap-exhaustion ceiling, now impossible to miss
 
 **Context**: x44 bisected `AppendToCRTLeaksFile`'s never-returning first write down to the exact `HeapAlloc` call site inside `__heap_alloc_base` — reached with fully valid arguments, but neither the success log nor either error branch ever fired, and execution silently ended up running unrelated code a moment later.
