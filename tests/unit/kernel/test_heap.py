@@ -56,3 +56,19 @@ class TestHeapValidate:
         assert h1 != h2
         assert h1 >= before
         assert h2 > h1
+
+
+class TestSimpleAllocWraparound:
+    """Regression test for simple_alloc() passing a fully guest-controlled
+    size straight into bump_alloc_next's u32 arithmetic with no upper-bound
+    check. A huge size wraps (current + size + 15) & ~15 mod 2^32 to a small
+    address that passes the `new_cursor > ceiling` check instead of failing
+    it -- silent heap corruption instead of the intended loud RuntimeError.
+    """
+
+    def test_huge_size_raises_instead_of_wrapping(self, state):
+        before = state.next_heap_alloc
+        with pytest.raises(RuntimeError):
+            state.simple_alloc(0xFFFFFFF0)
+        # Must not have committed a wrapped, corrupted cursor.
+        assert state.next_heap_alloc == before
