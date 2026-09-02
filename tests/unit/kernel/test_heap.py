@@ -56,3 +56,42 @@ class TestHeapValidate:
         assert h1 != h2
         assert h1 >= before
         assert h2 > h1
+
+
+class TestSimpleAllocFree:
+
+    def test_freed_block_reused_by_same_size_alloc(self, state):
+        """simple_free must return the block to circulation, not just drop it --
+        a later simple_alloc of the same size should get the same address back
+        instead of bumping the cursor further."""
+        addr1 = state.simple_alloc(64)
+        state.simple_free(addr1)
+        addr2 = state.simple_alloc(64)
+        assert addr2 == addr1
+
+    def test_free_null_is_a_noop(self, state):
+        """free(NULL)/HeapFree(..., NULL) is legitimate per spec -- must not raise."""
+        state.simple_free(0)  # must not raise
+
+    def test_free_untracked_pointer_raises(self, state):
+        """A pointer simple_alloc never handed out (or a double free) is a real
+        bug -- must raise loudly, not silently no-op."""
+        with pytest.raises(RuntimeError):
+            state.simple_free(0xDEADBEEF)
+
+    def test_double_free_raises(self, state):
+        addr = state.simple_alloc(64)
+        state.simple_free(addr)
+        with pytest.raises(RuntimeError):
+            state.simple_free(addr)
+
+    def test_freeing_larger_block_splits_remainder_back_into_free_list(self, state):
+        """Allocating a smaller size than a freed block must not waste the
+        rest of it -- the leftover has to come back as its own free block."""
+        addr1 = state.simple_alloc(128)
+        state.simple_free(addr1)
+        addr2 = state.simple_alloc(32)
+        assert addr2 == addr1
+        # the remaining 96 bytes (at addr1+32) must still be reusable
+        addr3 = state.simple_alloc(96)
+        assert addr3 == addr1 + 32

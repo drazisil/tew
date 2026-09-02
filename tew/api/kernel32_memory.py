@@ -83,7 +83,7 @@ def register_kernel32_memory_handlers(
         size = dw_bytes or 1
         addr = state.simple_alloc(size)
         state.heap_alloc_owner[addr] = h_heap
-        logger.debug("handlers", f"HeapAlloc({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
+        logger.debug("memory", f"HeapAlloc({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
         if dw_flags & _HEAP_ZERO_MEMORY:
             for i in range(size):
                 memory.write8(addr + i, 0)
@@ -115,8 +115,7 @@ def register_kernel32_memory_handlers(
             cpu.halted = True
             cpu.fatal_halt = True
             return
-        del state.heap_alloc_sizes[lp_mem]
-        state.heap_alloc_owner.pop(lp_mem, None)
+        state.simple_free(lp_mem)
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 12)
 
@@ -155,9 +154,7 @@ def register_kernel32_memory_handlers(
             memory.load(new_addr, memory.read_bytes(lp_mem & 0xFFFFFFFF, copy_len))
         if (dw_flags & _HEAP_ZERO_MEMORY) and new_size > old_size:
             memory.load(new_addr + old_size, bytes(new_size - old_size))
-        if lp_mem != 0:
-            state.heap_alloc_sizes.pop(lp_mem, None)
-            state.heap_alloc_owner.pop(lp_mem, None)
+        state.simple_free(lp_mem)
         cpu.regs[EAX] = new_addr
         cleanup_stdcall(cpu, memory, 16)
 
