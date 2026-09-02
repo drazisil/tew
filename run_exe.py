@@ -2678,6 +2678,35 @@ try:
                 # what produced a second, worse native crash (a glibc
                 # buffer-overflow abort/core dump) this same session. Must
                 # break out of the loop immediately, not just flag it.
+                #
+                # 2026-09-02: found a THIRD layer of the same bug, one level
+                # deeper than either fix above -- dispatch_exception() itself
+                # (called just above, still inside *this* iteration, before
+                # the break) walks the game's real SEH handler chain, which
+                # means executing real guest handler code via nested
+                # cpu.run()/step() calls. Confirmed live (diagnostic logging
+                # at the post-dispatch_exception point): even when the whole
+                # chain concludes "unhandled" (handled=False), cpu.faulted
+                # already reads False by the time dispatch_exception returns
+                # -- the walk's own successful intermediate steps clear the
+                # native cpu_is_faulted() flag as a side effect, same
+                # mechanism as the two fixes above, just triggered from
+                # inside dispatch_exception rather than from a later loop
+                # iteration or preempt_slice(). Silently sent every such
+                # fault through the post-run elif cpu.faulted: / elif
+                # cpu.halted: dispatch as a plain halt (diagnose_halt, no
+                # leak dump) instead of a fault (diagnose_fault, WITH the
+                # crash-diagnostic leak dump) -- meaning _dump_crt_memory_
+                # leaks had never actually fired for a real fault since it
+                # was added (x43), because every fault that made it this far
+                # already had this problem. cpu.faulted's setter sets the
+                # sticky _py_faulted flag (see cpu_zig.py's `faulted`
+                # property: `self._py_faulted or _lib.cpu_is_faulted(...)`)
+                # which survives further native-flag resets -- set it
+                # explicitly here, right before halting, so the post-run
+                # dispatch sees the fault this branch already determined,
+                # not whatever the native flag happens to read by then.
+                cpu.faulted = True
                 cpu.halted = True
                 break
 
