@@ -898,6 +898,28 @@ def _mem_init_logpoint(eip, regs, memory, memory_size):
     logger.error("cpu", "[mem-init-probe] _MEM_init (00a719e0) reached")
 # cpu.add_logpoint(0x00a719e0, _mem_init_logpoint)
 
+# 2026-08-31: correlating MCity's own debug-CRT lRequest allocation-request
+# counter (DAT_01280804 in the decompile, __heap_alloc_dbg @ 009f6460) with
+# the x43 leak dump's then-unattributed 42MB block (allocation #522,
+# 44,040,192 bytes) -- confirmed via decompile that DAT_01280804 is a plain
+# long, read-then-incremented in __heap_alloc_dbg right before it's stored
+# as the new block header's lRequest field. This probe sits at 0x009f64ac,
+# the exact instruction (`MOV EDX, dword ptr [DAT_01280804]`) that loads the
+# counter's pre-increment value for that assignment -- reading it directly
+# from memory here gives the real request number about to be assigned,
+# alongside the requested size at [EBP+8] (param_1, confirmed via the
+# standard PUSH EBP/MOV EBP,ESP/SUB ESP,N prologue already visible in this
+# function's disassembly). Confirmed request #522/size 44040192 == the 42MB
+# block -- see memory/heap_and_message_pools.md §11. Left commented out;
+# its finding is already written up, kept here only as the citable probe.
+def _lrequest_counter_logpoint(eip, regs, memory, memory_size):
+    def read32(addr):
+        return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+    request_number = read32(0x01280804)
+    size = read32((regs[EBP] + 8) & 0xFFFFFFFF)
+    logger.error("cpu", f"[lrequest-probe] request=#{request_number} size={size}")
+# cpu.add_logpoint(0x009f64ac, _lrequest_counter_logpoint)
+
 # 2026-08-26: re-opening the "who actually writes field2_0x8" question an
 # earlier pre-compaction pass in this same investigation started but never
 # finished (its watchpoint got removed as an apparently-answered leftover --

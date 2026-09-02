@@ -333,15 +333,20 @@ def patch_crt_internals(
     # (CRT-internal) do. The game already knows how to handle its own
     # errors; let it.
 
-    # __free_dbg (0x009f6e20): internal MSVC debug CRT free, called by __freeptd and
-    # other CRT internals. Validates an MSVC debug block header (_BLOCK_TYPE_IS_VALID)
-    # before the pointer — our bump allocator never writes those headers, so any call
-    # would assert. No-op matches our existing free() IAT handler behavior.
-    # __cdecl (void*, int) — caller cleans args.
-    def _free_dbg_noop(cpu: "CPU") -> None:
-        pass
-
-    stubs.patch_address(0x009F6E20, "__free_dbg", _free_dbg_noop)
+    # __free_dbg (0x009f6e20): internal MSVC debug CRT free, called by __freeptd
+    # and other CRT internals. Deliberately left UNPATCHED (real guest code) --
+    # previously no-op'd on the reasoning that "our bump allocator never writes
+    # [MSVC debug block] headers, so any call would assert," but that reasoning
+    # doesn't hold: __heap_alloc_dbg (0x009f6460, also unpatched) already writes
+    # real MSVC debug block headers as real x86 code before calling through to
+    # our HeapAlloc handler for the underlying bytes -- __free_dbg's own
+    # _BLOCK_TYPE_IS_VALID check has real headers to validate. Confirmed live
+    # (2026-09-02, on top of this branch's real free()/reclaim): a 300s run
+    # reaches __free_dbg 12,165 times with zero asserts and a clean exit at the
+    # step cap. No-oping it was silently dropping every debug-tracked free at
+    # both the guest's own leak-tracking level (the block never gets unlinked
+    # from _CrtDumpMemoryLeaks' walked list) and, now that real free()/reclaim
+    # exists, at the host level too (state.simple_free() never ran for these).
 
     # SNDMEMI_init (FUN_00a5422a) — zero-fill pool + log
     #
