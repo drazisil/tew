@@ -32,7 +32,6 @@ CHKESP_ADDR       = 0x009F1BC0
 CRT_DBG_REPORT    = 0x009F9300
 CHANNEL_DBG_PRINT = 0x004CC5B0
 CHANNEL_SYS_PRINT = 0x004CBDE0
-FREE_DBG          = 0x009F6E20
 WINMAIN_CHECK1    = 0x0040D1D4
 WINMAIN_CHECK2    = 0x0040159B
 SNDMEMI_STRUCT_PTR = 0x020DEF78
@@ -585,17 +584,10 @@ class TestChannelPrintSkipsWorkWhenFiltered:
         assert captured_logs == []  # log itself still suppressed
 
 
-# ── __free_dbg ───────────────────────────────────────────────────────────────
-
-class TestFreeDbgNoop:
-
-    def test_no_observable_effect(self, env):
-        cpu, mem, state, stubs = env
-        cpu.regs[EAX] = 0x1234
-        patched(stubs, FREE_DBG)(cpu)  # must not raise
-        assert cpu.regs[EAX] == 0x1234
-        assert cpu.halted is False
-
+# __free_dbg (0x009f6e20) is deliberately left unpatched -- see the comment at
+# its former patch_address call site in patch_internals.py. No Python handler
+# exists there to unit-test; its correctness (12,165 hits, zero asserts, clean
+# exit over a full run) is verified live, not at the unit level.
 
 # ── SNDMEMI_init ─────────────────────────────────────────────────────────────
 

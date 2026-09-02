@@ -4,6 +4,18 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x48) — Un-no-op'd `__free_dbg`; raising `TEW_MAX_STEPS` reveals the run now reaches GUI init for the first time
+
+**`__free_dbg` fix**: `tew/api/patch_internals.py` used to patch `__free_dbg` (0x009f6e20, the guest's internal debug-CRT free routine) to a hard no-op, reasoned as necessary because "our bump allocator never writes MSVC debug block headers, so any call would assert." That reasoning didn't survive x47's `free()`/reclaim work: `__heap_alloc_dbg` (0x009f6460) was already unpatched real guest code, writing real MSVC debug block headers before x47 even landed -- `__free_dbg`'s own header-validation check has real headers to check. Left it unpatched instead. Live-verified over a 300s run: reached 12,165 times, zero asserts, no `except.txt`, clean exit. The no-op had been silently dropping every debug-tracked free at both the guest's own leak-tracking level (block never unlinked from the list `_CrtDumpMemoryLeaks` walks) and, now that real `free()`/reclaim exists, at the host level too. Removed the now-obsolete `TestFreeDbgNoop` unit test in `test_patch_internals.py` -- no Python handler remains there to test.
+
+**Milestone, found while testing the fix**: `TEW_MAX_STEPS` (default 500,000,000) turned out to be the actual thing ending every recent "clean" run, not a genuine blocker. Raised to 5,000,000,000, a run pushed to 692,847,967 steps / 72.4s vtime and reached `GUI Initialized @ 8388608 bytes: Version 1.31.14-DW` in `stdout.txt` -- further than this project has ever gotten, past all car-list loading and DB init. Halted on a new, mundane blocker: `[UNIMPLEMENTED] user32.dll!GetDoubleClickTime`. Not yet fixed.
+
+**Correction**: `_dump_crt_memory_leaks` (the crash-diagnostic leak dump from x43/x45/x46) only runs from `diagnose_fault`, gated on `cpu.faulted` -- a real CPU-level fault, not an ordinary handler halt like the `GetDoubleClickTime` one above (that goes through `diagnose_halt`, no leak dump). No run since `free()`/reclaim landed has hit a genuine `cpu.faulted` condition, so the leak-dump path has not actually been re-exercised against real `free()` yet, despite this session initially setting out to do exactly that.
+
+Branch: `worktree-crt-leak-report-with-free`. Full suite passing (1194 tests).
+
+---
+
 ## 2026-09-02 (cont'd x47) — Real free()/reclaim wired into the heap allocator; `HeapAlloc` logging moved to a new default-off `memory` category
 
 Two independent pieces landed together in the `simple-alloc-real-free` worktree.
