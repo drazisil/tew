@@ -4,6 +4,20 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x49) — Implemented `GetDoubleClickTime`; fixed `cpu.faulted` going stale during SEH dispatch, which had silently kept the crash-diagnostic leak dump from ever running on a real fault
+
+**`GetDoubleClickTime`**: trivial no-arg `user32.dll` handler, returns `500` (real Windows default). `tew/api/user32_handlers.py` + new `tests/unit/api/test_user32_getdoubleclicktime.py`.
+
+**Real bug, found while pushing past it**: raising `TEW_MAX_STEPS` let a run reach a genuine unhandled CPU fault at 75s vtime, but the post-run `elif cpu.faulted: diagnose_fault(...) elif cpu.halted: diagnose_halt(...)` dispatch took the `diagnose_halt` branch instead -- meaning the crash-diagnostic leak dump (`_dump_crt_memory_leaks`, added x43) silently never ran, despite this being exactly the `cpu.faulted` condition it's gated on. Diagnosed with temporary logging around `dispatch_exception()`: walking the game's real SEH handler chain executes guest handler code via nested `cpu.run()` calls, and confirmed live that `cpu.faulted` already reads `False` the instant `dispatch_exception()` returns -- even when the chain concludes "unhandled" -- because the walk's own successful intermediate steps clear the native `cpu_is_faulted()` flag as a side effect. Same mechanism as two already-documented, already-fixed instances of this bug at the same call site (see `run_exe.py`'s inline comment history), just one layer deeper -- inside `dispatch_exception()` itself rather than a later loop iteration or `preempt_slice()`. This means `_dump_crt_memory_leaks` had never actually fired for a real fault since it was added.
+
+**Fixed**: `cpu.faulted = True` explicitly in the unhandled-SEH branch, right before halting -- the setter sets the sticky `_py_faulted` flag (`cpu_zig.py`), immune to the native flag's later reset.
+
+**Confirmed live**: `diagnose_fault` now runs, `_dump_crt_memory_leaks` genuinely invokes the guest's real `_CrtDumpMemoryLeaks` -- and immediately hits a new fault at `EIP=0x004d980f` (the same address that self-recovered via SEH earlier in the same run, on a different thread) which doesn't recover this time. Dump never completes. New open thread, not investigated further this session.
+
+Branch: `worktree-getdoubleclicktime` (stacked on PR #12). Full suite passing (1197 tests).
+
+---
+
 ## 2026-09-02 (cont'd x48) — Un-no-op'd `__free_dbg`; raising `TEW_MAX_STEPS` reveals the run now reaches GUI init for the first time
 
 **`__free_dbg` fix**: `tew/api/patch_internals.py` used to patch `__free_dbg` (0x009f6e20, the guest's internal debug-CRT free routine) to a hard no-op, reasoned as necessary because "our bump allocator never writes MSVC debug block headers, so any call would assert." That reasoning didn't survive x47's `free()`/reclaim work: `__heap_alloc_dbg` (0x009f6460) was already unpatched real guest code, writing real MSVC debug block headers before x47 even landed -- `__free_dbg`'s own header-validation check has real headers to check. Left it unpatched instead. Live-verified over a 300s run: reached 12,165 times, zero asserts, no `except.txt`, clean exit. The no-op had been silently dropping every debug-tracked free at both the guest's own leak-tracking level (block never unlinked from the list `_CrtDumpMemoryLeaks` walks) and, now that real `free()`/reclaim exists, at the host level too. Removed the now-obsolete `TestFreeDbgNoop` unit test in `test_patch_internals.py` -- no Python handler remains there to test.
