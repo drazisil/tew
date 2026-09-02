@@ -510,6 +510,14 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetDesktopWindow", _GetDesktopWindow)
 
+    # GetDoubleClickTime() -> UINT  (no args — max ms between clicks of a
+    # double-click; real Windows default is 500, user-configurable via
+    # SPI_GETDOUBLECLICKTIME/registry, neither of which this emulator models)
+    def _GetDoubleClickTime(cpu: "CPU") -> None:
+        cpu.regs[EAX] = 500
+
+    stubs.register_handler("user32.dll", "GetDoubleClickTime", _GetDoubleClickTime)
+
     # GetWindow(hWnd, uCmd) -> HWND
     _GW_HWNDFIRST = 0
     _GW_HWNDLAST  = 1
