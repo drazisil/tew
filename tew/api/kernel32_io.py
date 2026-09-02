@@ -42,7 +42,7 @@ from tew.api._state import (
 )
 from tew.api.kernel32_system import _fire_due_timers
 from tew.fs import find_file_ci
-from tew.logger import logger
+from tew.logger import logger, INFO
 
 # ── Environment variable store ────────────────────────────────────────────────
 # Shared by Set/GetEnvironmentVariable{A,W} handlers.
@@ -2446,7 +2446,13 @@ def register_kernel32_io_handlers(
                     break
                 s.append(chr(ch))
             text = "".join(s)
-            logger.info("handlers", f"[OutputDebugString] {text}")
+            # always(), not .info(): a real debugger shows OutputDebugString
+            # unconditionally, regardless of any verbosity setting -- it must
+            # not be silently dropped by whatever LOG_LEVEL/LOG_CATEGORIES an
+            # operator happened to pick, same reasoning as the crash-
+            # diagnostic lines that got this same treatment (see logger.py's
+            # `always` docstring).
+            logger.always(INFO, "handlers", f"[OutputDebugString] {text}")
             # Also lands in the real stdout.txt stream (guest_stdout_handle,
             # same sink Channel_SystemPrint uses -- Molly's request
             # 2026-08-07) rather than only tew's own /tmp/emu.log, since

@@ -71,6 +71,25 @@ class TestOutputDebugStringNoStdoutHandle:
             logger_module.set_emit_hook(None)
         assert any("plain message" in line for line in lines)
 
+    def test_logs_even_under_a_restrictive_level_and_category_filter(self):
+        # A real debugger shows OutputDebugString unconditionally -- must
+        # not be silently dropped by whatever LOG_LEVEL/LOG_CATEGORIES an
+        # operator happened to pick (same reasoning as crash-diagnostic
+        # lines -- see logger.py's `always`).
+        cpu, mem, state, stubs = _env()
+        lines: list[str] = []
+        logger_module.set_emit_hook(lambda level, line: lines.append(line))
+        saved_level = logger_module._active_level
+        saved_categories = logger_module._active_categories
+        try:
+            logger_module.configure_logger(level="error", categories="cpu")
+            _call(stubs, cpu, mem, "should still appear")
+        finally:
+            logger_module.set_emit_hook(None)
+            logger_module._active_level = saved_level
+            logger_module._active_categories = saved_categories
+        assert any("should still appear" in line for line in lines)
+
 
 class TestOutputDebugStringWritesToGuestStdout:
 

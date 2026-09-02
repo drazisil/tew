@@ -4,6 +4,24 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x50) — RESOLVED: `MessagePool::Get(NULL)` crash on DBThread, root-caused to `WSAStartup` hardcoding the wrong negotiated version; two missing wsock32 ordinal aliases fixed along the way; `OutputDebugString` now bypasses log filtering
+
+Chasing the `0x00a8299b` `MessagePool::Get(NULL)` crash found at x49 (initially suspected `0x004d980f`/`_CLayer_DetectDebugger` might be connected -- confirmed unrelated, that address is just the already-understood anti-debug self-test re-triggering on a different thread).
+
+**Root cause, traced via the crash's real EBP chain** (`DBHandlers.c` -> `DBResultQ_AllocMsg` -> `SocketMgr::Initialize` -> `TCPMgr::Initialize`, `0x00a7a4fe`): `CommMgr::GetFreeMsg` (`0x00a80163`) reads one of three `MessagePool*` member fields (small/medium/large, `this+0x34/0x38/0x3c`) with no null check. `TCPMgr::Initialize` calls `WSAStartup` (ordinal 115) requesting `MAKEWORD(1,1)=0x0101`, then does an exact byte-for-byte match of the returned `wVersion` before proceeding to construct any of the three pools -- real Winsock always echoes back the requested version, but `tew/api/wsock32_handlers.py`'s `_wsa_startup` hardcoded `wVersion=0x0202` unconditionally, so the check always failed and all three `MessagePool::Initialize` calls were silently skipped every run. `DAT_020d6250` (the global `CommMgr*`) gets set before `Initialize()` even runs, so `DBResultQ_Startup`'s own "already initialized" check never retries.
+
+**Fixed**: `_wsa_startup` now echoes the real requested version back as `wVersion` instead of a hardcoded constant; `wHighVersion` (the DLL's own max capability) stays constant, correctly. New `tests/unit/api/test_wsock32_wsastartup.py`, 5 tests.
+
+**Also found and fixed, live-testing the above**: `wsock32.dll!Ordinal #57` (`gethostname`) unimplemented -- both `gethostname` and `gethostbyname` were already fully implemented and registered by name, just missing from `ordinal_map` (same bug class as 2026-08-21's `LoadTypeLibEx` fix). Confirmed via `objdump -p` on the real DLL and MCity_d.exe's own import table (ordinal-only) that ordinals 52 and 57 were the actual gaps; added the full real contiguous block (51/56 too) for completeness. New `tests/unit/api/test_wsock32_ordinals.py`, 5 tests.
+
+**Also fixed**: `OutputDebugString` (`tew/api/kernel32_io.py`) used `logger.info`, silently droppable by `LOG_LEVEL`/`LOG_CATEGORIES` -- a real debugger shows it unconditionally. Switched to `logger.always()`, same treatment as other load-bearing diagnostic lines (2026-08-21 x5). 1 new test in `test_output_debug_string.py`.
+
+**Confirmed live**: `TcpMgr::Initialize(keepAliveThread) thread created` and `SockMgr::Initialize(outgoingThread) thread created` both now appear -- both `Initialize()` calls complete fully for the first time. Reaches `Missing resource file: scn.login` (non-fatal), halts at 77.5s on an unrelated `DS::DuplicateSoundBuffer: invalid this=0x067c0080` DirectSound bug -- new, not investigated.
+
+Branch: `worktree-investigate-004d980f` (stacked on PR #13). Full suite passing (1208 tests).
+
+---
+
 ## 2026-09-02 (cont'd x49) — Implemented `GetDoubleClickTime`; fixed `cpu.faulted` going stale during SEH dispatch, which had silently kept the crash-diagnostic leak dump from ever running on a real fault
 
 **`GetDoubleClickTime`**: trivial no-arg `user32.dll` handler, returns `500` (real Windows default). `tew/api/user32_handlers.py` + new `tests/unit/api/test_user32_getdoubleclicktime.py`.
