@@ -319,6 +319,11 @@ class CRTState:
         self.next_heap_alloc: int = 0x04000000
         self.heap_alloc_sizes: dict[int, int] = {}   # addr → user size
         self.heap_alloc_owner: dict[int, int] = {}   # addr → heap handle
+        # Freed blocks, first-fit-searched by simple_alloc before it bumps the
+        # cursor further. addr is always 16-byte aligned (every block, split
+        # remainders included, originates from bump_alloc_next's own aligned
+        # cursor -- see simple_free/simple_alloc's splitting logic).
+        self.heap_free_list: list[tuple[int, int]] = []   # [(addr, size), ...]
         self.heap_handles: set[int] = set()
         self.next_heap_handle: int = 0x9000
         # Pre-register process heap
@@ -491,6 +496,20 @@ class CRTState:
         libcpu.so's bump_alloc_next (cpu/src/alloc.zig); the cursor itself
         and the size-tracking dict stay Python-owned, same split as
         ZigMemory leaving the buffer Python-owned in memory_zig.py."""
+        for i, (free_addr, free_size) in enumerate(self.heap_free_list):
+            if free_size >= size:
+                del self.heap_free_list[i]
+                # Align the consumed portion to 16 bytes, matching
+                # bump_alloc_next's own rounding, so a split remainder's
+                # start address stays 16-byte aligned like every other block.
+                aligned_size = (size + 15) & ~15
+                if aligned_size < free_size:
+                    remainder_addr = free_addr + aligned_size
+                    remainder_size = free_size - aligned_size
+                    self.heap_free_list.append((remainder_addr, remainder_size))
+                self.heap_alloc_sizes[free_addr] = size
+                return free_addr
+
         addr = self.next_heap_alloc
         new_cursor = bump_alloc_next(self.next_heap_alloc, size)
         if new_cursor > THREAD_STACK_BASE:
@@ -503,6 +522,21 @@ class CRTState:
         self.next_heap_alloc = new_cursor
         self.heap_alloc_sizes[addr] = size
         return addr
+
+    def simple_free(self, addr: int) -> None:
+        """Returns a block simple_alloc handed out back to circulation. NULL
+        (addr == 0) is a legitimate no-op, matching real free()/HeapFree()
+        semantics. An untracked or already-freed addr raises -- a double
+        free or garbage pointer is a real bug, not something to no-op past."""
+        if addr == 0:
+            return
+        if addr not in self.heap_alloc_sizes:
+            raise RuntimeError(
+                f"simple_free: untracked or already-freed pointer 0x{addr:x}"
+            )
+        size = self.heap_alloc_sizes.pop(addr)
+        self.heap_alloc_owner.pop(addr, None)
+        self.heap_free_list.append((addr, size))
 
     # ── Path translation ──────────────────────────────────────────────────────
 

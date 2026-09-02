@@ -7,7 +7,7 @@ Control via environment variables:
 
 Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
             graphics, fileio, registry, exception, startup, scheduler, winsock, calls,
-            window, dialog, channel
+            window, dialog, channel, memory
 
 Each comma-separated LOG_CATEGORIES token may be prefixed with `+` (default,
 if omitted) or `-`, and may target a single Win32 function within a category
@@ -18,6 +18,11 @@ category except CompareStringA". A per-function rule only takes effect for
 logging done while that function's own registered handler is on the call
 stack (see set_current_handler / win32_handlers.py's dispatch loop) -- log
 lines from anywhere else only ever match on the bare category.
+
+`memory` is excluded even under the bare `*`/unset default (unlike every
+other category) -- it's per-allocation HeapAlloc/HeapFree noise, useful
+only when actually chasing an allocator bug. Opt in explicitly with
+`+memory` (alone or alongside other categories).
 """
 
 import os
@@ -31,8 +36,13 @@ LogCategory = Literal[
     "cpu", "dll", "loader", "handlers", "thread", "wininet",
     "d3d8", "graphics", "fileio", "registry", "exception",
     "startup", "scheduler", "winsock", "calls",
-    "window", "dialog", "channel",
+    "window", "dialog", "channel", "memory",
 ]
+
+# Categories that stay silent even under the bare "*"/unset LOG_CATEGORIES
+# default -- must be explicitly opted into with "+<category>". See the
+# "memory" note in the module docstring for why.
+_DEFAULT_OFF_CATEGORIES = {"memory"}
 
 ERROR = 0
 WARN = 1
@@ -152,21 +162,33 @@ def set_thread_id_provider(provider: ThreadIdProvider | None) -> None:
     _thread_id_provider = provider
 
 
+def _category_permitted(level: int, category: str) -> bool:
+    # ERROR is exempt from category filtering for every category, memory
+    # included -- same as "exception" already was: every halt/fault this
+    # emulator produces is required (CLAUDE.md's "halt loudly" rule) to log
+    # an ERROR right before setting cpu.halted -- if that line could be
+    # silently dropped by an unrelated LOG_CATEGORIES scope, the halt
+    # diagnostic that follows would have no reason attached.
+    if level == ERROR:
+        return True
+    # A default-off category (currently just "memory") needs an explicit
+    # "+category" rule even under the bare "*"/unset default -- everything
+    # else falls through to the normal "no filter means everything passes"
+    # behavior.
+    if category in _DEFAULT_OFF_CATEGORIES:
+        return _active_categories is not None and _category_active(
+            _active_categories, category, _current_handler_name
+        )
+    if _active_categories is None or category == "exception":
+        return True
+    return _category_active(_active_categories, category, _current_handler_name)
+
+
 def _emit(level: int, category: str, msg: str, *, force: bool = False) -> None:
     if not force:
         if level > _active_level:
             return
-        # ERROR is exempt from category filtering, same as "exception" already
-        # was: every halt/fault this emulator produces is required (CLAUDE.md's
-        # "halt loudly" rule) to log an ERROR right before setting cpu.halted --
-        # if that line could be silently dropped by an unrelated LOG_CATEGORIES
-        # scope, the halt diagnostic that follows would have no reason attached.
-        if (
-            _active_categories is not None
-            and category != "exception"
-            and level != ERROR
-            and not _category_active(_active_categories, category, _current_handler_name)
-        ):
+        if not _category_permitted(level, category):
             return
 
     elapsed = time.monotonic() - _start_time
@@ -183,11 +205,7 @@ def _emit(level: int, category: str, msg: str, *, force: bool = False) -> None:
 def is_active(level: int, category: str) -> bool:
     if level > _active_level:
         return False
-    if _active_categories is not None and not _category_active(
-        _active_categories, category, _current_handler_name
-    ):
-        return False
-    return True
+    return _category_permitted(level, category)
 
 
 class _Logger:

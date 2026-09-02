@@ -4,6 +4,20 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x47) — Real free()/reclaim wired into the heap allocator; `HeapAlloc` logging moved to a new default-off `memory` category
+
+Two independent pieces landed together in the `simple-alloc-real-free` worktree.
+
+**Real free()**: `state.simple_free()` (`tew/api/_state.py`) returns a freed block to a first-fit free list (`heap_free_list`) that `simple_alloc()` now searches before bumping the cursor further; a block larger than the request gets split, with the 16-byte-aligned remainder pushed back onto the free list. `NULL` is a legitimate no-op; an untracked or already-freed pointer raises `RuntimeError` -- a double free is a real bug, not something to silently no-op past. Wired into `msvcrt.dll`'s `free()` and `operator delete` (`msvcrt_handlers.py`), both previously no-ops. New tests: `TestSimpleAllocFree` in `tests/unit/kernel/test_heap.py` (reuse, NULL no-op, untracked-pointer raise, double-free raise, split-remainder reuse).
+
+**Confirmed live**: a clean foreground run (`LOG_LEVEL=debug LOG_CATEGORIES=handlers,cpu,exception,startup,fileio`) reached the 500,000,000-step execution cap at 187s of guest vtime with a clean exit -- no heap-exhaustion halt, versus the previous ceiling reliably hit in the 85-100s window (x45/x46, before this worktree's `free()` work). Not proven gone for good (this run didn't go indefinitely), but the free list is clearly reclaiming in practice.
+
+**Logging**: `HeapAlloc`'s per-call debug line (`kernel32_memory.py`) was flooding the `handlers` category (62,501 lines in one run) now that allocations actually cycle instead of just climbing forever. Moved to a new `memory` category that stays silent even under the bare `*`/unset `LOG_CATEGORIES` default -- opt in with `+memory`. Implemented via a new `_DEFAULT_OFF_CATEGORIES` set consulted by a shared `_category_permitted()` helper in `logger.py` (also now used by `is_active()`), keeping the pre-existing "ERROR always bypasses category filtering" guarantee intact for every category, `memory` included. 6 new tests in `test_logger.py`.
+
+Branch: `worktree-simple-alloc-real-free`. Full suite passing (1195 tests).
+
+---
+
 ## 2026-08-31 (cont'd x46) — Fixed `_dump_crt_memory_leaks` silently swallowing `FatalHaltError` from its nested `_CrtDumpMemoryLeaks` call, found during PR #8 review
 
 **Context**: PR #8 bundles x45's exception-swallowing fix (`CPU.handle_exception`) with the D3D8/Vulkan fix and the real `_CrtDumpMemoryLeaks` wiring. A code review of that PR caught a second, related instance of the same swallowing pattern one layer up, in the very diagnostic code x45 added.
