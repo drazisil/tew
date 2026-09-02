@@ -71,8 +71,7 @@ FIONBIO = 0x8004667E
 # ── WSADATA layout (WinSock 2.2, 400 bytes) ──────────────────────────────────
 
 _WSADATA_SIZE     = 400
-_WSADATA_VERSION  = 0x0202
-_WSADATA_HIGHVER  = 0x0202
+_WSADATA_HIGHVER  = 0x0202  # highest version this "DLL" claims to support
 _WSADATA_DESC     = b"WinSock 2.0\x00"
 _WSADATA_STATUS   = b"Running\x00"
 _WSADATA_MAXSOCKS = 512
@@ -194,6 +193,9 @@ def register_wsock32_handlers(
         16:  "recv",             17:  "recvfrom",           18:  "select",
         19:  "send",             20:  "sendto",             21:  "setsockopt",
         22:  "shutdown",         23:  "socket",
+        51:  "gethostbyaddr",    52:  "gethostbyname",       53:  "getprotobyname",
+        54:  "getprotobynumber", 55:  "getservbyname",        56:  "getservbyport",
+        57:  "gethostname",
         101: "WSAAsyncSelect",   102: "WSAAsyncGetHostByAddr",
         103: "WSAAsyncGetHostByName",
         108: "WSACancelAsyncRequest",
@@ -206,13 +208,29 @@ def register_wsock32_handlers(
     # ── WSA startup / teardown ────────────────────────────────────────────────
 
     def _wsa_startup(cpu: "CPU") -> None:
-        """WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) -> int."""
+        """WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) -> int.
+
+        Real WSAStartup echoes wVersionRequested straight back as wVersion
+        (it's the version the caller and the "DLL" have agreed to use for
+        the rest of the session), not the DLL's own max-supported version --
+        wHighVersion is the only field that reports that. Real, confirmed
+        bug this was hardcoding both to 0x0202: TCPMgr::Initialize
+        (0x00a7a4fe) requests MAKEWORD(1,1)=0x0101 and does an exact
+        byte-for-byte match of the returned wVersion against what it asked
+        for before proceeding -- with wVersion always reported back as
+        0x0202, that check always failed, silently skipping all three of
+        its MessagePool::Initialize calls (small/medium/large) every run,
+        leaving CommMgr's pool pointers permanently NULL. Confirmed live:
+        MessagePool::Get(NULL) crash on DBThread the first time a queued
+        message needed one of those pools.
+        """
         global _wsa_last_error
+        w_version_requested = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
         lp_wsa_data = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if lp_wsa_data:
             for i in range(_WSADATA_SIZE):
                 memory.write8((lp_wsa_data + i) & 0xFFFFFFFF, 0)
-            memory.write16(lp_wsa_data,       _WSADATA_VERSION)
+            memory.write16(lp_wsa_data,       w_version_requested)
             memory.write16(lp_wsa_data + 2,   _WSADATA_HIGHVER)
             for i, b in enumerate(_WSADATA_DESC):
                 memory.write8((lp_wsa_data + 4 + i) & 0xFFFFFFFF, b)
