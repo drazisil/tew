@@ -134,3 +134,42 @@ class TestMemoryCategoryDefaultOff:
         configure_logger(level="error", categories="*")
         logger.error("memory", "errors always show")
         assert len(captured) == 1
+
+
+class TestRegistryCategoryDefaultOff:
+    """"registry" (per-call RegOpenKeyExA/RegQueryValueExA noise) must stay
+    silent unless explicitly opted into, unlike every other category -- see
+    the _DEFAULT_OFF_CATEGORIES note in logger.py."""
+
+    def test_hidden_under_bare_star_default(self, captured):
+        configure_logger(level="debug", categories="*")
+        logger.debug("registry", "should not appear")
+        assert captured == []
+
+    def test_hidden_when_categories_unset(self, captured):
+        configure_logger(level="debug", categories=None)
+        logger_module._active_categories = None  # simulate LOG_CATEGORIES never set
+        logger.debug("registry", "should not appear")
+        assert captured == []
+
+    def test_hidden_when_other_categories_requested(self, captured):
+        configure_logger(level="debug", categories="handlers,cpu")
+        logger.debug("registry", "should not appear")
+        assert captured == []
+
+    def test_shown_with_explicit_opt_in(self, captured):
+        configure_logger(level="debug", categories="+registry")
+        logger.debug("registry", "should appear")
+        assert len(captured) == 1
+
+    def test_shown_alongside_other_categories(self, captured):
+        configure_logger(level="debug", categories="handlers,+registry")
+        logger.debug("registry", "should appear")
+        assert len(captured) == 1
+
+    def test_error_level_still_bypasses_even_for_registry(self, captured):
+        # ERROR's "halt loudly" exemption applies to every category, registry
+        # included -- consistent with the pre-existing exception/ERROR rule.
+        configure_logger(level="error", categories="*")
+        logger.error("registry", "errors always show")
+        assert len(captured) == 1
