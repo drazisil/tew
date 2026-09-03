@@ -234,6 +234,15 @@ crt_state = register_crt_handlers(
 crt_state.exe_path = exe_path   # used by GetModuleFileNameA
 set_thread_id_provider(crt_state.tls_current_thread_id)
 
+# AppendToCRTLeaksFile (real, unpatched guest CRT code) opens
+# C:\memleaksCRT.txt in append mode -- fine for the real game's own
+# multi-session debugging workflow, but tew replays this same run
+# repeatedly, so without truncating it here the file keeps concatenating
+# leak reports across every run ever taken, making it unreadable fast.
+_memleaks_path = crt_state.translate_windows_path("C:\\memleaksCRT.txt")
+if os.path.exists(_memleaks_path):
+    os.remove(_memleaks_path)
+
 # Attach PE resources so dialog templates and bitmap controls can be loaded
 with open(exe_path, "rb") as _f:
     _pe_resources = PEResources(_f.read())
