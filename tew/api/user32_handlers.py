@@ -725,6 +725,41 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetWindowRect", _GetWindowRect)
 
+    # GetWindowPlacement(HWND hWnd, WINDOWPLACEMENT *lpwndpl) -> BOOL
+    # WINDOWPLACEMENT: UINT length; UINT flags; UINT showCmd;
+    #                  POINT ptMinPosition; POINT ptMaxPosition; RECT rcNormalPosition;
+    # This project tracks no separate minimized/maximized state (see the
+    # ShowWindow/IsWindowVisible comment above), so showCmd only distinguishes
+    # SW_HIDE from SW_SHOWNORMAL, and ptMinPosition/ptMaxPosition report the
+    # real-Windows "never minimized/maximized" default of (-1, -1).
+    def _GetWindowPlacement(cpu: "CPU") -> None:
+        h_wnd    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_wndpl = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        length = memory.read32(lp_wndpl) if lp_wndpl else 0
+        if entry is not None and lp_wndpl and length == 44:
+            show_cmd = 1 if (entry.style & WS_VISIBLE) else 0  # SW_SHOWNORMAL : SW_HIDE
+            px_x  = du_to_px_x(entry.x)
+            px_y  = du_to_px_y(entry.y)
+            px_cx = du_to_px_x(entry.cx)
+            px_cy = du_to_px_y(entry.cy)
+            memory.write32(lp_wndpl + 4,  0)             # flags
+            memory.write32(lp_wndpl + 8,  show_cmd)       # showCmd
+            memory.write32(lp_wndpl + 12, 0xFFFFFFFF)     # ptMinPosition.x = -1
+            memory.write32(lp_wndpl + 16, 0xFFFFFFFF)     # ptMinPosition.y = -1
+            memory.write32(lp_wndpl + 20, 0xFFFFFFFF)     # ptMaxPosition.x = -1
+            memory.write32(lp_wndpl + 24, 0xFFFFFFFF)     # ptMaxPosition.y = -1
+            memory.write32(lp_wndpl + 28, px_x)           # rcNormalPosition.left
+            memory.write32(lp_wndpl + 32, px_y)           # rcNormalPosition.top
+            memory.write32(lp_wndpl + 36, px_x + px_cx)   # rcNormalPosition.right
+            memory.write32(lp_wndpl + 40, px_y + px_cy)   # rcNormalPosition.bottom
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            cpu.regs[EAX] = 0  # FALSE
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "GetWindowPlacement", _GetWindowPlacement)
+
     # GetClientRect(HWND hWnd, LPRECT lpRect) -> BOOL
     def _GetClientRect(cpu: "CPU") -> None:
         h_wnd   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
