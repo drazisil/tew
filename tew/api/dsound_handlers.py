@@ -3,10 +3,21 @@
 Real PCM audio via SDL2 audio callback.  IDirectSound + IDirectSoundBuffer COM
 stubs sufficient for DirectSound-based game audio.
 
-Fixed-data region addresses (immediately after DInput vtables at 0x00220368):
-    DS_VTABLE     = 0x00220370  IDirectSound      11 slots × 4 =  44 bytes → 0x0022039C
-    DS_OBJ        = 0x002203A0  IDirectSound singleton (4 bytes)
-    DS_BUF_VTABLE = 0x002203B0  IDirectSoundBuffer 21 slots × 4 =  84 bytes → 0x00220404
+Fixed-data region addresses (immediately after DInput vtables at 0x00220388):
+    DS_VTABLE     = 0x00220390  IDirectSound      11 slots × 4 =  44 bytes → 0x002203BC
+    DS_OBJ        = 0x002203C0  IDirectSound singleton (4 bytes)
+    DS_BUF_VTABLE = 0x002203D0  IDirectSoundBuffer 21 slots × 4 =  84 bytes → 0x00220424
+
+    These sit right after DI_DEV_VTABLE (tew/api/dinput_handlers.py), which
+    must stay ahead of these in registration order -- DI_DEV_VTABLE previously
+    ended at 0x00220368 (18 slots) leaving these addresses clear, but grew to
+    0x00220388 (26 slots, the real IDirectInputDevice2A spec) without these
+    being moved to match, silently overlapping DI_DEV_VTABLE's slots 20-25
+    with DS_VTABLE's slots 0-5. Confirmed live: a real Poll() call (DI slot
+    25) landed on DS::DuplicateSoundBuffer's trampoline (DS slot 5) instead,
+    since dsound_handlers.py registers after dinput_handlers.py and silently
+    clobbered the shared address -- surfaced as a "DS::DuplicateSoundBuffer:
+    invalid this" halt that had nothing to do with DirectSound at all.
 
 Buffer COM object layout (16 bytes, bump-allocated from D3D8 heap):
     [0]  vtable ptr   DS_BUF_VTABLE
@@ -37,9 +48,12 @@ from tew.api._state import CRTState
 from tew.logger import logger
 
 # ── Fixed COM addresses ────────────────────────────────────────────────────────
-DS_VTABLE     = 0x00220370   # IDirectSound vtable       (11 × 4 = 44 bytes → 0x0022039C)
-DS_OBJ        = 0x002203A0   # IDirectSound singleton    (4 bytes)
-DS_BUF_VTABLE = 0x002203B0   # IDirectSoundBuffer vtable (21 × 4 = 84 bytes → 0x00220404)
+# Must stay clear of DI_DEV_VTABLE (tew/api/dinput_handlers.py), which ends at
+# 0x00220388 -- see this module's docstring for the overlap bug these values
+# previously had.
+DS_VTABLE     = 0x00220390   # IDirectSound vtable       (11 × 4 = 44 bytes → 0x002203BC)
+DS_OBJ        = 0x002203C0   # IDirectSound singleton    (4 bytes)
+DS_BUF_VTABLE = 0x002203D0   # IDirectSoundBuffer vtable (21 × 4 = 84 bytes → 0x00220424)
 
 # ── Status codes ──────────────────────────────────────────────────────────────
 DS_OK                    = 0x00000000
