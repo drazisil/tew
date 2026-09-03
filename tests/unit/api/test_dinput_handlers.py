@@ -48,7 +48,7 @@ class _FakeCPU:
         self.halted = False
 
 
-MEM_SIZE = 128 * 1024 * 1024  # must exceed the D3D8 private heap base (0x04800000)
+MEM_SIZE = 272 * 1024 * 1024  # must exceed the D3D8 private heap limit (0x10000000)
 STACK    = 0x200000
 BUF_A    = 0x300000
 BUF_B    = 0x310000
@@ -312,6 +312,42 @@ class TestDevGetDeviceInfo:
         assert cpu.regs[EAX] == DI_OK
 
 
+DEV_FIXED_RETURN_CASES = [
+    ("Dev::CreateEffect",              16, DIERR_UNSUPPORTED),
+    ("Dev::EnumEffects",               12, DI_OK),
+    ("Dev::GetEffectInfo",              8, DIERR_UNSUPPORTED),
+    ("Dev::GetForceFeedbackState",      4, DIERR_UNSUPPORTED),
+    ("Dev::SendForceFeedbackCommand",   4, DIERR_UNSUPPORTED),
+    ("Dev::EnumCreatedEffectObjects",  12, DI_OK),
+    ("Dev::Escape",                     4, DIERR_UNSUPPORTED),
+    ("Dev::Poll",                       0, DI_OK),
+]
+
+
+class TestDevFixedReturnMethods:
+    """Real bug this covers: these 8 slots (CreateEffect..Poll) didn't exist
+    at all until now -- DI_DEV_VTABLE was only 18 slots (offsets 0-0x44),
+    so calling any of them (Poll in particular, real IDirectInputDevice2
+    offset 0x64) read 32 bytes past the vtable's own end and crashed with
+    EIP=0 -- confirmed live via an unhandled CPU fault. Poll is the one
+    the real game code actually calls (_INPUT_getdevicedata, 0x00a73d40);
+    the rest exist so it lands at the right offset relative to vtable start."""
+
+    @pytest.mark.parametrize("name,arg_bytes,expected", DEV_FIXED_RETURN_CASES)
+    def test_returns_expected_code(self, env, name, arg_bytes, expected):
+        cpu, mem, stubs = env
+        args = [0] * (arg_bytes // 4)
+        com_call(stubs, cpu, mem, "dinput.dll", name, DEV_OBJ, args)
+        assert cpu.regs[EAX] == expected
+
+    def test_none_of_them_halt(self, env):
+        cpu, mem, stubs = env
+        for name, arg_bytes, _ in DEV_FIXED_RETURN_CASES:
+            args = [0] * (arg_bytes // 4)
+            com_call(stubs, cpu, mem, "dinput.dll", name, DEV_OBJ, args)
+            assert cpu.halted is False, f"{name} halted"
+
+
 # ── Setup smoke test ────────────────────────────────────────────────────────────
 
 class TestVtableSetup:
@@ -319,3 +355,32 @@ class TestVtableSetup:
     def test_di_obj_points_to_di_vtable(self, env):
         cpu, mem, stubs = env
         assert mem.read32(DI_OBJ) == DI_VTABLE
+
+    def test_dev_vtable_spans_26_real_slots(self, env):
+        # Regression guard for the exact bug this session found: a vtable
+        # short by even one trailing slot means whatever real game code
+        # calls that offset reads into unrelated memory instead of a real
+        # function pointer -- confirmed live as an EIP=0 unhandled CPU
+        # fault (real IDirectInputDevice2::Poll, offset 0x64). This test
+        # env's get_handler_address fake always returns 0 (see module
+        # docstring), so it can't check the *written* vtable bytes -- what
+        # it can check is that every one of the 26 real slot names is
+        # actually registered as a callable handler (a genuinely missing
+        # slot raises KeyError from stubs.get, same as it would from a
+        # real unresolved trampoline).
+        cpu, mem, stubs = env
+        real_slot_names = [
+            "Dev::QueryInterface", "Dev::AddRef", "Dev::Release",
+            "Dev::GetCapabilities", "Dev::EnumObjects", "Dev::GetProperty",
+            "Dev::SetProperty", "Dev::Acquire", "Dev::Unacquire",
+            "Dev::GetDeviceState", "Dev::GetDeviceData", "Dev::SetDataFormat",
+            "Dev::SetEventNotification", "Dev::SetCooperativeLevel",
+            "Dev::GetObjectInfo", "Dev::GetDeviceInfo", "Dev::RunControlPanel",
+            "Dev::Initialize", "Dev::CreateEffect", "Dev::EnumEffects",
+            "Dev::GetEffectInfo", "Dev::GetForceFeedbackState",
+            "Dev::SendForceFeedbackCommand", "Dev::EnumCreatedEffectObjects",
+            "Dev::Escape", "Dev::Poll",
+        ]
+        assert len(real_slot_names) == 26
+        for name in real_slot_names:
+            stubs.get("dinput.dll", name)  # raises KeyError if missing

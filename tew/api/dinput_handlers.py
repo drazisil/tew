@@ -6,8 +6,16 @@ sufficient for the game to complete DI initialisation and proceed to the render 
 COM vtable addresses (fixed-data region, after D3DTEX_VTABLE ends at 0x002202D8):
     DI_VTABLE     = 0x002202E0  (IDirectInput2A,       9 slots × 4 =  36 bytes → 0x00220304)
     DI_OBJ        = 0x00220310  (IDirectInput2A object, 4 bytes)
-    DI_DEV_VTABLE = 0x00220320  (IDirectInputDevice2A, 18 slots × 4 = 72 bytes → 0x00220368)
+    DI_DEV_VTABLE = 0x00220320  (IDirectInputDevice2A, 26 slots × 4 = 104 bytes → 0x00220388)
     Device objects are bump-allocated from the D3D8 heap (8 bytes each).
+
+    The vtable's real slot count matters, not just "enough methods to boot":
+    real IDirectInputDevice2 has 26 methods (indices 0-25, through Poll at
+    offset 0x64) -- slots 18-25 (CreateEffect through Poll) were missing
+    entirely until a real, confirmed live crash (EIP=0x00000000, unhandled
+    CPU fault) traced a compiled Poll()/Acquire()-retry helper
+    (_INPUT_getdevicedata, 0x00a73d40) calling vtable+0x64 -- 32 bytes past
+    the vtable's own end, into whatever memory happened to follow it.
 
 All handlers read `this` from ESP+4 (dx8z / game push `this` on stack, not ECX).
 """
@@ -28,7 +36,7 @@ from tew.logger import logger
 # ── Fixed COM object addresses ────────────────────────────────────────────────
 DI_VTABLE     = 0x002202E0   # IDirectInput2A vtable     (9  × 4 = 36 bytes → 0x00220304)
 DI_OBJ        = 0x00220310   # IDirectInput2A singleton  (4 bytes)
-DI_DEV_VTABLE = 0x00220320   # IDirectInputDevice2A vtable (18 × 4 = 72 bytes → 0x00220368)
+DI_DEV_VTABLE = 0x00220320   # IDirectInputDevice2A vtable (26 × 4 = 104 bytes → 0x00220388)
 
 # ── DirectInput error / status codes ─────────────────────────────────────────
 DI_OK                  = 0x00000000
@@ -211,6 +219,42 @@ def register_dinput_handlers(
         # [17] Initialize(hinst, dwVersion, REFGUID)
         _com_stub(stubs, "dinput.dll", "Dev::Initialize",
                   lambda cpu, mem: _set_eax(cpu, DI_OK), 12, memory),
+        # [18] CreateEffect(REFGUID, LPCDIEFFECT, LPDIRECTINPUTEFFECT*, LPUNKNOWN)
+        _com_stub(stubs, "dinput.dll", "Dev::CreateEffect",
+                  lambda cpu, mem: _set_eax(cpu, DIERR_UNSUPPORTED), 16, memory),
+        # [19] EnumEffects(LPDIENUMEFFECTSCALLBACK, LPVOID, DWORD) -- nothing to enumerate
+        _com_stub(stubs, "dinput.dll", "Dev::EnumEffects",
+                  lambda cpu, mem: _set_eax(cpu, DI_OK), 12, memory),
+        # [20] GetEffectInfo(LPDIEFFECTINFO, REFGUID)
+        _com_stub(stubs, "dinput.dll", "Dev::GetEffectInfo",
+                  lambda cpu, mem: _set_eax(cpu, DIERR_UNSUPPORTED), 8, memory),
+        # [21] GetForceFeedbackState(LPDWORD)
+        _com_stub(stubs, "dinput.dll", "Dev::GetForceFeedbackState",
+                  lambda cpu, mem: _set_eax(cpu, DIERR_UNSUPPORTED), 4, memory),
+        # [22] SendForceFeedbackCommand(DWORD)
+        _com_stub(stubs, "dinput.dll", "Dev::SendForceFeedbackCommand",
+                  lambda cpu, mem: _set_eax(cpu, DIERR_UNSUPPORTED), 4, memory),
+        # [23] EnumCreatedEffectObjects(LPDIENUMCREATEDEFFECTOBJECTSCALLBACK, LPVOID, DWORD)
+        # -- no effects were ever created (CreateEffect always fails above), so
+        # there's genuinely nothing to enumerate; DI_OK is the honest answer,
+        # not a stand-in for unimplemented force feedback.
+        _com_stub(stubs, "dinput.dll", "Dev::EnumCreatedEffectObjects",
+                  lambda cpu, mem: _set_eax(cpu, DI_OK), 12, memory),
+        # [24] Escape(LPDIEFFESCAPE) -- driver-specific passthrough, no real driver here
+        _com_stub(stubs, "dinput.dll", "Dev::Escape",
+                  lambda cpu, mem: _set_eax(cpu, DIERR_UNSUPPORTED), 4, memory),
+        # [25] Poll() -- real, confirmed bug this fixes: this slot didn't exist
+        # at all until now (DI_DEV_VTABLE was only 18 slots, offsets 0-0x44),
+        # so _INPUT_getdevicedata's real compiled Poll()-then-Acquire()-retry
+        # idiom (0x00a73d40) read a null function pointer 32 bytes past the
+        # vtable's own end and jumped to EIP=0 -- confirmed live via a real
+        # unhandled CPU fault. GetDeviceState/GetDeviceData already report
+        # device state synchronously and unconditionally on every call (no
+        # internal queue to advance), so there is nothing for a real poll to
+        # do here; DI_OK is the correct, honest "state is already current"
+        # answer, not a placeholder.
+        _com_stub(stubs, "dinput.dll", "Dev::Poll",
+                  lambda cpu, mem: _set_eax(cpu, DI_OK), 0, memory),
     ]
     for i, addr in enumerate(dev_vtable):
         memory.write32(DI_DEV_VTABLE + i * 4, addr)
