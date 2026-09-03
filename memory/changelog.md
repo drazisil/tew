@@ -4,6 +4,22 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x52) — RESOLVED: `DS::DuplicateSoundBuffer` "invalid this" halt was never a DirectSound bug — a real DirectInput `Poll()` call was landing on DirectSound's trampoline because their fixed COM vtable regions silently overlapped
+
+**Root cause**: `DI_DEV_VTABLE` (`tew/api/dinput_handlers.py`) was extended from 18 to 26 slots at x51, growing its real end from `0x00220368` to `0x00220388` — but `DS_VTABLE` (`tew/api/dsound_handlers.py`) still started at the old boundary, `0x00220370`, 24 bytes (6 slots) inside DI_DEV_VTABLE's new range. Since `register_dsound_handlers` runs after `register_dinput_handlers` (`tew/api/crt_handlers.py`), DS_VTABLE's writes silently clobbered DI_DEV_VTABLE's last 6 slots (`GetEffectInfo` through `Poll`) with DS_VTABLE's first 6 (`QueryInterface` through `DuplicateSoundBuffer`) — exact address match: `DI_DEV_VTABLE+25*4 = DS_VTABLE+5*4 = 0x220384`.
+
+**How it was traced**: read `/tmp/emu_crash.json`, converted every register to hex — `EAX=0x00220320` turned out to be `DI_DEV_VTABLE`'s own base (not, as first assumed, inside DS_VTABLE's range), meaning the crashing object was a real, correctly-typed DirectInput device, not DirectSound at all. An isolated Python harness replaying both `register_*_handlers()` calls in the real order confirmed the *static* vtable content was correct in isolation, ruling out a list-index bug and narrowing it to the two regions physically overlapping in guest memory. The game's own call was completely legitimate (`pDevice->Poll()`); tew's own address layout was the only thing wrong.
+
+**Fix** (`tew/api/dsound_handlers.py`): moved `DS_VTABLE`/`DS_OBJ`/`DS_BUF_VTABLE` to `0x00220390`/`0x002203C0`/`0x002203D0`, right after DI_DEV_VTABLE's real end. New `tests/unit/api/test_com_vtable_layout.py`: a general pairwise-overlap check across every fixed COM region (D3D8's 6, DirectInput's 3, DirectSound's 3) in the shared `0x00220000+` space, plus a direct regression check for this exact bug — verified it fails against the old value before the fix.
+
+**Confirmed live**: reran with `TEW_MAX_STEPS=2000000000`, execution now runs straight past the old halt point (93.076s/923M steps) to 94.278s/911M steps with no vtable issue. New halt: `[UNIMPLEMENTED] user32.dll!GetWindowPlacement` — a plain missing handler, unrelated and much simpler.
+
+**Also found, not a regression**: chaining `test_dialog_click_integration.py` + `test_dinput_handlers.py` + all three DirectSound test files back-to-back in one manually-ordered pytest invocation reproducibly hangs in kernel `D` state — reproduced with and without this session's changes, so a pre-existing SDL2/audio-device environment flake, not code. The standard `pytest -q` full-suite invocation doesn't hit it.
+
+Branch: `fix/dsound-duplicatesoundbuffer`. Full suite passing (1225 tests).
+
+---
+
 ## 2026-09-02 (cont'd x51) — RESOLVED: `EIP=0x00000000` null-jump crash, root-caused to two uncoordinated, unbounded bump allocators sharing overlapping guest address space
 
 Picked up the `DS::DuplicateSoundBuffer` halt left open at x50 — downstream of missing guest asset files (`scn.*` GUI resources); resolved once the real files were supplied. Past that, hit a new `EIP=0x00000000` fault.
