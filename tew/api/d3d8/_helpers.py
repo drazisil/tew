@@ -47,15 +47,30 @@ if TYPE_CHECKING:
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE
 
-# ── D3D8 private bump-heap (separate from CRT heap at 0x04000000) ─────────────
-_next_heap_addr: int = 0x04800000
+# ── D3D8 private bump-heap ──────────────────────────────────────────────────
+# Own bounded region, non-overlapping with the CRT heap (0x04000000 -
+# THREAD_STACK_BASE=0x08000000, see tew/api/_state.py) or the thread-stack
+# region (0x08000000-0x08FFFFFF) or the DLL range (0x10000000+, see
+# tew/loader/dll_loader.py) it sits between.
+D3D8_HEAP_BASE: int = 0x09000000
+D3D8_HEAP_LIMIT: int = 0x10000000
+
+_next_heap_addr: int = D3D8_HEAP_BASE
 
 
 def _heap_alloc(size: int) -> int:
     """Bump-allocate from the D3D8 private heap (16-byte aligned)."""
     global _next_heap_addr
     addr = _next_heap_addr
-    _next_heap_addr = (_next_heap_addr + size + 15) & ~15
+    new_cursor = (_next_heap_addr + size + 15) & ~15
+    if new_cursor > D3D8_HEAP_LIMIT:
+        raise RuntimeError(
+            f"D3D8 private heap exhausted: alloc of {size} bytes at 0x{addr:x} "
+            f"would push the heap cursor to 0x{new_cursor:x}, past D3D8_HEAP_LIMIT "
+            f"(0x{D3D8_HEAP_LIMIT:x}) -- this would silently alias the DLL range "
+            f"instead of failing"
+        )
+    _next_heap_addr = new_cursor
     return addr
 
 

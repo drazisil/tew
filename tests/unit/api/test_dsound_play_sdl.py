@@ -66,7 +66,7 @@ class _FakeCPU:
         self.halted = False
 
 
-MEM_SIZE = 128 * 1024 * 1024  # must exceed the D3D8 private heap base (0x04800000)
+MEM_SIZE = 272 * 1024 * 1024  # must exceed the D3D8 private heap limit (0x10000000)
 STACK    = 0x200000
 BUF_A    = 0x300000
 DESC_ADDR = 0x320000

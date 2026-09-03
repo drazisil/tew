@@ -4,6 +4,24 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-02 (cont'd x51) — RESOLVED: `EIP=0x00000000` null-jump crash, root-caused to two uncoordinated, unbounded bump allocators sharing overlapping guest address space
+
+Picked up the `DS::DuplicateSoundBuffer` halt left open at x50 — downstream of missing guest asset files (`scn.*` GUI resources); resolved once the real files were supplied. Past that, hit a new `EIP=0x00000000` fault.
+
+**Root cause, confirmed live via watchpoint + allocator-cursor diagnostic**: `tew/api/d3d8/_helpers.py`'s `_heap_alloc()` (D3D8/DirectSound/DirectInput COM object allocation) was a bare bump allocator starting at `0x04800000` with no upper bound, despite a comment claiming separation from the CRT heap — that start address already sat *inside* `state.simple_alloc`'s own valid range (`0x04000000`-`THREAD_STACK_BASE`=`0x08000000`, `tew/api/_state.py`). By crash time the D3D8 cursor had reached `0x09d91780` (~89.6MB), well past `THREAD_STACK_BASE` too. A real SHAPE/TEXTURE format-converter function (`_bpp16to15`, reached only via a function-pointer dispatch table at `0x01284cb8`-`0x01284db4`) writing genuine pixel data clobbered a `_heap_alloc`'d DirectInput device object's vtable pointer (`0xbdecc1cc`), which the CPU then jumped through.
+
+**Investigated and ruled out first**: extended `DI_DEV_VTABLE` (`tew/api/dinput_handlers.py`) from 18 to 26 slots to match the real `IDirectInputDevice2A` spec (`CreateEffect`, `EnumEffects`, `GetEffectInfo`, `GetForceFeedbackState`, `SendForceFeedbackCommand`, `EnumCreatedEffectObjects`, `Escape`, `Poll`) — a legitimate, independently-correct fix (kept), but live-verification showed the identical crash recurring; the real crashing object's vtable pointer was garbage unrelated to any tew-defined vtable, pointing one layer deeper at the allocator overlap above.
+
+**Also checked and ruled out**: whether real MSVC CRT globals track a heap boundary we could reuse instead of inventing one. Traced live in Ghidra: `___sbh_threshold` (`0x01281418`, real accessors `__get_sbh_threshold`/`__set_sbh_threshold` at `0x00a061f0`/`0x00a06200`) is the small-block-heap size-class threshold (≤1016 bytes) — unrelated to address bounds, and MCity never even calls the setter. `__CrtCheckMemory`/`__heapchk` are pure corruption validators, no limit-setting/querying capability, ultimately delegating to `HeapValidate(__crtheap, ...)` — a real Win32 call, so any bound is tew's emulation to own. `__heap_init` (`0x00a06100`, called from `entry()` at `0x009fc9fe`, before `WinMain`) itself calls `HeapCreate(flags, 0x1000, 0)` — `dwMaximumSize=0`; the real binary declines to state a limit too, relying on the OS. No CRT lever existed here.
+
+**Fix** (`tew/api/d3d8/_helpers.py`): `_heap_alloc` now starts at `D3D8_HEAP_BASE=0x09000000`, raises `RuntimeError` past `D3D8_HEAP_LIMIT=0x10000000` — the real unused gap between the thread-stack region (`0x08000000`-`0x08FFFFFF`) and the DLL range (`0x10000000+`), mirroring `simple_alloc`'s own `THREAD_STACK_BASE` bounds check. New `tests/unit/api/test_d3d8_heap_alloc.py` (5 tests). Bumped `MEM_SIZE` from `128MB` to `272MB` in the four D3D8/DirectSound/DirectInput test files that no longer covered the new region.
+
+**Confirmed live**: reran with a raised `TEW_MAX_STEPS`, execution now runs straight through the step count (~921M) where the null-jump used to fire, reaching step 923M / 93s wall-clock with no overlap. New halt one layer deeper: `DS::DuplicateSoundBuffer: invalid this=0x0afc0080 (expected 0x002203a0)` — `0x0afc0080` is a legitimately-allocated object inside the new D3D8 heap region, not garbage; the `_com_stub`'s `expected_this` check is a hardcoded singleton-object assumption that doesn't support more than one DirectSound buffer.
+
+Branch: `fix/d3d8-heap-bounded-region` (worktree `directsound-dupbuffer`). Full suite passing (1223 tests).
+
+---
+
 ## 2026-09-02 (cont'd x50) — RESOLVED: `MessagePool::Get(NULL)` crash on DBThread, root-caused to `WSAStartup` hardcoding the wrong negotiated version; two missing wsock32 ordinal aliases fixed along the way; `OutputDebugString` now bypasses log filtering
 
 Chasing the `0x00a8299b` `MessagePool::Get(NULL)` crash found at x49 (initially suspected `0x004d980f`/`_CLayer_DetectDebugger` might be connected -- confirmed unrelated, that address is just the already-understood anti-debug self-test re-triggering on a different thread).
