@@ -443,6 +443,14 @@ def is_valid_eip(eip: int) -> str | None:
 #   fn(eip: u32, regs: ptr[u32 x8], memory: ptr[u8], memory_size: usize)
 # Use mem.read32() / cpu.regs[] from the *Python* handler for readable access;
 # use the raw pointers only when you need speed.
+#
+# CAUTION (found 2026-09-03) -- cpu.add_logpoint has the SAME fixed 8-slot
+# limit as breakpoints (cpu/src/core.zig:124, "EIP logpoints... up to 8
+# slots", same cpu_add_logpoint in kernel.zig) -- despite the breakpoint-only
+# framing above. Live-verified: a 9th cpu.add_logpoint() call in this file
+# registered without error but its callback silently never fired for the
+# rest of the run, no diagnostic anywhere. Keep total cpu.add_logpoint()
+# calls at <= 8 too, same as breakpoints.
 
 _bp_handlers: dict = {}   # eip -> callable(cpu, mem)
 

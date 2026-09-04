@@ -6,6 +6,58 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-04): tew runs killed abruptly (harness OOM-guard, not real memory pressure) can wedge the compositor / stall SDL2 at startup
+
+A run killed abruptly by Claude Code's own low-memory task guard (confirmed
+by Molly to be the harness, not genuine system memory pressure -- `free -h`
+showed plenty available both times) left the run's own process alive
+outside the harness's job tracking, but a *subsequent* run got stuck at
+SDL2 window init (main thread parked in `poll()`, virtual time frozen at
+1.65s) -- the same compositor-wedge signature documented in emu32's "Stuck
+SDL Window" pattern, previously only seen after a `SIGKILL`. A plain
+`SIGTERM` sent to the wedged run did not land for several minutes; sending
+one real input event via `/dev/uinput` (scratch script, KEY_A press+release)
+was followed shortly after by the process finally noticing the signal and
+running its own clean SDL2 shutdown path -- correlation only, not confirmed
+causation. Needs a real investigation: does Claude Code's background-task
+killer send SIGKILL (not SIGTERM) to processes under its job tracking even
+when nohup+disown'd, and is there a more reliable way to launch a
+long-running tew session that survives the harness's own memory guard
+without wedging the compositor.
+
+**UPDATE (2026-09-04 15:29 EDT), likely real root cause found for the
+SDL2-stuck-at-startup half of this (not the abrupt-kill-with-no-error half,
+which is still unexplained -- see above)**: `~/.config/powerdevilrc` had
+`[AC][Display] DimDisplayIdleTimeoutSec=900` (15 min). Two separate stalls
+(one at 10:24, one at ~15:11) each froze at SDL2 window init for a duration
+matching that 900s timeout, and each was immediately followed by real
+progress (not just an exit) right after sending one real input event via
+`/dev/uinput` -- confirmed on the second stall specifically (main thread
+went from `poll()`-parked to `running`, new Vulkan/SDL worker threads
+appeared, vtime jumped from 1.59s to 786.6s within 9s of CPU time, all
+*without* sending any signal to the process). Leading theory: `tew`'s SDL2/
+Vulkan window-surface creation does a `wl_display_roundtrip()` (see the
+`vk_pump` comment in `tew/api/d3d8/_helpers.py`), and KWin stops servicing
+that round-trip for a *new* client while the display is dimmed/idle --
+existing, already-rendering clients seem unaffected, only first-time window
+creation blocks. This would also retroactively explain the older
+`status_archive.md` "SIGKILL wedges the compositor" incidents
+(2026-07-24, 2026-08-25) as likely the same idle-dim mechanism, misattributed
+to the kill itself, since those were also long unattended/AFK runs.
+No `journalctl` entries exist for the dim transition either time (KWin
+doesn't log it to the system journal) -- this is a strong timing/behavior
+correlation, not a confirmed mechanism.
+
+**Test in progress**: set `DimDisplayIdleTimeoutSec=0` via `kwriteconfig6
+--file powerdevilrc --group AC --group Display --key
+DimDisplayIdleTimeoutSec 0` and restarted `plasma-powerdevil.service` to
+apply it live (2026-09-04 15:29 EDT). Next long unattended tew run should
+confirm whether disabling display dimming eliminates the SDL2-startup
+stall entirely. If it does, the emu32 skill's "Stuck SDL Window" section
+needs a rewrite: the fix is disabling AC display dimming, not avoiding
+SIGKILL, and the "do not restart the compositor" guidance may have been
+solving the wrong problem all along.
+
 ## NEW (2026-08-29): a scheduler mock/test helper is worth building at some point
 
 Noted by Molly: real async coverage (queues, packet handling) is coming up,

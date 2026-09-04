@@ -253,7 +253,7 @@ def register_dsound_handlers(
             )
 
         # Allocate COM object in emulator memory (16 bytes)
-        obj = _heap_alloc(16)
+        obj = _heap_alloc(16, "dsound_obj")
         mem.write32(obj,      DS_BUF_VTABLE)
         mem.write32(obj + 4,  pcm_addr)
         mem.write32(obj + 8,  buf_bytes)
@@ -303,7 +303,7 @@ def register_dsound_handlers(
                 sample_rate=orig.sample_rate, channels=orig.channels,
                 bits_per_sample=orig.bits_per_sample,
             )
-        obj = _heap_alloc(16)
+        obj = _heap_alloc(16, "dsound_obj")
         mem.write32(obj,      DS_BUF_VTABLE)
         mem.write32(obj + 4,  pcm_addr)
         mem.write32(obj + 8,  orig.buf_size)

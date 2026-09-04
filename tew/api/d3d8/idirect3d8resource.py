@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax
+from tew.api.d3d8._helpers import _com_stub, _set_eax, _heap_free, _alloc_registry
 
 # Per-object reference counts: obj_addr -> count (initial = 1 on first access)
 _ref_counts: dict[int, int] = {}
@@ -44,6 +44,39 @@ def _add_ref(cpu: "CPU", mem: "Memory") -> None:
     cpu.regs[EAX] = count
 
 
+def _dec_ref_and_maybe_free(addr: int) -> None:
+    """Release() semantics for an object address, without a stack frame --
+    used both by the COM Release() handler and by a texture releasing its
+    own ownership ref on each mip surface when the texture itself is freed.
+    """
+    count = _ref_counts.get(addr, 1) - 1
+    if count > 0:
+        _ref_counts[addr] = count
+        return
+    _ref_counts.pop(addr, None)
+    _free_object(addr)
+
+
+def _free_object(addr: int) -> None:
+    """Return an object's heap blocks once its refcount has reached zero."""
+    entry = _alloc_registry.pop(addr, None)
+    if entry is None:
+        return
+    kind = entry["kind"]
+    if kind == "resource":
+        _heap_free(entry["data_ptr"], entry["data_size"], "d3d8_res_data")
+        _heap_free(addr, entry["obj_size"], "d3d8_res_obj")
+    elif kind == "surface":
+        _heap_free(entry["data_ptr"], entry["data_size"], "d3d8_surf_data")
+        _heap_free(addr, entry["obj_size"], "d3d8_surf_obj")
+    elif kind == "texture":
+        _heap_free(addr, entry["obj_size"], "d3d8_tex_obj")
+        # Give up the texture's own ownership ref on each mip surface --
+        # a surface with an outstanding GetSurfaceLevel() ref stays alive.
+        for surf in entry["mips"]:
+            _dec_ref_and_maybe_free(surf)
+
+
 def _release(cpu: "CPU", mem: "Memory") -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) - 1
@@ -51,6 +84,7 @@ def _release(cpu: "CPU", mem: "Memory") -> None:
         _ref_counts[this] = count
     else:
         _ref_counts.pop(this, None)
+        _free_object(this)
     cpu.regs[EAX] = max(count, 0)
 
 

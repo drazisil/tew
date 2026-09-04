@@ -67,7 +67,7 @@ def register_dinput_handlers(
         # CreateDevice(REFGUID, lplpDID, pUnkOuter) — arg_bytes=12
         pp_dev = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if pp_dev:
-            obj = _heap_alloc(8)
+            obj = _heap_alloc(8, "dinput_obj")
             mem.write32(obj,     DI_DEV_VTABLE)
             mem.write32(obj + 4, 0)
             mem.write32(pp_dev, obj)

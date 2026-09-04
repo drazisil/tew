@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
 from tew.api.d3d8._helpers import _com_stub, _set_eax
-from tew.api.d3d8.idirect3d8resource import _add_ref, _release
+from tew.api.d3d8.idirect3d8resource import _add_ref, _release, _ref_counts
 
 # D3DSURFACE_DESC field offsets (matches idirect3d8surface.py)
 _DESC_FORMAT      = 0
@@ -162,6 +162,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             cpu.halted = True
             cpu.fatal_halt = True
             return
+        # GetSurfaceLevel() hands out a new reference per COM convention --
+        # without this, the texture's own Release() (which drops its one
+        # ownership ref on each mip) could free a surface the caller still
+        # holds and is about to Release() itself, double-freeing the block.
+        _ref_counts[surf] = _ref_counts.get(surf, 1) + 1
         if pp_surf:
             mem.write32(pp_surf, surf)
         _log.debug("d3d8", f"Texture::GetSurfaceLevel level={level} -> surf=0x{surf:08x}")

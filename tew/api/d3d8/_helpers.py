@@ -57,21 +57,54 @@ D3D8_HEAP_LIMIT: int = 0x10000000
 
 _next_heap_addr: int = D3D8_HEAP_BASE
 
+# ── Free-list, keyed by (kind, aligned_size) ────────────────────────────────
+# Reused blocks must match BOTH kind and size -- this allocator is shared
+# across D3D8 (resource/surface/texture objects and their data buffers) and
+# unrelated subsystems (dinput/dsound device objects, see dinput_handlers.py
+# / dsound_handlers.py) that never free their blocks. A bare size-keyed free
+# list let a freed D3D8 object block get handed back to satisfy an unrelated
+# allocation of the same rounded size -- confirmed live (2026-09-04) to cause
+# real type confusion (a reproducible fault at a bogus EIP). Tagging by kind
+# means a dinput/dsound allocation can never be satisfied from a D3D8 free
+# block (or vice versa) even when the sizes collide.
+_free_lists: dict[tuple[str, int], list[int]] = {}
 
-def _heap_alloc(size: int) -> int:
-    """Bump-allocate from the D3D8 private heap (16-byte aligned)."""
+# obj_addr -> allocation record, used by idirect3d8resource.py's Release()
+# to know what to give back when an object's refcount hits zero.
+_alloc_registry: dict[int, dict] = {}
+
+
+def _heap_alloc(size: int, kind: str = "misc") -> int:
+    """Allocate `size` bytes from the D3D8 private heap (16-byte aligned).
+
+    Reuses a freed block of the same `kind` and aligned size before bump-
+    allocating fresh memory. `kind` must be supplied consistently by both
+    the allocating and the freeing call site (see `_heap_free`).
+    """
     global _next_heap_addr
+    aligned_size = (size + 15) & ~15
+    free_list = _free_lists.get((kind, aligned_size))
+    if free_list:
+        return free_list.pop()
+
     addr = _next_heap_addr
     new_cursor = (_next_heap_addr + size + 15) & ~15
     if new_cursor > D3D8_HEAP_LIMIT:
         raise RuntimeError(
-            f"D3D8 private heap exhausted: alloc of {size} bytes at 0x{addr:x} "
+            f"D3D8 private heap exhausted: alloc of {size} bytes ({kind}) at 0x{addr:x} "
             f"would push the heap cursor to 0x{new_cursor:x}, past D3D8_HEAP_LIMIT "
             f"(0x{D3D8_HEAP_LIMIT:x}) -- this would silently alias the DLL range "
             f"instead of failing"
         )
     _next_heap_addr = new_cursor
     return addr
+
+
+def _heap_free(addr: int, size: int, kind: str = "misc") -> None:
+    """Return a block to the free-list for `kind` so a future same-kind,
+    same-size `_heap_alloc` can reuse it."""
+    aligned_size = (size + 15) & ~15
+    _free_lists.setdefault((kind, aligned_size), []).append(addr)
 
 
 def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
@@ -116,11 +149,16 @@ def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
 
     Layout (12 bytes): [0] vtable ptr, [4] data ptr, [8] size.
     """
-    data_ptr = _heap_alloc(data_size or 4)
-    obj = _heap_alloc(12)
+    size = data_size or 4
+    data_ptr = _heap_alloc(size, "d3d8_res_data")
+    obj = _heap_alloc(12, "d3d8_res_obj")
     memory.write32(obj,     D3DRES_VTABLE)
     memory.write32(obj + 4, data_ptr)
     memory.write32(obj + 8, data_size)
+    _alloc_registry[obj] = {
+        "kind": "resource", "obj_size": 12,
+        "data_ptr": data_ptr, "data_size": size,
+    }
     return obj
 
 
@@ -130,14 +168,19 @@ def _alloc_surface_obj(w: int, h: int, fmt: int, memory: "Memory") -> int:
     Layout (24 bytes): [0] vtable ptr, [4] data ptr, [8] size,
                        [12] width, [16] height, [20] D3DFORMAT.
     """
-    data_ptr = _heap_alloc((w * h * 4) or 4)
-    obj = _heap_alloc(24)
+    size = (w * h * 4) or 4
+    data_ptr = _heap_alloc(size, "d3d8_surf_data")
+    obj = _heap_alloc(24, "d3d8_surf_obj")
     memory.write32(obj,      D3DSURF_VTABLE)
     memory.write32(obj + 4,  data_ptr)
     memory.write32(obj + 8,  w * h * 4)
     memory.write32(obj + 12, w)
     memory.write32(obj + 16, h)
     memory.write32(obj + 20, fmt)
+    _alloc_registry[obj] = {
+        "kind": "surface", "obj_size": 24,
+        "data_ptr": data_ptr, "data_size": size,
+    }
     return obj
 
 
@@ -152,13 +195,15 @@ def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") 
     """
     actual_levels = max(levels, 1)
     obj_size = 28 + actual_levels * 4
-    obj = _heap_alloc(obj_size)
+    obj = _heap_alloc(obj_size, "d3d8_tex_obj")
 
     # Allocate mip-level surface objects and store their addresses in the texture object.
+    mip_surfs = []
     for i in range(actual_levels):
         mip_w = max(w >> i, 1)
         mip_h = max(h >> i, 1)
         surf = _alloc_surface_obj(mip_w, mip_h, fmt, memory)
+        mip_surfs.append(surf)
         memory.write32(obj + 28 + i * 4, surf)
 
     # Populate header fields using mip-0 surface data.
@@ -173,6 +218,9 @@ def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") 
     memory.write32(obj + 16, h)
     memory.write32(obj + 20, fmt)
     memory.write32(obj + 24, actual_levels)
+    _alloc_registry[obj] = {
+        "kind": "texture", "obj_size": obj_size, "mips": mip_surfs,
+    }
     return obj
 
 
