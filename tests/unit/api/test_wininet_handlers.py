@@ -23,6 +23,8 @@ from tew.api.wininet_handlers import (
     InetRequest,
     HTTP_QUERY_STATUS_CODE,
     HTTP_QUERY_FLAG_NUMBER,
+    INTERNET_DEFAULT_HTTP_PORT,
+    INTERNET_DEFAULT_HTTPS_PORT,
 )
 from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
@@ -152,6 +154,87 @@ class TestInternetConnectA:
         write_cstring(mem, BUF_A, "example.com")
         call(stubs, cpu, mem, "InternetConnectA", [0, BUF_A, 80, 0, 0, 3, 0, 0])
         assert cpu.regs[ESP] == STACK + 32
+
+
+# ── InternetOpenUrlA ───────────────────────────────────────────────────────────
+
+class TestInternetOpenUrlA:
+
+    def _mocked_conn(self, captured, status=200, body=b""):
+        def fake_connection(*a, **kw):
+            conn = MagicMock()
+            conn.getresponse.return_value = MagicMock(status=status, read=lambda: body)
+            captured.append(conn)
+            return conn
+        return fake_connection
+
+    def test_parses_url_and_returns_readable_handle(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "http://example.com:8080/path?x=1")
+        captured = []
+        with patch("http.client.HTTPConnection", side_effect=self._mocked_conn(captured, 200, b"hi")):
+            call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        handle = cpu.regs[EAX]
+        assert handle != 0
+        req = _handle_map[handle]
+        assert isinstance(req, InetRequest)
+        assert req.server == "example.com"
+        assert req.port == 8080
+        assert req.path == "/path?x=1"
+        assert req.status_code == 200
+        assert req.response_body == b"hi"
+        captured[-1].request.assert_called_once()
+        assert captured[-1].request.call_args.args[0] == "GET"
+        assert captured[-1].request.call_args.args[1] == "/path?x=1"
+
+    def test_default_port_and_root_path_for_bare_url(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "http://example.com")
+        captured = []
+        with patch("http.client.HTTPConnection", side_effect=self._mocked_conn(captured)):
+            call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        handle = cpu.regs[EAX]
+        req = _handle_map[handle]
+        assert req.port == INTERNET_DEFAULT_HTTP_PORT
+        assert req.path == "/"
+
+    def test_https_scheme_uses_https_connection_and_default_port(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "https://example.com/secure")
+        captured = []
+        with patch("http.client.HTTPSConnection", side_effect=self._mocked_conn(captured)) as mock_https:
+            call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        mock_https.assert_called_once()
+        handle = cpu.regs[EAX]
+        assert _handle_map[handle].port == INTERNET_DEFAULT_HTTPS_PORT
+
+    def test_headers_forwarded(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "http://example.com/")
+        write_cstring(mem, BUF_B, "X-Foo: bar\r\n")
+        captured = []
+        with patch("http.client.HTTPConnection", side_effect=self._mocked_conn(captured)):
+            call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, BUF_B, 0xFFFFFFFF, 0, 0])
+        headers = captured[-1].request.call_args.kwargs["headers"]
+        assert headers == {"X-Foo": "bar"}
+
+    def test_unparseable_url_returns_zero(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "not a url")
+        call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        assert cpu.regs[EAX] == 0
+
+    def test_unreachable_host_returns_zero(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "http://127.0.0.1:1/x")  # port 1: nothing listening
+        call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        assert cpu.regs[EAX] == 0
+
+    def test_stdcall_cleanup(self, env):
+        cpu, mem, state, stubs = env
+        write_cstring(mem, BUF_A, "http://127.0.0.1:1/x")
+        call(stubs, cpu, mem, "InternetOpenUrlA", [0, BUF_A, 0, 0, 0, 0])
+        assert cpu.regs[ESP] == STACK + 24
 
 
 # ── HttpOpenRequestA ───────────────────────────────────────────────────────────

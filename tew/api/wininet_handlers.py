@@ -2,8 +2,9 @@
 
 Implements the core WinINet HTTP API used by authlogin.dll:
     InternetAttemptConnect, InternetOpenA, InternetConnectA,
-    HttpOpenRequestA, InternetSetOptionA, HttpSendRequestA,
-    HttpQueryInfoA, InternetReadFile, InternetCloseHandle.
+    InternetOpenUrlA, HttpOpenRequestA, InternetSetOptionA,
+    HttpSendRequestA, HttpQueryInfoA, InternetReadFile,
+    InternetCloseHandle.
 
 HTTP requests are forwarded to a local server using Python's built-in
 http.client.  If the server is not available the send call returns FALSE
@@ -18,6 +19,7 @@ from __future__ import annotations
 import http.client
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
@@ -349,6 +351,64 @@ def register_wininet_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
+    def _internet_open_url_a(cpu: "CPU") -> None:
+        """
+        HINTERNET InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl,
+            LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags,
+            DWORD_PTR dwContext)
+
+        Combines InternetConnectA + HttpOpenRequestA + HttpSendRequestA into
+        one call, given a full URL instead of separate server/path args --
+        the request is opened and sent immediately, synchronously (matching
+        this codebase's existing synchronous-HTTP model), and the returned
+        handle is readable right away via InternetReadFile/HttpQueryInfoA,
+        same as an already-sent HttpOpenRequestA handle.
+        """
+        esp = cpu.regs[ESP]
+        lp_url      = memory.read32((esp +  8) & 0xFFFFFFFF)
+        lp_headers  = memory.read32((esp + 12) & 0xFFFFFFFF)
+        dw_hdr_len  = memory.read32((esp + 16) & 0xFFFFFFFF)
+
+        url = read_cstring(lp_url, memory, max_len=4096) if lp_url else ""
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.hostname:
+            logger.warn("wininet", f"InternetOpenUrlA: unparseable URL {url!r}")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        port = parts.port or (
+            INTERNET_DEFAULT_HTTPS_PORT if parts.scheme == "https" else INTERNET_DEFAULT_HTTP_PORT
+        )
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+
+        extra_headers: list[str] = []
+        if lp_headers:
+            if dw_hdr_len == 0xFFFFFFFF:
+                hdr_text = read_cstring(lp_headers, memory, max_len=4096)
+            else:
+                hdr_text = "".join(
+                    chr(memory.read8(lp_headers + i)) for i in range(dw_hdr_len)
+                )
+            for line in hdr_text.replace("\r\n", "\n").splitlines():
+                line = line.strip()
+                if line:
+                    extra_headers.append(line)
+
+        req = InetRequest(server=parts.hostname, port=port, verb="GET", path=path)
+        ok = _send_http(req, extra_headers, b"")
+        if not ok:
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 24)
+            return
+
+        handle = _alloc_handle(req)
+        logger.debug("wininet", f"InternetOpenUrlA({url}) -> 0x{handle:x} status={req.status_code}")
+        cpu.regs[EAX] = handle
+        cleanup_stdcall(cpu, memory, 24)
+
     def _internet_close_handle(cpu: "CPU") -> None:
         """BOOL InternetCloseHandle(HINTERNET hInternet) → TRUE"""
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -359,6 +419,7 @@ def register_wininet_handlers(
     stubs.register_handler("wininet.dll", "InternetAttemptConnect", _internet_attempt_connect)
     stubs.register_handler("wininet.dll", "InternetOpenA",          _internet_open_a)
     stubs.register_handler("wininet.dll", "InternetConnectA",       _internet_connect_a)
+    stubs.register_handler("wininet.dll", "InternetOpenUrlA",       _internet_open_url_a)
     stubs.register_handler("wininet.dll", "HttpOpenRequestA",       _http_open_request_a)
     stubs.register_handler("wininet.dll", "InternetSetOptionA",     _internet_set_option_a)
     stubs.register_handler("wininet.dll", "HttpSendRequestA",       _http_send_request_a)
