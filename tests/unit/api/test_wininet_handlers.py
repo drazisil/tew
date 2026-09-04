@@ -545,6 +545,57 @@ class TestInternetReadFile:
         assert mem.read32(BUF_B) == 0  # nothing left to read
 
 
+# ── InternetQueryDataAvailable ──────────────────────────────────────────────────
+
+class TestInternetQueryDataAvailable:
+
+    def test_invalid_handle_returns_false(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(BUF_B, 0xFFFFFFFF)  # pre-dirty
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [INVALID_HANDLE, BUF_B, 0, 0])
+        assert cpu.regs[EAX] == 0
+
+    def test_reports_full_body_before_any_read(self, env):
+        cpu, mem, state, stubs = env
+        handle = open_request(stubs, cpu, mem)
+        _handle_map[handle].response_body = b"hello world"
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [handle, BUF_B, 0, 0])
+        assert cpu.regs[EAX] == 1
+        assert mem.read32(BUF_B) == 11
+
+    def test_reflects_remaining_bytes_after_partial_read(self, env):
+        cpu, mem, state, stubs = env
+        handle = open_request(stubs, cpu, mem)
+        _handle_map[handle].response_body = b"hello world"
+        call(stubs, cpu, mem, "InternetReadFile", [handle, BUF_A, 5, BUF_B])
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [handle, BUF_B, 0, 0])
+        assert cpu.regs[EAX] == 1
+        assert mem.read32(BUF_B) == 6
+
+    def test_zero_when_body_fully_consumed(self, env):
+        cpu, mem, state, stubs = env
+        handle = open_request(stubs, cpu, mem)
+        _handle_map[handle].response_body = b"hi"
+        call(stubs, cpu, mem, "InternetReadFile", [handle, BUF_A, 100, BUF_B])
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [handle, BUF_B, 0, 0])
+        assert cpu.regs[EAX] == 1
+        assert mem.read32(BUF_B) == 0
+
+    def test_null_avail_pointer_does_not_crash(self, env):
+        cpu, mem, state, stubs = env
+        handle = open_request(stubs, cpu, mem)
+        _handle_map[handle].response_body = b"hi"
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [handle, 0, 0, 0])  # must not raise
+        assert cpu.regs[EAX] == 1
+
+    def test_stdcall_cleanup(self, env):
+        cpu, mem, state, stubs = env
+        handle = open_request(stubs, cpu, mem)
+        cpu.regs[ESP] = STACK
+        call(stubs, cpu, mem, "InternetQueryDataAvailable", [handle, BUF_B, 0, 0])
+        assert cpu.regs[ESP] == STACK + 16
+
+
 # ── InternetCloseHandle ────────────────────────────────────────────────────────
 
 class TestInternetCloseHandle:

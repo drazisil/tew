@@ -4,7 +4,7 @@ Implements the core WinINet HTTP API used by authlogin.dll:
     InternetAttemptConnect, InternetOpenA, InternetConnectA,
     InternetOpenUrlA, HttpOpenRequestA, InternetSetOptionA,
     HttpSendRequestA, HttpQueryInfoA, InternetReadFile,
-    InternetCloseHandle.
+    InternetQueryDataAvailable, InternetCloseHandle.
 
 HTTP requests are forwarded to a local server using Python's built-in
 http.client.  If the server is not available the send call returns FALSE
@@ -409,6 +409,35 @@ def register_wininet_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 24)
 
+    def _internet_query_data_available(cpu: "CPU") -> None:
+        """
+        BOOL InternetQueryDataAvailable(HINTERNET hFile,
+            LPDWORD lpdwNumberOfBytesAvailable, DWORD dwReserved, DWORD_PTR dwContext)
+
+        Real semantics: reports how many bytes are available to read from
+        hFile's response buffer *right now* without blocking. This codebase's
+        HTTP model is fully synchronous -- the whole response body is already
+        fetched by the time InternetOpenUrlA/HttpSendRequestA returns -- so
+        the honest answer is simply what's left unread (same bookkeeping
+        InternetReadFile already uses: response_body/read_pos on InetRequest).
+        """
+        esp = cpu.regs[ESP]
+        h_file    = memory.read32((esp + 4) & 0xFFFFFFFF)
+        lp_avail  = memory.read32((esp + 8) & 0xFFFFFFFF)
+
+        req = _handle_map.get(h_file)
+        if not isinstance(req, InetRequest):
+            logger.warn("wininet", f"InternetQueryDataAvailable: unknown handle 0x{h_file:x}")
+            cpu.regs[EAX] = 0
+            cleanup_stdcall(cpu, memory, 16)
+            return
+
+        available = len(req.response_body) - req.read_pos
+        if lp_avail:
+            memory.write32(lp_avail, available)
+        cpu.regs[EAX] = 1
+        cleanup_stdcall(cpu, memory, 16)
+
     def _internet_close_handle(cpu: "CPU") -> None:
         """BOOL InternetCloseHandle(HINTERNET hInternet) → TRUE"""
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -425,4 +454,5 @@ def register_wininet_handlers(
     stubs.register_handler("wininet.dll", "HttpSendRequestA",       _http_send_request_a)
     stubs.register_handler("wininet.dll", "HttpQueryInfoA",         _http_query_info_a)
     stubs.register_handler("wininet.dll", "InternetReadFile",       _internet_read_file)
+    stubs.register_handler("wininet.dll", "InternetQueryDataAvailable", _internet_query_data_available)
     stubs.register_handler("wininet.dll", "InternetCloseHandle",    _internet_close_handle)
