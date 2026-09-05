@@ -83,7 +83,7 @@ def captured_logs():
 
 
 def patched(stubs, addr):
-    return stubs._patched_addrs[addr].handler
+    return stubs._handlers_by_addr[addr].handler
 
 
 def write_cstring(mem, addr, s: str) -> None:

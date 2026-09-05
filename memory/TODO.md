@@ -6,6 +6,67 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-04, night): black screen at persona-select -- D3D8 renders every frame but never draws anything
+
+Full investigation in status.md (current entry at time of writing; will
+rotate to status_archive.md once superseded). Summary: the whole client
+stack genuinely succeeds -- login, shard list, persona load (`Login.log`
+shows `Persona added: Dr Brown`), and D3D8's `BeginScene`/`EndScene`/
+`Present` cycle continuously reporting OK -- but the actual game window
+shows solid black (screenshotted and confirmed), no music, no cursor.
+`Dev::Clear`/`Dev::DrawPrimitive` are never called even once across
+multiple full runs. Real game debug output (`channel_log.txt`)
+shows `draw.c "upload all"` firing repeatedly around the same time, with
+no corresponding D3D8 draw call ever appearing in tew's dispatch log.
+
+**Next steps, in order**:
+1. Trace what `draw.c`'s "upload all" actually calls -- does it reach
+   D3D8 at all (Lock/SetTexture/DrawPrimitive), and if so, why doesn't
+   any of it show up in tew's `[d3d8]` dispatch log? Could be a real
+   silent no-op, or another logging gap like the one just fixed.
+2. Separately confirmed, not yet tied to the black screen specifically:
+   `IDirect3D8::CheckDeviceFormat` (`tew/api/d3d8/idirect3d8.py:495`)
+   unconditionally returns `S_OK` for every format query -- confirmed
+   live for DXT1 (FourCC `0x31545844`) and DXT3 (`0x33545844`) queries.
+   `tew/api/d3d8/` has zero DXT/S3TC/BC1-3 decompression code anywhere;
+   every texture is allocated as `w*h*4` uncompressed RGBA regardless of
+   `fmt`. If the game's real GUI textures are DXT-compressed, this would
+   silently hand raw compressed bytes to the renderer as if already
+   decoded. Needs: check whether `scn.login`'s actual `.fsh` textures are
+   DXT-encoded before treating this as confirmed-root-cause rather than
+   a real-but-maybe-unrelated gap.
+3. `C:\Data\GUI\dlg.options` still reported missing on disk
+   (`~/.emu32/Data/GUI/dlg.options`) -- low priority, doesn't appear to
+   block rendering, but worth resolving for completeness.
+
+## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
+
+Full investigation and root-cause in status.md (rotated to status_archive.md
+once superseded). Summary: the ~200s GUI-init delay is genuine, correctly-
+emulated work (real Jet/DAO database engine + the game's own polling loop
+in `wait_task_executing`/`_SYNCTASK_run`), not a bug -- confirmed via direct
+measurement (cpu.step_count ground truth, per-function dispatch timing,
+Ghidra decompilation of the actual hot address). Not fixed this session,
+by design -- it would need either a faster (JIT-style) CPU core, or:
+
+**Scoped option, not attempted**: `EnterCriticalSection`/`LeaveCriticalSection`
+alone account for ~830,000 calls / ~17.4s of dispatch time in one ~217s
+window (measured, see status.md step 6) -- by far the highest call volume
+of any Win32 API in this profile. Both have simple, well-defined semantics
+(a few memory reads/writes against a CRITICAL_SECTION struct, no guest-
+visible side effects beyond that struct) and no logging/dispatch-log
+requirement that couldn't be dropped for this pair specifically. A native
+(Zig) fast-path that resolves these two calls entirely inside `cpu_run`'s
+INT-dispatch check -- without ever crossing into Python -- could plausibly
+eliminate most of that 17.4s, and would likely also reduce, though not
+eliminate (per-call overhead isn't the same as native-execution time),
+some of the game's own polling-loop cost since `_SYNCTASK_run`'s callbacks
+may use CS internally too (not confirmed -- would need re-measuring after
+the fact). Real engineering effort: needs the semantics reimplemented in
+Zig and kept in sync with `tew/api/kernel32_sync.py`'s Python version, and
+a plan for what happens on the (currently only Python-side) contested/
+blocking path.
+
 ## NEW (2026-09-04): tew runs killed abruptly (harness OOM-guard, not real memory pressure) can wedge the compositor / stall SDL2 at startup
 
 A run killed abruptly by Claude Code's own low-memory task guard (confirmed
@@ -48,12 +109,18 @@ No `journalctl` entries exist for the dim transition either time (KWin
 doesn't log it to the system journal) -- this is a strong timing/behavior
 correlation, not a confirmed mechanism.
 
-**Test in progress**: set `DimDisplayIdleTimeoutSec=0` via `kwriteconfig6
---file powerdevilrc --group AC --group Display --key
+**Test result so far (2026-09-04, evening)**: set `DimDisplayIdleTimeoutSec=0`
+via `kwriteconfig6 --file powerdevilrc --group AC --group Display --key
 DimDisplayIdleTimeoutSec 0` and restarted `plasma-powerdevil.service` to
-apply it live (2026-09-04 15:29 EDT). Next long unattended tew run should
-confirm whether disabling display dimming eliminates the SDL2-startup
-stall entirely. If it does, the emu32 skill's "Stuck SDL Window" section
+apply it live (2026-09-04 15:29 EDT). Since then, roughly a dozen more tew
+launches this session (each stopped gracefully via `kill -TERM` and
+relaunched fresh, for an unrelated GUI-init-delay investigation -- see
+status.md) -- **none** stalled at SDL2 window init, all progressed normally
+from launch. This is real supporting evidence but not a full confirmation:
+every one of those relaunches followed a *graceful* stop, not the original
+abrupt-harness-kill scenario that triggered the stall in the first place --
+that specific repro hasn't recurred to retest. If a future abrupt kill also
+fails to wedge the next launch, the emu32 skill's "Stuck SDL Window" section
 needs a rewrite: the fix is disabling AC display dimming, not avoiding
 SIGKILL, and the "do not restart the compositor" guidance may have been
 solving the wrong problem all along.

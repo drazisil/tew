@@ -108,7 +108,7 @@ class Win32Handlers:
     def __init__(self, memory: "Memory") -> None:
         self._handlers: dict[str, HandlerEntry] = {}          # "dllname!funcName" → entry
         self._handlers_by_id: list[HandlerEntry] = []
-        self._patched_addrs: dict[int, HandlerEntry] = {}     # patched code address → entry
+        self._handlers_by_addr: dict[int, HandlerEntry] = {}  # trampoline/patched code address → entry
         self._next_handler_addr: int = HANDLER_BASE
         self._memory: "Memory" = memory
         self._installed: bool = False
@@ -151,6 +151,7 @@ class Win32Handlers:
 
         self._handlers[key] = entry
         self._handlers_by_id.append(entry)
+        self._handlers_by_addr[address] = entry
 
         # Write stub machine code into memory:
         #   INT 0xFE  → CD FE   (triggers Python handler via on_interrupt)
@@ -186,7 +187,7 @@ class Win32Handlers:
         )
 
         self._handlers_by_id.append(entry)
-        self._patched_addrs[addr] = entry
+        self._handlers_by_addr[addr] = entry
 
         # Overwrite code at addr with: INT 0xFE; RET
         self._memory.write8(addr, 0xCD)           # INT
@@ -373,14 +374,7 @@ class Win32Handlers:
         """
         handler_addr = (cpu.eip - 2) & 0xFFFFFFFF
 
-        # Check patched addresses first (O(1)), then fall back to linear scan
-        entry = self._patched_addrs.get(handler_addr)
-        if entry is None:
-            for candidate in self._handlers_by_id:
-                if candidate.address == handler_addr:
-                    entry = candidate
-                    break
-
+        entry = self._handlers_by_addr.get(handler_addr)
         if entry is None:
             raise RuntimeError(f"Unknown Win32 stub at 0x{handler_addr:08x}")
 
