@@ -4,6 +4,98 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-05 (full session) — RESOLVED: D3D8 texture-sampling pipeline built end-to-end; real textured content confirmed ON SCREEN via a live screenshot
+
+Follow-on from the 2026-09-05 overnight session, which found (but didn't fix)
+that D3D8 had no texture-sampling pipeline at all. This session built one and
+found seven more real bugs before anything was actually visible — see
+`status_archive.md`'s "Previous status (2026-09-05, overnight)" entry and
+`TODO.md`'s matching RESOLVED item for full narrative detail; this entry is
+the durable summary.
+
+**1. Real texture-upload path traced via Ghidra + confirmed via call tracing**:
+the real game/`dx8z.dll` "thrash driver" middleware genuinely drives the real
+D3D8 device (`CreateTexture` at vtable offset `0x50`, `SetTexture` at `0xF4`
+— cross-checked against tew's own vtable layout via `Release`/`GetBackBuffer`/
+`GetRenderTarget`/`BeginScene` offsets, not guessed). Live call tracing
+(`LOG_LEVEL=trace LOG_CATEGORIES=calls`) then showed the real per-pixel
+upload happens through `IDirect3DSurface8::LockRect`/`UnlockRect` on the
+mip-0 surface obtained via `GetSurfaceLevel` — never the texture's own
+`LockRect`/`UnlockRect` (0 calls vs. 1211 on the surface, in one real run).
+
+**2–8. Bugs found and fixed, in the order found**:
+- `CreateTexture`/`SetTexture`/`GetTextureStageState`/`SetTextureStageState`
+  (`tew/api/d3d8/idirect3d8device.py`) converted from lying no-op stubs
+  (`_ok`) to real state-tracking implementations.
+- Real GPU texture upload wired into `IDirect3DSurface8::UnlockRect`
+  (`tew/api/d3d8/idirect3d8surface.py`) — `upload_texture_image` in
+  `_pipeline.py` does a real `vkCreateImage` + staging-buffer copy.
+- D3DFORMAT-aware pitch + BGRA8 conversion (`_format_bytes_per_pixel`/
+  `_convert_to_bgra8`, `tew/api/d3d8/_helpers.py`): `LockRect`'s `Pitch`
+  was hardcoded to `width*4` regardless of the real declared format —
+  confirmed live via `fmt=0x17` (`D3DFMT_R5G6B5`, 16-bit, no alpha) on a
+  real UI icon texture, corrupting every row after the first. Handles
+  R5G6B5/X1R5G5B5/A1R5G5B5/A4R4G4B4/A8; unrecognized formats fall back to
+  the old raw-passthrough behavior rather than halting.
+- Window-transparency bug: degenerate draws with `dif=0x00000000` (alpha=0)
+  were, with blending disabled, writing real transparency into the
+  swapchain's alpha channel — the Wayland compositor honored it, showing
+  the desktop wallpaper through the game window instead of solid black.
+  Fixed by excluding `VK_COLOR_COMPONENT_A_BIT` from the pipeline's
+  `colorWriteMask` (`_pipeline.py`) — D3D8 has no concept of "make my own
+  window transparent," so backbuffer alpha should never reach the OS.
+- Descriptor-set race: `_set_texture` mutated one shared `VkDescriptorSet`
+  in place. Vulkan reads descriptor contents at command-buffer *execution*
+  time (`Present`'s `vkQueueSubmit`), not at record time — since many
+  `BeginScene`/`DrawPrimitive` calls accumulate into one command buffer
+  before a `Present` ever happens, every draw ended up sampling whichever
+  texture the *last* `SetTexture()` of that frame had bound. Fixed with one
+  persistent descriptor set per texture, allocated once in
+  `IDirect3DSurface8::UnlockRect` and cached in `_alloc_registry`, resolved
+  and bound per-draw at record time in `_draw_primitive`.
+- Same class of bug, for vertex data: `_draw_primitive` always wrote fresh
+  vertex data to the shared vertex buffer's offset 0, so every draw
+  accumulated in a frame overwrote the previous one's data before the GPU
+  ever executed any of the recorded `vkCmdDraw` calls. Fixed with a
+  per-frame cursor (`_state._vk_vertex_cursor`), reset once per new frame
+  acquire in `_begin_scene`, giving each draw its own buffer region.
+- **The Y-flip bug — the actual last blocker, found only because Molly
+  refused to accept a provably-correct GPU pixel readback as proof of a
+  working screen** ("I'd love to see something on the screen. I'm still not
+  agreeing that a blank screen is working."). Vulkan's NDC Y-axis points
+  DOWN by default (opposite of OpenGL), but `_draw_primitive`'s
+  screen-to-NDC math used the OpenGL-style flip (`yn = 1 - y/h*2`),
+  rendering everything upside-down/off-screen relative to any screenshot.
+  Fixed: `yn = (y/vp_h)*2 - 1` — D3D8 screen-space Y-down already matches
+  Vulkan NDC Y-down, no flip needed.
+- A related, separately-real Vulkan bug found while chasing the above:
+  `_begin_scene`'s per-frame swapchain-image re-acquire barrier used
+  `oldLayout=VK_IMAGE_LAYOUT_UNDEFINED` unconditionally — a real
+  content-discard hint some drivers honor literally, correct only the very
+  first time each swapchain image index is used (D3D8's `Clear()`, not
+  every frame boundary, is what's supposed to erase backbuffer content).
+  Fixed by tracking used image indices (`_state._vk_swapchain_images_used`,
+  reset on swapchain rebuild) and using `oldLayout=PRESENT_SRC_KHR` for
+  every re-acquire after the first.
+
+**Verification chain, strongest to weakest**: (a) a real textured quad
+directly visible in a live screenshot, confirmed only after temporarily
+injecting a standing per-frame debug draw to escape the one-shot timing of
+the real game's own draws (removed before finishing); (b) a full-screen
+solid-red `Clear()` confirmed reaching the actual composited window,
+proving the presentation pipeline itself independent of any draw-content
+bug; (c) direct GPU pixel readback (`vkCmdCopyImageToBuffer` into a
+host-visible staging buffer, read back in Python) showing real
+non-clear-color texture data at the expected screen location; (d) full
+test suite green (1249 passed) after every single change, all session.
+
+**Also found, not fixed this session** (see `TODO.md` for two new items):
+a real guest-code crash around t≈41s in live runs (`EIP=0x00688c68`,
+unrelated to D3D8); and the D3D8 game window receiving no real mouse
+movement, button-up, or focus-change events at all, plus
+`DirectInput::GetDeviceState` being a hardcoded zero-fill stub — meaning
+even a fully visible persona-select screen currently can't be clicked.
+
 ## 2026-09-02 (cont'd x52) — RESOLVED: `DS::DuplicateSoundBuffer` "invalid this" halt was never a DirectSound bug — a real DirectInput `Poll()` call was landing on DirectSound's trampoline because their fixed COM vtable regions silently overlapped
 
 **Root cause**: `DI_DEV_VTABLE` (`tew/api/dinput_handlers.py`) was extended from 18 to 26 slots at x51, growing its real end from `0x00220368` to `0x00220388` — but `DS_VTABLE` (`tew/api/dsound_handlers.py`) still started at the old boundary, `0x00220370`, 24 bytes (6 slots) inside DI_DEV_VTABLE's new range. Since `register_dsound_handlers` runs after `register_dinput_handlers` (`tew/api/crt_handlers.py`), DS_VTABLE's writes silently clobbered DI_DEV_VTABLE's last 6 slots (`GetEffectInfo` through `Poll`) with DS_VTABLE's first 6 (`QueryInterface` through `DuplicateSoundBuffer`) — exact address match: `DI_DEV_VTABLE+25*4 = DS_VTABLE+5*4 = 0x220384`.

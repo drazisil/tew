@@ -55,6 +55,32 @@ _vk_pipeline_layout:  object = None
 _vk_vertex_buffer:    object = None
 _vk_vertex_memory:    object = None
 _vk_vertex_mapped_ptr: object = None  # ctypes void* from vkMapMemory (persistent)
+_vk_vertex_buffer_size: int = 0
+
+# Byte offset into _vk_vertex_buffer for the NEXT DrawPrimitive's vertex data.
+# Every draw in a frame gets its own region instead of all sharing offset 0:
+# vkCmdBindVertexBuffers/vkCmdDraw don't snapshot buffer contents at record
+# time, only at actual GPU execution (Present's vkQueueSubmit) -- since many
+# BeginScene/DrawPrimitive calls can accumulate into one command buffer
+# before a Present ever happens, writing every draw's vertices to the same
+# offset 0 meant every draw in that frame read back whichever draw wrote
+# last, not its own data (confirmed live via direct GPU pixel readback: a
+# correctly-recorded, real-textured, non-degenerate draw came back as pure
+# black because a later degenerate draw in the same frame overwrote its
+# vertex data before the GPU ever read it). Reset to 0 at the start of each
+# new frame (BeginScene's fresh image-acquire path, not a same-frame
+# continuation).
+_vk_vertex_cursor: int = 0
+
+# Swapchain image indices that have completed at least one full
+# BeginScene->Present cycle. BeginScene's per-frame re-acquire barrier used
+# oldLayout=UNDEFINED unconditionally, which is a real content-discard hint
+# in Vulkan (some drivers honor it literally) -- correct only the very first
+# time each image is used, since D3D8's Clear() is meant to be the only
+# thing that erases prior backbuffer content, not every frame's re-acquire.
+# Reset whenever the swapchain is (re)created, since a fresh swapchain's
+# images are genuinely undefined again.
+_vk_swapchain_images_used: set = set()
 
 # True while inside a vkCmdBeginRenderPass / vkCmdEndRenderPass pair.
 _vk_in_render_pass: bool = False
@@ -65,6 +91,22 @@ _draw_stream_stride: int = 0   # stride in bytes
 
 # Vertex FVF/handle set by SetVertexShader.
 _draw_vertex_fvf: int = 0
+
+# Descriptor set / sampler / default white texture (created once in
+# CreateDevice, alongside the rest of the pipeline).
+_vk_descriptor_set_layout: object = None
+_vk_descriptor_pool:       object = None
+_vk_descriptor_set:        object = None
+_vk_sampler:               object = None
+_vk_default_tex_image:     object = None
+_vk_default_tex_memory:    object = None
+_vk_default_tex_view:      object = None
+
+# Bound IDirect3DBaseTexture8* per sampler stage, set by SetTexture (0 = none).
+_bound_textures: dict[int, int] = {}
+
+# (stage, D3DTEXTURESTAGESTATETYPE) -> DWORD value, set by SetTextureStageState.
+_texture_stage_state: dict[tuple[int, int], int] = {}
 
 # Real SDL cursor set via IDirect3DDevice8::SetCursorProperties (previously a
 # lying no-op stub that returned S_OK without ever telling SDL to display a

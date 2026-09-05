@@ -107,6 +107,89 @@ def _heap_free(addr: int, size: int, kind: str = "misc") -> None:
     _free_lists.setdefault((kind, aligned_size), []).append(addr)
 
 
+# ── D3DFORMAT bytes-per-pixel + conversion to BGRA8 ─────────────────────────
+# The Vulkan image tew uploads textures into is always VK_FORMAT_B8G8R8A8_UNORM
+# (see _pipeline.upload_texture_image), but real D3D8 textures are frequently
+#16-bit or 8-bit formats -- confirmed live via fmt=0x17 (D3DFMT_R5G6B5) on an
+# actual UI icon texture. Surface::LockRect's reported Pitch (idirect3d8surface.py)
+# MUST match the real format's bytes-per-pixel, or the guest writes its pixel
+# data at the wrong stride and every row after the first is corrupted once we
+# reinterpret the buffer as BGRA8.
+_FORMAT_BYTES_PER_PIXEL: dict[int, int] = {
+    0x15: 4,  # D3DFMT_X8R8G8B8
+    0x16: 4,  # D3DFMT_A8R8G8B8
+    0x17: 2,  # D3DFMT_R5G6B5
+    0x18: 2,  # D3DFMT_X1R5G5B5
+    0x19: 2,  # D3DFMT_A1R5G5B5
+    0x1A: 2,  # D3DFMT_A4R4G4B4
+    0x1E: 1,  # D3DFMT_A8
+}
+
+
+def _format_bytes_per_pixel(fmt: int) -> int:
+    """Bytes per pixel for a D3DFORMAT; unrecognized formats default to 4
+    (the pre-existing behavior before per-format handling existed)."""
+    return _FORMAT_BYTES_PER_PIXEL.get(fmt, 4)
+
+
+def _convert_to_bgra8(fmt: int, width: int, height: int, raw: bytes) -> bytes:
+    """Convert raw pixel bytes in the given D3DFORMAT to tight BGRA8 bytes.
+
+    Formats without a specific converter below (including the already-BGRA8
+    D3DFMT_A8R8G8B8/X8R8G8B8) are passed through as-is -- correct for the
+    already-4-bytes-per-pixel formats, and the least-wrong fallback for any
+    other unrecognized format (matches the original always-BGRA8 assumption).
+    """
+    import struct as _struct
+
+    bpp = _format_bytes_per_pixel(fmt)
+    n = width * height
+    if bpp == 4:
+        return raw[:n * 4]
+
+    out = bytearray(n * 4)
+    if fmt == 0x17:  # D3DFMT_R5G6B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            r = ((px >> 11) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x3F) * 255 // 63
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, 255))
+    elif fmt == 0x18:  # D3DFMT_X1R5G5B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            r = ((px >> 10) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x1F) * 255 // 31
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, 255))
+    elif fmt == 0x19:  # D3DFMT_A1R5G5B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            a = 255 if (px & 0x8000) else 0
+            r = ((px >> 10) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x1F) * 255 // 31
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, a))
+    elif fmt == 0x1A:  # D3DFMT_A4R4G4B4
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            a = ((px >> 12) & 0xF) * 255 // 15
+            r = ((px >> 8)  & 0xF) * 255 // 15
+            g = ((px >> 4)  & 0xF) * 255 // 15
+            b = ( px        & 0xF) * 255 // 15
+            out[i*4:i*4+4] = bytes((b, g, r, a))
+    elif fmt == 0x1E:  # D3DFMT_A8 (alpha-only, opaque white RGB)
+        for i in range(n):
+            a = raw[i]
+            out[i*4:i*4+4] = bytes((255, 255, 255, a))
+    else:
+        # Unrecognized non-4-byte format: no converter written yet. Return
+        # what we have rather than raising -- an honestly-wrong (garbled)
+        # texture beats halting the whole render pipeline over one format.
+        out[:min(len(raw), n * 4)] = raw[:n * 4]
+    return bytes(out)
+
+
 def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
     """stdcall stack cleanup for COM methods (this in ECX, args on stack)."""
     ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)

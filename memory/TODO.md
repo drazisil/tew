@@ -6,69 +6,120 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## NEW (2026-09-05, overnight): D3D8 has no texture-sampling pipeline at all -- the real black-screen root cause, needs a proper feature session
+## RESOLVED (2026-09-05, full session): D3D8 texture-sampling pipeline built end-to-end, real content confirmed ON SCREEN
 
-Full investigation and two already-fixed bugs (a render-pass/command-buffer
-frame-discard bug, and lying no-op cursor stubs) are in status.md (current
-entry as of writing). This item is the one that's NOT fixed: after both of
-those real fixes, the screen was screenshotted again and is still solid
-black -- confirming the actual root cause is architectural, not either of
-the two bugs already resolved.
+Full methodology in changelog.md (2026-09-05 entry) and the rotated
+status_archive.md entry. Six real, independently-verified bugs found and
+fixed across a single long session, ending with a real textured quad
+confirmed visible in a live screenshot (not just via GPU pixel readback):
 
-**Confirmed via direct code inspection (not guessed)**:
-- `Dev::SetTexture`/`Dev::SetTextureStageState` are no-op stubs -- binding a
-  texture for drawing does nothing.
-- No `vkCreateImage` call exists anywhere for game textures (only the
-  swapchain's own images get a real Vulkan image). `_alloc_texture_obj` only
-  allocates a plain byte buffer in tew's *emulated guest memory* -- never a
-  real GPU-visible image.
-- `tew/api/d3d8/_pipeline.py`'s hand-encoded SPIR-V shaders are a bare
-  position+diffuse-color passthrough -- no sampler, no UV coordinates
-  anywhere in the pipeline.
-- `_draw_primitive` reads a hardcoded vertex byte layout (position + diffuse
-  only) regardless of the real FVF the game declares via `SetVertexShader`
-  (captured in `_state._draw_vertex_fvf` but never consulted). Plausible
-  this specific offset is still correct for diffuse under the standard
-  D3DFVF field ordering (RHW sits between position and diffuse) -- meaning
-  UV coordinates, if present, are just never read rather than misread as
-  color -- but this was NOT verified against real live vertex data. Confirm
-  before assuming the byte-offset itself is fine.
+1. `CreateTexture`/`SetTexture`/`GetTextureStageState`/`SetTextureStageState`
+   converted from lying no-ops to real state-tracking implementations.
+2. Real GPU texture upload wired into `IDirect3DSurface8::LockRect`/
+   `UnlockRect` (confirmed via call tracing to be the actual path the real
+   game uses -- the texture's OWN `LockRect`/`UnlockRect` are never called).
+3. D3DFORMAT-aware pitch + BGRA8 conversion (`_format_bytes_per_pixel`/
+   `_convert_to_bgra8` in `_helpers.py`) -- `LockRect`'s `Pitch` was
+   hardcoded to `width*4` regardless of real format, corrupting every
+   non-32bpp texture (confirmed live with real `D3DFMT_R5G6B5` textures).
+   Handles R5G6B5/X1R5G5B5/A1R5G5B5/A4R4G4B4/A8; DXT/S3TC still unhandled
+   (see item below).
+4. Window-transparency bug: alpha=0 draws (blend disabled) were writing
+   real transparency into the swapchain's alpha channel, letting the
+   Wayland compositor show the desktop through the game window. Fixed by
+   excluding alpha from the pipeline's `colorWriteMask`.
+5. Descriptor-set race: a single shared descriptor set mutated per
+   `SetTexture()` call doesn't work, because Vulkan reads descriptor
+   contents at command-buffer *execution* time (Present's `vkQueueSubmit`),
+   not at record time -- every draw in an unpresented frame sampled
+   whichever texture was bound *last* in that frame. Fixed with one
+   persistent descriptor set per texture (`_pipeline.py`'s
+   `_MAX_TEXTURE_DESCRIPTOR_SETS` pool), resolved and bound per-draw at
+   record time in `_draw_primitive`.
+6. Same class of bug, for vertex data: `_draw_primitive` always wrote to
+   vertex-buffer offset 0, so every draw accumulated in a frame overwrote
+   the previous one's vertex data before the GPU ever read any of it. Fixed
+   with a per-frame cursor (`_state._vk_vertex_cursor`) giving each draw
+   its own buffer region, reset once per new frame acquire.
+7. **The actual remaining bug, found only after Molly refused to accept "a
+   provably-correct GPU readback" as proof of a working screen**: Vulkan's
+   NDC Y-axis points DOWN by default (opposite of OpenGL), but
+   `_draw_primitive`'s screen-to-NDC Y math used the OpenGL-style flip
+   formula (`1 - y/h*2`) inherited from a GL mental model, rendering
+   everything upside-down/off-screen relative to where anyone would look
+   for it. Fixed: `yn = (y/vp_h)*2 - 1` (no flip; D3D8 screen-space Y-down
+   already matches Vulkan NDC Y-down).
+8. A separate, real Vulkan correctness bug found while chasing the above:
+   `BeginScene`'s per-frame swapchain-image re-acquire barrier used
+   `oldLayout=UNDEFINED` unconditionally -- a real "discard prior content"
+   hint some drivers honor literally, wrong for every re-acquire after the
+   first (D3D8's `Clear()`, not every frame boundary, is supposed to be
+   what erases backbuffer content). Fixed by tracking which swapchain image
+   indices have completed at least one frame
+   (`_state._vk_swapchain_images_used`) and using `oldLayout=PRESENT_SRC_KHR`
+   for every re-acquire after the first.
 
-**Real per-vertex-color draws happen and reach the screen now** (after the
-render-pass fix) but nothing the game expects a bound *texture* to visually
-provide (button art, icons, text, backgrounds) can ever appear, since no
-texture image reaches the GPU and nothing samples one. Fully sufficient on
-its own to explain a black/solid-flat screen regardless of how correct
-everything else is.
+**Verification chain, strongest to weakest**: (a) a real textured quad
+directly confirmed in a live screenshot -- the actual bar Molly held this
+session to, not accepted until met; (b) full-screen solid-red `Clear()`
+confirmed reaching the actual composited window (proved the presentation
+pipeline itself, independent of any draw-content bug); (c) direct GPU pixel
+readback (`vkCmdCopyImageToBuffer` to a host-visible staging buffer) showing
+real non-clear-color texture data at the expected screen location; (d) full
+test suite green (1249 passed) after every change.
 
-**Scope for a real session** (not an overnight patch -- this is a genuine
-feature, not a bug fix):
-1. Real GPU-side texture upload: `vkCreateImage`/`vkAllocateMemory`/a
-   staging-buffer-and-copy path (or persistent mapped memory) triggered from
-   texture creation and/or `Lock()`/`Unlock()` -- whichever the game
-   actually uses to write pixel data (traced this session: no `Lock`/`Unlock`
-   calls appear near the game's own "upload all" routine, meaning it likely
-   writes directly through a cached raw data pointer -- confirm this before
-   designing the upload trigger).
-2. A real sampler + descriptor set, and a second shader variant (or extend
-   the existing one) with a `sampler2D`/UV input, wired through `SetTexture`.
-3. Verify the REAL vertex FVF-to-byte-layout mapping against live guest
-   vertex data before trusting `_draw_primitive`'s current hardcoded offsets
-   generalize correctly once UV coordinates need to be read too.
-4. `IDirect3D8::CheckDeviceFormat` (`tew/api/d3d8/idirect3d8.py:495`)
-   unconditionally returns `S_OK` for every format query, confirmed live for
-   DXT1 (FourCC `0x31545844`) and DXT3 (`0x33545844`) -- `tew/api/d3d8/` has
-   zero DXT/S3TC/BC1-3 decompression code anywhere. Check whether
-   `scn.login`'s actual `.fsh` textures are DXT-encoded; if so, real
-   decompression is needed as part of the same upload path, not a
-   standalone fix.
-5. `C:\Data\GUI\dlg.options` still occasionally reported missing depending
-   on what's on disk at `~/.emu32/Data/GUI/dlg.options` -- low priority,
-   doesn't block rendering.
-6. DirectSound was checked and looks like a real, working implementation
-   (`Buf::Play` opens a real SDL audio device, real PCM mixing exists) --
-   "no music" probably isn't the same class of bug as the texture pipeline;
-   worth a focused look on its own rather than assuming it's related.
+**Still open, carried forward**:
+- DXT/S3TC/BC1-3 texture decompression -- `IDirect3D8::CheckDeviceFormat`
+  still unconditionally returns `S_OK` for DXT1/DXT3 FourCCs
+  (`tew/api/d3d8/idirect3d8.py:495`) with no decompression path; the real
+  textures traced this session were uncompressed (`D3DFMT_R5G6B5`), so this
+  wasn't blocking, but a DXT-compressed texture would currently render
+  garbage via the "unrecognized format, pass through raw" fallback in
+  `_convert_to_bgra8`.
+- Only stage-0 textures are wired to the GPU-visible descriptor set --
+  multitexturing (stage > 0) is tracked in `_state._bound_textures` but not
+  rendered. Not yet observed to matter in practice.
+- `C:\Data\GUI\dlg.options` still occasionally reported missing -- low
+  priority, doesn't block rendering.
+- DirectSound looks like a real, working implementation -- "no music"
+  probably isn't the same class of bug as the texture pipeline; not
+  investigated this session.
+
+## NEW (2026-09-05): real guest-code crash around t≈41s, unrelated to D3D8 -- needs investigation
+
+Observed repeatedly during this session's live runs (`EIP=0x00688c68`,
+crash details written to `/tmp/emu_crash.json`). Not yet investigated --
+happens independently of the D3D8/texture work above (seen both with and
+without the debug instrumentation from that session). Next step: read
+`/tmp/emu_crash.json` and correlate `0x00688c68` against `MCity_d.exe` in
+Ghidra to identify what function is crashing and why.
+
+## NEW (2026-09-05): D3D8 game window receives no real mouse/keyboard input at all
+
+Confirmed via direct code inspection this session, while investigating why
+a persona couldn't be selected even with a visible screen:
+- `tew/api/window_manager.py`'s `_handle_sdl_event` only translates
+  keyboard events and left-mouse-button-*down* into Win32 messages, and
+  only for tew's own emulated Win32 dialog-box widget system
+  (`_focused_hwnd`/`_cycle_focus`) -- not the D3D8 render window itself.
+  Mouse *movement* (`SDL_MOUSEMOTION`) is never handled at all -- a
+  `WM_MOUSEMOVE` constant is defined but never referenced anywhere.
+  Left-button-*up*, and the right/middle buttons, are also never handled.
+  There is no window focus-change handling either (no SDL
+  `SDL_WINDOWEVENT_FOCUS_GAINED`/`_LOST` handling, no `WM_ACTIVATE`/
+  `WM_SETFOCUS`/`WM_KILLFOCUS` ever posted).
+- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` -- the real
+  DirectInput polling API a game like this almost certainly uses every
+  frame for keyboard/mouse -- is a hardcoded zero-fill stub (the comment
+  literally says "zero-fill output"). Even if the game polls correctly, it
+  always reads "nothing pressed, no movement."
+
+Net effect: even once the persona-select screen is fully visible, there is
+currently no way to click a persona or otherwise interact with the game.
+Real scope: wire `SDL_MOUSEMOTION`/button-up/right-and-middle-button events
+into the D3D8 window's real input path (separate from the dialog-widget
+system), add focus-change message posting, and replace `GetDeviceState`'s
+zero-fill with real `SDL_GetMouseState`/`SDL_GetKeyboardState` polling.
 
 ## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
 

@@ -457,6 +457,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 _state._vk_swapchain_format,
                 _state._vk_swapchain_width,
                 _state._vk_swapchain_height,
+                _state._vk_command_pool,
+                _state._vk_graphics_queue,
             )
             _state._vk_image_views      = pipe["image_views"]
             _state._vk_render_pass      = pipe["render_pass"]
@@ -466,6 +468,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             _state._vk_vertex_buffer    = pipe["vertex_buffer"]
             _state._vk_vertex_memory    = pipe["vertex_memory"]
             _state._vk_vertex_mapped_ptr = pipe["vertex_mapped"]
+            _state._vk_vertex_buffer_size = pipe["vertex_buffer_size"]
+            _state._vk_descriptor_set_layout = pipe["descriptor_set_layout"]
+            _state._vk_descriptor_pool       = pipe["descriptor_pool"]
+            _state._vk_descriptor_set        = pipe["descriptor_set"]
+            _state._vk_sampler               = pipe["sampler"]
+            _state._vk_default_tex_image     = pipe["default_tex_image"]
+            _state._vk_default_tex_memory    = pipe["default_tex_memory"]
+            _state._vk_default_tex_view      = pipe["default_tex_view"]
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: pipeline init failed: {exc} — halting")

@@ -94,9 +94,51 @@ def unimplemented_halt(name: str) -> Callable[["CPU"], None]:
     """
     def _h(cpu: "CPU") -> None:
         logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
+        log_register_dump(cpu)
         cpu.halted = True
         cpu.fatal_halt = True
     return _h
+
+
+def log_register_dump(cpu: "CPU", category: str = "cpu") -> None:
+    """Log all 8 GP registers plus the stdcall/cdecl return address and a run
+    of stack slots below ESP.
+
+    Shared by every "unimplemented API/method, halt loudly" handler (the
+    dll_loader.py IAT auto-stub and the D3D8 COM-vtable `_halt` closures) so
+    a halt always carries enough live state to diagnose without a re-run --
+    most Win32/COM calls take 0-6 stdcall args sitting right above ESP, and
+    printing them here beats adding a one-off logpoint and re-running.
+    """
+    esp = cpu.regs[ESP] & 0xFFFFFFFF
+    eip = getattr(cpu, "eip", None)
+    eip_str = f"0x{eip & 0xFFFFFFFF:08x}" if eip is not None else "?"
+    logger.error(
+        category,
+        f"  EIP={eip_str}  "
+        f"EAX=0x{cpu.regs[0] & 0xFFFFFFFF:08x}  "
+        f"ECX=0x{cpu.regs[1] & 0xFFFFFFFF:08x}  "
+        f"EDX=0x{cpu.regs[2] & 0xFFFFFFFF:08x}  "
+        f"EBX=0x{cpu.regs[3] & 0xFFFFFFFF:08x}",
+    )
+    logger.error(
+        category,
+        f"  ESP=0x{esp:08x}  "
+        f"EBP=0x{cpu.regs[5] & 0xFFFFFFFF:08x}  "
+        f"ESI=0x{cpu.regs[6] & 0xFFFFFFFF:08x}  "
+        f"EDI=0x{cpu.regs[7] & 0xFFFFFFFF:08x}",
+    )
+    try:
+        mem = cpu.memory
+        ret_addr = mem.read32(esp)
+        args = [mem.read32((esp + 4 + i * 4) & 0xFFFFFFFF) for i in range(6)]
+        logger.error(
+            category,
+            f"  [ESP]=ret 0x{ret_addr:08x}  args="
+            + " ".join(f"0x{a:08x}" for a in args),
+        )
+    except Exception as err:
+        logger.error(category, f"  (failed to read stack args: {err})")
 
 
 # ── Win32Handlers ─────────────────────────────────────────────────────────────
