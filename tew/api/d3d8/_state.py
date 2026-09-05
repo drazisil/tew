@@ -66,6 +66,13 @@ _draw_stream_stride: int = 0   # stride in bytes
 # Vertex FVF/handle set by SetVertexShader.
 _draw_vertex_fvf: int = 0
 
+# Real SDL cursor set via IDirect3DDevice8::SetCursorProperties (previously a
+# lying no-op stub that returned S_OK without ever telling SDL to display a
+# cursor). None until the game sets one; freed and replaced on each new
+# SetCursorProperties call to avoid leaking prior cursors (e.g. animation).
+_cursor_sdl_handle: object = None
+_cursor_shown: bool = False
+
 # Instance-level extension functions loaded after vkCreateInstance.
 _vk_fn_get_surface_caps = None   # vkGetPhysicalDeviceSurfaceCapabilitiesKHR
 

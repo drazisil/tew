@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
 
+import ctypes
 import struct as _struct
 
 from tew.hardware.cpu_zig import EAX, ECX, ESP
@@ -173,6 +174,82 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(p + 8,  0xABCD)  # hFocusWindow (fake HWND)
             mem.write32(p + 12, 0x40)    # BehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING
         cpu.regs[EAX] = S_OK
+
+    # [10] SetCursorProperties(XHotSpot, YHotSpot, IDirect3DSurface8*)
+    #
+    # FIXED (2026-09-05): was a lying no-op (`_ok`) that returned S_OK without
+    # ever telling anything to display a cursor image. Real D3D8 requires the
+    # surface to be D3DFMT_A8R8G8B8 (32-bit ARGB) -- same byte layout Clear()
+    # already assumes for D3DCOLOR (byte 0=B, 1=G, 2=R, 3=A, i.e. a little-
+    # endian 0xAARRGGBB u32) -- so no format-conversion is needed, just a
+    # direct read of the surface's pixel bytes into an SDL cursor.
+    def _set_cursor_properties(cpu: "CPU", mem: "Memory") -> None:
+        x_hot = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        y_hot = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        surf  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        if not surf:
+            logger.warn("d3d8", "SetCursorProperties: NULL surface")
+            cpu.regs[EAX] = S_OK
+            return
+
+        data_ptr = mem.read32((surf + 4)  & 0xFFFFFFFF)
+        width    = mem.read32((surf + 12) & 0xFFFFFFFF)
+        height   = mem.read32((surf + 16) & 0xFFFFFFFF)
+        if width == 0 or height == 0 or data_ptr == 0:
+            logger.warn("d3d8",
+                f"SetCursorProperties: degenerate surface {width}x{height} data_ptr=0x{data_ptr:x}")
+            cpu.regs[EAX] = S_OK
+            return
+
+        try:
+            from sdl2 import (
+                SDL_CreateRGBSurfaceFrom, SDL_FreeSurface,
+                SDL_CreateColorCursor, SDL_SetCursor, SDL_FreeCursor,
+            )
+            pitch = width * 4
+            raw = bytes(mem.read8((data_ptr + i) & 0xFFFFFFFF) for i in range(width * height * 4))
+            pixel_buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+            sdl_surface = SDL_CreateRGBSurfaceFrom(
+                ctypes.cast(pixel_buf, ctypes.c_void_p),
+                width, height, 32, pitch,
+                0x00FF0000,  # Rmask
+                0x0000FF00,  # Gmask
+                0x000000FF,  # Bmask
+                0xFF000000,  # Amask
+            )
+            if not sdl_surface:
+                logger.warn("d3d8", "SetCursorProperties: SDL_CreateRGBSurfaceFrom failed")
+                cpu.regs[EAX] = S_OK
+                return
+            cursor = SDL_CreateColorCursor(sdl_surface, x_hot, y_hot)
+            SDL_FreeSurface(sdl_surface)
+            if not cursor:
+                logger.warn("d3d8", "SetCursorProperties: SDL_CreateColorCursor failed")
+                cpu.regs[EAX] = S_OK
+                return
+            if _state._cursor_sdl_handle is not None:
+                SDL_FreeCursor(_state._cursor_sdl_handle)
+            _state._cursor_sdl_handle = cursor
+            SDL_SetCursor(cursor)
+            logger.info("d3d8",
+                f"SetCursorProperties: OK {width}x{height} hotspot=({x_hot},{y_hot})")
+        except Exception as exc:
+            logger.warn("d3d8", f"SetCursorProperties failed: {type(exc).__name__}: {exc}")
+        cpu.regs[EAX] = S_OK
+
+    # [12] ShowCursor(BOOL bShow) -> BOOL (previous visibility)
+    #
+    # FIXED (2026-09-05): was a lying no-op (`_uint`) that always returned 0
+    # without ever calling SDL_ShowCursor -- so even a correctly-set custom
+    # cursor image (once SetCursorProperties above is fixed) would never
+    # actually be shown.
+    def _show_cursor(cpu: "CPU", mem: "Memory") -> None:
+        from sdl2 import SDL_ShowCursor, SDL_ENABLE, SDL_DISABLE
+        b_show = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        previous = _state._cursor_shown
+        SDL_ShowCursor(SDL_ENABLE if b_show else SDL_DISABLE)
+        _state._cursor_shown = bool(b_show)
+        cpu.regs[EAX] = 1 if previous else 0
 
     # [14] Reset(D3DPRESENT_PARAMETERS*)
     def _reset(cpu: "CPU", mem: "Memory") -> None:
@@ -340,6 +417,21 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # Waits for the previous frame fence, acquires the next swapchain image, and
     # opens the command buffer.  Transitions the image to TRANSFER_DST_OPTIMAL so
     # Clear can vkCmdClearColorImage without an additional barrier.
+    #
+    # FIXED (2026-09-05): the real game calls BeginScene/EndScene multiple times
+    # per logical frame (confirmed live: ~18 BeginScene calls per real Present,
+    # e.g. once per widget draw batch), not once. This function used to
+    # unconditionally vkResetCommandBuffer + reacquire + re-transition on EVERY
+    # call, which discarded every prior BeginScene/EndScene bracket's recorded
+    # (but not yet submitted -- vkQueueSubmit only happens in Present) draw
+    # commands each time a new one started. Only ~1 in 18 scenes' content ever
+    # reached the screen; the rest were silently wiped, producing a black
+    # screen despite the game correctly loading and drawing its entire GUI.
+    # Fix: only do the acquire/reset/transition/begin-render-pass sequence when
+    # genuinely starting a new frame (no image currently acquired). If already
+    # mid-frame (continuing to accumulate draws before the eventual Present),
+    # this is a no-op -- the command buffer and render pass are already open
+    # and recording from the earlier BeginScene call in this same frame.
     def _begin_scene(cpu: "CPU", mem: "Memory") -> None:
         import vulkan as vk
 
@@ -349,7 +441,16 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             cpu.fatal_halt = True
             return
 
-        logger.info("d3d8", "BeginScene: ENTER")
+        _ret_eip = mem.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        logger.info("d3d8", f"BeginScene: ENTER called_from=0x{_ret_eip:08x}")
+
+        if _state._vk_image_acquired:
+            # Continuing the same unpresented frame -- command buffer and
+            # render pass are already open and recording. Do nothing.
+            logger.info("d3d8",
+                f"BeginScene: OK (continuing frame) image_idx={_state._vk_current_image_idx}")
+            cpu.regs[EAX] = S_OK
+            return
 
         def _wait_and_acquire():
             # vkWaitForFences can call wl_display_roundtrip on Mesa/Wayland WSI;
@@ -481,55 +582,65 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [35] EndScene()
-    # Ends the render pass and command buffer; the final image barrier (to
-    # PRESENT_SRC_KHR) is now handled by the render pass finalLayout.
+    #
+    # FIXED (2026-09-05): previously ended the render pass and command buffer
+    # here, every call. Since vkQueueSubmit only happens in Present, and the
+    # real game calls BeginScene/EndScene multiple times per logical frame
+    # (see _begin_scene's comment), ending the render pass here left the
+    # swapchain image in PRESENT_SRC_KHR (the render pass's own finalLayout)
+    # while the NEXT BeginScene's render pass still assumed the image was in
+    # COLOR_ATTACHMENT_OPTIMAL (its initialLayout) -- a real layout mismatch,
+    # on top of throwing away every earlier bracket's recorded draws. Real
+    # finalization (ending the render pass, ending the command buffer) now
+    # happens exactly once per frame, in Present, right before submission --
+    # see _finalize_frame_for_present. EndScene itself no longer needs to do
+    # anything beyond the existing device-initialized check.
     def _end_scene(cpu: "CPU", mem: "Memory") -> None:
-        import vulkan as vk
-
         if _state._vk_device is None:
             logger.error("d3d8", "EndScene: device not initialised — halting")
             cpu.halted = True
             cpu.fatal_halt = True
             return
 
-        try:
-            if _state._vk_in_render_pass:
-                vk.vkCmdEndRenderPass(_state._vk_cmd_buf)
-                _state._vk_in_render_pass = False
-            else:
-                # Fallback: manual barrier if render pass not yet ready
-                image = _state._vk_swapchain_images[_state._vk_current_image_idx]
-                subresource = vk.VkImageSubresourceRange(
-                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                    baseMipLevel=0, levelCount=1,
-                    baseArrayLayer=0, layerCount=1,
-                )
-                barrier = vk.VkImageMemoryBarrier(
-                    sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
-                    dstAccessMask=0,
-                    oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
-                    dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
-                    image=image,
-                    subresourceRange=subresource,
-                )
-                vk.vkCmdPipelineBarrier(
-                    _state._vk_cmd_buf,
-                    vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                    0, 0, None, 0, None, 1, [barrier],
-                )
-            vk.vkEndCommandBuffer(_state._vk_cmd_buf)
-        except Exception as exc:
-            logger.error("d3d8", f"EndScene failed: {exc} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-            return
-
         logger.info("d3d8", "EndScene: OK")
         cpu.regs[EAX] = S_OK
+
+    def _finalize_frame_for_present(cpu: "CPU", mem: "Memory") -> None:
+        """Ends the render pass (or applies the manual fallback barrier) and
+        the command buffer -- run once per frame, from Present, right before
+        vkQueueSubmit. See _begin_scene/_end_scene comments for why this
+        moved out of EndScene."""
+        import vulkan as vk
+
+        if _state._vk_in_render_pass:
+            vk.vkCmdEndRenderPass(_state._vk_cmd_buf)
+            _state._vk_in_render_pass = False
+        else:
+            # Fallback: manual barrier if render pass not yet ready
+            image = _state._vk_swapchain_images[_state._vk_current_image_idx]
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0, levelCount=1,
+                baseArrayLayer=0, layerCount=1,
+            )
+            barrier = vk.VkImageMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask=0,
+                oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                image=image,
+                subresourceRange=subresource,
+            )
+            vk.vkCmdPipelineBarrier(
+                _state._vk_cmd_buf,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, None, 0, None, 1, [barrier],
+            )
+        vk.vkEndCommandBuffer(_state._vk_cmd_buf)
 
     # [36] Clear(Count, pRects, Flags, Color, Z, Stencil)
     # Stack (this at ESP+4):
@@ -600,11 +711,15 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             return
 
         logger.debug("d3d8",
-            f"Clear: ARGB=0x{argb:08x} rgba=({r:.2f},{g:.2f},{b:.2f},{a:.2f})")
+            f"Clear: ARGB=0x{argb:08x} rgba=({r:.2f},{g:.2f},{b:.2f},{a:.2f}) image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
     # [15] Present(pSrc, pDest, hWnd, pRegion)
     # Submits the command buffer and presents the current swapchain image.
+    # Finalizes the frame (ends render pass + command buffer -- see
+    # _finalize_frame_for_present) before submitting, since EndScene no
+    # longer does that itself (a logical frame may span multiple
+    # BeginScene/EndScene brackets before the real Present call).
     def _present(cpu: "CPU", mem: "Memory") -> None:
         import vulkan as vk
 
@@ -616,6 +731,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
         logger.info("d3d8", "Present: ENTER")
         try:
+            _finalize_frame_for_present(cpu, mem)
             submit_info = vk.VkSubmitInfo(
                 sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 waitSemaphoreCount=1,
@@ -755,9 +871,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 _get_display_mode, 4, memory, D3DDEV_OBJ)
     dev[9]  = _com_stub(stubs, "d3d8dev", "Dev::GetCreationParameters",
                 _get_creation_params, 4, memory, D3DDEV_OBJ)
-    dev[10] = _ok  ("Dev::SetCursorProperties",       12)
+    dev[10] = _com_stub(stubs, "d3d8dev", "Dev::SetCursorProperties",
+                _set_cursor_properties, 12, memory, D3DDEV_OBJ)
     dev[11] = _void("Dev::SetCursorPosition",         12)
-    dev[12] = _uint("Dev::ShowCursor",                 4, 0)
+    dev[12] = _com_stub(stubs, "d3d8dev", "Dev::ShowCursor",
+                _show_cursor, 4, memory, D3DDEV_OBJ)
     dev[13] = _ok  ("Dev::CreateAdditionalSwapChain",  8)
     dev[14] = _com_stub(stubs, "d3d8dev", "Dev::Reset",   _reset,   4, memory, D3DDEV_OBJ)
     dev[15] = _com_stub(stubs, "d3d8dev", "Dev::Present",
@@ -905,7 +1023,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         vk.vkCmdBindVertexBuffers(cmd, 0, 1, [_state._vk_vertex_buffer], [0])
         vk.vkCmdDraw(cmd, n_verts, 1, 0, 0)
         logger.debug("d3d8",
-            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count}")
+            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count} image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
     dev[70] = _com_stub(stubs, "d3d8dev", "Dev::DrawPrimitive",

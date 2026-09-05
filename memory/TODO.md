@@ -6,38 +6,71 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## NEW (2026-09-04, night): black screen at persona-select -- D3D8 renders every frame but never draws anything
+## NEW (2026-09-05, overnight): D3D8 has no texture-sampling pipeline at all -- the real black-screen root cause, needs a proper feature session
 
-Full investigation in status.md (current entry at time of writing; will
-rotate to status_archive.md once superseded). Summary: the whole client
-stack genuinely succeeds -- login, shard list, persona load (`Login.log`
-shows `Persona added: Dr Brown`), and D3D8's `BeginScene`/`EndScene`/
-`Present` cycle continuously reporting OK -- but the actual game window
-shows solid black (screenshotted and confirmed), no music, no cursor.
-`Dev::Clear`/`Dev::DrawPrimitive` are never called even once across
-multiple full runs. Real game debug output (`channel_log.txt`)
-shows `draw.c "upload all"` firing repeatedly around the same time, with
-no corresponding D3D8 draw call ever appearing in tew's dispatch log.
+Full investigation and two already-fixed bugs (a render-pass/command-buffer
+frame-discard bug, and lying no-op cursor stubs) are in status.md (current
+entry as of writing). This item is the one that's NOT fixed: after both of
+those real fixes, the screen was screenshotted again and is still solid
+black -- confirming the actual root cause is architectural, not either of
+the two bugs already resolved.
 
-**Next steps, in order**:
-1. Trace what `draw.c`'s "upload all" actually calls -- does it reach
-   D3D8 at all (Lock/SetTexture/DrawPrimitive), and if so, why doesn't
-   any of it show up in tew's `[d3d8]` dispatch log? Could be a real
-   silent no-op, or another logging gap like the one just fixed.
-2. Separately confirmed, not yet tied to the black screen specifically:
-   `IDirect3D8::CheckDeviceFormat` (`tew/api/d3d8/idirect3d8.py:495`)
-   unconditionally returns `S_OK` for every format query -- confirmed
-   live for DXT1 (FourCC `0x31545844`) and DXT3 (`0x33545844`) queries.
-   `tew/api/d3d8/` has zero DXT/S3TC/BC1-3 decompression code anywhere;
-   every texture is allocated as `w*h*4` uncompressed RGBA regardless of
-   `fmt`. If the game's real GUI textures are DXT-compressed, this would
-   silently hand raw compressed bytes to the renderer as if already
-   decoded. Needs: check whether `scn.login`'s actual `.fsh` textures are
-   DXT-encoded before treating this as confirmed-root-cause rather than
-   a real-but-maybe-unrelated gap.
-3. `C:\Data\GUI\dlg.options` still reported missing on disk
-   (`~/.emu32/Data/GUI/dlg.options`) -- low priority, doesn't appear to
-   block rendering, but worth resolving for completeness.
+**Confirmed via direct code inspection (not guessed)**:
+- `Dev::SetTexture`/`Dev::SetTextureStageState` are no-op stubs -- binding a
+  texture for drawing does nothing.
+- No `vkCreateImage` call exists anywhere for game textures (only the
+  swapchain's own images get a real Vulkan image). `_alloc_texture_obj` only
+  allocates a plain byte buffer in tew's *emulated guest memory* -- never a
+  real GPU-visible image.
+- `tew/api/d3d8/_pipeline.py`'s hand-encoded SPIR-V shaders are a bare
+  position+diffuse-color passthrough -- no sampler, no UV coordinates
+  anywhere in the pipeline.
+- `_draw_primitive` reads a hardcoded vertex byte layout (position + diffuse
+  only) regardless of the real FVF the game declares via `SetVertexShader`
+  (captured in `_state._draw_vertex_fvf` but never consulted). Plausible
+  this specific offset is still correct for diffuse under the standard
+  D3DFVF field ordering (RHW sits between position and diffuse) -- meaning
+  UV coordinates, if present, are just never read rather than misread as
+  color -- but this was NOT verified against real live vertex data. Confirm
+  before assuming the byte-offset itself is fine.
+
+**Real per-vertex-color draws happen and reach the screen now** (after the
+render-pass fix) but nothing the game expects a bound *texture* to visually
+provide (button art, icons, text, backgrounds) can ever appear, since no
+texture image reaches the GPU and nothing samples one. Fully sufficient on
+its own to explain a black/solid-flat screen regardless of how correct
+everything else is.
+
+**Scope for a real session** (not an overnight patch -- this is a genuine
+feature, not a bug fix):
+1. Real GPU-side texture upload: `vkCreateImage`/`vkAllocateMemory`/a
+   staging-buffer-and-copy path (or persistent mapped memory) triggered from
+   texture creation and/or `Lock()`/`Unlock()` -- whichever the game
+   actually uses to write pixel data (traced this session: no `Lock`/`Unlock`
+   calls appear near the game's own "upload all" routine, meaning it likely
+   writes directly through a cached raw data pointer -- confirm this before
+   designing the upload trigger).
+2. A real sampler + descriptor set, and a second shader variant (or extend
+   the existing one) with a `sampler2D`/UV input, wired through `SetTexture`.
+3. Verify the REAL vertex FVF-to-byte-layout mapping against live guest
+   vertex data before trusting `_draw_primitive`'s current hardcoded offsets
+   generalize correctly once UV coordinates need to be read too.
+4. `IDirect3D8::CheckDeviceFormat` (`tew/api/d3d8/idirect3d8.py:495`)
+   unconditionally returns `S_OK` for every format query, confirmed live for
+   DXT1 (FourCC `0x31545844`) and DXT3 (`0x33545844`) -- `tew/api/d3d8/` has
+   zero DXT/S3TC/BC1-3 decompression code anywhere. Check whether
+   `scn.login`'s actual `.fsh` textures are DXT-encoded; if so, real
+   decompression is needed as part of the same upload path, not a
+   standalone fix.
+5. `C:\Data\GUI\dlg.options` still occasionally reported missing depending
+   on what's on disk at `~/.emu32/Data/GUI/dlg.options` -- low priority,
+   doesn't block rendering.
+6. DirectSound was checked and looks like a real, working implementation
+   (`Buf::Play` opens a real SDL audio device, real PCM mixing exists) --
+   "no music" probably isn't the same class of bug as the texture pipeline;
+   worth a focused look on its own rather than assuming it's related.
+
+## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
 
 ## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
 
