@@ -28,10 +28,88 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
+import ctypes
+
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
 from tew.logger import logger
+
+# SDL scancode -> DIK_* code, for the keys a game actually polls in practice
+# (letters, digits, common punctuation, function keys, arrows, modifiers).
+# DIK_* values ARE the real PC/AT set-1 keyboard scancodes (per dinput.h) --
+# not an arbitrary DirectInput invention -- so this table is fixed, not
+# guessed. Extended keys (arrows, ctrl/alt right-hand variants, navigation
+# cluster) use their real DIK_* extended-scancode values, which happen to
+# already be single bytes >= 0x80 in DirectInput's numbering (no separate
+# 0xE0 prefix byte the way raw PS/2 set 1 needs) -- values taken directly
+# from dinput.h, not derived.
+_SDL_SCANCODE_TO_DIK: dict[int, int] = {}
+
+
+def _build_scancode_table() -> dict[int, int]:
+    import sdl2 as _sdl2
+    t: dict[int, int] = {
+        _sdl2.SDL_SCANCODE_ESCAPE: 0x01,
+        _sdl2.SDL_SCANCODE_1: 0x02, _sdl2.SDL_SCANCODE_2: 0x03,
+        _sdl2.SDL_SCANCODE_3: 0x04, _sdl2.SDL_SCANCODE_4: 0x05,
+        _sdl2.SDL_SCANCODE_5: 0x06, _sdl2.SDL_SCANCODE_6: 0x07,
+        _sdl2.SDL_SCANCODE_7: 0x08, _sdl2.SDL_SCANCODE_8: 0x09,
+        _sdl2.SDL_SCANCODE_9: 0x0A, _sdl2.SDL_SCANCODE_0: 0x0B,
+        _sdl2.SDL_SCANCODE_MINUS: 0x0C, _sdl2.SDL_SCANCODE_EQUALS: 0x0D,
+        _sdl2.SDL_SCANCODE_BACKSPACE: 0x0E, _sdl2.SDL_SCANCODE_TAB: 0x0F,
+        _sdl2.SDL_SCANCODE_Q: 0x10, _sdl2.SDL_SCANCODE_W: 0x11,
+        _sdl2.SDL_SCANCODE_E: 0x12, _sdl2.SDL_SCANCODE_R: 0x13,
+        _sdl2.SDL_SCANCODE_T: 0x14, _sdl2.SDL_SCANCODE_Y: 0x15,
+        _sdl2.SDL_SCANCODE_U: 0x16, _sdl2.SDL_SCANCODE_I: 0x17,
+        _sdl2.SDL_SCANCODE_O: 0x18, _sdl2.SDL_SCANCODE_P: 0x19,
+        _sdl2.SDL_SCANCODE_LEFTBRACKET: 0x1A, _sdl2.SDL_SCANCODE_RIGHTBRACKET: 0x1B,
+        _sdl2.SDL_SCANCODE_RETURN: 0x1C, _sdl2.SDL_SCANCODE_LCTRL: 0x1D,
+        _sdl2.SDL_SCANCODE_A: 0x1E, _sdl2.SDL_SCANCODE_S: 0x1F,
+        _sdl2.SDL_SCANCODE_D: 0x20, _sdl2.SDL_SCANCODE_F: 0x21,
+        _sdl2.SDL_SCANCODE_G: 0x22, _sdl2.SDL_SCANCODE_H: 0x23,
+        _sdl2.SDL_SCANCODE_J: 0x24, _sdl2.SDL_SCANCODE_K: 0x25,
+        _sdl2.SDL_SCANCODE_L: 0x26, _sdl2.SDL_SCANCODE_SEMICOLON: 0x27,
+        _sdl2.SDL_SCANCODE_APOSTROPHE: 0x28, _sdl2.SDL_SCANCODE_GRAVE: 0x29,
+        _sdl2.SDL_SCANCODE_LSHIFT: 0x2A, _sdl2.SDL_SCANCODE_BACKSLASH: 0x2B,
+        _sdl2.SDL_SCANCODE_Z: 0x2C, _sdl2.SDL_SCANCODE_X: 0x2D,
+        _sdl2.SDL_SCANCODE_C: 0x2E, _sdl2.SDL_SCANCODE_V: 0x2F,
+        _sdl2.SDL_SCANCODE_B: 0x30, _sdl2.SDL_SCANCODE_N: 0x31,
+        _sdl2.SDL_SCANCODE_M: 0x32, _sdl2.SDL_SCANCODE_COMMA: 0x33,
+        _sdl2.SDL_SCANCODE_PERIOD: 0x34, _sdl2.SDL_SCANCODE_SLASH: 0x35,
+        _sdl2.SDL_SCANCODE_RSHIFT: 0x36, _sdl2.SDL_SCANCODE_KP_MULTIPLY: 0x37,
+        _sdl2.SDL_SCANCODE_LALT: 0x38, _sdl2.SDL_SCANCODE_SPACE: 0x39,
+        _sdl2.SDL_SCANCODE_CAPSLOCK: 0x3A,
+        _sdl2.SDL_SCANCODE_F1: 0x3B, _sdl2.SDL_SCANCODE_F2: 0x3C,
+        _sdl2.SDL_SCANCODE_F3: 0x3D, _sdl2.SDL_SCANCODE_F4: 0x3E,
+        _sdl2.SDL_SCANCODE_F5: 0x3F, _sdl2.SDL_SCANCODE_F6: 0x40,
+        _sdl2.SDL_SCANCODE_F7: 0x41, _sdl2.SDL_SCANCODE_F8: 0x42,
+        _sdl2.SDL_SCANCODE_F9: 0x43, _sdl2.SDL_SCANCODE_F10: 0x44,
+        _sdl2.SDL_SCANCODE_NUMLOCKCLEAR: 0x45, _sdl2.SDL_SCANCODE_SCROLLLOCK: 0x46,
+        _sdl2.SDL_SCANCODE_KP_7: 0x47, _sdl2.SDL_SCANCODE_KP_8: 0x48,
+        _sdl2.SDL_SCANCODE_KP_9: 0x49, _sdl2.SDL_SCANCODE_KP_MINUS: 0x4A,
+        _sdl2.SDL_SCANCODE_KP_4: 0x4B, _sdl2.SDL_SCANCODE_KP_5: 0x4C,
+        _sdl2.SDL_SCANCODE_KP_6: 0x4D, _sdl2.SDL_SCANCODE_KP_PLUS: 0x4E,
+        _sdl2.SDL_SCANCODE_KP_1: 0x4F, _sdl2.SDL_SCANCODE_KP_2: 0x50,
+        _sdl2.SDL_SCANCODE_KP_3: 0x51, _sdl2.SDL_SCANCODE_KP_0: 0x52,
+        _sdl2.SDL_SCANCODE_KP_PERIOD: 0x53,
+        _sdl2.SDL_SCANCODE_F11: 0x57, _sdl2.SDL_SCANCODE_F12: 0x58,
+        _sdl2.SDL_SCANCODE_KP_ENTER: 0x9C, _sdl2.SDL_SCANCODE_RCTRL: 0x9D,
+        _sdl2.SDL_SCANCODE_KP_DIVIDE: 0xB5, _sdl2.SDL_SCANCODE_RALT: 0xB8,
+        _sdl2.SDL_SCANCODE_HOME: 0xC7, _sdl2.SDL_SCANCODE_UP: 0xC8,
+        _sdl2.SDL_SCANCODE_PAGEUP: 0xC9, _sdl2.SDL_SCANCODE_LEFT: 0xCB,
+        _sdl2.SDL_SCANCODE_RIGHT: 0xCD, _sdl2.SDL_SCANCODE_END: 0xCF,
+        _sdl2.SDL_SCANCODE_DOWN: 0xD0, _sdl2.SDL_SCANCODE_PAGEDOWN: 0xD1,
+        _sdl2.SDL_SCANCODE_INSERT: 0xD2, _sdl2.SDL_SCANCODE_DELETE: 0xD3,
+    }
+    return t
+
+
+# Last polled absolute mouse position, for computing DIMOUSESTATE's
+# relative lX/lY deltas (DirectInput's default mouse axis mode is relative,
+# and SetProperty/DIPROP_AXISMODE is currently a no-op stub that never
+# records absolute mode, so relative is also the only mode this can honor).
+_last_mouse_pos: list[int] = [0, 0]
 
 # ── Fixed COM object addresses ────────────────────────────────────────────────
 DI_VTABLE     = 0x002202E0   # IDirectInput2A vtable     (9  × 4 = 36 bytes → 0x00220304)
@@ -133,11 +211,53 @@ def register_dinput_handlers(
         cpu.regs[EAX] = DI_OK
 
     def _dev_get_device_state(cpu: "CPU", mem: "Memory") -> None:
-        # GetDeviceState(DWORD cbData, LPVOID lpvData) — zero-fill output
+        # GetDeviceState(DWORD cbData, LPVOID lpvData) -- real SDL polling.
+        # This device object is generic (CreateDevice doesn't distinguish
+        # keyboard vs. mouse by REFGUID -- see its own comment), so which
+        # real device to poll is inferred from cbData, the one thing the
+        # caller always tells us: 256 means the 256-byte DirectInput
+        # keyboard buffer, anything else (16 for DIMOUSESTATE, 20 for
+        # DIMOUSESTATE2) means the mouse.
         cb_data  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lpv_data = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
-        if lpv_data and cb_data:
-            for off in range(cb_data):
+        if not (lpv_data and cb_data):
+            cpu.regs[EAX] = DI_OK
+            return
+
+        import sdl2 as _sdl2
+        if not _SDL_SCANCODE_TO_DIK:
+            _SDL_SCANCODE_TO_DIK.update(_build_scancode_table())
+
+        if cb_data == 256:
+            for off in range(256):
+                mem.write8((lpv_data + off) & 0xFFFFFFFF, 0)
+            num_keys = ctypes.c_int(0)
+            state_ptr = _sdl2.SDL_GetKeyboardState(ctypes.byref(num_keys))
+            state = ctypes.cast(state_ptr, ctypes.POINTER(ctypes.c_uint8 * num_keys.value)).contents
+            for scancode, dik in _SDL_SCANCODE_TO_DIK.items():
+                if scancode < num_keys.value and state[scancode]:
+                    mem.write8((lpv_data + dik) & 0xFFFFFFFF, 0x80)
+        else:
+            x = ctypes.c_int(0)
+            y = ctypes.c_int(0)
+            buttons = _sdl2.SDL_GetMouseState(ctypes.byref(x), ctypes.byref(y))
+            dx = x.value - _last_mouse_pos[0]
+            dy = y.value - _last_mouse_pos[1]
+            _last_mouse_pos[0] = x.value
+            _last_mouse_pos[1] = y.value
+            mem.write32(lpv_data,      dx & 0xFFFFFFFF)          # lX
+            mem.write32((lpv_data + 4) & 0xFFFFFFFF, dy & 0xFFFFFFFF)  # lY
+            mem.write32((lpv_data + 8) & 0xFFFFFFFF, 0)          # lZ (wheel, not tracked)
+            btn_bytes = [
+                0x80 if buttons & _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_LEFT) else 0,
+                0x80 if buttons & _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_RIGHT) else 0,
+                0x80 if buttons & _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_MIDDLE) else 0,
+                0,
+            ]
+            for i, b in enumerate(btn_bytes):
+                if 12 + i < cb_data:
+                    mem.write8((lpv_data + 12 + i) & 0xFFFFFFFF, b)
+            for off in range(16, cb_data):
                 mem.write8((lpv_data + off) & 0xFFFFFFFF, 0)
         cpu.regs[EAX] = DI_OK
 

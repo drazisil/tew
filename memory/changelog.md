@@ -4,6 +4,37 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-05 (cont'd) — RESOLVED: real mouse/keyboard input now reaches the D3D8 window; crash at t≈41s identified as the game's own `_Nfs_DebugBreak` assert (not yet root-caused, rare/non-reproducible)
+
+Direct follow-on from the texture-pipeline session (same day): once the
+screen could actually show content, the next real gap was that nothing
+could be clicked. Fixed:
+
+- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` was a hardcoded
+  zero-fill stub; now really polls SDL. The one generic DirectInput device
+  object (`CreateDevice` never distinguished keyboard vs. mouse by REFGUID)
+  is disambiguated by `cbData` at `GetDeviceState` time -- 256 means the
+  keyboard (`SDL_GetKeyboardState` + a fixed SDL-scancode -> real `DIK_*`
+  table), anything else means the mouse (`SDL_GetMouseState`, reported as
+  DirectInput's default relative lX/lY deltas + button bytes).
+- `tew/api/window_manager.py`'s `_handle_sdl_event` never handled
+  `SDL_MOUSEMOTION`, `SDL_MOUSEBUTTONUP`, or window focus events at all
+  (only keydown/keyup/lbuttondown, and only for tew's own emulated
+  dialog-widget system, not the real top-level window). Added
+  `WM_MOUSEMOVE`/`WM_LBUTTONUP` posting and `WM_ACTIVATE`+
+  `WM_SETFOCUS`/`WM_KILLFOCUS` posting on SDL focus gain/loss.
+
+Full suite green (1249 passed); sanity-checked live (no exceptions from the
+new SDL event handling).
+
+**Separately investigated** (not fixed, see `TODO.md`): a real guest crash
+seen a few times this session (`EIP=0x00688c68`) was identified via Ghidra
+as `_Nfs_DebugBreak`, called from `Nfs_exitCallback` (`nfspc.c`) asserting
+`hMutexNfsRunning != NULL` during the game's own exit sequence -- a real,
+named assert, not a random fault. Could not be reproduced again across 5+
+fresh runs to trace further live; root cause (real game bug vs. a tew
+`CreateMutex`/`CloseHandle` bug) not yet determined.
+
 ## 2026-09-05 (full session) — RESOLVED: D3D8 texture-sampling pipeline built end-to-end; real textured content confirmed ON SCREEN via a live screenshot
 
 Follow-on from the 2026-09-05 overnight session, which found (but didn't fix)

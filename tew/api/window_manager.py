@@ -29,9 +29,10 @@ from sdl2 import (
     SDL_QUIT,
     SDL_KEYDOWN, SDL_KEYUP,
     SDL_TEXTINPUT,
-    SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP,
+    SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP, SDL_MOUSEMOTION,
     SDL_WINDOWEVENT,
     SDL_WINDOWEVENT_CLOSE,
+    SDL_WINDOWEVENT_FOCUS_GAINED, SDL_WINDOWEVENT_FOCUS_LOST,
     SDL_GetWindowID,
     SDL_RaiseWindow,
     SDLK_BACKSPACE, SDLK_RETURN, SDLK_KP_ENTER, SDLK_TAB,
@@ -93,6 +94,9 @@ def _sdl_sym_to_vk(sym: int) -> int:
 
 WM_CREATE       = 0x0001
 WM_DESTROY      = 0x0002
+WM_ACTIVATE     = 0x0006
+WM_SETFOCUS     = 0x0007
+WM_KILLFOCUS    = 0x0008
 WM_PAINT        = 0x000F
 WM_SETTEXT      = 0x000C
 WM_GETTEXT      = 0x000D
@@ -667,6 +671,32 @@ class WindowManager:
                 hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
                 if hwnd:
                     self._message_queue.append((hwnd, WM_CLOSE, 0, 0))
+            elif we.event == SDL_WINDOWEVENT_FOCUS_GAINED:
+                hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
+                if hwnd:
+                    self._message_queue.append((hwnd, WM_ACTIVATE, 1, 0))
+                    self._message_queue.append((hwnd, WM_SETFOCUS, 0, 0))
+            elif we.event == SDL_WINDOWEVENT_FOCUS_LOST:
+                hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
+                if hwnd:
+                    self._message_queue.append((hwnd, WM_KILLFOCUS, 0, 0))
+                    self._message_queue.append((hwnd, WM_ACTIVATE, 0, 0))
+
+        elif etype == SDL_MOUSEMOTION:
+            motion = event.motion
+            hwnd = self._sdl_window_id_to_hwnd.get(motion.windowID, 0)
+            if hwnd:
+                lparam = (motion.x & 0xFFFF) | ((motion.y & 0xFFFF) << 16)
+                self._message_queue.append((hwnd, WM_MOUSEMOVE, 0, lparam))
+
+        elif etype == SDL_MOUSEBUTTONUP:
+            btn = event.button
+            if btn.button != SDL_BUTTON_LEFT:
+                return
+            hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
+            if hwnd:
+                lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
+                self._message_queue.append((hwnd, WM_LBUTTONUP, 0, lparam))
 
         elif etype == SDL_KEYDOWN:
             key = event.key

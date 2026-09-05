@@ -85,41 +85,62 @@ test suite green (1249 passed) after every change.
   probably isn't the same class of bug as the texture pipeline; not
   investigated this session.
 
-## NEW (2026-09-05): real guest-code crash around t≈41s, unrelated to D3D8 -- needs investigation
+## NEW (2026-09-05): real guest-code crash around t≈41s, IDENTIFIED but not yet root-caused -- genuinely rare, only reproduced once
 
-Observed repeatedly during this session's live runs (`EIP=0x00688c68`,
-crash details written to `/tmp/emu_crash.json`). Not yet investigated --
-happens independently of the D3D8/texture work above (seen both with and
-without the debug instrumentation from that session). Next step: read
-`/tmp/emu_crash.json` and correlate `0x00688c68` against `MCity_d.exe` in
-Ghidra to identify what function is crashing and why.
+`EIP=0x00688c68` decompiles (via Ghidra, `MCity_d.exe`) to `_Nfs_DebugBreak`
+-- the game's own deliberate `INT3` assert mechanism, not a random fault.
+Its caller (`ebp_chain` depth 0, ret `0x0068b0b2`) is `Nfs_exitCallback`
+(`nfspc.c`), which asserts `hMutexNfsRunning != NULL` during the game's own
+exit sequence -- `Channel_SystemPrint("ASSERT: %s(%d) %s\n", ...,
+"hMutexNfsRunning")` fires immediately before the breakpoint, confirming
+this is exactly that assert failing, not an unrelated fault landing at the
+same address. `_hMutexNfsRunning` was `0`/NULL when this ran.
 
-## NEW (2026-09-05): D3D8 game window receives no real mouse/keyboard input at all
+Two live possibilities, not yet distinguished: (1) real original-game logic
+-- something else triggered the game's exit sequence, and by the time this
+callback ran its own tracked mutex handle was already cleared/never set,
+a genuine (if rare) bug in the shipped game; (2) a tew bug in the real
+Win32 `CreateMutex`/`CloseHandle` handlers that back `_hMutexNfsRunning`.
 
-Confirmed via direct code inspection this session, while investigating why
-a persona couldn't be selected even with a visible screen:
-- `tew/api/window_manager.py`'s `_handle_sdl_event` only translates
-  keyboard events and left-mouse-button-*down* into Win32 messages, and
-  only for tew's own emulated Win32 dialog-box widget system
-  (`_focused_hwnd`/`_cycle_focus`) -- not the D3D8 render window itself.
-  Mouse *movement* (`SDL_MOUSEMOTION`) is never handled at all -- a
-  `WM_MOUSEMOVE` constant is defined but never referenced anywhere.
-  Left-button-*up*, and the right/middle buttons, are also never handled.
-  There is no window focus-change handling either (no SDL
-  `SDL_WINDOWEVENT_FOCUS_GAINED`/`_LOST` handling, no `WM_ACTIVATE`/
-  `WM_SETFOCUS`/`WM_KILLFOCUS` ever posted).
-- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` -- the real
-  DirectInput polling API a game like this almost certainly uses every
-  frame for keyboard/mouse -- is a hardcoded zero-fill stub (the comment
-  literally says "zero-fill output"). Even if the game polls correctly, it
-  always reads "nothing pressed, no movement."
+**Could not reproduce for further live tracing** -- captured once, then 5+
+subsequent fresh runs (varying `LOG_LEVEL`/`LOG_CATEGORIES`) all completed
+their full timeout cleanly with no crash. Whatever triggers it is timing-
+sensitive (coincides with heavy DAO/Jet DB worker-thread activity --
+`Tmp.MDB` reads, `DBThread is alive` -- in the one run it fired), and
+tew's own thread-scheduler interleaving isn't identical run to run.
 
-Net effect: even once the persona-select screen is fully visible, there is
-currently no way to click a persona or otherwise interact with the game.
-Real scope: wire `SDL_MOUSEMOTION`/button-up/right-and-middle-button events
-into the D3D8 window's real input path (separate from the dialog-widget
-system), add focus-change message posting, and replace `GetDeviceState`'s
-zero-fill with real `SDL_GetMouseState`/`SDL_GetKeyboardState` polling.
+Next step (needs a fresh repro, or static-only tracing without one): find
+where `_hMutexNfsRunning` is really set (its `CreateMutex` call site) and
+what actually calls into the exit sequence at t≈41s, then check tew's
+`CreateMutex`/`CloseHandle` handlers (`tew/api/kernel32_*.py`) for a real
+bug vs. confirming this is genuine original-game behavior.
+
+## RESOLVED (2026-09-05): D3D8 game window now receives real mouse/keyboard input
+
+Was: no real mouse/keyboard input reached the game at all (see prior
+description in `changelog.md`'s 2026-09-05 entry for the full original
+finding). Fixed both real gaps:
+- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` now really polls SDL:
+  `cbData==256` is treated as the keyboard (real `SDL_GetKeyboardState` +
+  a fixed SDL-scancode -> real `DIK_*` table covering letters, digits,
+  punctuation, function keys, arrows, and modifiers); any other `cbData`
+  (16/20) is treated as the mouse (`SDL_GetMouseState`, reported as
+  DirectInput's default *relative* lX/lY deltas since the last poll, plus
+  left/right/middle button bytes). The single generic device object
+  (`CreateDevice` doesn't distinguish keyboard vs. mouse by REFGUID) is
+  disambiguated this way since `cbData` is the one thing every caller
+  always states.
+- `tew/api/window_manager.py`'s `_handle_sdl_event` now handles
+  `SDL_MOUSEMOTION` (posts `WM_MOUSEMOVE`), `SDL_MOUSEBUTTONUP` (posts
+  `WM_LBUTTONUP`), and `SDL_WINDOWEVENT_FOCUS_GAINED`/`_LOST` (posts
+  `WM_ACTIVATE`+`WM_SETFOCUS` / `WM_ACTIVATE`+`WM_KILLFOCUS`) to the real
+  top-level window, not just tew's own dialog-widget system.
+
+Not yet done: right/middle mouse buttons in `window_manager.py`'s own
+message-based dialog path (DirectInput's mouse polling above does report
+them); mouse wheel (`lZ`) is not tracked at all. Full suite green (1249
+passed) throughout; sanity-checked with a live run (no exceptions from the
+new SDL event handling).
 
 ## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
 
