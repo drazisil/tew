@@ -4,6 +4,60 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-05 (cont'd again x3) — MILESTONE: RESOLVED, a fully legible, correctly-colored, correctly-sized persona-select screen. Two more real bugs found and fixed: vertex diffuse-color R/B channel swap, and alpha blending disabled entirely (broke all UI text) + swapchain/window resolution mismatch.
+
+Direct continuation of the same day's black-screen root-cause work. With
+real drawing finally reaching the screen, two more real bugs stood
+between that and an actually legible, usable screen:
+
+**Vertex diffuse-color R/B channel swap**: `_draw_primitive` packed
+D3DCOLOR into the vertex color attribute as `(b, g, r, a)` to mirror
+D3DCOLOR's `0xAARRGGBB` byte layout, but the vertex attribute is a plain
+`vec4` -- the GPU just fills `.xyzw` in memory order, and the fragment
+shader multiplies it straight into the output with no "this is BGRA"
+reinterpretation. Silently swapped red and blue for any non-gray vertex
+color; white/gray is swap-invariant, which is why it went unnoticed
+through the whole earlier texture-pipeline session. Fixed by extracting
+the decode into `_d3dcolor_to_rgba()` and returning `(r, g, b, a)`.
+Confirmed live: a toolbar element that had rendered blue now renders red,
+its correct color.
+
+**Alpha blending disabled entirely, which broke all UI text**: earlier
+the same session, `blendEnable=VK_FALSE` was set globally to fix a
+window-transparency bug, on the assumption that diffuse alpha "only ever
+meant something for in-engine blending, which is disabled here." Wrong:
+anti-aliased font glyphs are real alpha-blended quads (RGB = ink color,
+alpha = coverage). With blending off, every glyph quad rendered fully
+opaque using its raw RGB (typically black filler in a font atlas)
+instead of blending by coverage -- so every piece of UI text rendered as
+a solid black rectangle. Confirmed by cropping a live screenshot to full
+native resolution, ruling out "just blurry from window scaling": the
+black bars were pixel-exact solid rectangles. Fixed by re-enabling real
+RGB alpha blending while keeping the swapchain's alpha channel excluded
+from the write mask, so the original transparency fix still holds.
+
+**Swapchain/window resolution mismatch**: `CreateDevice` sized the
+swapchain from the Vulkan surface's actual `currentExtent` (the real OS
+window's current pixel size), not from the game's requested
+`D3DPRESENT_PARAMETERS` `BackBufferWidth`/`Height`. The SDL window was
+created earlier (from the game's own `CreateWindowExA` call) at an
+unrelated size, so the swapchain silently inherited that instead --
+confirmed live: game requested `back=640x480`, swapchain came out
+`1536x1248`. Fixed by resizing the real SDL window (`SDL_SetWindowSize`)
+to match before querying surface capabilities.
+
+**Both confirmed together, live, for the first time this whole effort**:
+a real, legible persona-select screen -- "CHOOSE YOUR PERSONA", "PLEASE
+SELECT FROM T[HE LIST BELOW]", column headers, and a real listed persona
+entry "Dr Brown" -- at the correct 640x480 window size, correct colors,
+no window transparency, no mosaic/corruption.
+
+Regression test added: `tests/unit/api/test_d3d8_diffuse_color_order.py`
+(the resolution fix needs live Vulkan/SDL and isn't unit-testable). Full
+suite green (1272 passed, up from 1266).
+
+---
+
 ## 2026-09-05 (cont'd again x2) — RESOLVED: `GetRenderTarget`/`GetDepthStencilSurface` fabricated a fresh surface object every call, causing premature Release; also fixed `LockRect` ignoring `pRect`. Regression tests added for all three fixes from this session.
 
 While chasing what first looked like a texture-format bug (a background

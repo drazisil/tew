@@ -6,6 +6,22 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-05, cont'd again x3): try real mouse/keyboard interaction with the persona-select screen now that it's legible
+
+The persona-select screen (`Dlg.Persona`) now renders fully legibly --
+correct colors, correct 640x480 window size, real text -- for the first
+time this whole multi-session effort (see status.md's current entry for
+the two fixes that got it there: a vertex-color channel swap, and
+disabled alpha blending + a swapchain/window resolution mismatch). Real
+mouse/keyboard input was wired into DirectInput and the D3D8 window
+earlier this same session (see changelog.md), but has never been
+exercised against a screen legible enough to interact with meaningfully.
+Next step: try clicking the listed persona ("Dr Brown") and see whether
+the game responds (proceeds to the next screen, highlights the
+selection, etc.).
+
+---
+
 ## RESOLVED (2026-09-05, cont'd again): "mistiled/blocky background image" root-caused as `GetRenderTarget`/`GetDepthStencilSurface` fabricating a fresh surface object every call — a real premature-free bug, not a missing D3DFORMAT case
 
 What first looked like a texture-format bug (a 1536x1248 surface,
