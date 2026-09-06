@@ -4,6 +4,45 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-05 (cont'd again) — RESOLVED: `IDirect3DVertexBuffer8::Lock`/`IndexBuffer8::Lock` ignored `OffsetToLock`, corrupting every dynamic vertex-buffer append — root cause of the persistent black screen; first non-black frame produced
+
+Root-caused by directly reading raw guest memory at draw time (not
+guessed): `idirect3d8resource.py::_buffer_lock` read the `OffsetToLock`
+argument off the stack but never used it, always writing back the
+buffer's base `data_ptr` regardless of the requested offset. Real D3D8
+apps append geometry into one large dynamic vertex/index buffer via
+repeated `Lock(offset, size, ..., D3DLOCK_NOOVERWRITE)` calls at a
+growing offset, writing new data past what's already there. Because tew
+always handed back the same base pointer, every such write landed at
+offset 0 (clobbering the previous write) instead of the real offset —
+while `DrawPrimitive` correctly read from `base + StartVertex*stride`,
+using the real `StartVertex` the game passed to `SetStreamSource`: an
+address that had never actually been written, so it read zeroed heap
+memory (position, color and UV all zero) for every draw after the first
+in a buffer.
+
+Confirmed live via temporary raw-hex diagnostics in `_draw_primitive`
+(added, used, then fully removed — not committed): of 905 sampled
+`DrawPrimitive` calls in one run, 904 with `StartVertex > 0` read
+all-zero vertex data from an otherwise correctly-populated buffer, while
+every `StartVertex == 0` call read real data.
+
+**Fixed**: `_buffer_lock` now returns `data_ptr + offset` instead of
+always `data_ptr`. Full suite green (1249 passed). Live re-verification
+with the same diagnostic showed all-zero reads drop from 904/905 to
+3/905, with previously-zero high-offset draws now reading real,
+distinct, incrementing vertex data.
+
+**This is the first time this whole multi-session effort has produced
+a non-black frame.** A live screenshot after the fix shows real UI
+content (a toolbar-like row of colored buttons) and a large image area,
+replacing solid black at every prior checkpoint. The image area itself
+renders as a blocky mosaic rather than clean art — a separate, still-open
+bug, likely a D3DFORMAT handling gap (see `status.md`'s current entry
+and `TODO.md`).
+
+---
+
 ## 2026-09-05 (cont'd) — RESOLVED: real mouse/keyboard input now reaches the D3D8 window; crash at t≈41s identified as the game's own `_Nfs_DebugBreak` assert (not yet root-caused, rare/non-reproducible)
 
 Direct follow-on from the texture-pipeline session (same day): once the

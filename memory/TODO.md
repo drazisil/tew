@@ -6,6 +6,44 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## IN PROGRESS (2026-09-05, cont'd again): mistiled/blocky background image — likely D3DFORMAT 0x4f (D3DFMT_D24X4S4, a depth-stencil format) being uploaded through the color texture path, OR a surface-object identity/aliasing bug
+
+After fixing the vertex-buffer-offset bug (see changelog.md, RESOLVED,
+same date) and getting the first-ever non-black frame, the large
+background image (1536x1248 surface, `this=0x09750000` in one traced
+run — the "Full Street" background) renders as a mosaic of flat-colored
+blocks instead of real image content. Confirmed via log: this same
+surface object reports `fmt=0x16` (`D3DFMT_X8R8G8B8`, real color) on its
+FIRST `Surface::UnlockRect`, then `fmt=0x4f` on every subsequent upload
+of the *same object* -- and 0x4f (79 decimal) is `D3DFMT_D24X4S4`, a
+depth-stencil format, not a color format.
+
+Two live hypotheses, NOT yet distinguished:
+1. `_FORMAT_BYTES_PER_PIXEL`/`_convert_to_bgra8` (`_helpers.py`) have no
+   case for `0x4f`, so it likely falls through an unhandled-format
+   passthrough (treat as already BGRA8) -- plausible match visually
+   since depth-buffer-shaped data has large near-uniform runs, which
+   would look like flat blocky patches.
+2. More suspicious: the SAME surface object's stored format field
+   (`_alloc_surface_obj`'s obj+20) changed between locks with no visible
+   `CreateSurface`/`SetTexture` call to explain it. That could mean a
+   surface-object identity or heap-allocation-aliasing bug -- e.g. two
+   different logical surfaces landing on overlapping addresses, or
+   something else writing into this object's format field. Needs
+   tracing (log every write to this object's format slot, or check
+   whether multiple CreateSurface-family calls return the same address)
+   before treating this as "just add a 0x4f format case," since doing
+   that could paper over real corruption.
+
+Next step: add temporary diagnostics logging every `CreateImageSurface`/
+`CreateRenderTarget`/`CreateDepthStencilSurface`/`CreateTexture` call's
+returned object address plus every write to a surface object's format
+slot, to see whether `0x09750000` is genuinely reused/aliased or whether
+the real game legitimately reformats the same surface (e.g. via some
+private extension) between locks.
+
+---
+
 ## RESOLVED (2026-09-05, full session): D3D8 texture-sampling pipeline built end-to-end, real content confirmed ON SCREEN
 
 Full methodology in changelog.md (2026-09-05 entry) and the rotated
