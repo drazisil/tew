@@ -124,6 +124,26 @@ from tew.api.d3d8._helpers import _alloc_registry
 import tew.api.d3d8._state as _state
 
 
+def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
+    """Decode a D3DCOLOR DWORD (0xAARRGGBB) into (r, g, b, a) floats in
+    [0, 1], in the order a plain vec4 vertex attribute needs.
+
+    FIXED: previously the caller packed these as (b, g, r, a) to mirror
+    D3DCOLOR's byte layout, but the vertex attribute is a plain vec4 -- the
+    GPU just fills .xyzw in memory order, and the fragment shader
+    multiplies it straight into the output with no "this is BGRA"
+    reinterpretation. That silently swapped red and blue for any non-gray
+    vertex color (white/gray is swap-invariant, which is why it went
+    unnoticed). Returning (r, g, b, a) here means plain vec4 .xyzw order
+    already means the right thing.
+    """
+    r = ((dif >> 16) & 0xFF) / 255.0
+    g = ((dif >>  8) & 0xFF) / 255.0
+    b = ((dif >>  0) & 0xFF) / 255.0
+    a = ((dif >> 24) & 0xFF) / 255.0
+    return r, g, b, a
+
+
 def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     """Return the 97 trampoline addresses for the IDirect3DDevice8 vtable."""
 
@@ -1107,12 +1127,9 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             # correct vertex data, correct color, correct UV, rendering at
             # the wrong screen location entirely.
             yn = (y / vp_h) * 2.0 - 1.0
-            b = ((dif >>  0) & 0xFF) / 255.0
-            g = ((dif >>  8) & 0xFF) / 255.0
-            r = ((dif >> 16) & 0xFF) / 255.0
-            a = ((dif >> 24) & 0xFF) / 255.0
+            r, g, b, a = _d3dcolor_to_rgba(dif)
             _struct.pack_into('<ffffffffff', out_verts, i * 40,
-                              xn, yn, z, 1.0, b, g, r, a, u, v)
+                              xn, yn, z, 1.0, r, g, b, a, u, v)
 
         size = len(out_verts)
 

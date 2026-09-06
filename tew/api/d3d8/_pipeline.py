@@ -44,7 +44,7 @@ def _encode_spv(words: list[int]) -> bytes:
 
 
 # ── Vertex shader: pos/color/uv passthrough ───────────────────────────────────
-# Inputs:  location 0 = vec4 pos (NDC xyzw), location 1 = vec4 color (BGRA floats),
+# Inputs:  location 0 = vec4 pos (NDC xyzw), location 1 = vec4 color (RGBA floats),
 #          location 2 = vec2 uv
 # Outputs: gl_Position = pos, location 0 = color, location 1 = uv
 #
@@ -600,7 +600,7 @@ def create_pipeline(device, render_pass, descriptor_set_layout):
             format=vk.VK_FORMAT_R32G32B32A32_SFLOAT, offset=0),   # NDC pos
         vk.VkVertexInputAttributeDescription(
             location=1, binding=0,
-            format=vk.VK_FORMAT_R32G32B32A32_SFLOAT, offset=16),  # BGRA color
+            format=vk.VK_FORMAT_R32G32B32A32_SFLOAT, offset=16),  # RGBA color
         vk.VkVertexInputAttributeDescription(
             location=2, binding=0,
             format=vk.VK_FORMAT_R32G32_SFLOAT, offset=32),        # UV
