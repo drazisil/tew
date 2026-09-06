@@ -650,17 +650,35 @@ def create_pipeline(device, render_pass, descriptor_set_layout):
     )
 
     blend_attach = vk.VkPipelineColorBlendAttachmentState(
-        blendEnable=vk.VK_FALSE,
-        # Alpha deliberately excluded: D3D8 has no concept of "make the
-        # window itself translucent" -- diffuse alpha only ever meant
-        # something for in-engine blending, which is disabled here. Writing
-        # it into the swapchain's alpha channel let the Wayland compositor
-        # treat alpha=0 draws (D3DCOLOR values with a zero top byte, seen
-        # constantly on real geometry -- e.g. degenerate/invisible glyph
-        # quads) as real window transparency, showing the desktop through
-        # the game window instead of the intended color. The backbuffer's
-        # alpha is set once by Clear (ARGB=0xff000000 -> alpha=1.0) and
-        # must stay untouched by every draw after that.
+        # FIXED: blending was previously disabled entirely (blendEnable=
+        # VK_FALSE), on the assumption that diffuse alpha "only ever meant
+        # something for in-engine blending, which is disabled here." That
+        # assumption was wrong -- anti-aliased font glyphs are rendered as
+        # real alpha-blended quads (RGB = ink color, alpha = coverage, with
+        # a font atlas's non-glyph filler typically black). With blending
+        # off, those quads render fully opaque using their raw RGB instead
+        # of blending by coverage, producing solid black rectangles instead
+        # of legible text -- confirmed live: the persona-select screen's
+        # headline, list rows, and every button label rendered as solid
+        # black bars. Real alpha blending is now enabled for RGB.
+        blendEnable=vk.VK_TRUE,
+        srcColorBlendFactor=vk.VK_BLEND_FACTOR_SRC_ALPHA,
+        dstColorBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        colorBlendOp=vk.VK_BLEND_OP_ADD,
+        srcAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE,
+        dstAlphaBlendFactor=vk.VK_BLEND_FACTOR_ZERO,
+        alphaBlendOp=vk.VK_BLEND_OP_ADD,
+        # Alpha still deliberately excluded from the write mask: D3D8 has
+        # no concept of "make the window itself translucent," and writing
+        # diffuse alpha into the swapchain's own alpha channel let the
+        # Wayland compositor treat alpha=0 draws (D3DCOLOR values with a
+        # zero top byte, seen constantly on real geometry -- e.g.
+        # degenerate/invisible glyph quads) as real window transparency,
+        # showing the desktop through the game window instead of the
+        # intended color. The backbuffer's alpha is set once by Clear
+        # (ARGB=0xff000000 -> alpha=1.0) and must stay untouched by every
+        # draw after that -- RGB blending above uses source alpha as a
+        # blend *factor* only, it never writes alpha itself.
         colorWriteMask=(
             vk.VK_COLOR_COMPONENT_R_BIT |
             vk.VK_COLOR_COMPONENT_G_BIT |

@@ -147,7 +147,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         import ctypes
         import vulkan as vk
         from vulkan import ffi
-        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion
+        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion, SDL_SetWindowSize
         from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
@@ -178,6 +178,22 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         # Top-level windows are created with SDL_WINDOW_VULKAN so no EGL
         # surface is attached to the wl_surface; no renderer to destroy here.
+
+        # FIXED: the SDL window was created earlier (from the game's
+        # CreateWindowExA call) at whatever size that call requested --
+        # unrelated to the resolution the game is now asking D3D8 for via
+        # D3DPRESENT_PARAMETERS. The swapchain below sizes itself from the
+        # Vulkan surface's real currentExtent (the actual OS window size),
+        # not from back_w/back_h directly, so a mismatched window size
+        # silently produced a swapchain at the wrong resolution -- confirmed
+        # live: the game requested back=640x480, but the window (and thus
+        # the swapchain) was still 1536x1248 from its original creation
+        # size, so every screen-space vertex position the game computed
+        # assuming a 640x480 viewport was rescaled against the wrong
+        # framebuffer dimensions. Resize the real window to match before
+        # querying the surface's capabilities.
+        if back_w > 0 and back_h > 0:
+            SDL_SetWindowSize(sdl_window, back_w, back_h)
 
         # ── Load instance-level KHR extension functions ────────────────────
         try:
