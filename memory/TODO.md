@@ -6,41 +6,45 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## IN PROGRESS (2026-09-05, cont'd again): mistiled/blocky background image — likely D3DFORMAT 0x4f (D3DFMT_D24X4S4, a depth-stencil format) being uploaded through the color texture path, OR a surface-object identity/aliasing bug
+## RESOLVED (2026-09-05, cont'd again): "mistiled/blocky background image" root-caused as `GetRenderTarget`/`GetDepthStencilSurface` fabricating a fresh surface object every call — a real premature-free bug, not a missing D3DFORMAT case
 
-After fixing the vertex-buffer-offset bug (see changelog.md, RESOLVED,
-same date) and getting the first-ever non-black frame, the large
-background image (1536x1248 surface, `this=0x09750000` in one traced
-run — the "Full Street" background) renders as a mosaic of flat-colored
-blocks instead of real image content. Confirmed via log: this same
-surface object reports `fmt=0x16` (`D3DFMT_X8R8G8B8`, real color) on its
-FIRST `Surface::UnlockRect`, then `fmt=0x4f` on every subsequent upload
-of the *same object* -- and 0x4f (79 decimal) is `D3DFMT_D24X4S4`, a
-depth-stencil format, not a color format.
+What first looked like a texture-format bug (a 1536x1248 surface,
+`this=0x09750000`, flipping from `fmt=0x16` to `fmt=0x4f`/`D3DFMT_D24X4S4`
+between `UnlockRect` calls) turned out to be a genuine object-lifetime
+bug, confirmed via temporary alloc/free diagnostics correlated
+chronologically against `Surface::UnlockRect` calls: `Dev::GetRenderTarget`
+and `Dev::GetDepthStencilSurface` allocated a brand-new, independently
+ref-counted surface object on *every* call instead of returning a stable,
+AddRef'd, cached one. Real D3D8 AddRef's and returns the same underlying
+surface every time -- the caller's matching `Release()` only drops their
+own reference, since the device keeps its own. Fabricating a fresh object
+per call meant the game's single, correct `Release()` immediately freed
+tew's only copy of it; the freed heap address was then handed to an
+unrelated later allocation, whose write into the object header's format
+field corrupted what the still-in-use original surface reported. Proven
+directly: a `Surface::UnlockRect` call on that address succeeded 23.8
+seconds after tew's own bookkeeping had already freed it, reading stale
+leftover memory.
 
-Two live hypotheses, NOT yet distinguished:
-1. `_FORMAT_BYTES_PER_PIXEL`/`_convert_to_bgra8` (`_helpers.py`) have no
-   case for `0x4f`, so it likely falls through an unhandled-format
-   passthrough (treat as already BGRA8) -- plausible match visually
-   since depth-buffer-shaped data has large near-uniform runs, which
-   would look like flat blocky patches.
-2. More suspicious: the SAME surface object's stored format field
-   (`_alloc_surface_obj`'s obj+20) changed between locks with no visible
-   `CreateSurface`/`SetTexture` call to explain it. That could mean a
-   surface-object identity or heap-allocation-aliasing bug -- e.g. two
-   different logical surfaces landing on overlapping addresses, or
-   something else writing into this object's format field. Needs
-   tracing (log every write to this object's format slot, or check
-   whether multiple CreateSurface-family calls return the same address)
-   before treating this as "just add a 0x4f format case," since doing
-   that could paper over real corruption.
+**Fixed**: both accessors now cache one canonical surface object per
+device (`_state._vk_backbuffer_surface_obj`/`_vk_depth_stencil_surface_obj`)
+and AddRef on repeat calls. Regression test:
+`tests/unit/api/test_d3d8_render_target_cache.py`.
 
-Next step: add temporary diagnostics logging every `CreateImageSurface`/
-`CreateRenderTarget`/`CreateDepthStencilSurface`/`CreateTexture` call's
-returned object address plus every write to a surface object's format
-slot, to see whether `0x09750000` is genuinely reused/aliased or whether
-the real game legitimately reformats the same surface (e.g. via some
-private extension) between locks.
+The visible "mosaic" itself was a separate misdiagnosis, corrected by
+Molly watching the actual game window live: it was real, correctly
+loading 32x32 icon content (1201 icon uploads in one run) caught
+mid-population, not corrupted output -- it resolved into real content
+once loading finished.
+
+Also fixed along the way (real, correct, but confirmed NOT the cause of
+this particular bug): `IDirect3DSurface8::LockRect` ignored the `pRect`
+sub-rectangle parameter, always returning a pointer to the surface's
+absolute origin regardless of which sub-rectangle was requested -- would
+cause exactly this kind of tile-patchwork corruption for any surface
+genuinely streamed/decoded via repeated `Lock(pRect)`/`Unlock` cycles on
+different sub-rects. Regression test:
+`tests/unit/api/test_d3d8_lock_rect_prect.py`.
 
 ---
 

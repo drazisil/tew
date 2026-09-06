@@ -108,6 +108,19 @@ _bound_textures: dict[int, int] = {}
 # (stage, D3DTEXTURESTAGESTATETYPE) -> DWORD value, set by SetTextureStageState.
 _texture_stage_state: dict[tuple[int, int], int] = {}
 
+# Cached canonical IDirect3DSurface8* for the primary render target / depth-
+# stencil surface, lazily created on first GetRenderTarget()/
+# GetDepthStencilSurface() call. Real D3D8 AddRef's and returns the SAME
+# underlying surface every call -- the caller's matching Release() only
+# drops their reference, since the device keeps its own. Fabricating a
+# fresh, independently-ref-counted object on every call (the old behaviour)
+# meant the game's single, correct Release() immediately freed tew's only
+# copy of it -- confirmed live: a 1536x1248 surface's format field got
+# clobbered by an unrelated later allocation reusing the same freed heap
+# address, while the game kept calling UnlockRect on it 20+ seconds later.
+_vk_backbuffer_surface_obj:    int | None = None
+_vk_depth_stencil_surface_obj: int | None = None
+
 # Real SDL cursor set via IDirect3DDevice8::SetCursorProperties (previously a
 # lying no-op stub that returned S_OK without ever telling SDL to display a
 # cursor). None until the game sets one; freed and replaced on each new

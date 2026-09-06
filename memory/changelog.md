@@ -4,6 +4,55 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-05 (cont'd again x2) — RESOLVED: `GetRenderTarget`/`GetDepthStencilSurface` fabricated a fresh surface object every call, causing premature Release; also fixed `LockRect` ignoring `pRect`. Regression tests added for all three fixes from this session.
+
+While chasing what first looked like a texture-format bug (a background
+surface's format field flipping between two D3DFORMAT values across
+`UnlockRect` calls), root-caused it as a real COM object-lifetime bug
+instead: `Dev::GetRenderTarget` and `Dev::GetDepthStencilSurface`
+allocated a brand-new, independently ref-counted surface object on every
+call, rather than AddRef'ing and returning a stable, cached one as real
+D3D8 does (the caller's matching `Release()` only drops their own
+reference; the device keeps its own). The game's single, correct
+`Release()` therefore immediately freed tew's only copy of the object;
+the freed heap address was then handed to an unrelated later allocation,
+whose write into the object header's format field corrupted what the
+still-in-use original surface reported.
+
+Confirmed via temporary alloc/free diagnostics (added, used, then fully
+removed) correlated chronologically against `Surface::UnlockRect` calls
+for the same address: a `Surface::UnlockRect` call succeeded 23.8 seconds
+after tew's own bookkeeping had already freed that address, reading stale
+leftover memory from an unrelated object that had briefly reused it.
+
+**Fixed**: both accessors now cache one canonical surface object per
+device and AddRef on repeat calls instead of reallocating. Live
+re-verification confirmed the format corruption is gone.
+
+**Also fixed, real and correct but confirmed not the cause of this
+particular symptom**: `IDirect3DSurface8::LockRect` ignored the `pRect`
+sub-rectangle parameter entirely, always returning a pointer to the
+surface's absolute origin regardless of which sub-rectangle the game
+requested. Real D3D8 apps stream/decode large images in tiles via
+repeated `Lock(pRect)`/`Unlock` cycles on different sub-rects of the same
+surface; every tile's data would land at buffer offset 0 instead of its
+real position. Fixed by computing `pBits = data_ptr + top*pitch + left*bpp`.
+
+**What looked like a third, unrelated bug (a "mosaic of flat-colored
+blocks" on screen) was a misdiagnosis**, corrected by directly watching
+the live game window: it was hundreds of legitimately small (32x32) icon
+textures still populating a loading grid at the moment a screenshot was
+taken (1201 icon uploads logged in one run), not corrupted output — it
+resolved into real content once loading finished.
+
+Regression tests added for all three real fixes from this session
+(vertex-buffer Lock offset, render-target/depth-stencil caching,
+LockRect pRect): `tests/unit/api/test_d3d8_buffer_lock_offset.py`,
+`test_d3d8_render_target_cache.py`, `test_d3d8_lock_rect_prect.py`. Full
+suite green (1266 passed, up from 1249).
+
+---
+
 ## 2026-09-05 (cont'd again) — RESOLVED: `IDirect3DVertexBuffer8::Lock`/`IndexBuffer8::Lock` ignored `OffsetToLock`, corrupting every dynamic vertex-buffer append — root cause of the persistent black screen; first non-black frame produced
 
 Root-caused by directly reading raw guest memory at draw time (not

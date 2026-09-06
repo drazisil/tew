@@ -104,7 +104,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     def _lock_rect(cpu: "CPU", mem: "Memory") -> None:
         this       = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p_locked   = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
-        # pRect (ESP+12) and Flags (ESP+16) ignored — we always lock the whole surface
+        p_rect     = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        # Flags (ESP+16) ignored.
         if p_locked:
             w        = mem.read32((this + _OBJ_WIDTH)  & 0xFFFFFFFF)
             fmt      = mem.read32((this + _OBJ_FORMAT) & 0xFFFFFFFF)
@@ -113,8 +114,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             # hardcoded ×4 here corrupts every row after the first for any
             # non-32bpp texture (confirmed live: fmt=0x17/D3DFMT_R5G6B5 UI
             # icons, written by the guest at half our assumed stride).
-            mem.write32(p_locked,     w * _format_bytes_per_pixel(fmt))  # Pitch
-            mem.write32(p_locked + 4, data_ptr)   # pBits
+            bpp = _format_bytes_per_pixel(fmt)
+            pitch = w * bpp
+            # FIXED: pRect was ignored entirely, always handing back a
+            # pointer to the surface's absolute origin (0,0) regardless of
+            # which sub-rectangle the game actually requested. Real D3D8
+            # apps stream/decode large images in tiles via repeated
+            # Lock(pRect)/Unlock cycles on different sub-rects of the same
+            # surface -- every tile's real pixel data landed at buffer
+            # offset 0 instead of its real (left, top) position, since we
+            # never applied pRect's offset. Confirmed live: a background
+            # image built from 8 separate Lock/Unlock cycles rendered as a
+            # blocky mosaic (each tile overwriting the same top-left region)
+            # instead of a complete image.
+            left, top = 0, 0
+            if p_rect:
+                left = mem.read32((p_rect + 0) & 0xFFFFFFFF)
+                top  = mem.read32((p_rect + 4) & 0xFFFFFFFF)
+            offset = top * pitch + left * bpp
+            mem.write32(p_locked,     pitch)                          # Pitch
+            mem.write32(p_locked + 4, (data_ptr + offset) & 0xFFFFFFFF)  # pBits
         cpu.regs[EAX] = S_OK
 
     # [10] UnlockRect() -- uploads the surface's raw BGRA bytes (written by

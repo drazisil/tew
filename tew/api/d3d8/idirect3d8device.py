@@ -353,20 +353,40 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
     # [32] GetRenderTarget(IDirect3DSurface8**)
     def _get_render_target(cpu: "CPU", mem: "Memory") -> None:
+        # FIXED: previously allocated a brand-new surface object on every
+        # call. Real D3D8 AddRef's and returns the SAME underlying surface
+        # every time -- the caller's matching Release() only drops their own
+        # reference, since the device keeps its own internal one. Handing
+        # out a fresh, independently-ref-counted object each call meant the
+        # game's single, correct Release() immediately freed tew's only
+        # copy of it, then handed the same heap address to an unrelated
+        # later allocation -- confirmed live via a corrupted format field on
+        # a still-in-use 1536x1248 surface. Now: create once, AddRef after.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        if _state._vk_backbuffer_surface_obj is None:
+            w = _state._vk_swapchain_width  or 800
+            h = _state._vk_swapchain_height or 600
+            _state._vk_backbuffer_surface_obj = _alloc_surface_obj(w, h, 0x16, mem)
+        else:
+            obj = _state._vk_backbuffer_surface_obj
+            _ref_counts[obj] = _ref_counts.get(obj, 1) + 1
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w, h, 0x16, mem))
+            mem.write32(pp_surf, _state._vk_backbuffer_surface_obj)
         cpu.regs[EAX] = S_OK
 
     # [33] GetDepthStencilSurface(IDirect3DSurface8**)
     def _get_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+        # Same fix as _get_render_target -- see its comment.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        if _state._vk_depth_stencil_surface_obj is None:
+            w = _state._vk_swapchain_width  or 800
+            h = _state._vk_swapchain_height or 600
+            _state._vk_depth_stencil_surface_obj = _alloc_surface_obj(w, h, 0x4F, mem)  # D3DFMT_D24S8 = 0x4F
+        else:
+            obj = _state._vk_depth_stencil_surface_obj
+            _ref_counts[obj] = _ref_counts.get(obj, 1) + 1
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w, h, 0x4F, mem))  # D3DFMT_D24S8 = 0x4F
+            mem.write32(pp_surf, _state._vk_depth_stencil_surface_obj)
         cpu.regs[EAX] = S_OK
 
     def _rebuild_swapchain() -> None:
