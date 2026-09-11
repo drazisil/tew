@@ -25,6 +25,16 @@ _vk_swapchain_images: list = []      # list of VkImage handles
 _vk_swapchain_width: int = 0
 _vk_swapchain_height: int = 0
 
+# The game's own requested D3DPRESENT_PARAMETERS BackBufferWidth/Height, as
+# opposed to _vk_swapchain_width/height (the real physical window/swapchain
+# size, which WINDOW_SCALE in idirect3d8.py may enlarge for display).
+# DrawPrimitive and every guest-observable surface size (GetBackBuffer,
+# GetRenderTarget, GetDepthStencilSurface) must use this logical size, not
+# the physical one, or vertex screen-space coordinates the game computed
+# assuming its requested resolution get normalized against the wrong extent.
+_vk_logical_width: int = 0
+_vk_logical_height: int = 0
+
 # Command pool / single reusable command buffer.
 _vk_command_pool = None
 _vk_cmd_buf = None

@@ -192,8 +192,31 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         # assuming a 640x480 viewport was rescaled against the wrong
         # framebuffer dimensions. Resize the real window to match before
         # querying the surface's capabilities.
+        #
+        # WINDOW_SCALE (Molly, 2026-09-06): the game's native 640x480 is too
+        # small to read comfortably on a modern display, so the real
+        # window/swapchain are sized at WINDOW_SCALEx the game's requested
+        # resolution -- everything the game itself can observe (vertex
+        # normalization in DrawPrimitive, GetBackBuffer/GetRenderTarget/
+        # GetDepthStencilSurface's reported surface size) still uses the
+        # unscaled logical size (_state._vk_logical_width/height) so the
+        # game's own coordinate math is untouched; only the Vulkan viewport
+        # stretches the resulting NDC space across the larger physical
+        # framebuffer.
+        WINDOW_SCALE = 2
+        _state._vk_logical_width  = back_w
+        _state._vk_logical_height = back_h
+        phys_w = back_w * WINDOW_SCALE
+        phys_h = back_h * WINDOW_SCALE
         if back_w > 0 and back_h > 0:
-            SDL_SetWindowSize(sdl_window, back_w, back_h)
+            SDL_SetWindowSize(sdl_window, phys_w, phys_h)
+            from sdl2 import SDL_GetWindowSize
+            real_w, real_h = ctypes.c_int(0), ctypes.c_int(0)
+            SDL_GetWindowSize(sdl_window, ctypes.byref(real_w), ctypes.byref(real_h))
+            logger.info("d3d8",
+                f"CreateDevice: requested window resize to {phys_w}x{phys_h} "
+                f"(WINDOW_SCALE={WINDOW_SCALE}), actual SDL_GetWindowSize "
+                f"reports {real_w.value}x{real_h.value}")
 
         # ── Load instance-level KHR extension functions ────────────────────
         try:
@@ -376,8 +399,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             w = caps.currentExtent.width
             h = caps.currentExtent.height
             if w == 0xFFFFFFFF:
-                w = back_w if back_w > 0 else 800
-                h = back_h if back_h > 0 else 600
+                w = phys_w if phys_w > 0 else 800
+                h = phys_h if phys_h > 0 else 600
             _state._vk_swapchain_width  = w
             _state._vk_swapchain_height = h
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(

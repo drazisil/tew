@@ -284,9 +284,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)
     def _get_back_buffer(cpu: "CPU", mem: "Memory") -> None:
         pp_surface = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        # Use swapchain dimensions if known, else fall back to 800×600
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        # Report the game's own logical resolution, not the (possibly
+        # WINDOW_SCALE-enlarged) physical swapchain -- see _state._vk_logical_width.
+        w = _state._vk_logical_width  or 800
+        h = _state._vk_logical_height or 600
         surf = _alloc_surface_obj(w, h, 0x16, mem)  # D3DFMT_X8R8G8B8 = 0x16
         if pp_surface:
             mem.write32(pp_surface, surf)
@@ -384,8 +385,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         # a still-in-use 1536x1248 surface. Now: create once, AddRef after.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if _state._vk_backbuffer_surface_obj is None:
-            w = _state._vk_swapchain_width  or 800
-            h = _state._vk_swapchain_height or 600
+            w = _state._vk_logical_width  or 800
+            h = _state._vk_logical_height or 600
             _state._vk_backbuffer_surface_obj = _alloc_surface_obj(w, h, 0x16, mem)
         else:
             obj = _state._vk_backbuffer_surface_obj
@@ -399,8 +400,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         # Same fix as _get_render_target -- see its comment.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if _state._vk_depth_stencil_surface_obj is None:
-            w = _state._vk_swapchain_width  or 800
-            h = _state._vk_swapchain_height or 600
+            w = _state._vk_logical_width  or 800
+            h = _state._vk_logical_height or 600
             _state._vk_depth_stencil_surface_obj = _alloc_surface_obj(w, h, 0x4F, mem)  # D3DFMT_D24S8 = 0x4F
         else:
             obj = _state._vk_depth_stencil_surface_obj
@@ -1097,8 +1098,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         stride  = _state._draw_stream_stride
         n_verts = prim_count * 3
         src_off = _state._draw_stream_ptr + start_vert * stride
-        vp_w    = float(_state._vk_swapchain_width  or 1)
-        vp_h    = float(_state._vk_swapchain_height or 1)
+        # Normalize against the game's own logical resolution, not the
+        # (possibly WINDOW_SCALE-enlarged) physical swapchain -- the game
+        # computed these screen-space coordinates assuming its requested
+        # D3DPRESENT_PARAMETERS resolution. The Vulkan viewport (set from
+        # the physical swapchain size below) stretches the resulting NDC
+        # space to fill the larger real framebuffer.
+        vp_w    = float(_state._vk_logical_width  or 1)
+        vp_h    = float(_state._vk_logical_height or 1)
 
         diffuse_off, uv_off = _fvf_layout(_state._draw_vertex_fvf)
 

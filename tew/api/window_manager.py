@@ -346,7 +346,17 @@ class WindowManager:
             # Non-dialog windows (the game's main rendering surface) need SDL_WINDOW_VULKAN
             # so that SDL_Vulkan_CreateSurface succeeds when D3D8 sets up its swapchain.
             is_dialog_class = (class_name == "#32770")
-            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN)
+            # RESIZABLE on the main window: IDirect3D8::CreateDevice
+            # (idirect3d8.py) later calls SDL_SetWindowSize to scale the
+            # real window/swapchain up (WINDOW_SCALE) from the game's
+            # requested D3DPRESENT_PARAMETERS size. Without this flag, a
+            # Wayland/xdg-shell toplevel is advertised as non-resizable at
+            # creation time, and KWin was observed clamping/rescaling the
+            # client's later size-change request back down to the window's
+            # original committed geometry instead of honoring it, even
+            # though SDL_GetWindowSize reported the resize as successful.
+            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (
+                SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE)
             sdl_win = SDL_CreateWindow(
                 title.encode("utf-8"),
                 x if x >= 0 else 100,
