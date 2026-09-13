@@ -6,6 +6,45 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-13): `SetWindowPos`/`MoveWindow` are lying no-ops for the real SDL window -- resize/move requests after `CreateDevice` are silently dropped
+
+`user32_handlers.py`'s `_SetWindowPos` and `_MoveWindow` only update the
+internal `WindowEntry.x/y/cx/cy` bookkeeping and unconditionally return
+`TRUE` -- neither ever calls `SDL_SetWindowSize`/`SDL_SetWindowPosition`
+on `entry.sdl_window`. The only place the real SDL window is actually
+resized today is `idirect3d8.py`'s `CreateDevice` (the swapchain
+resolution fix from the 2026-09-05 persona-select session, see
+`window_manager.py:350`'s comment) -- a one-time resize at device
+creation, not an ongoing sync. Any resize/move the game requests
+afterward via these two APIs (or `SetWindowPlacement`, currently
+entirely unregistered and would fatal-halt if the game called it) claims
+success but has no visible effect on the real window. Not yet known
+whether MCity_d.exe actually calls either post-`CreateDevice` in a way
+that matters (not observed causing a visible bug yet) -- flagged as a
+known gap, not a confirmed active blocker.
+
+---
+
+## RESOLVED (2026-09-13): `IDirect3DDevice8::Reset` was a complete lying no-op, clipping the persona-select screen
+
+Found while attempting the mouse/keyboard interaction item below: the
+persona dialog rendered larger than the actual window, clipping "PLEASE
+SELECT FROM THE LIST BELOW" and the persona list past the right/bottom
+edge. Root cause was `Dev::Reset` never reading its
+`D3DPRESENT_PARAMETERS*`, never resizing the window, and never
+recreating the swapchain -- the game's `setvideomode` takes the `Reset`
+path (not `CreateDevice`) for every mode change after the first, so the
+window/swapchain stayed frozen at the login screen's size. Fixed for
+real: swapchain/image-views/framebuffers now destroyed and recreated at
+the new size on every `Reset`, window resized to match (same
+`WINDOW_SCALE` as `CreateDevice`). Confirmed live via screenshot -- full
+writeup in changelog.md's 2026-09-13 entry. Does not fix the separate,
+still-open `SetWindowPos`/`MoveWindow` lying-no-op gap above -- Reset was
+the actual mechanism the game uses for mode changes; that item stays
+open as an unconfirmed, unrelated gap.
+
+---
+
 ## NEW (2026-09-05, cont'd again x3): try real mouse/keyboard interaction with the persona-select screen now that it's legible
 
 The persona-select screen (`Dlg.Persona`) now renders fully legibly --

@@ -4,6 +4,63 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-13 — RESOLVED: `IDirect3DDevice8::Reset` was a complete lying no-op -- window/swapchain never resized past `CreateDevice`, clipping the persona-select screen
+
+Found while trying the persona-select screen's mouse/keyboard interaction
+(this session's queued next step): the dialog rendered larger than the
+window, clipping "PLEASE SELECT FROM THE LIST BELOW" and the persona list
+past the window's right/bottom edge -- confirmed live via screenshot.
+
+Root cause: `Dev::Reset` (`idirect3d8device.py`) never read its
+`D3DPRESENT_PARAMETERS*` argument, never resized the real SDL window, and
+never recreated the Vulkan swapchain -- just logged and returned `S_OK`.
+The game's own `setvideomode` takes the `Reset` path (not `CreateDevice`)
+for every mode change after the first (`DAT_6001c080`, see this file's
+module docstring), so the window/swapchain stayed frozen at whatever
+`CreateDevice` set for the login screen while later screens rendered
+assuming their own requested `BackBufferWidth`/`Height`. Live log
+confirmed three `Reset(back=1024x768)` calls firing right after
+`CreateDevice: swapchain 1280x960` with zero effect.
+
+**Fixed**: `Dev::Reset` now does the real thing -- waits for the device to
+go idle, destroys the old framebuffers/image views/swapchain, resizes the
+real SDL window (same `WINDOW_SCALE=2` upscale `CreateDevice` uses),
+re-queries the surface's actual `currentExtent`, recreates the swapchain
+at the new size, and recreates image views + framebuffers against the
+*existing* render pass. The render pass, graphics pipeline, descriptor
+set/sampler/default texture and vertex buffer are all size- and
+format-independent (viewport/scissor are `VK_DYNAMIC_STATE`, not baked
+into the pipeline) so none of that needed touching. Frame-sync state and
+the cached backbuffer/depth-stencil surface objects are invalidated
+across Reset too, matching real D3D8's requirement that the app release
+its `D3DPOOL_DEFAULT` resources before calling it.
+
+Needed threading `window_manager` into `idirect3d8device.make_vtable`
+(previously only `stubs`/`memory`) and a new `_state._vk_hwnd`, since
+`Reset`'s `hDeviceWindow` is commonly 0 ("reuse `CreateDevice`'s window")
+and there was no existing way to look that window back up.
+
+**Confirmed live**: `Reset back=1024x768` now logs `Reset: swapchain
+recreated 2048x1354` (clamped by the real display, same class of
+compositor clamping already documented for `CreateDevice`'s own resize).
+Screenshot after `~/.emu32/Login.log` showed `Persona_DownloadList:
+Status=0` / `Persona added: Dr Brown on shard44` confirms a fully
+legible, correctly-sized persona-select screen -- header, full "PLEASE
+SELECT FROM THE LIST BELOW" text, persona row, and all four buttons
+entirely on-screen. Full suite green (1272 passed) after fixing one test
+(`test_d3d8_render_target_cache.py`) that called `make_vtable` directly
+without the new `window_manager` parameter.
+
+Also discovered and fixed, unrelated to tew: local login was failing with
+`[SSL: TLSV1_ALERT_INTERNAL_ERROR]` because a host-level `pyswitch`
+systemd service (a TLS/legacy-SSL classifying relay router) had taken
+real port 443 out from under the mco-server `nginx` container, which had
+drifted to publishing on `127.0.0.1:9443` instead. Not a tew bug --
+`pyswitch.service` stopped and `nginx` force-recreated to restore
+`0.0.0.0:443`.
+
+---
+
 ## 2026-09-05 (cont'd again x3) — MILESTONE: RESOLVED, a fully legible, correctly-colored, correctly-sized persona-select screen. Two more real bugs found and fixed: vertex diffuse-color R/B channel swap, and alpha blending disabled entirely (broke all UI text) + swapchain/window resolution mismatch.
 
 Direct continuation of the same day's black-screen root-cause work. With

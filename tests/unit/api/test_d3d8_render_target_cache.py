@@ -74,7 +74,7 @@ def env():
     mem = Memory(MEM_SIZE)
     cpu = _FakeCPU()
     stubs = _StubHandlers()
-    make_vtable(stubs, mem)
+    make_vtable(stubs, mem, window_manager=None)
     return cpu, mem, stubs
 
 

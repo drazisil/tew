@@ -18,6 +18,12 @@ _vk_present_queue = None
 # VkSurfaceKHR created from the SDL window in CreateDevice.
 _vk_surface = None
 
+# HWND the SDL window was resolved from in CreateDevice. Reset's
+# D3DPRESENT_PARAMETERS.hDeviceWindow is commonly 0 (meaning "reuse the
+# window CreateDevice was given"), so Reset looks this up instead of
+# re-parsing hDeviceWindow.
+_vk_hwnd: int = 0
+
 # Swapchain + image resources.
 _vk_swapchain = None
 _vk_swapchain_format: int = 0        # VkFormat integer

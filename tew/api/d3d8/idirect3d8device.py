@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+    from tew.api.window_manager import WindowManager
 
 import ctypes
 import struct as _struct
@@ -144,7 +145,7 @@ def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
     return r, g, b, a
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
     """Return the 97 trampoline addresses for the IDirect3DDevice8 vtable."""
 
     def _ok(name: str, arg_bytes: int) -> int:
@@ -277,8 +278,123 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = 1 if previous else 0
 
     # [14] Reset(D3DPRESENT_PARAMETERS*)
+    #
+    # FIXED (2026-09-13): was a lying no-op that never read pPresentationParameters,
+    # never resized the real window, and never recreated the swapchain -- so a
+    # mode change after CreateDevice (the game's setvideomode takes this path
+    # whenever DAT_6001c080 is 0, see this file's module docstring) left the
+    # window and swapchain frozen at whatever CreateDevice originally set,
+    # while the game rendered its next screen assuming the new BackBufferWidth/
+    # Height. Confirmed live: the persona-select dialog rendered larger than
+    # the still-640x480-native window, clipping "PLEASE SELECT FROM THE LIST
+    # BELOW" and the persona list past the window's right/bottom edge.
+    #
+    # The render pass, graphics pipeline, descriptor set/layout/pool, sampler,
+    # default texture and vertex buffer are all size- and format-independent
+    # (viewport/scissor are VK_DYNAMIC_STATE, not baked into the pipeline --
+    # see _pipeline.py's create_pipeline) so only the swapchain and its
+    # per-image views/framebuffers need destroying and recreating here,
+    # mirroring IDirect3D8::CreateDevice's own swapchain-creation block
+    # (idirect3d8.py) at the new size.
     def _reset(cpu: "CPU", mem: "Memory") -> None:
-        logger.info("d3d8", "IDirect3DDevice8::Reset")
+        import vulkan as vk
+        from tew.api.d3d8._pipeline import create_image_views, create_framebuffers
+
+        pp_params = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        back_w = mem.read32(pp_params & 0xFFFFFFFF)       if pp_params else 0
+        back_h = mem.read32((pp_params + 4) & 0xFFFFFFFF) if pp_params else 0
+        logger.info("d3d8", f"IDirect3DDevice8::Reset back={back_w}x{back_h}")
+
+        entry = window_manager.get_window(_state._vk_hwnd)
+        if entry is None or entry.sdl_window is None:
+            logger.error("d3d8",
+                f"Reset: no SDL window found for stored hwnd=0x{_state._vk_hwnd:x} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        sdl_window = entry.sdl_window
+
+        try:
+            vk.vkDeviceWaitIdle(_state._vk_device)
+
+            for fb in _state._vk_framebuffers:
+                vk.vkDestroyFramebuffer(_state._vk_device, fb, None)
+            for view in _state._vk_image_views:
+                vk.vkDestroyImageView(_state._vk_device, view, None)
+            if _state._vk_swapchain is not None:
+                _state._vk_fn_destroy_swapchain(_state._vk_device, _state._vk_swapchain, None)
+
+            # Same WINDOW_SCALE upscale as CreateDevice (idirect3d8.py) --
+            # the game's own coordinate math only ever sees the unscaled
+            # logical size via _vk_logical_width/height.
+            WINDOW_SCALE = 2
+            _state._vk_logical_width  = back_w
+            _state._vk_logical_height = back_h
+            phys_w = back_w * WINDOW_SCALE
+            phys_h = back_h * WINDOW_SCALE
+            if back_w > 0 and back_h > 0:
+                from sdl2 import SDL_SetWindowSize
+                SDL_SetWindowSize(sdl_window, phys_w, phys_h)
+
+            phys_dev = _state._vk_physical_devices[0]
+            caps = vk_pump(lambda: _state._vk_fn_get_surface_caps(
+                phys_dev, _state._vk_surface))
+            w = caps.currentExtent.width
+            h = caps.currentExtent.height
+            if w == 0xFFFFFFFF:
+                w = phys_w if phys_w > 0 else 800
+                h = phys_h if phys_h > 0 else 600
+
+            swapchain_ci = vk.VkSwapchainCreateInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+                surface=_state._vk_surface,
+                minImageCount=2,
+                imageFormat=_state._vk_swapchain_format,
+                imageColorSpace=0,  # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+                imageExtent=vk.VkExtent2D(width=w, height=h),
+                imageArrayLayers=1,
+                imageUsage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+                queueFamilyIndexCount=0,
+                pQueueFamilyIndices=None,
+                preTransform=0x00000001,  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
+                clipped=vk.VK_TRUE,
+                oldSwapchain=None,
+            )
+            _state._vk_swapchain = _state._vk_fn_create_swapchain(
+                _state._vk_device, swapchain_ci, None)
+            raw_imgs = _state._vk_fn_get_swapchain_images(
+                _state._vk_device, _state._vk_swapchain)
+            _state._vk_swapchain_images = list(raw_imgs)
+            _state._vk_swapchain_width  = w
+            _state._vk_swapchain_height = h
+
+            _state._vk_image_views = create_image_views(
+                _state._vk_device, _state._vk_swapchain_images, _state._vk_swapchain_format)
+            _state._vk_framebuffers = create_framebuffers(
+                _state._vk_device, _state._vk_render_pass, _state._vk_image_views, w, h)
+        except Exception as exc:
+            logger.error("d3d8", f"Reset: swapchain recreation failed: {exc!r} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+
+        # Frame-sync bookkeeping and cached surface objects all referred to
+        # the now-destroyed swapchain/images -- real D3D8 requires the app to
+        # release its D3DPOOL_DEFAULT resources (including render targets)
+        # across Reset, so invalidating the cache is the correct behavior,
+        # not just a safety net.
+        _state._vk_current_image_idx = 0
+        _state._vk_frame_submitted = False
+        _state._vk_image_acquired = False
+        _state._vk_swapchain_images_used = set()
+        _state._vk_backbuffer_surface_obj = None
+        _state._vk_depth_stencil_surface_obj = None
+
+        logger.info("d3d8", f"Reset: swapchain recreated {w}x{h}")
         cpu.regs[EAX] = S_OK
 
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)

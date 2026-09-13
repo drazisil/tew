@@ -175,6 +175,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         sdl_window = entry.sdl_window
+        _state._vk_hwnd = hwnd
 
         # Top-level windows are created with SDL_WINDOW_VULKAN so no EGL
         # surface is attached to the wl_surface; no renderer to destroy here.
