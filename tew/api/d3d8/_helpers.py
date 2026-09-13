@@ -220,7 +220,19 @@ def _com_stub(
                 cpu.halted = True
                 cpu.fatal_halt = True
                 return
+        # Every COM method call is visible at DEBUG level, no exceptions --
+        # added 2026-09-13 after burning real time on "does the game even
+        # call this at all" guesswork for DirectInput's mouse-click path.
+        # Most non-D3D8 COM interfaces here are one-line
+        # `lambda: _set_eax(cpu, SOME_CODE)` stubs with no logging of their
+        # own; a caller silently getting back a plausible-looking success
+        # code from one is indistinguishable, from the log, to it never
+        # being called at all. This makes the whole call surface
+        # observable in one place instead of instrumenting handlers
+        # one-by-one after the fact.
+        _logger.debug("handlers", f"[COM] {dll_name}!{name} called")
         handler(cpu, memory)
+        _logger.debug("handlers", f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
         _cleanup_com(cpu, memory, arg_bytes)
 
     stubs.register_handler(dll_name, name, _h)

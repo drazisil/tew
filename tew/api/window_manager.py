@@ -698,6 +698,8 @@ class WindowManager:
             if hwnd:
                 lparam = (motion.x & 0xFFFF) | ((motion.y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_MOUSEMOVE, 0, lparam))
+            from tew.api.dinput_handlers import notify_mouse_motion
+            notify_mouse_motion(motion.x, motion.y)
 
         elif etype == SDL_MOUSEBUTTONUP:
             btn = event.button
@@ -707,6 +709,8 @@ class WindowManager:
             if hwnd:
                 lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_LBUTTONUP, 0, lparam))
+            from tew.api.dinput_handlers import notify_mouse_button
+            notify_mouse_button(SDL_BUTTON_LEFT, False)
 
         elif etype == SDL_KEYDOWN:
             key = event.key
@@ -786,6 +790,21 @@ class WindowManager:
             win_hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
             if win_hwnd == 0:
                 return
+            # FIXED (2026-09-13): only SDL_MOUSEBUTTONUP/MOTION ever posted a
+            # real Win32 message to the window's own queue -- MOUSEBUTTONDOWN
+            # instead went straight into _handle_mouse_click's dialog-only
+            # child-control hit-test, which silently drops the event for any
+            # top-level window that isn't one of tew's own rendered dialogs
+            # (e.g. the main D3D8 game window). Real WM_LBUTTONDOWN is now
+            # posted unconditionally, same as WM_LBUTTONUP/WM_MOUSEMOVE
+            # already were -- confirmed live this was the actual reason a
+            # persona-select click never reached the game at all: none of
+            # WM_LBUTTONDOWN, DirectInput polling, or GetAsyncKeyState(
+            # VK_LBUTTON) were ever fed real click data for that window.
+            lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
+            self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, 0, lparam))
+            from tew.api.dinput_handlers import notify_mouse_button
+            notify_mouse_button(SDL_BUTTON_LEFT, True)
             self._handle_mouse_click(win_hwnd, btn.x, btn.y)
 
     def _handle_mouse_click(self, dlg_hwnd: int, px: int, py: int) -> None:

@@ -6,6 +6,25 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-13): persona-select list's selection-highlight bar overdraws the PERSONA/SERVER-vs-POP. column divider
+
+On the persona-select screen, every unselected row shows a visible
+vertical divider between the Persona/Server list and the POP. list. The
+selected row's black highlight bar paints straight over that divider --
+looks like the highlight quad is wider than the Persona/Server list
+control's actual bounds, not a missing-alpha/blending issue (RGB
+blending is already on, see the 2026-09-05 session). Deliberately not
+investigated yet -- deferred by Molly 2026-09-13 ("if it's broken, it
+won't be the only instance"), and not yet known whether POP. is even
+supposed to be part of the same highlighted selection. Don't touch the
+swapchain's alpha colorWriteMask to "fix" this -- that's deliberately
+excluded to prevent the window itself going transparent to the desktop
+(see `_pipeline.py`'s `blend_attach` comment). If picked up: trace the
+actual `DrawPrimitive` call for this quad (vertex rect + diffuse color)
+before changing any blend state.
+
+---
+
 ## NEW (2026-09-13): `SetWindowPos`/`MoveWindow` are lying no-ops for the real SDL window -- resize/move requests after `CreateDevice` are silently dropped
 
 `user32_handlers.py`'s `_SetWindowPos` and `_MoveWindow` only update the
@@ -45,19 +64,25 @@ open as an unconfirmed, unrelated gap.
 
 ---
 
-## NEW (2026-09-05, cont'd again x3): try real mouse/keyboard interaction with the persona-select screen now that it's legible
+## RESOLVED (2026-09-13): real mouse/keyboard interaction with the persona-select screen -- clicking "Dr Brown" advanced the game to the lobby-connect screen
 
-The persona-select screen (`Dlg.Persona`) now renders fully legibly --
-correct colors, correct 640x480 window size, real text -- for the first
-time this whole multi-session effort (see status.md's current entry for
-the two fixes that got it there: a vertex-color channel swap, and
-disabled alpha blending + a swapchain/window resolution mismatch). Real
-mouse/keyboard input was wired into DirectInput and the D3D8 window
-earlier this same session (see changelog.md), but has never been
-exercised against a screen legible enough to interact with meaningfully.
-Next step: try clicking the listed persona ("Dr Brown") and see whether
-the game responds (proceeds to the next screen, highlights the
-selection, etc.).
+Confirmed live: clicking the listed persona now genuinely advances the
+game past persona-select to "Connecting to localhost:8226 try 1" (the
+real lobby-server connect screen, port matching the shard list's
+`LobbyServerPort`). Getting here required three real, independently-
+confirmed bugs, not one -- see changelog.md's 2026-09-13 entries for the
+full chain: (1) `IDirect3DDevice8::Reset` was a lying no-op clipping the
+window (RESOLVED entry above), (2) `SDL_MOUSEBUTTONDOWN` never posted a
+real `WM_LBUTTONDOWN` to any non-dialog top-level window (only
+MOUSEBUTTONUP/MOTION did), so the main game window never received a
+click message at all, and (3) DirectInput's `SetEventNotification`
+accepted event-handle registration and then never signaled it, so even a
+correctly-delivered click would never wake a thread waiting on it. Real
+mouse/keyboard input being "wired into DirectInput" (earlier session
+note) meant the vtable slots existed and returned plausible values, not
+that any of them were actually being called or fed by real events --
+worth remembering next time a similar "should just work" input claim
+comes up.
 
 ---
 

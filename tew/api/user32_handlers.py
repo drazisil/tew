@@ -514,6 +514,7 @@ def register_user32_gdi32_handlers(
     # double-click; real Windows default is 500, user-configurable via
     # SPI_GETDOUBLECLICKTIME/registry, neither of which this emulator models)
     def _GetDoubleClickTime(cpu: "CPU") -> None:
+        logger.debug("handlers", "[Win32] GetDoubleClickTime() -> 500")
         cpu.regs[EAX] = 500
 
     stubs.register_handler("user32.dll", "GetDoubleClickTime", _GetDoubleClickTime)
@@ -795,18 +796,55 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetSystemMetrics", _GetSystemMetrics)
 
-    # GetKeyState(int nVirtKey) -> SHORT
+    # GetKeyState(int nVirtKey) / GetAsyncKeyState(int vKey) -> SHORT
     # Returns key state: high bit set = key down, low bit = toggle state.
-    # We have no real keyboard input path; report all keys up and untoggled.
+    #
+    # FIXED (2026-09-13): unconditionally reported every key -- including
+    # the mouse-button virtual keys VK_LBUTTON/VK_RBUTTON/VK_MBUTTON -- as
+    # up, full stop. The three mouse-button VKs now report real state, fed
+    # by the same real SDL event pump dinput_handlers.py's
+    # notify_mouse_button tracks (see that module's 2026-09-13 redesign
+    # note). Real keyboard scancodes still report "up" -- no VK<->SDL-
+    # scancode table exists yet, and nothing has needed one (DirectInput's
+    # own real keyboard path already covers dinput_handlers.py's
+    # _SDL_SCANCODE_TO_DIK users) -- so this is deliberately scoped to
+    # mouse buttons, not a claim that keyboard VK queries are also real.
+    _VK_LBUTTON, _VK_RBUTTON, _VK_MBUTTON = 0x01, 0x02, 0x04
+
+    def _mouse_vk_state(vk: int) -> int | None:
+        if vk not in (_VK_LBUTTON, _VK_RBUTTON, _VK_MBUTTON):
+            return None
+        import sdl2 as _sdl2
+        from tew.api.dinput_handlers import get_mouse_buttons
+        buttons = get_mouse_buttons()
+        mask = {
+            _VK_LBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_LEFT),
+            _VK_RBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_RIGHT),
+            _VK_MBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_MIDDLE),
+        }[vk]
+        return 0x8000 if buttons & mask else 0
+
+    # Every call logged, not just mouse-button hits -- see this section's
+    # 2026-09-13 fix note above: silently returning a plausible value is
+    # indistinguishable, from the log, to this never being called at all,
+    # which is exactly what made the persona-select click investigation
+    # take three wrong guesses in a row.
     def _GetKeyState(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        vk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
+        state = _mouse_vk_state(vk)
+        result = state if state is not None else 0
+        logger.debug("handlers", f"[Win32] GetKeyState(vk=0x{vk:02x}) -> 0x{result:04x}")
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetKeyState", _GetKeyState)
 
-    # GetAsyncKeyState(int vKey) -> SHORT — same as GetKeyState: all keys up
     def _GetAsyncKeyState(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        vk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
+        state = _mouse_vk_state(vk)
+        result = state if state is not None else 0
+        logger.debug("handlers", f"[Win32] GetAsyncKeyState(vk=0x{vk:02x}) -> 0x{result:04x}")
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetAsyncKeyState", _GetAsyncKeyState)

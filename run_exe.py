@@ -278,6 +278,78 @@ def _auto_decline_fullscreen_prompt(caption, text, u_type):
 crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
 crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
 
+# ── Debug-only mouse click injection (2026-09-13) ───────────────────────────
+# In-game screens like persona-select have no HWND/control-ID structure the
+# way the native Win32 login dialog does -- they're plain D3D8-rendered
+# geometry drawn by the game's own "FEDC" GUI system. Earlier versions of
+# this tool faked an OS-level click (XTest) or overrode a side-channel
+# state variable a poll would read next -- both wrong for the same reason:
+# neither one flows through the real path an actual click would. The real
+# path is window_manager.py's own SDL event pump (pump_sdl_events, called
+# from PeekMessageA/GetMessageA), which turns SDL_MOUSEMOTION/BUTTONDOWN/UP
+# into real WM_MOUSEMOVE/WM_LBUTTONDOWN/UP messages AND feeds
+# dinput_handlers.py's real event-driven mouse state -- see that module's
+# 2026-09-13 redesign. Pushing a real SDL_Event via SDL_PushEvent puts a
+# synthetic click through that exact same pump, indistinguishable from a
+# real one once it's in the queue.
+#
+# Env-gated debug tool, not permanent behavior:
+#   TEW_CLICK_AT=<x>,<y>        window-relative pixel coords to click
+#   TEW_CLICK_AFTER_SEC=<secs>  real wall-clock seconds after process start
+_TEW_CLICK_AT = os.environ.get("TEW_CLICK_AT")
+_TEW_CLICK_AFTER_SEC = os.environ.get("TEW_CLICK_AFTER_SEC")
+_click_injected = False
+_click_start_wall_time = time.monotonic()
+
+
+def _inject_click(rel_x: int, rel_y: int) -> None:
+    import sdl2
+    import tew.api.d3d8._state as _d3d8_state
+
+    entry = crt_state.window_manager.get_window(_d3d8_state._vk_hwnd)
+    if entry is None or entry.sdl_window is None:
+        logger.error("startup",
+            f"[click] no SDL window for hwnd=0x{_d3d8_state._vk_hwnd:x} -- cannot inject click")
+        return
+    win_id = sdl2.SDL_GetWindowID(entry.sdl_window)
+
+    motion = sdl2.SDL_Event()
+    motion.type = sdl2.SDL_MOUSEMOTION
+    motion.motion.windowID = win_id
+    motion.motion.which = 0
+    motion.motion.state = 0
+    motion.motion.x = rel_x
+    motion.motion.y = rel_y
+    motion.motion.xrel = 0
+    motion.motion.yrel = 0
+    sdl2.SDL_PushEvent(ctypes.byref(motion))
+
+    down = sdl2.SDL_Event()
+    down.type = sdl2.SDL_MOUSEBUTTONDOWN
+    down.button.windowID = win_id
+    down.button.which = 0
+    down.button.button = sdl2.SDL_BUTTON_LEFT
+    down.button.state = sdl2.SDL_PRESSED
+    down.button.clicks = 1
+    down.button.x = rel_x
+    down.button.y = rel_y
+    sdl2.SDL_PushEvent(ctypes.byref(down))
+
+    up = sdl2.SDL_Event()
+    up.type = sdl2.SDL_MOUSEBUTTONUP
+    up.button.windowID = win_id
+    up.button.which = 0
+    up.button.button = sdl2.SDL_BUTTON_LEFT
+    up.button.state = sdl2.SDL_RELEASED
+    up.button.clicks = 1
+    up.button.x = rel_x
+    up.button.y = rel_y
+    sdl2.SDL_PushEvent(ctypes.byref(up))
+
+    logger.always(WARN, "startup",
+        f"[click] pushed real SDL click event at window-relative ({rel_x},{rel_y})")
+
+
 # `timeout N ... run_exe.py` (the standard way this project's debugging
 # sessions bound a run) sends SIGTERM on expiry -- Python's default handler
 # for that just kills the process immediately, skipping every line below
@@ -2651,6 +2723,12 @@ try:
         batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
         cpu.run(batch)
         step_count += batch
+
+        if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_injected
+                and time.monotonic() - _click_start_wall_time >= float(_TEW_CLICK_AFTER_SEC)):
+            _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
+            _inject_click(_rel_x, _rel_y)
+            _click_injected = True
 
         if cpu.faulted:
             # Give the game's own SEH chain a chance to handle this before

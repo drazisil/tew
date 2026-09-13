@@ -136,7 +136,7 @@ def register_crt_handlers(
     register_version_handlers(stubs, memory, state)
     register_wininet_handlers(stubs, memory, state)
     register_wsock32_handlers(stubs, memory, state)
-    register_dinput_handlers(stubs, memory)
+    register_dinput_handlers(stubs, memory, state)
     register_ifc22_handlers(stubs, memory)
     register_dsound_handlers(stubs, memory, state)
 

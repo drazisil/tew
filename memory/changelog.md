@@ -4,6 +4,90 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-13 (cont'd) — RESOLVED: real mouse click delivery to the game -- clicking a persona now genuinely advances the game to the lobby-connect screen
+
+Direct continuation of the same day's `Reset` fix, chasing the queued
+"try clicking the persona" step. Once the window/swapchain sizing was
+fixed, a click at the right pixel still produced *nothing* -- three
+separate real bugs stacked on top of each other, found the hard way
+(two earlier guesses this session -- XTest injection through a desktop
+permission portal, then a `GetKeyState`/`GetAsyncKeyState` patch -- were
+both premature: neither was confirmed to be what the game actually
+calls before being implemented, which just produced more silent
+non-reactions and wasted a full run each). Molly's framework for
+un-sticking this: there are only two ways for the game to learn about
+input at all -- poll for it, or register a listener and get told. Walking
+every real candidate against that split is what actually found the bugs:
+
+1. **`SDL_MOUSEBUTTONDOWN` never posted a real Win32 message to any
+   non-dialog window.** `window_manager.py`'s SDL event pump correctly
+   posts `WM_MOUSEMOVE`/`WM_LBUTTONUP` to *any* top-level window's real
+   message queue, generically -- but `SDL_MOUSEBUTTONDOWN` was instead
+   hijacked entirely into `_handle_mouse_click`, a dialog-only child-
+   control hit-tester that silently drops the event for any window that
+   isn't one of tew's own rendered dialogs (e.g. the main D3D8 game
+   window). `WM_LBUTTONDOWN` is now posted unconditionally first, exactly
+   like the other two already were, with the dialog hit-test still
+   running afterward for tew's own dialog windows.
+
+2. **`IDirectInputDevice2::SetEventNotification` accepted event-handle
+   registration and then did nothing with it.** A game thread doing
+   `WaitForSingleObject`/`WaitForMultipleObjects` on that handle to be
+   woken by real input would wait forever for that specific reason, while
+   still legitimately waking for its other wait conditions -- which is
+   exactly why a game stuck this way never looks hung. The handle is now
+   stored per-device and genuinely signaled (via the scheduler's existing
+   `EventHandle.signaled` + `unblock_handle` mechanism, the same one the
+   timer-heartbeat code already used) whenever real input arrives.
+
+3. **DirectInput's mouse state was sampled lazily, only when polled.**
+   `GetDeviceState`/`GetDeviceData` called `SDL_GetMouseState()` on
+   demand -- confirmed live the game calls neither during the persona
+   screen's own loop, so nothing ever sampled the mouse at all, making
+   (1) and (2) alone insufficient. Real DirectInput tracks state
+   continuously in the background regardless of whether the app asks;
+   `dinput_handlers.py` now works the same way --
+   `notify_mouse_motion`/`notify_mouse_button` are window_manager's real
+   SDL event pump calling straight into this module as events actually
+   arrive (the exact same event stream (1)'s Win32 messages come from,
+   not a separate side channel), updating tracked state, queuing
+   `GetDeviceData`'s buffered events, and calling into (2)'s signaling in
+   real time.
+
+Also removed: the debug click-injection tool (`TEW_CLICK_AT`/
+`TEW_CLICK_AFTER_SEC`, `run_exe.py`) previously faked input two different
+wrong ways in a row (XTest at the X11 level -- blocked silently by a
+desktop "remote control" permission portal neither this project nor
+`xdotool`/`ydotool` could get past; then a side-channel state override a
+poll would pick up next, which fixed nothing since nothing was polling).
+It now pushes a real `SDL_Event` via `SDL_PushEvent`, indistinguishable
+from a real click once it's in the queue -- exercising the exact same
+path fixes 1-3 above required to work for any input, not a shortcut
+around it.
+
+**Confirmed live**: clicking "Dr Brown" now produces, in order: real
+`notify_mouse_button` button-down/up log lines, real `WM_LBUTTONDOWN`/UP
+`DispatchMessageA` calls against the main game window (confirmed via
+`entry.wnd_proc_addr` actually being invoked, not just logged), and the
+game visibly transitioning off persona-select to "MOTOR CITY / DEBUG:
+Connecting to localhost:8226 try 1" -- the real lobby-connect screen
+(port matches `LobbyServerPort` from the shard list). Full 400s run
+completed with a clean shutdown, no fatal halt. All 1272 tests green
+after updating one test fixture
+(`test_dinput_handlers.py`) for `register_dinput_handlers`'s new `state`
+parameter.
+
+Also added: every `_com_stub`-registered COM method (`_helpers.py`,
+shared by D3D8 and DirectInput) now logs its call and return value at
+DEBUG level unconditionally -- most DirectInput methods were one-line
+`lambda: _set_eax(cpu, CODE)` stubs with no logging of their own, and a
+caller silently getting back a plausible success code from one was
+indistinguishable, from the log, to it never being called at all. That
+blind spot is what made the first two wrong guesses in this
+investigation possible; it shouldn't be possible to repeat.
+
+---
+
 ## 2026-09-13 — RESOLVED: `IDirect3DDevice8::Reset` was a complete lying no-op -- window/swapchain never resized past `CreateDevice`, clipping the persona-select screen
 
 Found while trying the persona-select screen's mouse/keyboard interaction

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
+    from tew.api._state import CRTState
 
 import ctypes
 
@@ -105,11 +106,118 @@ def _build_scancode_table() -> dict[int, int]:
     return t
 
 
-# Last polled absolute mouse position, for computing DIMOUSESTATE's
-# relative lX/lY deltas (DirectInput's default mouse axis mode is relative,
-# and SetProperty/DIPROP_AXISMODE is currently a no-op stub that never
-# records absolute mode, so relative is also the only mode this can honor).
-_last_mouse_pos: list[int] = [0, 0]
+# Real, event-driven mouse state (2026-09-13 redesign). Previously this
+# module polled SDL_GetMouseState() on demand from inside GetDeviceState/
+# GetDeviceData -- which meant that if the game never called either of
+# those (confirmed live: it doesn't, during the persona-select screen),
+# tew never sampled the mouse at all, and a debug tool faking a click by
+# overriding what the *next poll* would return was fixing nothing real,
+# since nothing was ever polling.
+#
+# Real DirectInput doesn't work by polling hardware on demand either -- the
+# driver tracks state continuously in the background from real input
+# events, independent of whether/when the app asks. notify_mouse_motion/
+# notify_mouse_button are window_manager.py's real SDL event pump calling
+# straight into this module as those events actually arrive (see
+# _handle_sdl_event's SDL_MOUSEMOTION/BUTTONDOWN/BUTTONUP handling), which
+# is the same real event stream Win32 WM_MOUSEMOVE/WM_LBUTTONDOWN messages
+# come from -- not a separate side channel.
+_mouse_pos: list[int] = [0, 0]
+_mouse_buttons: list[int] = [0]
+
+# Absolute position as of the last GetDeviceState call specifically, kept
+# separate from _mouse_pos -- GetDeviceState reports lX/lY as the delta
+# since *it* was last called (DirectInput's relative-axis convention),
+# which is a different consumer than GetDeviceData's queue below.
+_last_polled_pos: list[int] = [0, 0]
+
+# Buffered DIDEVICEOBJECTDATA queue for GetDeviceData: (dwOfs, dwData)
+# pairs, appended in real time as notify_mouse_motion/notify_mouse_button
+# observe an actual transition, and drained by GetDeviceData.
+_mouse_dod_queue: list[tuple[int, int]] = []
+
+# hEvent handles registered via SetEventNotification, keyed by device
+# object address (`this`) -- signaled for real by _signal_registered_events()
+# whenever a real mouse event arrives. Needs the CRTState set by
+# register_dinput_handlers to reach kernel_handle_map/scheduler.
+_registered_events: dict[int, int] = {}
+_state_ref = None
+
+
+def get_mouse_buttons() -> int:
+    """Current real mouse button bitmask (SDL_BUTTON(...) mask shape) for
+    consumers that just want current state, not GetDeviceState's own
+    per-call delta bookkeeping -- e.g. GetKeyState/GetAsyncKeyState's
+    mouse-button VK handling in user32_handlers.py."""
+    return _mouse_buttons[0]
+
+
+def notify_mouse_motion(x: int, y: int) -> None:
+    """Real SDL_MOUSEMOTION arrived (window_manager.py's event pump) --
+    not a polling entrypoint. Updates tracked position, queues an axis
+    DIDEVICEOBJECTDATA entry, and signals any registered event."""
+    dx = x - _mouse_pos[0]
+    dy = y - _mouse_pos[1]
+    _mouse_pos[0] = x
+    _mouse_pos[1] = y
+    if not (dx or dy):
+        return
+    if dx:
+        _mouse_dod_queue.append((0, dx & 0xFFFFFFFF))
+    if dy:
+        _mouse_dod_queue.append((4, dy & 0xFFFFFFFF))
+    _signal_registered_events()
+
+
+def notify_mouse_button(sdl_button: int, is_down: bool) -> None:
+    """Real SDL_MOUSEBUTTONDOWN/UP arrived (window_manager.py's event
+    pump) -- not a polling entrypoint. Updates the tracked button bitmask,
+    queues a button DIDEVICEOBJECTDATA entry, and signals any registered
+    event."""
+    import sdl2 as _sdl2
+    ofs = {
+        _sdl2.SDL_BUTTON_LEFT:   12,
+        _sdl2.SDL_BUTTON_RIGHT:  13,
+        _sdl2.SDL_BUTTON_MIDDLE: 14,
+    }.get(sdl_button)
+    if ofs is None:
+        return
+    mask = _sdl2.SDL_BUTTON(sdl_button)
+    was_down = bool(_mouse_buttons[0] & mask)
+    if was_down == is_down:
+        return
+    if is_down:
+        _mouse_buttons[0] |= mask
+    else:
+        _mouse_buttons[0] &= ~mask
+    logger.debug("handlers",
+        f"[dinput] real mouse button {sdl_button} {'down' if is_down else 'up'} at ({_mouse_pos[0]},{_mouse_pos[1]})")
+    _mouse_dod_queue.append((ofs, 0x80 if is_down else 0x00))
+    _signal_registered_events()
+
+
+def _signal_registered_events() -> None:
+    if _state_ref is None or not _registered_events:
+        return
+    from tew.api._state import EventHandle
+    for h_event in set(_registered_events.values()):
+        if not h_event:
+            continue
+        obj = _state_ref.kernel_handle_map.get(h_event)
+        if isinstance(obj, EventHandle):
+            obj.signaled = True
+            _state_ref.scheduler.unblock_handle(h_event)
+
+
+def _sample_for_get_device_state() -> tuple[int, int, int, int, int]:
+    """GetDeviceState's own view of the real, event-driven state: current
+    position/buttons plus the delta since GetDeviceState was last called."""
+    x, y = _mouse_pos[0], _mouse_pos[1]
+    dx = x - _last_polled_pos[0]
+    dy = y - _last_polled_pos[1]
+    _last_polled_pos[0] = x
+    _last_polled_pos[1] = y
+    return x, y, _mouse_buttons[0], dx, dy
 
 # ── Fixed COM object addresses ────────────────────────────────────────────────
 DI_VTABLE     = 0x002202E0   # IDirectInput2A vtable     (9  × 4 = 36 bytes → 0x00220304)
@@ -130,8 +238,11 @@ DIERR_OBJECTNOTFOUND   = 0x80040181
 def register_dinput_handlers(
     stubs: "Win32Handlers",
     memory: "Memory",
+    state: "CRTState",
 ) -> None:
     """Register all DirectInput COM stubs and write vtable pointers into memory."""
+    global _state_ref
+    _state_ref = state
 
     # ── IDirectInput2A vtable ─────────────────────────────────────────────────
 
@@ -238,13 +349,7 @@ def register_dinput_handlers(
                 if scancode < num_keys.value and state[scancode]:
                     mem.write8((lpv_data + dik) & 0xFFFFFFFF, 0x80)
         else:
-            x = ctypes.c_int(0)
-            y = ctypes.c_int(0)
-            buttons = _sdl2.SDL_GetMouseState(ctypes.byref(x), ctypes.byref(y))
-            dx = x.value - _last_mouse_pos[0]
-            dy = y.value - _last_mouse_pos[1]
-            _last_mouse_pos[0] = x.value
-            _last_mouse_pos[1] = y.value
+            _x, _y, buttons, dx, dy = _sample_for_get_device_state()
             mem.write32(lpv_data,      dx & 0xFFFFFFFF)          # lX
             mem.write32((lpv_data + 4) & 0xFFFFFFFF, dy & 0xFFFFFFFF)  # lY
             mem.write32((lpv_data + 8) & 0xFFFFFFFF, 0)          # lZ (wheel, not tracked)
@@ -261,16 +366,74 @@ def register_dinput_handlers(
                 mem.write8((lpv_data + off) & 0xFFFFFFFF, 0)
         cpu.regs[EAX] = DI_OK
 
+    # FIXED (2026-09-13): was a lying no-op that always reported zero
+    # buffered events, regardless of any real mouse/keyboard activity --
+    # confirmed live investigating why the persona-select screen never
+    # reacted to a click: GetDeviceState's mouse branch was never even
+    # being called (no log line ever appeared across a full run), meaning
+    # this game's FEDC GUI system reads its click events through buffered
+    # mode instead, if it uses DirectInput at all. _mouse_dod_queue is now
+    # populated in real time by notify_mouse_motion/notify_mouse_button
+    # (window_manager.py's real SDL event pump) rather than lazily on
+    # poll, so buffered events exist even if GetDeviceState is never
+    # called. Only the mouse's transitions are tracked -- this device
+    # object doesn't distinguish keyboard vs. mouse (see CreateDevice's
+    # own comment), and nothing in this project has needed buffered
+    # keyboard events yet.
+    _DIGDD_PEEK = 0x00000001
+
     def _dev_get_device_data(cpu: "CPU", mem: "Memory") -> None:
         # GetDeviceData(cbObjectData, rgdod, pdwInOut, dwFlags)
-        pdw_in_out = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        cb_object_data = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
+        p_rgdod        = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        pdw_in_out     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        dw_flags       = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+
+        if not p_rgdod:
+            # NULL rgdod: caller is just asking how many events are queued.
+            if pdw_in_out:
+                mem.write32(pdw_in_out, len(_mouse_dod_queue))
+            cpu.regs[EAX] = DI_OK
+            return
+
+        requested = mem.read32(pdw_in_out & 0xFFFFFFFF) if pdw_in_out else len(_mouse_dod_queue)
+        n = min(requested, len(_mouse_dod_queue)) if cb_object_data else 0
+        peek = bool(dw_flags & _DIGDD_PEEK)
+
+        for i in range(n):
+            ofs, data = _mouse_dod_queue[i] if peek else _mouse_dod_queue.pop(0)
+            base = (p_rgdod + i * cb_object_data) & 0xFFFFFFFF
+            if cb_object_data >= 4:
+                mem.write32(base, ofs)                                    # dwOfs
+            if cb_object_data >= 8:
+                mem.write32((base + 4) & 0xFFFFFFFF, data)                # dwData
+            if cb_object_data >= 12:
+                mem.write32((base + 8) & 0xFFFFFFFF, 0)                   # dwTimeStamp
+            if cb_object_data >= 16:
+                mem.write32((base + 12) & 0xFFFFFFFF, i)                  # dwSequence
+
         if pdw_in_out:
-            mem.write32(pdw_in_out, 0)   # no buffered events
+            mem.write32(pdw_in_out, n)
         cpu.regs[EAX] = DI_OK
 
+    # FIXED (2026-09-13): accepted the registration and returned success,
+    # but never stored hEvent anywhere -- so a game thread doing
+    # WaitForSingleObject/WaitForMultipleObjects on it to be woken by real
+    # input would wait forever for that specific reason (while still
+    # legitimately waking for its other wait conditions, which is why a
+    # game stuck this way doesn't look hung). Now stored per-device and
+    # actually signaled by _signal_registered_events() whenever
+    # notify_mouse_motion/notify_mouse_button observes a real transition.
     def _dev_set_event_notification(cpu: "CPU", mem: "Memory") -> None:
         # SetEventNotification(hEvent) — hEvent=NULL means polled
+        this    = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         h_event = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        if h_event:
+            _registered_events[this] = h_event
+            logger.debug("handlers",
+                f"[dinput] device 0x{this:08x} registered event notification hEvent=0x{h_event:x}")
+        else:
+            _registered_events.pop(this, None)
         cpu.regs[EAX] = DI_POLLEDDEVICE if h_event == 0 else DI_OK
 
     def _dev_get_device_info(cpu: "CPU", mem: "Memory") -> None:

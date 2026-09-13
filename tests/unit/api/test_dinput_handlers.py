@@ -58,7 +58,7 @@ BUF_B    = 0x310000
 def env():
     mem   = Memory(MEM_SIZE)
     stubs = _StubHandlers()
-    register_dinput_handlers(stubs, mem)
+    register_dinput_handlers(stubs, mem, state=None)
     cpu = _FakeCPU()
     return cpu, mem, stubs
 
