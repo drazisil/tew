@@ -230,9 +230,20 @@ def _com_stub(
         # being called at all. This makes the whole call surface
         # observable in one place instead of instrumenting handlers
         # one-by-one after the fact.
-        _logger.debug("handlers", f"[COM] {dll_name}!{name} called")
+        #
+        # Logged under "d3d8" for D3D8's own interfaces (dll_name starts
+        # with "d3d8": d3d8/d3d8dev/d3d8res/d3d8surf/d3d8tex) and
+        # "handlers" for everything else (DirectInput included) -- D3D8
+        # fires this hundreds of times per frame, so folding it into the
+        # same "handlers" category as everything else would make turning
+        # on non-D3D8 COM visibility (e.g. to see what the game actually
+        # calls on DirectInput) drag the whole per-frame D3D8 firehose
+        # back in too, which is most of what caused a run to get OOM-killed
+        # earlier this session.
+        _com_category = "d3d8" if dll_name.startswith("d3d8") else "handlers"
+        _logger.debug(_com_category, f"[COM] {dll_name}!{name} called")
         handler(cpu, memory)
-        _logger.debug("handlers", f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
+        _logger.debug(_com_category, f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
         _cleanup_com(cpu, memory, arg_bytes)
 
     stubs.register_handler(dll_name, name, _h)

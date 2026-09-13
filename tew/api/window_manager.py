@@ -379,7 +379,9 @@ class WindowManager:
             win_id = SDL_GetWindowID(sdl_win)
             self._sdl_window_id_to_hwnd[win_id] = hwnd
             SDL_RaiseWindow(sdl_win)
-            logger.info("window", f"[WindowManager] Created SDL window '{title}' ({px_w}x{px_h}) hwnd=0x{hwnd:x}")
+            logger.info("window",
+                f"[WindowManager] Created SDL window '{title}' ({px_w}x{px_h}) "
+                f"hwnd=0x{hwnd:x} sdl_win_id={win_id}")
         else:
             logger.debug("window",
                 f"[WindowManager] CreateWindow '{title}' class='{class_name}' "
@@ -484,7 +486,7 @@ class WindowManager:
         SDL_RaiseWindow(sdl_win)
         logger.info("dialog",
             f"[WindowManager] Created dialog '{template.title}' "
-            f"hwnd=0x{hwnd:x} ({px_w}x{px_h})"
+            f"hwnd=0x{hwnd:x} ({px_w}x{px_h}) sdl_win_id={win_id}"
         )
 
         # Create child controls
@@ -663,8 +665,24 @@ class WindowManager:
     def pump_sdl_events(self) -> bool:
         """Poll SDL2 events, convert to Win32 messages, post to queue.
         Returns False if SDL_QUIT was received (caller should exit)."""
+        self._pump_call_count = getattr(self, "_pump_call_count", 0) + 1
+        # Throttled call-count log (every 50th call) -- separate question
+        # from "did SDL hand us an event": this answers "is anything even
+        # calling this function" at all during an idle screen. Only
+        # PeekMessageA/GetMessageA/the dialog render loop call this --
+        # if nothing does, SDL's own internal event queue can be full of
+        # real clicks tew never asks for.
+        if self._pump_call_count % 50 == 1:
+            logger.debug("window",
+                f"[WindowManager] pump_sdl_events call #{self._pump_call_count}")
         event = SDL_Event()
         while SDL_PollEvent(ctypes.byref(event)) != 0:
+            # Every event SDL actually hands us, logged unconditionally --
+            # added 2026-09-13 to settle "are we even getting clicks from
+            # SDL at all" independent of whether the game's own message
+            # loop calls PeekMessageA/GetMessageA (the only thing that
+            # invokes this function) often enough to notice them.
+            logger.debug("window", f"[WindowManager] SDL event type=0x{event.type:x}")
             if event.type == SDL_QUIT:
                 logger.info("window", "[WindowManager] SDL_QUIT received")
                 return False
@@ -704,11 +722,23 @@ class WindowManager:
         elif etype == SDL_MOUSEBUTTONUP:
             btn = event.button
             if btn.button != SDL_BUTTON_LEFT:
+                # FIXED (2026-09-13): silently dropped, no log -- confirmed
+                # live this hid a real click that SDL_PollEvent picked up
+                # (logged as a bare "SDL event type=0x402") but that never
+                # produced any WM_LBUTTONUP or [dinput] reaction, with no
+                # trace of why in the log.
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONUP ignored: button={btn.button} (not SDL_BUTTON_LEFT)")
                 return
             hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
             if hwnd:
                 lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_LBUTTONUP, 0, lparam))
+            else:
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONUP: windowID={btn.windowID} not in "
+                    f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                    f"no WM_LBUTTONUP posted, but DirectInput still notified below")
             from tew.api.dinput_handlers import notify_mouse_button
             notify_mouse_button(SDL_BUTTON_LEFT, False)
 
@@ -786,10 +816,15 @@ class WindowManager:
         elif etype == SDL_MOUSEBUTTONDOWN:
             btn = event.button
             if btn.button != SDL_BUTTON_LEFT:
+                # FIXED (2026-09-13): silently dropped, no log -- confirmed
+                # live this hid a real click that SDL_PollEvent picked up
+                # (logged as a bare "SDL event type=0x401") but that never
+                # produced any WM_LBUTTONDOWN or [dinput] reaction, with no
+                # trace of why in the log. See TODO.md's matching entry.
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONDOWN ignored: button={btn.button} (not SDL_BUTTON_LEFT)")
                 return
             win_hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
-            if win_hwnd == 0:
-                return
             # FIXED (2026-09-13): only SDL_MOUSEBUTTONUP/MOTION ever posted a
             # real Win32 message to the window's own queue -- MOUSEBUTTONDOWN
             # instead went straight into _handle_mouse_click's dialog-only
@@ -801,11 +836,17 @@ class WindowManager:
             # persona-select click never reached the game at all: none of
             # WM_LBUTTONDOWN, DirectInput polling, or GetAsyncKeyState(
             # VK_LBUTTON) were ever fed real click data for that window.
-            lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
-            self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, 0, lparam))
+            if win_hwnd:
+                lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
+                self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, 0, lparam))
+                self._handle_mouse_click(win_hwnd, btn.x, btn.y)
+            else:
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONDOWN: windowID={btn.windowID} not in "
+                    f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                    f"no WM_LBUTTONDOWN posted, but DirectInput still notified below")
             from tew.api.dinput_handlers import notify_mouse_button
             notify_mouse_button(SDL_BUTTON_LEFT, True)
-            self._handle_mouse_click(win_hwnd, btn.x, btn.y)
 
     def _handle_mouse_click(self, dlg_hwnd: int, px: int, py: int) -> None:
         """Determine which child control was clicked and post appropriate message."""

@@ -64,25 +64,45 @@ open as an unconfirmed, unrelated gap.
 
 ---
 
-## RESOLVED (2026-09-13): real mouse/keyboard interaction with the persona-select screen -- clicking "Dr Brown" advanced the game to the lobby-connect screen
+## NEW (2026-09-13, corrected): real mouse/keyboard interaction with the persona-select screen -- three real bugs fixed, but click delivery is still NOT confirmed working
 
-Confirmed live: clicking the listed persona now genuinely advances the
-game past persona-select to "Connecting to localhost:8226 try 1" (the
-real lobby-server connect screen, port matching the shard list's
-`LobbyServerPort`). Getting here required three real, independently-
-confirmed bugs, not one -- see changelog.md's 2026-09-13 entries for the
-full chain: (1) `IDirect3DDevice8::Reset` was a lying no-op clipping the
-window (RESOLVED entry above), (2) `SDL_MOUSEBUTTONDOWN` never posted a
-real `WM_LBUTTONDOWN` to any non-dialog top-level window (only
-MOUSEBUTTONUP/MOTION did), so the main game window never received a
-click message at all, and (3) DirectInput's `SetEventNotification`
-accepted event-handle registration and then never signaled it, so even a
-correctly-delivered click would never wake a thread waiting on it. Real
-mouse/keyboard input being "wired into DirectInput" (earlier session
-note) meant the vtable slots existed and returned plausible values, not
-that any of them were actually being called or fed by real events --
-worth remembering next time a similar "should just work" input claim
-comes up.
+**Correction, same session**: this was briefly marked RESOLVED after
+clicking "Dr Brown" appeared to advance the game to "Connecting to
+localhost:8226 try 1" -- that screen turned out to be the LOGIN server
+reconnecting (`LoginServerPort=8226`), not the lobby (`LobbyServerPort=
+7003`), and further testing showed it's a periodic automatic refresh
+unrelated to any click (same payload repeats ~44s later regardless of
+what's clicked). Do not treat that screen transition as evidence the
+click worked.
+
+Three real, independently-confirmed bugs were fixed getting here -- see
+changelog.md's 2026-09-13 entries for the full chain: (1)
+`IDirect3DDevice8::Reset` was a lying no-op clipping the window
+(separate RESOLVED entry above), (2) `SDL_MOUSEBUTTONDOWN` never posted
+a real `WM_LBUTTONDOWN` to any non-dialog top-level window (only
+MOUSEBUTTONUP/MOTION did), and (3) DirectInput's `SetEventNotification`
+accepted event-handle registration and then never signaled it. All three
+are real and necessary fixes, confirmed via extensive live testing
+(SDL reliably delivers real clicks; `pump_sdl_events` runs continuously)
+-- but NOT sufficient: most real clicks during the persona-select screen
+still produce zero downstream reaction, while clicks during the earlier
+login-dialog stage reliably work.
+
+**Real, confirmed next step**: one dropped click was caught directly in
+the log (`SDL event type=0x401` with no follow-up) and traced to
+`_handle_sdl_event`'s `SDL_MOUSEBUTTONDOWN`/`UP` handlers
+(`window_manager.py`) having **silent** early-return paths (non-left
+button, or `windowID` not found in `_sdl_window_id_to_hwnd`) -- now
+instrumented with logging (both branches, both handlers, plus the actual
+`sdl_win_id` added to window-creation log lines) but not yet re-tested
+against a real dropped click. Next session: reproduce one and read which
+branch actually fired.
+
+Real mouse/keyboard input being "wired into DirectInput" (an even
+earlier session's note) meant the vtable slots existed and returned
+plausible values, not that any of them were actually being called or fed
+by real events -- worth remembering next time a similar "should just
+work" input claim comes up.
 
 ---
 

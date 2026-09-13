@@ -4,7 +4,82 @@ Entries are newest-first.
 
 ---
 
-## 2026-09-13 (cont'd) — RESOLVED: real mouse click delivery to the game -- clicking a persona now genuinely advances the game to the lobby-connect screen
+## 2026-09-13 (cont'd, later) — found and instrumented a real silent-drop bug in mouse-click handling; not yet confirmed as root cause
+
+Continuing the click-delivery investigation after the "confirmed working"
+claim below turned out to be wrong. Extensive live testing (real manual
+clicks from Molly, not synthetic ones) confirmed SDL itself reliably
+delivers every click as a real `SDL_MOUSEBUTTONDOWN`/`UP` event
+(`pump_sdl_events` logs every event's raw `event.type` unconditionally
+now) and that `pump_sdl_events` is called continuously throughout --
+ruling out "the message pump stopped running" as an explanation. But most
+real clicks during persona-select still produced zero downstream
+`[dinput]`/`DispatchMessageA` reaction, while every click during the
+earlier login-dialog stage did.
+
+One specific instance was caught directly: `SDL event type=0x401`
+(a real click SDL handed us) with no `[dinput]` or `DispatchMessageA`
+line anywhere near it. Traced to `_handle_sdl_event`'s
+`SDL_MOUSEBUTTONDOWN`/`SDL_MOUSEBUTTONUP` branches
+(`window_manager.py`): both have two early-return paths -- `btn.button
+!= SDL_BUTTON_LEFT`, and `windowID` not found in
+`_sdl_window_id_to_hwnd` -- and **neither path logged anything**, making
+a real, silently-dropped click indistinguishable, from the log, from a
+click that was never delivered at all (the exact class of bug this
+session's earlier `_com_stub` unconditional-logging fix was meant to
+prevent, just in a different file).
+
+**Fixed**: both branches on both handlers now log explicitly -- the
+actual button value on a non-left click, or the unmapped `windowID` plus
+the full list of currently-known window IDs (`_sdl_window_id_to_hwnd`)
+on a window mismatch. `SDL_MOUSEBUTTONUP`'s and `SDL_MOUSEBUTTONDOWN`'s
+`notify_mouse_button` calls are now unconditional (matching each
+other -- previously `DOWN` skipped it entirely on an unmapped window
+while `UP` didn't), so DirectInput's tracked state stays consistent
+either way. Also added the actual `sdl_win_id` to both window-creation
+log lines (`create_window`'s top-level-window path and the dialog path),
+which previously logged only the `hwnd`, not the SDL window ID that
+would need to match a click's `windowID` -- there was no way to check
+one against the other from the log before this.
+
+Also split `_com_stub`'s unconditional COM-call logging (added earlier
+this session) by `dll_name`: D3D8's own interfaces now log under `d3d8`
+instead of `handlers`, so turning on `handlers` to see DirectInput/other
+COM activity no longer drags back D3D8's own hundreds-of-calls-per-frame
+firehose -- confirmed necessary after a full-`handlers` run got killed by
+the harness's background-task memory guard.
+
+**Not yet run** with this instrumentation against a real dropped click --
+next session should reproduce one and read which specific branch fired,
+which will finally show whether the click is a genuine non-left button,
+a focus/window-ID mismatch, or something not yet considered. Full suite
+green (1272 passed) after these changes.
+
+---
+
+## 2026-09-13 (cont'd) — CORRECTION to the entry below: the "click confirmed working" claim was wrong
+
+Later the same session: the "Connecting to localhost:8226" screen is the
+**login** server reconnecting (`LoginServerPort=8226` per the shard
+list), not the lobby (`LobbyServerPort=7003`) -- and further testing
+showed it's a periodic automatic refresh (the identical login/persona-
+fetch payload repeats roughly every 44s regardless of what's clicked),
+not something the click itself triggered. Extensive follow-up testing
+(both synthetic and Molly's own real manual clicks) found that a real
+click during persona-select mostly still produces **no** `[dinput]`/
+`DispatchMessageA` reaction at all, while clicks during the earlier
+login-dialog stage reliably do -- so the three fixes below were real and
+necessary, but not sufficient; click delivery to the game is still not
+confirmed working. The three underlying fixes (WM_LBUTTONDOWN posting,
+real SetEventNotification signaling, event-driven DirectInput state) are
+still correct and still needed -- see the newer 2026-09-13 entry above
+this one for what was found afterward and the real, still-open next step
+(a silent early-return in `_handle_sdl_event`'s mouse-button handlers,
+now instrumented but not yet re-tested).
+
+---
+
+## 2026-09-13 (cont'd) — real mouse click delivery to the game: three real bugs fixed, but persona-select clicks still mostly don't register (see correction above)
 
 Direct continuation of the same day's `Reset` fix, chasing the queued
 "try clicking the persona" step. Once the window/swapchain sizing was
@@ -65,14 +140,17 @@ from a real click once it's in the queue -- exercising the exact same
 path fixes 1-3 above required to work for any input, not a shortcut
 around it.
 
-**Confirmed live**: clicking "Dr Brown" now produces, in order: real
-`notify_mouse_button` button-down/up log lines, real `WM_LBUTTONDOWN`/UP
-`DispatchMessageA` calls against the main game window (confirmed via
-`entry.wnd_proc_addr` actually being invoked, not just logged), and the
-game visibly transitioning off persona-select to "MOTOR CITY / DEBUG:
-Connecting to localhost:8226 try 1" -- the real lobby-connect screen
-(port matches `LobbyServerPort` from the shard list). Full 400s run
-completed with a clean shutdown, no fatal halt. All 1272 tests green
+**Confirmed live, that one specific run**: clicking "Dr Brown" produced,
+in order: real `notify_mouse_button` button-down/up log lines, real
+`WM_LBUTTONDOWN`/UP `DispatchMessageA` calls against the main game window
+(confirmed via `entry.wnd_proc_addr` actually being invoked, not just
+logged), and the game visibly transitioning off persona-select to "MOTOR
+CITY / DEBUG: Connecting to localhost:8226 try 1". **See the correction
+entry above**: that screen turned out to be the login server, not the
+lobby, and the connection turned out to be a periodic automatic refresh
+unrelated to the click -- so this specific success was likely
+coincidental timing, not proof the click itself worked. Full 400s run
+completed with a clean shutdown, no fatal halt either way. All 1272 tests green
 after updating one test fixture
 (`test_dinput_handlers.py`) for `register_dinput_handlers`'s new `state`
 parameter.
