@@ -1165,7 +1165,241 @@ def _nfsabortmessage_probe(eip, regs, memory, memory_size):
             f"[nfsabortmessage-probe] fmt=\"{fmt}\" abortfile=\"{abort_file}\" abortline={abort_line}")
     except Exception as e:
         logger.error("cpu", f"[nfsabortmessage-probe] EXCEPTION: {e!r}")
-cpu.add_logpoint(0x00687bd8, _nfsabortmessage_probe)
+# cpu.add_logpoint(0x00687bd8, _nfsabortmessage_probe)  # 2026-09-14: parked, unrelated to the active persona-select click investigation -- freeing slot
+
+# ── Persona-select click-path trace (2026-09-14) ────────────────────────────
+# Every static/setup-time check this session came back clean (delivery,
+# timing, enable/visible flags, authored rect bounds, ScreenToView
+# coefficients, GDialog+0x114/+0x118 OK/CANCEL wiring -- all confirmed
+# correct). This set of probes traces the actual per-click runtime path
+# live, in order, to find the first point where it diverges from what the
+# static analysis says should happen:
+#   _mfHitFirst (recursive rect hit-test, fires once per widget walked)
+#   -> GUI::HitTest (vtable+0x24, the release-time "still over me?" recheck)
+#   -> GDialog::OnNotify's handle comparison (this+0x114/+0x118 vs the
+#      notifying widget's actual handle)
+# GMouseInput::mPos (020e6214, a GPos {x,y}) is what both hit-tests compare
+# against -- read directly here instead of calling GetPosition().
+
+# CAUTION (2026-09-14, found the hard way): `memory` here is a raw
+# ctypes.POINTER(c_uint8) into the emulator's flat memory buffer -- there is
+# NO bounds checking on pointer indexing. Reading past `memory_size` is real
+# out-of-bounds native memory access, not a catchable Python exception --
+# confirmed live it segfaulted the whole host process (systemd-coredump
+# caught a real KCrash for python3.14, not a clean SIGTERM shutdown) when an
+# earlier version of these probes read from a computed address without
+# checking it against memory_size first. Every read below MUST bounds-check
+# before touching `memory` at all.
+
+def _in_bounds(addr, length, memory_size):
+    return 0 <= addr and addr + length <= memory_size
+
+def _read32(memory, addr, memory_size):
+    if not _in_bounds(addr, 4, memory_size):
+        return None
+    return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+
+# CORRECTED (2026-09-14): GRect and GPos both derive from GObject and carry
+# a real vtable -- confirmed via their constructors' decompile
+# (`*(undefined***)this = &_vftable_` before the field writes). Real layout,
+# all plain 32-bit `int` (MSVC mangling confirms `H` = int, not double):
+#   GRect: +0x0 vtable, +0x4 top, +0x8 left, +0xc width, +0x10 height
+#          (Right()/Bottom() compute left+width / top+height on the fly --
+#          not stored fields)
+#   GPos:  +0x0 vtable, +0x4 x, +0x8 y
+# Neither the original "4 consecutive i32 at +0" nor the "doubles" guess
+# were right -- the vtable pointer at +0x0 was what looked like garbage.
+
+def _read_rect(memory, addr, memory_size):
+    top    = _read32(memory, (addr + 0x4) & 0xFFFFFFFF, memory_size)
+    left   = _read32(memory, (addr + 0x8) & 0xFFFFFFFF, memory_size)
+    width  = _read32(memory, (addr + 0xc) & 0xFFFFFFFF, memory_size)
+    height = _read32(memory, (addr + 0x10) & 0xFFFFFFFF, memory_size)
+    right  = None if (left is None or width is None) else left + width
+    bottom = None if (top is None or height is None) else top + height
+    return {"left": left, "top": top, "width": width, "height": height, "right": right, "bottom": bottom}
+
+def _read_pos(memory, memory_size):
+    base = 0x020e6214
+    x = _read32(memory, (base + 0x4) & 0xFFFFFFFF, memory_size)
+    y = _read32(memory, (base + 0x8) & 0xFFFFFFFF, memory_size)
+    return {"x": x, "y": y}
+
+def _hexdump_window(memory, base, lo_off, hi_off, memory_size):
+    addr = (base + lo_off) & 0xFFFFFFFF
+    length = hi_off - lo_off
+    if not _in_bounds(addr, length, memory_size):
+        return f"OUT OF BOUNDS (addr=0x{addr:08x} len={length} memory_size={memory_size})"
+    raw = bytes(memory[addr + i] for i in range(length))
+    return " ".join(f"{b:02x}" for b in raw)
+
+_dumped_once = []
+def _mfhitfirst_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    if not _dumped_once:
+        _dumped_once.append(True)
+        dump = _hexdump_window(memory, this, 0xa0, 0xe0, memory_size)
+        logger.error("cpu", f"[mfhitfirst-probe] RAW BYTES this=0x{this:08x} [+0xa0..+0xe0)={dump}")
+    rect = _read_rect(memory, (this + 0xbc) & 0xFFFFFFFF, memory_size)
+    pos = _read_pos(memory, memory_size)
+    # _mFocus (020e5c0c) / _mCapture (020e5c10): global HGUI__ handles for
+    # who currently has keyboard focus / mouse capture -- both raw handle
+    # values (not resolved pointers), 0 means "nobody".
+    mfocus = _read32(memory, 0x020e5c0c, memory_size)
+    mcapture = _read32(memory, 0x020e5c10, memory_size)
+    logger.error("cpu",
+        f"[mfhitfirst-probe] this=0x{this:08x} rect(+0xbc)={rect} mousePos={pos} "
+        f"mFocus={mfocus} mCapture={mcapture}")
+cpu.add_logpoint(0x00aef1b0, _mfhitfirst_probe)
+
+def _hittest_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    rect = _read_rect(memory, (this + 0xa8) & 0xFFFFFFFF, memory_size)
+    pos = _read_pos(memory, memory_size)
+    logger.error("cpu",
+        f"[hittest-probe] this=0x{this:08x} rect(+0xa8)={rect} mousePos={pos}")
+cpu.add_logpoint(0x00aeefa0, _hittest_probe)
+
+_onnotify_this_capture = []
+def _onnotify_entry_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    _onnotify_this_capture.append(this)
+    # thiscall: this=ECX, param_1(notifier GUI*)=[ESP+4], param_2(GEVENT)=[ESP+8],
+    # param_3=[ESP+0xC] -- true at function entry, before PUSH EBP shifts ESP.
+    notifier_ptr = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    event_code = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    logger.error("cpu",
+        f"[onnotify-probe] ENTRY this=0x{this:08x} notifier_ptr={notifier_ptr} event={event_code}")
+cpu.add_logpoint(0x00b08020, _onnotify_entry_probe)
+
+def _onnotify_afterhandle_probe(eip, regs, memory, memory_size):
+    if not _onnotify_this_capture:
+        logger.error("cpu", "[onnotify-probe] AFTERHANDLE fired with no prior ENTRY capture!")
+        return
+    this = _onnotify_this_capture.pop()
+    ok_handle = _read32(memory, (this + 0x114) & 0xFFFFFFFF, memory_size)
+    cancel_handle = _read32(memory, (this + 0x118) & 0xFFFFFFFF, memory_size)
+    notifier_handle = regs[EAX]
+    logger.error("cpu",
+        f"[onnotify-probe] this=0x{this:08x} notifier_handle=0x{notifier_handle:08x} "
+        f"+0x114(OK)=0x{ok_handle} +0x118(CANCEL)=0x{cancel_handle} "
+        f"MATCH_OK={notifier_handle == ok_handle} MATCH_CANCEL={notifier_handle == cancel_handle}")
+cpu.add_logpoint(0x00b0804e, _onnotify_afterhandle_probe)
+
+# GButton::OnMouseUp (00b47720) gates the actual click-fire behind three
+# checks in order: HasMouseCapture(this) && param_1==0 (left button) to even
+# enter the real branch; HitTest() (vtable+0x24, at 00b4776b's landing
+# point, right after its CALL) must return nonzero; and
+# (*(uint*)(this+0x134) & 0x48) == 0 must hold, before SendEvent(0x2a) ever
+# fires. The hittest-probe hits we've seen so far are from _mfHitFirst's own
+# idle-poll self-check, NOT confirmed to be from inside OnMouseUp itself --
+# these two probes observe the actual gating values at this specific call
+# site to find which (if any) check fails for a real click.
+# RETIRED (2026-09-14): confirmed OnMouseUp is never entered at all (zero
+# hits across every real click this session) -- freeing both slots for the
+# GetDeviceState raw-buffer check below, the actual remaining unknown.
+# cpu.add_logpoint(0x00b47720, _onmouseup_entry_probe)
+# cpu.add_logpoint(0x00b4776b, _onmouseup_posthittest_probe)
+
+# THE decisive check: read the raw DIMOUSESTATE buffer bytes tew's own
+# GetDeviceState handler actually wrote, immediately after its COM call
+# returns -- 00a73d84 is the CALL itself (vtable+0x24), 00a73d87 is the very
+# next instruction. Capture lpvData from the stack right before the call
+# (stdcall push order confirmed earlier: [ESP+0]=this [ESP+4]=cbData
+# [ESP+8]=lpvData at the CALL site itself, before the call pushes a return
+# address), then read lpvData+12 (left button byte) right after it returns.
+_getdevicestate_lpvdata = []
+def _getdevicestate_precall_probe(eip, regs, memory, memory_size):
+    this_arg = _read32(memory, (regs[ESP] + 0) & 0xFFFFFFFF, memory_size)
+    cb_data = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    lpv_data = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    _getdevicestate_lpvdata.append(lpv_data)
+    logger.error("cpu",
+        f"[getdevicestate-probe] PRECALL this_arg={this_arg} cb_data={cb_data} lpv_data={lpv_data}")
+cpu.add_logpoint(0x00a73d84, _getdevicestate_precall_probe)
+
+def _getdevicestate_postcall_probe(eip, regs, memory, memory_size):
+    if not _getdevicestate_lpvdata:
+        logger.error("cpu", "[getdevicestate-probe] POSTCALL fired with no PRECALL capture!")
+        return
+    lpv_data = _getdevicestate_lpvdata.pop()
+    if not lpv_data:
+        logger.error("cpu", "[getdevicestate-probe] POSTCALL lpv_data is 0/None, skipping read")
+        return
+    lx = _read32(memory, lpv_data & 0xFFFFFFFF, memory_size)
+    ly = _read32(memory, (lpv_data + 4) & 0xFFFFFFFF, memory_size)
+    btn0 = memory[(lpv_data + 12) & 0xFFFFFFFF] if _in_bounds(lpv_data + 12, 1, memory_size) else None
+    btn1 = memory[(lpv_data + 13) & 0xFFFFFFFF] if _in_bounds(lpv_data + 13, 1, memory_size) else None
+    logger.error("cpu",
+        f"[getdevicestate-probe] POSTCALL lpv_data={lpv_data} lX={lx} lY={ly} "
+        f"btn0(left)={btn0} btn1(right)={btn1}")
+cpu.add_logpoint(0x00a73d87, _getdevicestate_postcall_probe)
+
+# GMouseInput::Do's own edge-detector (per-button loop, offsets +0x2c=raw
+# down state, +0x48=pending/edge counter, both indexed by button*4) --
+# logging entry state directly settles whether Do() ever even observes
+# raw_down!=0 during a confirmed-real button-down window, independent of
+# everything already traced downstream of it.
+def _mouseinput_do_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    raw_down0 = _read32(memory, (this + 0x2c) & 0xFFFFFFFF, memory_size)
+    pending0 = _read32(memory, (this + 0x48) & 0xFFFFFFFF, memory_size)
+    if raw_down0:
+        logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
+cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)
+
+# GMouseInput::MouseSetButton(button_index, state) is the ONLY writer of
+# this+0x2c+i*4 (confirmed via decompile: writes (state!=0)). Do() has now
+# been shown to never observe raw_down0!=0 even across two real clicks held
+# 6.3s and 17.4s -- this settles whether the setter itself is ever called
+# with a real down value at all, independent of everything downstream.
+def _mousesetbutton_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    button_index = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    state = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    logger.error("cpu",
+        f"[mousesetbutton-probe] this=0x{this:08x} button_index={button_index} state={state}")
+cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)
+
+# cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
+
+# GDialog::OnBegin (00b080c0) wires its own "default button" handles by name:
+#   +0x114 = FindChildHandle(this, "<OK>")
+#   +0x118 = FindChildHandle(this, "<CANCEL>")
+# GDialog::OnNotify later only fires OnAccept/OnCancel (GEVENT 0x27/0x28) if
+# the notifying button's handle matches one of these two fields -- if either
+# is still 0 (FindChildHandle found nothing) at click time, a perfectly
+# correct, perfectly delivered, perfectly captured click on START/QUIT would
+# be silently swallowed right here, with no log anywhere else in the chain.
+# Traced the whole path (click delivery -> capture -> GButton::OnMouseUp's
+# SendEvent(0x2a) -> GDialog::OnNotify's handle comparison) and everything
+# checks out structurally in the guest's own code -- per project convention,
+# assume the guest code is correct and the divergence is in tew's own
+# emulation (state.pe_resources / GDialogs.gui parsing, FindChildHandle's
+# name lookup, or something in how tew feeds the guest's own child-widget
+# tree) -- not a real MCO bug. This pair of probes captures `this` (ECX,
+# thiscall) at entry, then reads +0x114/+0x118 right after both
+# FindChildHandle calls have written them (0x00b08109, just before the
+# chained GWidget::OnBegin call) to see what they actually end up holding.
+_onbegin_this_capture = []
+def _gdialog_onbegin_entry_probe(eip, regs, memory, memory_size):
+    _onbegin_this_capture.append(regs[ECX])
+    logger.error("cpu", f"[onbegin-probe] ENTRY this=0x{regs[ECX]:08x}")
+# cpu.add_logpoint(0x00b080c0, _gdialog_onbegin_entry_probe)  # 2026-09-14: confirmed OK/CANCEL wiring correct for MPersonaSelectDlg (0x5f9/0x5fd), freeing slot
+
+def _gdialog_onbegin_afterwire_probe(eip, regs, memory, memory_size):
+    if not _onbegin_this_capture:
+        logger.error("cpu", "[onbegin-probe] AFTERWIRE fired with no prior ENTRY capture!")
+        return
+    this = _onbegin_this_capture.pop()
+    def read32(addr):
+        return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+    ok_handle = read32((this + 0x114) & 0xFFFFFFFF)
+    cancel_handle = read32((this + 0x118) & 0xFFFFFFFF)
+    logger.error("cpu",
+        f"[onbegin-probe] AFTERWIRE this=0x{this:08x} "
+        f"+0x114(OK)=0x{ok_handle:08x} +0x118(CANCEL)=0x{cancel_handle:08x}")
+# cpu.add_logpoint(0x00b08109, _gdialog_onbegin_afterwire_probe)  # 2026-09-14: confirmed OK/CANCEL wiring correct for MPersonaSelectDlg (0x5f9/0x5fd), freeing slot
 
 # 2026-08-26: re-opening the "who actually writes field2_0x8" question an
 # earlier pre-compaction pass in this same investigation started but never
