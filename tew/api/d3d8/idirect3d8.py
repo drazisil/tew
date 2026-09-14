@@ -24,6 +24,7 @@ Returns D3D8_OBJ on success; halts loudly on any Vulkan failure.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -84,13 +85,18 @@ def _query_real_desktop_mode() -> tuple[int, int, int]:
     the real host's actual (likely modern, possibly ultrawide) desktop —
     live-verified that the game's own mode-validation code rejects unusual
     resolutions/aspect ratios with a "switch your desktop video mode to
-    800x600 ... and restart game" dialog. 1024x768 was a completely
-    ordinary XP-era desktop size and keeps this in sync with gdi32.dll's
-    GetDeviceCaps HORZRES/VERTRES fallback (user32_handlers.py), which the
-    game separately queries at startup — both must agree with each other
-    to look like one consistent, real monitor.
+    800x600 ... and restart game" dialog. Switched from 1024x768 to 800x600
+    (2026-09-14) to match FEDC's hardcoded GUI_InitView reference canvas
+    exactly (Screen_SetScreenMode passes GRect(0,0,800,600) as the view
+    rect) — at 800x600 the guest's own ScreenToView scale coefficients
+    collapse to an identity transform (1:1), eliminating reference-canvas
+    scaling as a variable in the persona-select click investigation. Keeps
+    this in sync with gdi32.dll's GetDeviceCaps HORZRES/VERTRES fallback
+    and GetSystemMetrics SM_CXSCREEN/SM_CYSCREEN (user32_handlers.py),
+    which the game separately queries at startup — all three must agree
+    with each other to look like one consistent, real monitor.
     """
-    return 1024, 768, 60
+    return 800, 600, 60
 
 
 def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
@@ -204,7 +210,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         # game's own coordinate math is untouched; only the Vulkan viewport
         # stretches the resulting NDC space across the larger physical
         # framebuffer.
-        WINDOW_SCALE = 2
+        WINDOW_SCALE = int(os.environ.get("TEW_WINDOW_SCALE", "2"))
         _state._vk_logical_width  = back_w
         _state._vk_logical_height = back_h
         phys_w = back_w * WINDOW_SCALE

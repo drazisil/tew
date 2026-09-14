@@ -779,10 +779,12 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "GetClientRect", _GetClientRect)
 
     # GetSystemMetrics(int nIndex) -> int
-    # Cap SM_CXSCREEN/SM_CYSCREEN at 1024x768; the game sets its render target from
-    # these values and a full-resolution window (e.g. 5160x2340) wastes resources.
-    _SM_CXSCREEN_MAX = 1024
-    _SM_CYSCREEN_MAX = 768
+    # Cap SM_CXSCREEN/SM_CYSCREEN at 800x600 (2026-09-14, was 1024x768) --
+    # must agree with idirect3d8.py's _query_real_desktop_mode and
+    # _GetDeviceCaps below; see idirect3d8.py's docstring for why 800x600
+    # specifically.
+    _SM_CXSCREEN_MAX = 800
+    _SM_CYSCREEN_MAX = 600
 
     def _GetSystemMetrics(cpu: "CPU") -> None:
         n_index = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -2323,7 +2325,9 @@ def register_user32_gdi32_handlers(
         # game separately queries and cross-checks against this. Live-
         # verified: an unusual real resolution/aspect ratio here trips the
         # game's own mode-validation code into an early abort dialog.
-        screen_w, screen_h = 1024, 768
+        # 800x600 (2026-09-14, was 1024x768) — see idirect3d8.py's
+        # _query_real_desktop_mode docstring for why.
+        screen_w, screen_h = 800, 600
         if n_index == 8:
             val = screen_w
         elif n_index == 10:

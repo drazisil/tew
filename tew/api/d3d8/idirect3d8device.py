@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from tew.api.window_manager import WindowManager
 
 import ctypes
+import os
 import struct as _struct
 
 from tew.hardware.cpu_zig import EAX, ECX, ESP
@@ -331,7 +332,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             # Same WINDOW_SCALE upscale as CreateDevice (idirect3d8.py) --
             # the game's own coordinate math only ever sees the unscaled
             # logical size via _vk_logical_width/height.
-            WINDOW_SCALE = 2
+            WINDOW_SCALE = int(os.environ.get("TEW_WINDOW_SCALE", "2"))
             _state._vk_logical_width  = back_w
             _state._vk_logical_height = back_h
             phys_w = back_w * WINDOW_SCALE
