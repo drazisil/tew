@@ -4,6 +4,185 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-14 — FIXED: four per-byte memory-access loops replaced with bulk reads/writes, found via py-spy profiling
+
+First real performance investigation, prompted by Molly's "let's make
+this faster" push. Profiled a normal (`LOG_LEVEL=info`, representative of
+real usage, not debugging) run with `py-spy record --native --rate 50`
+(needed `--native` to see through the Zig CPU core's `run()` call, which
+otherwise swallows ~97% of samples as a single opaque frame -- `--native`
+and `--nonblocking` are mutually exclusive, use `--native` alone).
+
+**Found**: `_heap_alloc`'s `HEAP_ZERO_MEMORY` handling (`kernel32_memory.py`)
+zero-filled allocated memory one byte at a time via `memory.write8()` in a
+Python loop -- confirmed via the flamegraph's actual stack (walked up from
+the hot frame using the SVG's own x/y rect coordinates, not guessed) that
+this sat directly under `_c_int_dispatch` -> `_handle_api_int` ->
+`_heap_alloc`, and alone accounted for **23% of all sampled time** in a
+60s window. Every `HeapAlloc(..., HEAP_ZERO_MEMORY)` call -- extremely
+common, and this project already has a documented 42MB single allocation
+-- was paying a full Python + ctypes round-trip per byte for what should
+be one native `memset`.
+
+**This is the same disease already fixed once before**: `memory_zig.py`'s
+`read_bytes()` bulk-read method exists specifically because of an
+identical bug found and fixed 2026-08-07 in `WriteFile` (`kernel32_io.py`)
+-- a `for i in range(n_bytes): buf[i] = memory.read8(...)` loop that alone
+accounted for a third of total runtime on a real profiled session (see
+that method's own docstring). Grepped for the same pattern
+(`for i in range(...)` wrapping `read8`/`write8`) across the whole
+codebase this session and found three more real instances worth fixing
+(several other hits were small fixed-size loops -- 16-byte GUIDs, 6-8
+stack args -- not worth touching):
+
+1. `kernel32_memory.py`'s `_heap_alloc` zero-fill loop -> replaced with
+   `memory.load(addr, bytes(size))` (a bulk-write primitive that already
+   existed, one `ctypes` call instead of `size`).
+2. `d3d8/idirect3d8device.py:236` (`SetCursorProperties`-adjacent texture
+   pixel read) -- was `width*height*4` individual `read8()` calls (over a
+   million for a 512x512 texture) -> `memory.read_bytes(...)`.
+3. `wsock32_handlers.py`'s `send()` handler -- was `length` individual
+   `read8()` calls per socket send -> `memory.read_bytes(...)`.
+4. `wsock32_handlers.py`'s `sendto()` handler -- same fix.
+
+**Verified with a before/after profile pair**, not just reasoning about
+it: after the `_heap_alloc` fix alone, `write8` no longer appears among
+significant frames at all (was 23%), and `_c_int_dispatch` (the whole
+Win32 API dispatch layer) dropped from 50.6% to 25.8% of all sampled
+time -- roughly half. Full suite green (1275 passed) after all four
+fixes.
+
+**Not yet re-profiled after the socket/texture fixes** (those loops don't
+fire during the passive startup/idle window a quick profile naturally
+samples -- would need a profile that actually exercises texture
+locks/socket sends to confirm their real-world impact the same rigorous
+way the heap fix was confirmed). Worth doing next time real gameplay
+network/texture activity can be captured.
+
+---
+
+## 2026-09-13 (cont'd, later still) — FIXED: real click coordinates weren't scaled back to the guest's logical window size
+
+Found while tracing the guest's own input-dispatch chain in Ghidra
+(`MCity_d.exe`, `debug_clean` project): `GUI_Main` -> `GUSER_DoInput` ->
+`GUser::DoInput` -> `MMouseInput::AppPollMouse` -> `GMouseInput::Do`, which
+edge-detects a button-down transition and posts `GEVENT=0xb` through
+`GEventQueue::Process` -> `GUI::OnEvent`'s vtable-offset dispatch (confirmed
+against the `GDialog::OnKeyDown`...`MPersonaSelectDlg::OnAccept`/`OnCancel`
+vtable Molly pasted at the start of this trace -- it's `MPersonaSelectDlg`'s
+own vtable).
+
+**Root cause**: `IDirect3DDevice8::CreateDevice`/`Reset` resize the *real*
+SDL window to `WINDOW_SCALE=2`x the guest's requested backbuffer purely for
+host-display readability (640x480 guest -> 1280x960 real window) -- their
+own comments are explicit the guest must never observe this anywhere
+(`GetBackBuffer` size, vertex math, all stay logical). But
+`window_manager.py`'s `_handle_sdl_event` posted the real window's raw SDL
+pixel coordinates straight into `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/
+`WM_LBUTTONUP`'s lParam and `dinput_handlers.notify_mouse_motion`, unscaled.
+Every click on the rescaled main window landed at exactly 2x its real
+logical position from the guest's point of view -- explaining exactly the
+observed split: the login dialog (a separate, native, never-rescaled SDL
+window) always worked; the main D3D8/FEDC window (rescaled after
+`CreateDevice`) is where clicks kept silently missing. `WM_LBUTTONDOWN` was
+genuinely delivered every time -- just at coordinates no real control was
+ever drawn at, so the guest's own hit-testing correctly found nothing there.
+
+**Fix**: `WindowEntry` gained `logical_w/h` (recorded at `CreateWindow`
+time) and `phys_w/h` (recorded whenever `CreateDevice`/`Reset` calls
+`SDL_SetWindowSize`; 0 if never rescaled). New
+`WindowManager._to_logical_xy(hwnd, x, y)` divides back to logical
+coordinates before they reach `WM_MOUSE*`'s lParam, `_handle_mouse_click`,
+or DirectInput's tracked position -- a no-op (not a special case) for any
+window with `phys_w == 0`, i.e. dialogs and the main window before
+`CreateDevice` ever runs.
+
+**Verified via new unit tests**, not a full run:
+`test_to_logical_xy_scales_down_for_enlarged_window`,
+`test_to_logical_xy_noop_for_never_rescaled_window`,
+`test_to_logical_xy_noop_for_unknown_hwnd`
+(`tests/unit/api/test_window_manager.py`). Two attempted full runs this
+session were killed early by the harness's background-task OOM guard
+before reaching persona-select (host `free` showed ~7GB available both
+times -- looked like cumulative desktop load, not a tew problem). Full
+suite green: 1275 passed.
+
+**Follow-up, same session (later still)**: Molly pointed out the persona is
+already selected by default (only entry) -- re-tested clicking START
+(`<OK>.GButton` [30,310] 96,27 dialog-relative -> logical (360,531) ->
+physical (720,936)) instead of the row. Delivery confirmed again by exact
+lParam match, but still no reaction. Grepping the run's own log found why:
+**1166 `GetDeviceState` calls, zero `GetDeviceData` calls** -- the guest
+polls DirectInput's live/immediate state only, at a measured ~385ms real
+interval, never buffered mode. `_inject_click` (`run_exe.py`) pushed
+`SDL_MOUSEBUTTONDOWN` immediately followed by `SDL_MOUSEBUTTONUP` (~3ms
+apart) -- shorter than a single poll gap, so no real poll could ever
+observe it. Not a DirectInput/game bug (real immediate-mode DirectInput can
+legitimately miss a transition that short too); the injected click just
+wasn't modeling a real click's hold time. Fixed: split into
+`_inject_click_down`/`_inject_click_up`, scheduled as two separately-timed
+real-wall-clock events (`TEW_CLICK_HOLD_SEC`, default 0.5s) so the main
+loop -- and therefore the guest's own polling -- keeps running during the
+hold, rather than a blocking `sleep()` which would stall CPU stepping too.
+Full suite green (1275 passed).
+
+**Re-tested with the hold fix**: held 621.341s-621.884s (543ms); confirmed
+two real `GetDeviceState` calls (621.439s, 621.825s) landed inside that
+window -- the guest's poll genuinely had the down state available this
+time. **Still zero reaction.** So all five bugs fixed this session (Reset,
+WM_LBUTTONDOWN unconditional post, DirectInput event-driven redesign,
+click-coordinate 2x scaling, click-injection hold duration) are real and
+confirmed, and input delivery is now provably correct end-to-end -- the
+remaining bug is further downstream.
+
+**Deep Ghidra trace, same session, Molly digging directly**: ruled out
+`MMouseInput::AppPollMouse` (confirmed at vtable+0xc, but only fails if
+DirectInput is uninitialized -- not the case here), the `_mfHitNext`
+`IsModal` gate (it's not even the real dispatch path -- `GetMouseFocus()`
+goes through `_mfHitFirst` instead, which isn't gated that way), and
+wrong-target-via-modal-resolution (`DoModal`'s own loop passes the dialog
+directly into `GUI_Main`, so `GetModalProcess()` can't matter here). Found
+the one live remaining suspect: `GMouseInput::Do` runs the mouse position
+through `ScreenToView` before any hit-testing touches it -- a scale+offset
+transform using four global float coefficients (`GUI_fS2VX/Y`,
+`GUI_fV2SXt/Yt`) whose writer hasn't been found yet. Very likely the real
+mechanism behind the empirically-derived 800x600->1024x768 (1.28x)
+`GDialogs.gui` scale factor found earlier tonight.
+
+**DECISIVE TEST**: synthetic click at physical (987,1097) -- directly
+measured via `xdotool` with the real cursor sitting dead-center on START
+(confirmed visually via screenshot, "Dr Brown" highlighted) -- held 524ms,
+with a `GetDeviceState` call confirmed landing squarely inside the
+down-to-up window. **Still zero reaction.** This rules out emulation
+speed/poll-timing as a factor entirely: coordinates, delivery, and timing
+are now all simultaneously proven correct in the same click, for the first
+time this investigation. The `ScreenToView` coefficient lead above is now
+the most likely place the real remaining bug hides.
+
+---
+
+## 2026-09-13 (cont'd, later) — click-coordinate fix CONFIRMED end to end against a real run
+
+**CONFIRMED end to end, same session (later)**: reached persona-select for
+real via a detached run (`nohup ... & disown` -- 3 harness-tracked
+background attempts got OOM-killed despite `free -h` showing 7-10GB
+available each time; detaching from the harness's tracked process tree
+worked around it). Actual active size at persona-select: logical 1024x768,
+physical 2048x1354 (clamped) -- confirmed via `Reset back=1024x768` /
+`Reset: swapchain recreated 2048x1354`, not 640x480. Computed a real click
+target from `dlg.persona`'s own layout (`<PERSONAS>.GListBox` [28,149]
+274,94, rowHeight=18, centered in 1024x768) -> logical (382,365) -> physical
+(764,644), injected via `TEW_CLICK_AT`/`TEW_CLICK_AFTER_SEC`. Log confirms:
+`[dinput] real mouse button 1 down at (382,365)` and `DispatchMessageA
+hwnd=0x1034 msg=0x0201 wp=0x0 lp=0x16d017e` (lParam decodes to exactly
+x=382, y=365) -- `WM_LBUTTONDOWN` really did reach the game's WndProc at the
+intended logical position. The scaling bug and its fix are both confirmed
+real, not hypothetical. See `status.md` for what's still open: whether a
+single click (vs. select-then-START, or double-click) is enough to actually
+advance the screen hasn't been tested yet.
+
+---
+
 ## 2026-09-13 (cont'd, later) — found and instrumented a real silent-drop bug in mouse-click handling; not yet confirmed as root cause
 
 Continuing the click-delivery investigation after the "confirmed working"
