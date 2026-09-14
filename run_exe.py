@@ -1250,7 +1250,7 @@ def _mfhitfirst_probe(eip, regs, memory, memory_size):
     logger.error("cpu",
         f"[mfhitfirst-probe] this=0x{this:08x} rect(+0xbc)={rect} mousePos={pos} "
         f"mFocus={mfocus} mCapture={mcapture}")
-cpu.add_logpoint(0x00aef1b0, _mfhitfirst_probe)
+# cpu.add_logpoint(0x00aef1b0, _mfhitfirst_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 def _hittest_probe(eip, regs, memory, memory_size):
     this = regs[ECX]
@@ -1258,7 +1258,7 @@ def _hittest_probe(eip, regs, memory, memory_size):
     pos = _read_pos(memory, memory_size)
     logger.error("cpu",
         f"[hittest-probe] this=0x{this:08x} rect(+0xa8)={rect} mousePos={pos}")
-cpu.add_logpoint(0x00aeefa0, _hittest_probe)
+# cpu.add_logpoint(0x00aeefa0, _hittest_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 _onnotify_this_capture = []
 def _onnotify_entry_probe(eip, regs, memory, memory_size):
@@ -1270,7 +1270,7 @@ def _onnotify_entry_probe(eip, regs, memory, memory_size):
     event_code = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
     logger.error("cpu",
         f"[onnotify-probe] ENTRY this=0x{this:08x} notifier_ptr={notifier_ptr} event={event_code}")
-cpu.add_logpoint(0x00b08020, _onnotify_entry_probe)
+# cpu.add_logpoint(0x00b08020, _onnotify_entry_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 def _onnotify_afterhandle_probe(eip, regs, memory, memory_size):
     if not _onnotify_this_capture:
@@ -1284,7 +1284,7 @@ def _onnotify_afterhandle_probe(eip, regs, memory, memory_size):
         f"[onnotify-probe] this=0x{this:08x} notifier_handle=0x{notifier_handle:08x} "
         f"+0x114(OK)=0x{ok_handle} +0x118(CANCEL)=0x{cancel_handle} "
         f"MATCH_OK={notifier_handle == ok_handle} MATCH_CANCEL={notifier_handle == cancel_handle}")
-cpu.add_logpoint(0x00b0804e, _onnotify_afterhandle_probe)
+# cpu.add_logpoint(0x00b0804e, _onnotify_afterhandle_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 # GButton::OnMouseUp (00b47720) gates the actual click-fire behind three
 # checks in order: HasMouseCapture(this) && param_1==0 (left button) to even
@@ -1316,7 +1316,7 @@ def _getdevicestate_precall_probe(eip, regs, memory, memory_size):
     _getdevicestate_lpvdata.append(lpv_data)
     logger.error("cpu",
         f"[getdevicestate-probe] PRECALL this_arg={this_arg} cb_data={cb_data} lpv_data={lpv_data}")
-cpu.add_logpoint(0x00a73d84, _getdevicestate_precall_probe)
+# cpu.add_logpoint(0x00a73d84, _getdevicestate_precall_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 def _getdevicestate_postcall_probe(eip, regs, memory, memory_size):
     if not _getdevicestate_lpvdata:
@@ -1333,7 +1333,7 @@ def _getdevicestate_postcall_probe(eip, regs, memory, memory_size):
     logger.error("cpu",
         f"[getdevicestate-probe] POSTCALL lpv_data={lpv_data} lX={lx} lY={ly} "
         f"btn0(left)={btn0} btn1(right)={btn1}")
-cpu.add_logpoint(0x00a73d87, _getdevicestate_postcall_probe)
+# cpu.add_logpoint(0x00a73d87, _getdevicestate_postcall_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 # GMouseInput::Do's own edge-detector (per-button loop, offsets +0x2c=raw
 # down state, +0x48=pending/edge counter, both indexed by button*4) --
@@ -1346,7 +1346,7 @@ def _mouseinput_do_probe(eip, regs, memory, memory_size):
     pending0 = _read32(memory, (this + 0x48) & 0xFFFFFFFF, memory_size)
     if raw_down0:
         logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
-cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)
+# cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 # GMouseInput::MouseSetButton(button_index, state) is the ONLY writer of
 # this+0x2c+i*4 (confirmed via decompile: writes (state!=0)). Do() has now
@@ -1359,7 +1359,7 @@ def _mousesetbutton_probe(eip, regs, memory, memory_size):
     state = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
     logger.error("cpu",
         f"[mousesetbutton-probe] this=0x{this:08x} button_index={button_index} state={state}")
-cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)
+# cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
 # cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
 
