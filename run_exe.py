@@ -296,13 +296,78 @@ crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
 # Env-gated debug tool, not permanent behavior:
 #   TEW_CLICK_AT=<x>,<y>        window-relative pixel coords to click
 #   TEW_CLICK_AFTER_SEC=<secs>  real wall-clock seconds after process start
+#   TEW_CLICK_HOLD_SEC=<secs>   real seconds to hold the button down (default 0.5)
+#
+# FIXED (2026-09-13, later): down and up were pushed back-to-back with no
+# hold -- confirmed live this was invisible to the guest. The persona-select
+# screen's FEDC input system polls IDirectInputDevice8::GetDeviceState
+# (confirmed live: 1166 calls, zero GetDeviceData calls, one real screen) --
+# an immediate/live sample, not a buffered queue -- at ~385ms real-world
+# intervals in this emulator. A <3ms synthetic down-then-up (the previous
+# behavior) flips the tracked button state 0->1->0 well inside a single poll
+# gap, so no real poll ever observes it -- same as a real mouse click held
+# for a physically impossible sub-millisecond duration would be lost on
+# real DirectInput too. This is not a DirectInput/game bug to patch; the
+# injected click just wasn't modeling a real click's hold time. Down and up
+# are now two separately-scheduled real-wall-clock events (not a blocking
+# sleep, which would also stall the CPU stepping loop and prevent the guest
+# from polling at all during the hold) so the main loop keeps running --
+# and therefore keeps calling GetDeviceState -- while the button is held.
+#   TEW_CLOSE_AFTER_SEC=<secs>  real wall-clock seconds after process start
+#                               to push a real SDL_WINDOWEVENT_CLOSE
+_TEW_CLOSE_AFTER_SEC = os.environ.get("TEW_CLOSE_AFTER_SEC")
+_close_injected = False
+
 _TEW_CLICK_AT = os.environ.get("TEW_CLICK_AT")
 _TEW_CLICK_AFTER_SEC = os.environ.get("TEW_CLICK_AFTER_SEC")
-_click_injected = False
+_TEW_CLICK_HOLD_SEC = float(os.environ.get("TEW_CLICK_HOLD_SEC", "0.5"))
+_click_down_injected = False
+_click_up_injected = False
+_click_down_wall_time: float | None = None
 _click_start_wall_time = time.monotonic()
 
+# 2026-09-14: double-click injection, added after Molly's real manual
+# testing found the persona-select dialog genuinely CAN dismiss (to a
+# "please wait..." screen, followed ~1min later by the LEAK_printclassf
+# fault) -- but only after a sequence that included double-clicking the
+# persona name, not a single click on any button alone. `dlg.persona`'s
+# own `<PERSONAS>.GListBox` has `*WEVENT_ACCEPT=GWidget_ACCEPT_PARENT`,
+# i.e. double-clicking the list IS the real accept gesture -- matches.
+#
+# Real double-click detection (GMouseInput::Do, Ghidra-confirmed) measures
+# down-edge to down-edge, not full press-release cycles, and must land
+# within GetDoubleClickTime (confirmed live: 500ms). That's in tension
+# with the ~385ms real DirectInput poll gap this emulator has (see the
+# single-click TEW_CLICK_HOLD_SEC fix above) -- a hold long enough to
+# guarantee a poll catches it (~400ms+) leaves little/no room for a
+# second full cycle inside the 500ms window. Real human double-clicks
+# (short holds, ~80-150ms) only have partial odds of being caught by any
+# one poll -- Molly's own account ("when I was about to give up") suggests
+# it took real people multiple tries too. TEW_DBLCLICK_REPEAT fires the
+# whole down/up/gap/down/up cycle multiple times in a row (default 3) to
+# raise the odds of at least one attempt landing on favorable poll timing,
+# rather than pretending a single deterministic attempt is guaranteed to
+# work when the real mechanism is inherently timing-sensitive.
+#   TEW_DBLCLICK_AT=<x>,<y>          window-relative pixel coords
+#   TEW_DBLCLICK_AFTER_SEC=<secs>    real wall-clock seconds after start
+#   TEW_DBLCLICK_HOLD_SEC=<secs>     hold per click (default 0.15)
+#   TEW_DBLCLICK_GAP_SEC=<secs>      gap between the two clicks (default 0.05)
+#   TEW_DBLCLICK_REPEAT=<n>          how many double-click attempts (default 3)
+#   TEW_DBLCLICK_RETRY_SEC=<secs>    real seconds between attempts (default 1.0)
+_TEW_DBLCLICK_AT = os.environ.get("TEW_DBLCLICK_AT")
+_TEW_DBLCLICK_AFTER_SEC = os.environ.get("TEW_DBLCLICK_AFTER_SEC")
+_TEW_DBLCLICK_HOLD_SEC = float(os.environ.get("TEW_DBLCLICK_HOLD_SEC", "0.15"))
+_TEW_DBLCLICK_GAP_SEC = float(os.environ.get("TEW_DBLCLICK_GAP_SEC", "0.05"))
+_TEW_DBLCLICK_REPEAT = int(os.environ.get("TEW_DBLCLICK_REPEAT", "3"))
+_TEW_DBLCLICK_RETRY_SEC = float(os.environ.get("TEW_DBLCLICK_RETRY_SEC", "1.0"))
+# State machine steps per attempt: 0=idle/waiting, 1=click1 down pushed,
+# 2=click1 up pushed, 3=click2 down pushed, 4=click2 up pushed (attempt done)
+_dblclick_attempt = 0
+_dblclick_step = 0
+_dblclick_step_wall_time: float | None = None
 
-def _inject_click(rel_x: int, rel_y: int) -> None:
+
+def _get_click_sdl_window_id():
     import sdl2
     import tew.api.d3d8._state as _d3d8_state
 
@@ -310,8 +375,41 @@ def _inject_click(rel_x: int, rel_y: int) -> None:
     if entry is None or entry.sdl_window is None:
         logger.error("startup",
             f"[click] no SDL window for hwnd=0x{_d3d8_state._vk_hwnd:x} -- cannot inject click")
+        return None
+    return sdl2.SDL_GetWindowID(entry.sdl_window)
+
+
+def _inject_window_close() -> None:
+    """Push a real SDL_WINDOWEVENT_CLOSE, exactly what a real click on the
+    OS window's own close (X) button produces -- exercises the same
+    `_handle_sdl_event`/WM_CLOSE path window_manager.py already has,
+    landing on FUN_00780550 (real guest code) -> PostQuitMessage(0), NOT
+    any GUI dialog Cancel path. Added 2026-09-14 after Molly's own
+    recollection that both times she saw the persona-select dialog
+    dismiss and the game later fault, closing the window (her only click)
+    was the trigger -- testing whether that's a real causal link or
+    coincidence."""
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
         return
-    win_id = sdl2.SDL_GetWindowID(entry.sdl_window)
+
+    close = sdl2.SDL_Event()
+    close.type = sdl2.SDL_WINDOWEVENT
+    close.window.windowID = win_id
+    close.window.event = sdl2.SDL_WINDOWEVENT_CLOSE
+    sdl2.SDL_PushEvent(ctypes.byref(close))
+
+    logger.always(WARN, "startup", "[close] pushed real SDL_WINDOWEVENT_CLOSE")
+
+
+def _inject_click_down(rel_x: int, rel_y: int) -> None:
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
 
     motion = sdl2.SDL_Event()
     motion.type = sdl2.SDL_MOUSEMOTION
@@ -335,6 +433,18 @@ def _inject_click(rel_x: int, rel_y: int) -> None:
     down.button.y = rel_y
     sdl2.SDL_PushEvent(ctypes.byref(down))
 
+    logger.always(WARN, "startup",
+        f"[click] pushed real SDL button-down at window-relative ({rel_x},{rel_y}), "
+        f"holding for {_TEW_CLICK_HOLD_SEC}s")
+
+
+def _inject_click_up(rel_x: int, rel_y: int) -> None:
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
+
     up = sdl2.SDL_Event()
     up.type = sdl2.SDL_MOUSEBUTTONUP
     up.button.windowID = win_id
@@ -347,7 +457,7 @@ def _inject_click(rel_x: int, rel_y: int) -> None:
     sdl2.SDL_PushEvent(ctypes.byref(up))
 
     logger.always(WARN, "startup",
-        f"[click] pushed real SDL click event at window-relative ({rel_x},{rel_y})")
+        f"[click] pushed real SDL button-up at window-relative ({rel_x},{rel_y})")
 
 
 # `timeout N ... run_exe.py` (the standard way this project's debugging
@@ -1008,6 +1118,54 @@ def _lrequest_counter_logpoint(eip, regs, memory, memory_size):
     size = read32((regs[EBP] + 8) & 0xFFFFFFFF)
     logger.error("cpu", f"[lrequest-probe] request=#{request_number} size={size}")
 # cpu.add_logpoint(0x009f64ac, _lrequest_counter_logpoint)
+
+# 2026-09-14: chasing an unhandled fault inside LEAK_printclassf
+# (0x5a7bfc, walking the game's own custom `_memclass` leak-tracking
+# linked list) that happens while `_NFSabortmessage` (0x687bd8) is
+# formatting a real assert/abort message -- confirmed live the crash
+# happens *before* the message ever gets formatted or printed, so the
+# actual reason for the abort is lost every time this recurs (stdout.txt
+# cuts off right after "checking for memory leaks..."). This probe reads
+# the abort message format string (cdecl arg1, [ESP+4] at function entry)
+# plus `_REALabortfilename`/`_REALabortlinenum` (set by whoever called in)
+# the instant `_NFSabortmessage` is entered -- before `LEAKS_
+# CheckForMemoryLeaks` can crash and destroy that context. See
+# status.md's "unhandled CPU fault inside the game's own memory-leak
+# walker" entry for the full investigation.
+def _nfsabortmessage_probe(eip, regs, memory, memory_size):
+    # DIAGNOSTIC (2026-09-14): this probe fired zero times across two real
+    # crash reproductions despite `_NFSabortmessage` demonstrably running
+    # each time (confirmed via stdout.txt's "NFSAM -1"/"NFSAM 0"). Entry
+    # log is unconditional and exception-wrapped so a ctypes-callback
+    # exception (which can be silently swallowed at the FFI boundary,
+    # per this file's own docstring on `_c_int_dispatch`) can't hide --
+    # if "PROBE ENTERED" never shows up next time either, the callback
+    # genuinely isn't being invoked at all; if it shows but nothing after
+    # it does, the bug is in the read32/read_cstr logic below.
+    logger.error("cpu", f"[nfsabortmessage-probe] PROBE ENTERED eip=0x{eip:08x}")
+    try:
+        def read32(addr):
+            return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+        def read_cstr(addr, max_len=256):
+            if addr == 0:
+                return "(null)"
+            out = bytearray()
+            for i in range(max_len):
+                b = memory[addr + i]
+                if b == 0:
+                    break
+                out.append(b)
+            return out.decode("latin-1", errors="replace")
+        fmt_ptr = read32((regs[ESP] + 4) & 0xFFFFFFFF)
+        fmt = read_cstr(fmt_ptr)
+        abort_file_ptr = read32(0x020d84b4)
+        abort_file = read_cstr(abort_file_ptr)
+        abort_line = read32(0x020d84b8)
+        logger.error("cpu",
+            f"[nfsabortmessage-probe] fmt=\"{fmt}\" abortfile=\"{abort_file}\" abortline={abort_line}")
+    except Exception as e:
+        logger.error("cpu", f"[nfsabortmessage-probe] EXCEPTION: {e!r}")
+cpu.add_logpoint(0x00687bd8, _nfsabortmessage_probe)
 
 # 2026-08-26: re-opening the "who actually writes field2_0x8" question an
 # earlier pre-compaction pass in this same investigation started but never
@@ -2724,11 +2882,51 @@ try:
         cpu.run(batch)
         step_count += batch
 
-        if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_injected
+        if (_TEW_CLOSE_AFTER_SEC and not _close_injected
+                and time.monotonic() - _click_start_wall_time >= float(_TEW_CLOSE_AFTER_SEC)):
+            _inject_window_close()
+            _close_injected = True
+
+        if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_down_injected
                 and time.monotonic() - _click_start_wall_time >= float(_TEW_CLICK_AFTER_SEC)):
             _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
-            _inject_click(_rel_x, _rel_y)
-            _click_injected = True
+            _inject_click_down(_rel_x, _rel_y)
+            _click_down_injected = True
+            _click_down_wall_time = time.monotonic()
+        elif (_click_down_injected and not _click_up_injected
+                and time.monotonic() - _click_down_wall_time >= _TEW_CLICK_HOLD_SEC):
+            _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
+            _inject_click_up(_rel_x, _rel_y)
+            _click_up_injected = True
+
+        if (_TEW_DBLCLICK_AT and _TEW_DBLCLICK_AFTER_SEC
+                and _dblclick_attempt < _TEW_DBLCLICK_REPEAT):
+            _dx, _dy = (int(v) for v in _TEW_DBLCLICK_AT.split(","))
+            _elapsed = time.monotonic() - _click_start_wall_time
+            _attempt_start = float(_TEW_DBLCLICK_AFTER_SEC) + _dblclick_attempt * _TEW_DBLCLICK_RETRY_SEC
+            if _dblclick_step == 0 and _elapsed >= _attempt_start:
+                _inject_click_down(_dx, _dy)
+                _dblclick_step = 1
+                _dblclick_step_wall_time = time.monotonic()
+                logger.always(WARN, "startup",
+                    f"[dblclick] attempt {_dblclick_attempt + 1}/{_TEW_DBLCLICK_REPEAT} click 1 down")
+            elif (_dblclick_step == 1
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_HOLD_SEC):
+                _inject_click_up(_dx, _dy)
+                _dblclick_step = 2
+                _dblclick_step_wall_time = time.monotonic()
+            elif (_dblclick_step == 2
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_GAP_SEC):
+                _inject_click_down(_dx, _dy)
+                _dblclick_step = 3
+                _dblclick_step_wall_time = time.monotonic()
+                logger.always(WARN, "startup",
+                    f"[dblclick] attempt {_dblclick_attempt + 1}/{_TEW_DBLCLICK_REPEAT} click 2 down")
+            elif (_dblclick_step == 3
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_HOLD_SEC):
+                _inject_click_up(_dx, _dy)
+                _dblclick_step = 0
+                _dblclick_attempt += 1
 
         if cpu.faulted:
             # Give the game's own SEH chain a chance to handle this before
