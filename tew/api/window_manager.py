@@ -177,6 +177,10 @@ class WindowEntry:
     sdl_window: Optional[object] = None        # SDL_Window* for top-level windows
     sdl_renderer: Optional[object] = None      # SDL_Renderer* for top-level windows
     bitmap_texture: Optional[object] = None    # SDL_Texture* for SS_BITMAP STATIC controls
+    logical_w: int = 0                         # window size (px) as CreateWindow/CreateWindowExA
+    logical_h: int = 0                         # requested it -- what the guest believes its window is
+    phys_w: int = 0                            # real SDL window size (px) right now; 0 = same as
+    phys_h: int = 0                            # logical_w/h (never rescaled by D3D8's WINDOW_SCALE)
 
 
 # ── Window manager ─────────────────────────────────────────────────────────────
@@ -342,6 +346,8 @@ class WindowManager:
         if is_top_level and is_visible:
             px_w = du_to_px_x(cx) if cx > 0 else 640
             px_h = du_to_px_y(cy) if cy > 0 else 480
+            entry.logical_w = px_w
+            entry.logical_h = px_h
             # Dialog windows (class #32770) use SDL renderer for drawing and hit-testing.
             # Non-dialog windows (the game's main rendering surface) need SDL_WINDOW_VULKAN
             # so that SDL_Vulkan_CreateSurface succeeds when D3D8 sets up its swapchain.
@@ -689,6 +695,29 @@ class WindowManager:
             self._handle_sdl_event(event)
         return True
 
+    def _to_logical_xy(self, hwnd: int, x: int, y: int) -> tuple[int, int]:
+        """Translate a real SDL mouse coordinate (in the window's current,
+        possibly D3D8-WINDOW_SCALE-enlarged physical pixel size) back to the
+        logical pixel space the guest's window was actually created at --
+        matching real Windows, where WM_MOUSEMOVE/WM_LBUTTONDOWN and
+        DirectInput both report coordinates in the window's own client area,
+        never in some separate host display-scaling space the app never
+        asked for. Real Windows DPI-virtualizes exactly this way for a
+        non-DPI-aware app; tew's own WINDOW_SCALE upscale is the same kind
+        of host-side-only enlargement (see idirect3d8.py's CreateDevice
+        comment: the guest must never observe it anywhere, GetBackBuffer
+        size included) and mouse coordinates were the one place that
+        invariant wasn't applied yet. A window that's never been resized by
+        D3D8 (dialogs, or the main window before CreateDevice) has
+        phys_w/h == 0, so this is a no-op for it."""
+        entry = self._windows.get(hwnd)
+        if entry is None or not entry.phys_w or not entry.logical_w:
+            return x, y
+        return (
+            round(x * entry.logical_w / entry.phys_w),
+            round(y * entry.logical_h / entry.phys_h),
+        )
+
     def _handle_sdl_event(self, event: SDL_Event) -> None:
         """Convert a single SDL event to Win32 message(s) and post them."""
         etype = event.type
@@ -696,9 +725,19 @@ class WindowManager:
         if etype == SDL_WINDOWEVENT:
             we = event.window
             if we.event == SDL_WINDOWEVENT_CLOSE:
+                # FIXED (2026-09-14): silently dropped if windowID wasn't
+                # known -- no log at any level, unlike the mouse-button
+                # handlers' own "windowID not found" warnings. Found while
+                # testing a real window-close: the event vanished with zero
+                # trace anywhere in the log.
                 hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
                 if hwnd:
                     self._message_queue.append((hwnd, WM_CLOSE, 0, 0))
+                else:
+                    logger.warn("window",
+                        f"[WindowManager] WINDOWEVENT_CLOSE: windowID={we.windowID} not in "
+                        f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                        f"no WM_CLOSE posted")
             elif we.event == SDL_WINDOWEVENT_FOCUS_GAINED:
                 hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
                 if hwnd:
@@ -713,11 +752,12 @@ class WindowManager:
         elif etype == SDL_MOUSEMOTION:
             motion = event.motion
             hwnd = self._sdl_window_id_to_hwnd.get(motion.windowID, 0)
+            log_x, log_y = self._to_logical_xy(hwnd, motion.x, motion.y)
             if hwnd:
-                lparam = (motion.x & 0xFFFF) | ((motion.y & 0xFFFF) << 16)
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_MOUSEMOVE, 0, lparam))
             from tew.api.dinput_handlers import notify_mouse_motion
-            notify_mouse_motion(motion.x, motion.y)
+            notify_mouse_motion(log_x, log_y)
 
         elif etype == SDL_MOUSEBUTTONUP:
             btn = event.button
@@ -732,7 +772,8 @@ class WindowManager:
                 return
             hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
             if hwnd:
-                lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
+                log_x, log_y = self._to_logical_xy(hwnd, btn.x, btn.y)
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_LBUTTONUP, 0, lparam))
             else:
                 logger.debug("window",
@@ -837,9 +878,10 @@ class WindowManager:
             # WM_LBUTTONDOWN, DirectInput polling, or GetAsyncKeyState(
             # VK_LBUTTON) were ever fed real click data for that window.
             if win_hwnd:
-                lparam = (btn.x & 0xFFFF) | ((btn.y & 0xFFFF) << 16)
+                log_x, log_y = self._to_logical_xy(win_hwnd, btn.x, btn.y)
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, 0, lparam))
-                self._handle_mouse_click(win_hwnd, btn.x, btn.y)
+                self._handle_mouse_click(win_hwnd, log_x, log_y)
             else:
                 logger.debug("window",
                     f"[WindowManager] MOUSEBUTTONDOWN: windowID={btn.windowID} not in "

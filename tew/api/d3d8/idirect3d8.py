@@ -214,6 +214,13 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             from sdl2 import SDL_GetWindowSize
             real_w, real_h = ctypes.c_int(0), ctypes.c_int(0)
             SDL_GetWindowSize(sdl_window, ctypes.byref(real_w), ctypes.byref(real_h))
+            # Real mouse events report coordinates against the window's
+            # actual size, which a compositor can clamp below the requested
+            # phys_w/h (documented elsewhere in this file) -- record what
+            # SDL_GetWindowSize really reports, not the request, or
+            # _to_logical_xy's scale would be wrong on a clamped display.
+            entry.logical_w, entry.logical_h = back_w, back_h
+            entry.phys_w, entry.phys_h = real_w.value, real_h.value
             logger.info("d3d8",
                 f"CreateDevice: requested window resize to {phys_w}x{phys_h} "
                 f"(WINDOW_SCALE={WINDOW_SCALE}), actual SDL_GetWindowSize "

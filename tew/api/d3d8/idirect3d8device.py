@@ -233,7 +233,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 SDL_CreateColorCursor, SDL_SetCursor, SDL_FreeCursor,
             )
             pitch = width * 4
-            raw = bytes(mem.read8((data_ptr + i) & 0xFFFFFFFF) for i in range(width * height * 4))
+            # FIXED (2026-09-14): was width*height*4 individual read8()
+            # ctypes calls (over a million for a 512x512 texture) -- same
+            # disease as the HeapAlloc zero-fill fix, confirmed by profiling.
+            # read_bytes() reads the shared backing buffer directly in one call.
+            raw = mem.read_bytes(data_ptr & 0xFFFFFFFF, width * height * 4)
             pixel_buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
             sdl_surface = SDL_CreateRGBSurfaceFrom(
                 ctypes.cast(pixel_buf, ctypes.c_void_p),
@@ -344,6 +348,15 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             if w == 0xFFFFFFFF:
                 w = phys_w if phys_w > 0 else 800
                 h = phys_h if phys_h > 0 else 600
+
+            # Real mouse events report coordinates against the window's
+            # actual (possibly compositor-clamped, see `w`/`h` above) size,
+            # not the raw resize request -- record what the surface really
+            # ended up at, or _to_logical_xy's scale would be wrong on a
+            # clamped display.
+            if back_w > 0 and back_h > 0:
+                entry.logical_w, entry.logical_h = back_w, back_h
+                entry.phys_w, entry.phys_h = w, h
 
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(
                 sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,

@@ -143,3 +143,43 @@ def test_click_control_against_real_login_dialog_continue_id():
 
     assert wm.click_control(DLG_HWND, 0x0001) is True
     assert wm.peek_message() == (DLG_HWND, WM_COMMAND, 0x0001, BUTTON_HWND)
+
+
+# ── _to_logical_xy: real mouse coords -> guest logical coords ───────────────
+# A window D3D8 has WINDOW_SCALE-enlarged (idirect3d8.py's CreateDevice/
+# idirect3d8device.py's Reset) reports SDL mouse coordinates in that larger
+# real pixel space. The guest's own WM_MOUSEMOVE/WM_LBUTTONDOWN and
+# DirectInput must see coordinates in the window's own client area instead,
+# same as real Windows DPI-virtualizes for a non-DPI-aware app -- otherwise
+# every click lands at 2x the guest-visible position and silently misses
+# whatever FEDC control was actually drawn there.
+
+def test_to_logical_xy_scales_down_for_enlarged_window():
+    wm = WindowManager()
+    win = WindowEntry(
+        hwnd=DLG_HWND, class_name="MCityWindow", title="Motor City Online",
+        style=0, ex_style=0, x=0, y=0, cx=640, cy=480, parent_hwnd=0,
+        logical_w=640, logical_h=480, phys_w=1280, phys_h=960,
+    )
+    wm._windows[DLG_HWND] = win
+    assert wm._to_logical_xy(DLG_HWND, 360, 442) == (180, 221)
+    assert wm._to_logical_xy(DLG_HWND, 1280, 960) == (640, 480)
+    assert wm._to_logical_xy(DLG_HWND, 0, 0) == (0, 0)
+
+
+def test_to_logical_xy_noop_for_never_rescaled_window():
+    """A dialog (or the main window before CreateDevice ever runs) has
+    phys_w/h == 0 -- real SDL coords already match the guest's own size."""
+    wm = WindowManager()
+    dlg = WindowEntry(
+        hwnd=DLG_HWND, class_name="#32770", title="Motor City Online Login",
+        style=0, ex_style=0, x=0, y=0, cx=372, cy=346, parent_hwnd=0,
+        logical_w=372, logical_h=346,
+    )
+    wm._windows[DLG_HWND] = dlg
+    assert wm._to_logical_xy(DLG_HWND, 100, 200) == (100, 200)
+
+
+def test_to_logical_xy_noop_for_unknown_hwnd():
+    wm = WindowManager()
+    assert wm._to_logical_xy(0xDEAD, 100, 200) == (100, 200)
