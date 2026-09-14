@@ -38,12 +38,36 @@ from sdl2 import (
     SDLK_BACKSPACE, SDLK_RETURN, SDLK_KP_ENTER, SDLK_TAB,
     SDLK_ESCAPE, SDLK_DELETE,
     SDL_BUTTON_LEFT,
+    SDL_BUTTON_LMASK, SDL_BUTTON_RMASK, SDL_BUTTON_MMASK,
+    SDL_GetMouseState,
 )
 
 from sdl2.hints import SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
 
 from tew.logger import logger
 from tew.api.pe_resources import DialogTemplate
+
+
+def _sdl_buttons_to_wparam(sdl_button_state: int) -> int:
+    """Real WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP always carry the live
+    MK_LBUTTON/MK_RBUTTON/MK_MBUTTON (etc.) modifier bits in wParam --
+    confirmed live via Ghidra that the guest's own legacy mouse-tracking
+    (seteacmouse, reached because this game's DirectInput mouse polling
+    never actually fires -- see status.md) reads button state exclusively
+    from these bits, not from DirectInput at all. This was hardcoded to 0
+    at every call site, so the guest's own click-tracking globals
+    (DAT_020e398c) were always being set to 0 regardless of the real
+    button state -- root cause of every persona-select click doing
+    nothing all session, confirmed via a live memory probe on the actual
+    GetDeviceState buffer and seteacmouse's own decompiled source."""
+    wparam = 0
+    if sdl_button_state & SDL_BUTTON_LMASK:
+        wparam |= 0x0001  # MK_LBUTTON
+    if sdl_button_state & SDL_BUTTON_RMASK:
+        wparam |= 0x0002  # MK_RBUTTON
+    if sdl_button_state & SDL_BUTTON_MMASK:
+        wparam |= 0x0010  # MK_MBUTTON
+    return wparam
 
 
 def _sdl_sym_to_vk(sym: int) -> int:
@@ -754,8 +778,9 @@ class WindowManager:
             hwnd = self._sdl_window_id_to_hwnd.get(motion.windowID, 0)
             log_x, log_y = self._to_logical_xy(hwnd, motion.x, motion.y)
             if hwnd:
+                wparam = _sdl_buttons_to_wparam(motion.state)
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
-                self._message_queue.append((hwnd, WM_MOUSEMOVE, 0, lparam))
+                self._message_queue.append((hwnd, WM_MOUSEMOVE, wparam, lparam))
             from tew.api.dinput_handlers import notify_mouse_motion
             notify_mouse_motion(log_x, log_y)
 
@@ -773,8 +798,9 @@ class WindowManager:
             hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
             if hwnd:
                 log_x, log_y = self._to_logical_xy(hwnd, btn.x, btn.y)
+                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
-                self._message_queue.append((hwnd, WM_LBUTTONUP, 0, lparam))
+                self._message_queue.append((hwnd, WM_LBUTTONUP, wparam, lparam))
             else:
                 logger.debug("window",
                     f"[WindowManager] MOUSEBUTTONUP: windowID={btn.windowID} not in "
@@ -879,8 +905,9 @@ class WindowManager:
             # VK_LBUTTON) were ever fed real click data for that window.
             if win_hwnd:
                 log_x, log_y = self._to_logical_xy(win_hwnd, btn.x, btn.y)
+                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
-                self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, 0, lparam))
+                self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, wparam, lparam))
                 self._handle_mouse_click(win_hwnd, log_x, log_y)
             else:
                 logger.debug("window",
