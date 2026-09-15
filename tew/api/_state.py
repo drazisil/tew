@@ -212,8 +212,8 @@ def load_registry_json(
         logger.info("registry", f"Loaded {len(result)} keys from registry.json")
         return result
     except Exception as e:
-        from tew.logger import logger
-        logger.error("registry", f"Could not load registry.json: {e} — using empty registry")
+        from tew.logger import WARN, logger
+        logger.always(WARN, "registry", f"Could not load registry.json: {e} — using empty registry")
         return {}
 
 
@@ -224,7 +224,7 @@ def save_registry_json(registry_values: RegistryMap) -> None:
     original file.  All registry key paths and value names are written in
     the normalised (lowercase) form that load_registry_json expects.
     """
-    from tew.logger import logger
+    from tew.logger import WARN, logger
     file_path = os.path.join(os.getcwd(), "registry.json")
     existing: dict = {}
     try:
@@ -246,7 +246,7 @@ def save_registry_json(registry_values: RegistryMap) -> None:
             json.dump(result, f, indent=2)
         logger.debug("registry", f"Persisted {len(registry_values)} keys to registry.json")
     except Exception as e:
-        logger.error("registry", f"Could not save registry.json: {e}")
+        logger.always(WARN, "registry", f"Could not save registry.json: {e}")
 
 
 def load_emulator_config() -> EmulatorConfig:
