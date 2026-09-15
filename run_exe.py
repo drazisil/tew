@@ -3103,6 +3103,109 @@ _progress_countdown = 5_000_000
 import collections as _collections_for_thread_probe
 _THREAD_TIME_TOTALS: dict = _collections_for_thread_probe.defaultdict(float)
 _THREAD_TIME_SAMPLE_COUNT = [0]
+# See the dll-time-probe comment at its preempt_slice() call site below.
+_DLL_TIME_TOTALS: dict = _collections_for_thread_probe.defaultdict(float)
+_DLL_TIME_SAMPLE_COUNT = [0]
+
+# Function-level flamegraph sampler (2026-09-14, temporary): EBP-chain stack
+# walk + nearest-preceding-export symbol resolution, per DLL. dll-time-probe
+# only says WHICH DLL is hot; this answers WHICH FUNCTION inside it, and
+# with what call structure -- Molly wants a real flamegraph of MSJET35.DLL's
+# hot path (Jet 3.5 loops repeatedly through result rows there, ~50%+ of
+# cumulative time -- see dll-time-probe). Frame-pointer walking (not DWARF
+# unwind info, which this old MSVC-era code doesn't ship) -- works because
+# 1990s-2000s MSVC debug/retail builds default to EBP-based frames unless
+# built with /Oy. Output is standard folded-stack format (root;...;leaf
+# count per line) so it can feed any flamegraph renderer.
+import bisect as _bisect_for_flame
+_FLAME_STACK_COUNTS: dict = _collections_for_thread_probe.Counter()
+_FLAME_SAMPLE_COUNT = [0]
+_FLAME_SAMPLE_STRIDE = 20  # EBP-walk is ~2 ctypes reads/frame * up to 24 frames -- too
+                            # expensive to do every single preempt_slice() call, unlike
+                            # the 1-read dll-time-probe; sample 1-in-20 instead.
+_FLAME_EXPORTS_BY_DLL: dict = {}  # dll_name -> sorted [(addr, name), ...], built lazily
+
+def _flame_exports_for(dll_name: str) -> list:
+    cached = _FLAME_EXPORTS_BY_DLL.get(dll_name)
+    if cached is not None:
+        return cached
+    dll = _dll_loader_ref.get_dll(dll_name)
+    entries = sorted((addr, name) for name, addr in dll.exports.items()) if dll else []
+    _FLAME_EXPORTS_BY_DLL[dll_name] = entries
+    return entries
+
+_FLAME_EXE_BASE = exe.optional_header.image_base
+_FLAME_EXE_END = _FLAME_EXE_BASE + exe.optional_header.size_of_image
+
+def _flame_resolve(addr: int) -> str:
+    # find_dll_for_address only tracks secondary DLLs (dll_loader.py) -- the
+    # main EXE's own image needs its own range check, or every frame inside
+    # MCity_d.exe itself (likely a large fraction of any sample set) would
+    # wrongly show up as generic "<unmapped>" instead of real exe code.
+    if _FLAME_EXE_BASE <= addr < _FLAME_EXE_END:
+        return f"MCity_d.exe+0x{addr - _FLAME_EXE_BASE:x}"
+    dll = _dll_loader_ref.find_dll_for_address(addr)
+    if dll is None:
+        return f"<unmapped>+0x{addr:08x}"
+    exports = _flame_exports_for(dll.name)
+    if not exports:
+        return f"{dll.name}+0x{addr - dll.base_address:x}"
+    idx = _bisect_for_flame.bisect_right(exports, (addr, chr(0x10FFFF))) - 1
+    if idx < 0:
+        return f"{dll.name}+0x{addr - dll.base_address:x}"
+    sym_addr, sym_name = exports[idx]
+    offset = addr - sym_addr
+    return f"{dll.name}!{sym_name}" if offset == 0 else f"{dll.name}!{sym_name}+0x{offset:x}"
+
+def _flame_walk_stack(cpu: "CPU", mem: "Memory", max_frames: int = 24) -> list:
+    # CAVEAT (2026-09-14, confirmed live): this walk trusts every frame to be
+    # a real EBP-based prologue. Nested calls into hand-tuned/optimized
+    # native code (not all of MSJET35.DLL's internals necessarily keep frame
+    # pointers -- inner loops sometimes repurpose EBP as a plain register)
+    # can silently break the chain: either a false-but-plausible-looking
+    # "caller" if EBP happens to look like a valid pointer at that moment, or
+    # an early stop. Confirmed: a real sample captured a literal
+    # "<unmapped>+0xcccccccc" frame -- MSVC's uninitialized-stack-fill byte
+    # pattern, meaning the chain walked into garbage, not a real caller. The
+    # LEAF frame (cpu.eip itself, read directly, no walking) stays reliable
+    # regardless; only the nesting/depth/recursion-looking structure beyond
+    # it should be treated as suggestive, not confirmed, once several calls
+    # deep into DLL internals.
+    frames = [_flame_resolve(cpu.eip & 0xFFFFFFFF)]
+    ebp = cpu.regs[EBP] & 0xFFFFFFFF
+    for _ in range(max_frames):
+        if ebp == 0 or not mem.is_valid_range(ebp, 8):
+            break
+        saved_ebp = mem.read32(ebp)
+        ret_addr = mem.read32(ebp + 4)
+        if ret_addr == 0:
+            break
+        frames.append(_flame_resolve(ret_addr))
+        if saved_ebp <= ebp:  # stack grows down -> caller frames sit at higher addresses;
+            break              # non-increasing EBP means a corrupt chain or the top of it
+        ebp = saved_ebp
+    frames.reverse()  # folded-stack convention: root first, leaf (current EIP) last
+    return frames
+
+# MSJET35.DLL ordinal #325 call counter (2026-09-14, temporary): Ghidra RE
+# identified 0x7a8b0c4c (static) as the real entry gate for Jet's
+# ValidationRule/Required/AllowZeroLength field-property machinery -- it
+# short-circuits immediately unless the property name is exactly one of
+# those three, then calls into the validation-query builder (ordinals
+# #156/#158) that showed up hot in the flamegraph sampler. Molly's question:
+# is this really only ~5 calls (once per table-open, and only one real
+# table gets written to in the login/persona-select flow), or do temp
+# tables inflate it? A plain call counter answers this directly, cheaper
+# than resampling. Registered once msjet35.dll is actually loaded (its
+# runtime base isn't known until then) -- see the registration check at
+# the top of the main loop below.
+_ORD325_CALL_COUNT = [0]
+_ORD325_LOGPOINT_ADDED = [False]
+
+def _ord325_call_counter(eip, regs, memory, memory_size):
+    _ORD325_CALL_COUNT[0] += 1
+    logger.error("cpu", f"[ord325-probe] call #{_ORD325_CALL_COUNT[0]}")
+
 _THREAD_TIME_SAMPLE_STRIDE = 1  # preempt_slice() is called once per OUTER loop iteration (once per
                                  # up-to-100k-step cpu.run() batch, not per instruction) -- confirmed
                                  # 2026-09-14 by reading the call site, so total calls over a whole
@@ -3124,6 +3227,21 @@ try:
         batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
         cpu.run(batch)
         step_count += batch
+
+        # ord325-probe disabled -- 2026-09-14/15 investigation closed: MSJET35.DLL
+        # ordinal #325 (the ValidationRule/Required/AllowZeroLength property-access
+        # gate) fired ZERO times across a full run to persona-select, ruling out
+        # the "per-record validation" theory. dblog.txt's real game-level trace
+        # (DBParts_GetBrandedPartDefInfo, 154 calls) turned out to be the actual
+        # answer -- see memory/status.md. Re-enable by uncommenting below if this
+        # ordinal needs rechecking under a different flow (e.g. actual gameplay
+        # writes, not just login/persona-select).
+        # if not _ORD325_LOGPOINT_ADDED[0]:
+        #     _msjet35_dll = _dll_loader_ref.get_dll("msjet35.dll")
+        #     if _msjet35_dll is not None:
+        #         cpu.add_logpoint((_msjet35_dll.base_address + 0x70c4c) & 0xFFFFFFFF, _ord325_call_counter)
+        #         _ORD325_LOGPOINT_ADDED[0] = True
+        #         logger.error("cpu", f"[ord325-probe] registered at 0x{(_msjet35_dll.base_address + 0x70c4c) & 0xFFFFFFFF:08x}")
 
         if (_TEW_CLOSE_AFTER_SEC and not _close_injected
                 and time.monotonic() - _click_start_wall_time >= float(_TEW_CLOSE_AFTER_SEC)):
@@ -3264,14 +3382,46 @@ try:
             logger.error("cpu", f"[watchpoint-hit-live] EIP=0x{cpu.watchpoint_eip:08x} written=0x{cpu.watchpoint_val:02x} step={step_count}")
             cpu.set_watchpoint(_tew_watch_addr_int)
             cpu.halted = False
-        # Lightweight per-guest-thread wall-clock accounting -- 2026-09-14:
-        # confirmed DB thread (tid=1011) dominant through startup (peaked
-        # ~82% of cumulative time), then used to verify the
-        # CriticalSectionEntry fix in kernel32_sync.py. Freeing for the next
-        # investigation; re-enable by uncommenting the block below (and
-        # restoring the bare crt_state.scheduler.preempt_slice(cpu, mem)
-        # call to the commented form).
+        # Per-guest-thread (thread-time-probe), per-DLL (dll-time-probe), and
+        # function-level flamegraph (flame-probe) wall-clock probes all
+        # disabled below -- 2026-09-14/15 investigation closed. Confirmed:
+        # DB thread (tid=1011) dominant through startup (peaked ~82%),
+        # MSJET35.DLL dominant among DLLs (peaked ~56%), and the real "loop
+        # through results" cost is the game's own dbparts.c
+        # DBParts_GetBrandedPartDefInfo (154 calls, one per branded car
+        # part) per dblog.txt's real trace -- not a tew gap or a Jet
+        # internals problem. See memory/status.md. Re-enable any of these
+        # by uncommenting its block (only one may call preempt_slice(),
+        # currently the bare call directly below).
         crt_state.scheduler.preempt_slice(cpu, mem)
+        # _dll_time_t0 = time.perf_counter()
+        # _dll_at_batch_start = _dll_loader_ref.find_dll_for_address(cpu.eip & 0xFFFFFFFF)
+        # _dll_name_for_probe = _dll_at_batch_start.name if _dll_at_batch_start else "<exe/unmapped>"
+        # crt_state.scheduler.preempt_slice(cpu, mem)
+        # _DLL_TIME_TOTALS[_dll_name_for_probe] += time.perf_counter() - _dll_time_t0
+        # _DLL_TIME_SAMPLE_COUNT[0] += 1
+        # if _DLL_TIME_SAMPLE_COUNT[0] % 500 == 0:
+        #     _dll_grand_total = sum(_DLL_TIME_TOTALS.values()) or 1.0
+        #     _dll_breakdown = ", ".join(
+        #         f"{name}={100*v/_dll_grand_total:.1f}%"
+        #         for name, v in sorted(_DLL_TIME_TOTALS.items(), key=lambda kv: -kv[1])[:10]
+        #     )
+        #     logger.error("cpu", f"[dll-time-probe] total={_dll_grand_total:.2f}s {_dll_breakdown}")
+        # _FLAME_SAMPLE_COUNT[0] += 1
+        # if _FLAME_SAMPLE_COUNT[0] % _FLAME_SAMPLE_STRIDE == 0:
+        #     try:
+        #         _flame_stack = _flame_walk_stack(cpu, mem)
+        #         _FLAME_STACK_COUNTS[";".join(_flame_stack)] += 1
+        #     except Exception as _flame_exc:
+        #         logger.debug("cpu", f"[flame-probe] stack walk failed: {_flame_exc}")
+        #     if len(_FLAME_STACK_COUNTS) and sum(_FLAME_STACK_COUNTS.values()) % 200 == 0:
+        #         try:
+        #             with open("/tmp/flame_samples.txt", "w") as _flame_f:
+        #                 for _stack, _count in _FLAME_STACK_COUNTS.items():
+        #                     _flame_f.write(f"{_stack} {_count}\n")
+        #             logger.error("cpu", f"[flame-probe] wrote {sum(_FLAME_STACK_COUNTS.values())} samples, {len(_FLAME_STACK_COUNTS)} unique stacks to /tmp/flame_samples.txt")
+        #         except OSError as _flame_io_exc:
+        #             logger.debug("cpu", f"[flame-probe] write failed: {_flame_io_exc}")
         # _THREAD_TIME_SAMPLE_COUNT[0] += 1
         # if _THREAD_TIME_SAMPLE_COUNT[0] % _THREAD_TIME_SAMPLE_STRIDE == 0:
         #     try:
