@@ -381,16 +381,29 @@ def allocate_descriptor_set(device, pool, set_layout):
 
 
 def create_sampler(device):
-    """One shared sampler: linear filter, repeat wrap -- matches typical D3D8
-    default texture-stage sampler state (games override via SetSamplerState,
-    not yet wired -- this is the reasonable default until they are)."""
+    """One shared sampler: linear filter, clamp-to-edge wrap.
+
+    2026-09-14: was VK_SAMPLER_ADDRESS_MODE_REPEAT (matching D3D8's own
+    D3DTADDRESS_WRAP default) -- confirmed live this caused visible ~1-2px
+    seams between adjacent tiles of a single logical image (e.g. the login
+    screen's "back" shape, real vertex data confirmed tiled with exact,
+    gapless integer boundaries -- see _draw_primitive's seam-debug capture).
+    With REPEAT, linear-filtered samples taken right at a tile's UV edge
+    (u/v at or fractionally past 0.0/1.0, from float precision) blend with
+    texels wrapped from the FAR edge of that same tile's texture instead of
+    clamping to the nearest real edge texel -- visible as a seam at every
+    tile boundary even though the underlying quad geometry is seamless.
+    CLAMP_TO_EDGE is correct for tiled UI/background art like this; a game
+    that genuinely wants real UV wrapping (a repeating floor texture, say)
+    would need per-texture-stage sampler state (SetSamplerState, not yet
+    wired -- this is the reasonable shared default until it is)."""
     import vulkan as vk
     ci = vk.VkSamplerCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         magFilter=vk.VK_FILTER_LINEAR, minFilter=vk.VK_FILTER_LINEAR,
-        addressModeU=vk.VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        addressModeV=vk.VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        addressModeW=vk.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        addressModeU=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        addressModeV=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        addressModeW=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         mipmapMode=vk.VK_SAMPLER_MIPMAP_MODE_NEAREST,
     )
     return vk.vkCreateSampler(device, ci, None)
