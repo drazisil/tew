@@ -19,10 +19,12 @@ logging done while that function's own registered handler is on the call
 stack (see set_current_handler / win32_handlers.py's dispatch loop) -- log
 lines from anywhere else only ever match on the bare category.
 
-`memory` is excluded even under the bare `*`/unset default (unlike every
-other category) -- it's per-allocation HeapAlloc/HeapFree noise, useful
-only when actually chasing an allocator bug. Opt in explicitly with
-`+memory` (alone or alongside other categories).
+`memory` and `registry` are excluded even under the bare `*`/unset default
+(unlike every other category) -- `memory` is per-allocation HeapAlloc/
+HeapFree noise, `registry` is per-call RegOpenKeyExA/RegQueryValueExA
+noise, both useful only when actually chasing a bug in that specific area.
+Opt in explicitly with `+memory`/`+registry` (alone or alongside other
+categories).
 """
 
 import os
@@ -41,8 +43,12 @@ LogCategory = Literal[
 
 # Categories that stay silent even under the bare "*"/unset LOG_CATEGORIES
 # default -- must be explicitly opted into with "+<category>". See the
-# "memory" note in the module docstring for why.
-_DEFAULT_OFF_CATEGORIES = {"memory"}
+# "memory" note in the module docstring for why. "registry" joined 2026-09-03:
+# RegOpenKeyExA/RegQueryValueExA calls are frequent enough during normal
+# startup/gameplay to bury the categories someone's actually chasing at the
+# default LOG_LEVEL=info -- opt in with "+registry" when registry access is
+# the thing under investigation.
+_DEFAULT_OFF_CATEGORIES = {"memory", "registry"}
 
 ERROR = 0
 WARN = 1
