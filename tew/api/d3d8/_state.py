@@ -18,12 +18,28 @@ _vk_present_queue = None
 # VkSurfaceKHR created from the SDL window in CreateDevice.
 _vk_surface = None
 
+# HWND the SDL window was resolved from in CreateDevice. Reset's
+# D3DPRESENT_PARAMETERS.hDeviceWindow is commonly 0 (meaning "reuse the
+# window CreateDevice was given"), so Reset looks this up instead of
+# re-parsing hDeviceWindow.
+_vk_hwnd: int = 0
+
 # Swapchain + image resources.
 _vk_swapchain = None
 _vk_swapchain_format: int = 0        # VkFormat integer
 _vk_swapchain_images: list = []      # list of VkImage handles
 _vk_swapchain_width: int = 0
 _vk_swapchain_height: int = 0
+
+# The game's own requested D3DPRESENT_PARAMETERS BackBufferWidth/Height, as
+# opposed to _vk_swapchain_width/height (the real physical window/swapchain
+# size, which WINDOW_SCALE in idirect3d8.py may enlarge for display).
+# DrawPrimitive and every guest-observable surface size (GetBackBuffer,
+# GetRenderTarget, GetDepthStencilSurface) must use this logical size, not
+# the physical one, or vertex screen-space coordinates the game computed
+# assuming its requested resolution get normalized against the wrong extent.
+_vk_logical_width: int = 0
+_vk_logical_height: int = 0
 
 # Command pool / single reusable command buffer.
 _vk_command_pool = None
@@ -55,6 +71,32 @@ _vk_pipeline_layout:  object = None
 _vk_vertex_buffer:    object = None
 _vk_vertex_memory:    object = None
 _vk_vertex_mapped_ptr: object = None  # ctypes void* from vkMapMemory (persistent)
+_vk_vertex_buffer_size: int = 0
+
+# Byte offset into _vk_vertex_buffer for the NEXT DrawPrimitive's vertex data.
+# Every draw in a frame gets its own region instead of all sharing offset 0:
+# vkCmdBindVertexBuffers/vkCmdDraw don't snapshot buffer contents at record
+# time, only at actual GPU execution (Present's vkQueueSubmit) -- since many
+# BeginScene/DrawPrimitive calls can accumulate into one command buffer
+# before a Present ever happens, writing every draw's vertices to the same
+# offset 0 meant every draw in that frame read back whichever draw wrote
+# last, not its own data (confirmed live via direct GPU pixel readback: a
+# correctly-recorded, real-textured, non-degenerate draw came back as pure
+# black because a later degenerate draw in the same frame overwrote its
+# vertex data before the GPU ever read it). Reset to 0 at the start of each
+# new frame (BeginScene's fresh image-acquire path, not a same-frame
+# continuation).
+_vk_vertex_cursor: int = 0
+
+# Swapchain image indices that have completed at least one full
+# BeginScene->Present cycle. BeginScene's per-frame re-acquire barrier used
+# oldLayout=UNDEFINED unconditionally, which is a real content-discard hint
+# in Vulkan (some drivers honor it literally) -- correct only the very first
+# time each image is used, since D3D8's Clear() is meant to be the only
+# thing that erases prior backbuffer content, not every frame's re-acquire.
+# Reset whenever the swapchain is (re)created, since a fresh swapchain's
+# images are genuinely undefined again.
+_vk_swapchain_images_used: set = set()
 
 # True while inside a vkCmdBeginRenderPass / vkCmdEndRenderPass pair.
 _vk_in_render_pass: bool = False
@@ -65,6 +107,42 @@ _draw_stream_stride: int = 0   # stride in bytes
 
 # Vertex FVF/handle set by SetVertexShader.
 _draw_vertex_fvf: int = 0
+
+# Descriptor set / sampler / default white texture (created once in
+# CreateDevice, alongside the rest of the pipeline).
+_vk_descriptor_set_layout: object = None
+_vk_descriptor_pool:       object = None
+_vk_descriptor_set:        object = None
+_vk_sampler:               object = None
+_vk_default_tex_image:     object = None
+_vk_default_tex_memory:    object = None
+_vk_default_tex_view:      object = None
+
+# Bound IDirect3DBaseTexture8* per sampler stage, set by SetTexture (0 = none).
+_bound_textures: dict[int, int] = {}
+
+# (stage, D3DTEXTURESTAGESTATETYPE) -> DWORD value, set by SetTextureStageState.
+_texture_stage_state: dict[tuple[int, int], int] = {}
+
+# Cached canonical IDirect3DSurface8* for the primary render target / depth-
+# stencil surface, lazily created on first GetRenderTarget()/
+# GetDepthStencilSurface() call. Real D3D8 AddRef's and returns the SAME
+# underlying surface every call -- the caller's matching Release() only
+# drops their reference, since the device keeps its own. Fabricating a
+# fresh, independently-ref-counted object on every call (the old behaviour)
+# meant the game's single, correct Release() immediately freed tew's only
+# copy of it -- confirmed live: a 1536x1248 surface's format field got
+# clobbered by an unrelated later allocation reusing the same freed heap
+# address, while the game kept calling UnlockRect on it 20+ seconds later.
+_vk_backbuffer_surface_obj:    int | None = None
+_vk_depth_stencil_surface_obj: int | None = None
+
+# Real SDL cursor set via IDirect3DDevice8::SetCursorProperties (previously a
+# lying no-op stub that returned S_OK without ever telling SDL to display a
+# cursor). None until the game sets one; freed and replaced on each new
+# SetCursorProperties call to avoid leaking prior cursors (e.g. animation).
+_cursor_sdl_handle: object = None
+_cursor_shown: bool = False
 
 # Instance-level extension functions loaded after vkCreateInstance.
 _vk_fn_get_surface_caps = None   # vkGetPhysicalDeviceSurfaceCapabilitiesKHR

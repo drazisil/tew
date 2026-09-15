@@ -278,6 +278,188 @@ def _auto_decline_fullscreen_prompt(caption, text, u_type):
 crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
 crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
 
+# ── Debug-only mouse click injection (2026-09-13) ───────────────────────────
+# In-game screens like persona-select have no HWND/control-ID structure the
+# way the native Win32 login dialog does -- they're plain D3D8-rendered
+# geometry drawn by the game's own "FEDC" GUI system. Earlier versions of
+# this tool faked an OS-level click (XTest) or overrode a side-channel
+# state variable a poll would read next -- both wrong for the same reason:
+# neither one flows through the real path an actual click would. The real
+# path is window_manager.py's own SDL event pump (pump_sdl_events, called
+# from PeekMessageA/GetMessageA), which turns SDL_MOUSEMOTION/BUTTONDOWN/UP
+# into real WM_MOUSEMOVE/WM_LBUTTONDOWN/UP messages AND feeds
+# dinput_handlers.py's real event-driven mouse state -- see that module's
+# 2026-09-13 redesign. Pushing a real SDL_Event via SDL_PushEvent puts a
+# synthetic click through that exact same pump, indistinguishable from a
+# real one once it's in the queue.
+#
+# Env-gated debug tool, not permanent behavior:
+#   TEW_CLICK_AT=<x>,<y>        window-relative pixel coords to click
+#   TEW_CLICK_AFTER_SEC=<secs>  real wall-clock seconds after process start
+#   TEW_CLICK_HOLD_SEC=<secs>   real seconds to hold the button down (default 0.5)
+#
+# FIXED (2026-09-13, later): down and up were pushed back-to-back with no
+# hold -- confirmed live this was invisible to the guest. The persona-select
+# screen's FEDC input system polls IDirectInputDevice8::GetDeviceState
+# (confirmed live: 1166 calls, zero GetDeviceData calls, one real screen) --
+# an immediate/live sample, not a buffered queue -- at ~385ms real-world
+# intervals in this emulator. A <3ms synthetic down-then-up (the previous
+# behavior) flips the tracked button state 0->1->0 well inside a single poll
+# gap, so no real poll ever observes it -- same as a real mouse click held
+# for a physically impossible sub-millisecond duration would be lost on
+# real DirectInput too. This is not a DirectInput/game bug to patch; the
+# injected click just wasn't modeling a real click's hold time. Down and up
+# are now two separately-scheduled real-wall-clock events (not a blocking
+# sleep, which would also stall the CPU stepping loop and prevent the guest
+# from polling at all during the hold) so the main loop keeps running --
+# and therefore keeps calling GetDeviceState -- while the button is held.
+#   TEW_CLOSE_AFTER_SEC=<secs>  real wall-clock seconds after process start
+#                               to push a real SDL_WINDOWEVENT_CLOSE
+_TEW_CLOSE_AFTER_SEC = os.environ.get("TEW_CLOSE_AFTER_SEC")
+_close_injected = False
+
+_TEW_CLICK_AT = os.environ.get("TEW_CLICK_AT")
+_TEW_CLICK_AFTER_SEC = os.environ.get("TEW_CLICK_AFTER_SEC")
+_TEW_CLICK_HOLD_SEC = float(os.environ.get("TEW_CLICK_HOLD_SEC", "0.5"))
+_click_down_injected = False
+_click_up_injected = False
+_click_down_wall_time: float | None = None
+_click_start_wall_time = time.monotonic()
+
+# 2026-09-14: double-click injection, added after Molly's real manual
+# testing found the persona-select dialog genuinely CAN dismiss (to a
+# "please wait..." screen, followed ~1min later by the LEAK_printclassf
+# fault) -- but only after a sequence that included double-clicking the
+# persona name, not a single click on any button alone. `dlg.persona`'s
+# own `<PERSONAS>.GListBox` has `*WEVENT_ACCEPT=GWidget_ACCEPT_PARENT`,
+# i.e. double-clicking the list IS the real accept gesture -- matches.
+#
+# Real double-click detection (GMouseInput::Do, Ghidra-confirmed) measures
+# down-edge to down-edge, not full press-release cycles, and must land
+# within GetDoubleClickTime (confirmed live: 500ms). That's in tension
+# with the ~385ms real DirectInput poll gap this emulator has (see the
+# single-click TEW_CLICK_HOLD_SEC fix above) -- a hold long enough to
+# guarantee a poll catches it (~400ms+) leaves little/no room for a
+# second full cycle inside the 500ms window. Real human double-clicks
+# (short holds, ~80-150ms) only have partial odds of being caught by any
+# one poll -- Molly's own account ("when I was about to give up") suggests
+# it took real people multiple tries too. TEW_DBLCLICK_REPEAT fires the
+# whole down/up/gap/down/up cycle multiple times in a row (default 3) to
+# raise the odds of at least one attempt landing on favorable poll timing,
+# rather than pretending a single deterministic attempt is guaranteed to
+# work when the real mechanism is inherently timing-sensitive.
+#   TEW_DBLCLICK_AT=<x>,<y>          window-relative pixel coords
+#   TEW_DBLCLICK_AFTER_SEC=<secs>    real wall-clock seconds after start
+#   TEW_DBLCLICK_HOLD_SEC=<secs>     hold per click (default 0.15)
+#   TEW_DBLCLICK_GAP_SEC=<secs>      gap between the two clicks (default 0.05)
+#   TEW_DBLCLICK_REPEAT=<n>          how many double-click attempts (default 3)
+#   TEW_DBLCLICK_RETRY_SEC=<secs>    real seconds between attempts (default 1.0)
+_TEW_DBLCLICK_AT = os.environ.get("TEW_DBLCLICK_AT")
+_TEW_DBLCLICK_AFTER_SEC = os.environ.get("TEW_DBLCLICK_AFTER_SEC")
+_TEW_DBLCLICK_HOLD_SEC = float(os.environ.get("TEW_DBLCLICK_HOLD_SEC", "0.15"))
+_TEW_DBLCLICK_GAP_SEC = float(os.environ.get("TEW_DBLCLICK_GAP_SEC", "0.05"))
+_TEW_DBLCLICK_REPEAT = int(os.environ.get("TEW_DBLCLICK_REPEAT", "3"))
+_TEW_DBLCLICK_RETRY_SEC = float(os.environ.get("TEW_DBLCLICK_RETRY_SEC", "1.0"))
+# State machine steps per attempt: 0=idle/waiting, 1=click1 down pushed,
+# 2=click1 up pushed, 3=click2 down pushed, 4=click2 up pushed (attempt done)
+_dblclick_attempt = 0
+_dblclick_step = 0
+_dblclick_step_wall_time: float | None = None
+
+
+def _get_click_sdl_window_id():
+    import sdl2
+    import tew.api.d3d8._state as _d3d8_state
+
+    entry = crt_state.window_manager.get_window(_d3d8_state._vk_hwnd)
+    if entry is None or entry.sdl_window is None:
+        logger.error("startup",
+            f"[click] no SDL window for hwnd=0x{_d3d8_state._vk_hwnd:x} -- cannot inject click")
+        return None
+    return sdl2.SDL_GetWindowID(entry.sdl_window)
+
+
+def _inject_window_close() -> None:
+    """Push a real SDL_WINDOWEVENT_CLOSE, exactly what a real click on the
+    OS window's own close (X) button produces -- exercises the same
+    `_handle_sdl_event`/WM_CLOSE path window_manager.py already has,
+    landing on FUN_00780550 (real guest code) -> PostQuitMessage(0), NOT
+    any GUI dialog Cancel path. Added 2026-09-14 after Molly's own
+    recollection that both times she saw the persona-select dialog
+    dismiss and the game later fault, closing the window (her only click)
+    was the trigger -- testing whether that's a real causal link or
+    coincidence."""
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
+
+    close = sdl2.SDL_Event()
+    close.type = sdl2.SDL_WINDOWEVENT
+    close.window.windowID = win_id
+    close.window.event = sdl2.SDL_WINDOWEVENT_CLOSE
+    sdl2.SDL_PushEvent(ctypes.byref(close))
+
+    logger.always(WARN, "startup", "[close] pushed real SDL_WINDOWEVENT_CLOSE")
+
+
+def _inject_click_down(rel_x: int, rel_y: int) -> None:
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
+
+    motion = sdl2.SDL_Event()
+    motion.type = sdl2.SDL_MOUSEMOTION
+    motion.motion.windowID = win_id
+    motion.motion.which = 0
+    motion.motion.state = 0
+    motion.motion.x = rel_x
+    motion.motion.y = rel_y
+    motion.motion.xrel = 0
+    motion.motion.yrel = 0
+    sdl2.SDL_PushEvent(ctypes.byref(motion))
+
+    down = sdl2.SDL_Event()
+    down.type = sdl2.SDL_MOUSEBUTTONDOWN
+    down.button.windowID = win_id
+    down.button.which = 0
+    down.button.button = sdl2.SDL_BUTTON_LEFT
+    down.button.state = sdl2.SDL_PRESSED
+    down.button.clicks = 1
+    down.button.x = rel_x
+    down.button.y = rel_y
+    sdl2.SDL_PushEvent(ctypes.byref(down))
+
+    logger.always(WARN, "startup",
+        f"[click] pushed real SDL button-down at window-relative ({rel_x},{rel_y}), "
+        f"holding for {_TEW_CLICK_HOLD_SEC}s")
+
+
+def _inject_click_up(rel_x: int, rel_y: int) -> None:
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
+
+    up = sdl2.SDL_Event()
+    up.type = sdl2.SDL_MOUSEBUTTONUP
+    up.button.windowID = win_id
+    up.button.which = 0
+    up.button.button = sdl2.SDL_BUTTON_LEFT
+    up.button.state = sdl2.SDL_RELEASED
+    up.button.clicks = 1
+    up.button.x = rel_x
+    up.button.y = rel_y
+    sdl2.SDL_PushEvent(ctypes.byref(up))
+
+    logger.always(WARN, "startup",
+        f"[click] pushed real SDL button-up at window-relative ({rel_x},{rel_y})")
+
+
 # `timeout N ... run_exe.py` (the standard way this project's debugging
 # sessions bound a run) sends SIGTERM on expiry -- Python's default handler
 # for that just kills the process immediately, skipping every line below
@@ -443,6 +625,14 @@ def is_valid_eip(eip: int) -> str | None:
 #   fn(eip: u32, regs: ptr[u32 x8], memory: ptr[u8], memory_size: usize)
 # Use mem.read32() / cpu.regs[] from the *Python* handler for readable access;
 # use the raw pointers only when you need speed.
+#
+# CAUTION (found 2026-09-03) -- cpu.add_logpoint has the SAME fixed 8-slot
+# limit as breakpoints (cpu/src/core.zig:124, "EIP logpoints... up to 8
+# slots", same cpu_add_logpoint in kernel.zig) -- despite the breakpoint-only
+# framing above. Live-verified: a 9th cpu.add_logpoint() call in this file
+# registered without error but its callback silently never fired for the
+# rest of the run, no diagnostic anywhere. Keep total cpu.add_logpoint()
+# calls at <= 8 too, same as breakpoints.
 
 _bp_handlers: dict = {}   # eip -> callable(cpu, mem)
 
@@ -928,6 +1118,288 @@ def _lrequest_counter_logpoint(eip, regs, memory, memory_size):
     size = read32((regs[EBP] + 8) & 0xFFFFFFFF)
     logger.error("cpu", f"[lrequest-probe] request=#{request_number} size={size}")
 # cpu.add_logpoint(0x009f64ac, _lrequest_counter_logpoint)
+
+# 2026-09-14: chasing an unhandled fault inside LEAK_printclassf
+# (0x5a7bfc, walking the game's own custom `_memclass` leak-tracking
+# linked list) that happens while `_NFSabortmessage` (0x687bd8) is
+# formatting a real assert/abort message -- confirmed live the crash
+# happens *before* the message ever gets formatted or printed, so the
+# actual reason for the abort is lost every time this recurs (stdout.txt
+# cuts off right after "checking for memory leaks..."). This probe reads
+# the abort message format string (cdecl arg1, [ESP+4] at function entry)
+# plus `_REALabortfilename`/`_REALabortlinenum` (set by whoever called in)
+# the instant `_NFSabortmessage` is entered -- before `LEAKS_
+# CheckForMemoryLeaks` can crash and destroy that context. See
+# status.md's "unhandled CPU fault inside the game's own memory-leak
+# walker" entry for the full investigation.
+def _nfsabortmessage_probe(eip, regs, memory, memory_size):
+    # DIAGNOSTIC (2026-09-14): this probe fired zero times across two real
+    # crash reproductions despite `_NFSabortmessage` demonstrably running
+    # each time (confirmed via stdout.txt's "NFSAM -1"/"NFSAM 0"). Entry
+    # log is unconditional and exception-wrapped so a ctypes-callback
+    # exception (which can be silently swallowed at the FFI boundary,
+    # per this file's own docstring on `_c_int_dispatch`) can't hide --
+    # if "PROBE ENTERED" never shows up next time either, the callback
+    # genuinely isn't being invoked at all; if it shows but nothing after
+    # it does, the bug is in the read32/read_cstr logic below.
+    logger.error("cpu", f"[nfsabortmessage-probe] PROBE ENTERED eip=0x{eip:08x}")
+    try:
+        def read32(addr):
+            return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+        def read_cstr(addr, max_len=256):
+            if addr == 0:
+                return "(null)"
+            out = bytearray()
+            for i in range(max_len):
+                b = memory[addr + i]
+                if b == 0:
+                    break
+                out.append(b)
+            return out.decode("latin-1", errors="replace")
+        fmt_ptr = read32((regs[ESP] + 4) & 0xFFFFFFFF)
+        fmt = read_cstr(fmt_ptr)
+        abort_file_ptr = read32(0x020d84b4)
+        abort_file = read_cstr(abort_file_ptr)
+        abort_line = read32(0x020d84b8)
+        logger.error("cpu",
+            f"[nfsabortmessage-probe] fmt=\"{fmt}\" abortfile=\"{abort_file}\" abortline={abort_line}")
+    except Exception as e:
+        logger.error("cpu", f"[nfsabortmessage-probe] EXCEPTION: {e!r}")
+# cpu.add_logpoint(0x00687bd8, _nfsabortmessage_probe)  # 2026-09-14: parked, unrelated to the active persona-select click investigation -- freeing slot
+
+# ── Persona-select click-path trace (2026-09-14) ────────────────────────────
+# Every static/setup-time check this session came back clean (delivery,
+# timing, enable/visible flags, authored rect bounds, ScreenToView
+# coefficients, GDialog+0x114/+0x118 OK/CANCEL wiring -- all confirmed
+# correct). This set of probes traces the actual per-click runtime path
+# live, in order, to find the first point where it diverges from what the
+# static analysis says should happen:
+#   _mfHitFirst (recursive rect hit-test, fires once per widget walked)
+#   -> GUI::HitTest (vtable+0x24, the release-time "still over me?" recheck)
+#   -> GDialog::OnNotify's handle comparison (this+0x114/+0x118 vs the
+#      notifying widget's actual handle)
+# GMouseInput::mPos (020e6214, a GPos {x,y}) is what both hit-tests compare
+# against -- read directly here instead of calling GetPosition().
+
+# CAUTION (2026-09-14, found the hard way): `memory` here is a raw
+# ctypes.POINTER(c_uint8) into the emulator's flat memory buffer -- there is
+# NO bounds checking on pointer indexing. Reading past `memory_size` is real
+# out-of-bounds native memory access, not a catchable Python exception --
+# confirmed live it segfaulted the whole host process (systemd-coredump
+# caught a real KCrash for python3.14, not a clean SIGTERM shutdown) when an
+# earlier version of these probes read from a computed address without
+# checking it against memory_size first. Every read below MUST bounds-check
+# before touching `memory` at all.
+
+def _in_bounds(addr, length, memory_size):
+    return 0 <= addr and addr + length <= memory_size
+
+def _read32(memory, addr, memory_size):
+    if not _in_bounds(addr, 4, memory_size):
+        return None
+    return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+
+# CORRECTED (2026-09-14): GRect and GPos both derive from GObject and carry
+# a real vtable -- confirmed via their constructors' decompile
+# (`*(undefined***)this = &_vftable_` before the field writes). Real layout,
+# all plain 32-bit `int` (MSVC mangling confirms `H` = int, not double):
+#   GRect: +0x0 vtable, +0x4 top, +0x8 left, +0xc width, +0x10 height
+#          (Right()/Bottom() compute left+width / top+height on the fly --
+#          not stored fields)
+#   GPos:  +0x0 vtable, +0x4 x, +0x8 y
+# Neither the original "4 consecutive i32 at +0" nor the "doubles" guess
+# were right -- the vtable pointer at +0x0 was what looked like garbage.
+
+def _read_rect(memory, addr, memory_size):
+    top    = _read32(memory, (addr + 0x4) & 0xFFFFFFFF, memory_size)
+    left   = _read32(memory, (addr + 0x8) & 0xFFFFFFFF, memory_size)
+    width  = _read32(memory, (addr + 0xc) & 0xFFFFFFFF, memory_size)
+    height = _read32(memory, (addr + 0x10) & 0xFFFFFFFF, memory_size)
+    right  = None if (left is None or width is None) else left + width
+    bottom = None if (top is None or height is None) else top + height
+    return {"left": left, "top": top, "width": width, "height": height, "right": right, "bottom": bottom}
+
+def _read_pos(memory, memory_size):
+    base = 0x020e6214
+    x = _read32(memory, (base + 0x4) & 0xFFFFFFFF, memory_size)
+    y = _read32(memory, (base + 0x8) & 0xFFFFFFFF, memory_size)
+    return {"x": x, "y": y}
+
+def _hexdump_window(memory, base, lo_off, hi_off, memory_size):
+    addr = (base + lo_off) & 0xFFFFFFFF
+    length = hi_off - lo_off
+    if not _in_bounds(addr, length, memory_size):
+        return f"OUT OF BOUNDS (addr=0x{addr:08x} len={length} memory_size={memory_size})"
+    raw = bytes(memory[addr + i] for i in range(length))
+    return " ".join(f"{b:02x}" for b in raw)
+
+_dumped_once = []
+def _mfhitfirst_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    if not _dumped_once:
+        _dumped_once.append(True)
+        dump = _hexdump_window(memory, this, 0xa0, 0xe0, memory_size)
+        logger.error("cpu", f"[mfhitfirst-probe] RAW BYTES this=0x{this:08x} [+0xa0..+0xe0)={dump}")
+    rect = _read_rect(memory, (this + 0xbc) & 0xFFFFFFFF, memory_size)
+    pos = _read_pos(memory, memory_size)
+    # _mFocus (020e5c0c) / _mCapture (020e5c10): global HGUI__ handles for
+    # who currently has keyboard focus / mouse capture -- both raw handle
+    # values (not resolved pointers), 0 means "nobody".
+    mfocus = _read32(memory, 0x020e5c0c, memory_size)
+    mcapture = _read32(memory, 0x020e5c10, memory_size)
+    logger.error("cpu",
+        f"[mfhitfirst-probe] this=0x{this:08x} rect(+0xbc)={rect} mousePos={pos} "
+        f"mFocus={mfocus} mCapture={mcapture}")
+# cpu.add_logpoint(0x00aef1b0, _mfhitfirst_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+def _hittest_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    rect = _read_rect(memory, (this + 0xa8) & 0xFFFFFFFF, memory_size)
+    pos = _read_pos(memory, memory_size)
+    logger.error("cpu",
+        f"[hittest-probe] this=0x{this:08x} rect(+0xa8)={rect} mousePos={pos}")
+# cpu.add_logpoint(0x00aeefa0, _hittest_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+_onnotify_this_capture = []
+def _onnotify_entry_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    _onnotify_this_capture.append(this)
+    # thiscall: this=ECX, param_1(notifier GUI*)=[ESP+4], param_2(GEVENT)=[ESP+8],
+    # param_3=[ESP+0xC] -- true at function entry, before PUSH EBP shifts ESP.
+    notifier_ptr = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    event_code = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    logger.error("cpu",
+        f"[onnotify-probe] ENTRY this=0x{this:08x} notifier_ptr={notifier_ptr} event={event_code}")
+# cpu.add_logpoint(0x00b08020, _onnotify_entry_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+def _onnotify_afterhandle_probe(eip, regs, memory, memory_size):
+    if not _onnotify_this_capture:
+        logger.error("cpu", "[onnotify-probe] AFTERHANDLE fired with no prior ENTRY capture!")
+        return
+    this = _onnotify_this_capture.pop()
+    ok_handle = _read32(memory, (this + 0x114) & 0xFFFFFFFF, memory_size)
+    cancel_handle = _read32(memory, (this + 0x118) & 0xFFFFFFFF, memory_size)
+    notifier_handle = regs[EAX]
+    logger.error("cpu",
+        f"[onnotify-probe] this=0x{this:08x} notifier_handle=0x{notifier_handle:08x} "
+        f"+0x114(OK)=0x{ok_handle} +0x118(CANCEL)=0x{cancel_handle} "
+        f"MATCH_OK={notifier_handle == ok_handle} MATCH_CANCEL={notifier_handle == cancel_handle}")
+# cpu.add_logpoint(0x00b0804e, _onnotify_afterhandle_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+# GButton::OnMouseUp (00b47720) gates the actual click-fire behind three
+# checks in order: HasMouseCapture(this) && param_1==0 (left button) to even
+# enter the real branch; HitTest() (vtable+0x24, at 00b4776b's landing
+# point, right after its CALL) must return nonzero; and
+# (*(uint*)(this+0x134) & 0x48) == 0 must hold, before SendEvent(0x2a) ever
+# fires. The hittest-probe hits we've seen so far are from _mfHitFirst's own
+# idle-poll self-check, NOT confirmed to be from inside OnMouseUp itself --
+# these two probes observe the actual gating values at this specific call
+# site to find which (if any) check fails for a real click.
+# RETIRED (2026-09-14): confirmed OnMouseUp is never entered at all (zero
+# hits across every real click this session) -- freeing both slots for the
+# GetDeviceState raw-buffer check below, the actual remaining unknown.
+# cpu.add_logpoint(0x00b47720, _onmouseup_entry_probe)
+# cpu.add_logpoint(0x00b4776b, _onmouseup_posthittest_probe)
+
+# THE decisive check: read the raw DIMOUSESTATE buffer bytes tew's own
+# GetDeviceState handler actually wrote, immediately after its COM call
+# returns -- 00a73d84 is the CALL itself (vtable+0x24), 00a73d87 is the very
+# next instruction. Capture lpvData from the stack right before the call
+# (stdcall push order confirmed earlier: [ESP+0]=this [ESP+4]=cbData
+# [ESP+8]=lpvData at the CALL site itself, before the call pushes a return
+# address), then read lpvData+12 (left button byte) right after it returns.
+_getdevicestate_lpvdata = []
+def _getdevicestate_precall_probe(eip, regs, memory, memory_size):
+    this_arg = _read32(memory, (regs[ESP] + 0) & 0xFFFFFFFF, memory_size)
+    cb_data = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    lpv_data = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    _getdevicestate_lpvdata.append(lpv_data)
+    logger.error("cpu",
+        f"[getdevicestate-probe] PRECALL this_arg={this_arg} cb_data={cb_data} lpv_data={lpv_data}")
+# cpu.add_logpoint(0x00a73d84, _getdevicestate_precall_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+def _getdevicestate_postcall_probe(eip, regs, memory, memory_size):
+    if not _getdevicestate_lpvdata:
+        logger.error("cpu", "[getdevicestate-probe] POSTCALL fired with no PRECALL capture!")
+        return
+    lpv_data = _getdevicestate_lpvdata.pop()
+    if not lpv_data:
+        logger.error("cpu", "[getdevicestate-probe] POSTCALL lpv_data is 0/None, skipping read")
+        return
+    lx = _read32(memory, lpv_data & 0xFFFFFFFF, memory_size)
+    ly = _read32(memory, (lpv_data + 4) & 0xFFFFFFFF, memory_size)
+    btn0 = memory[(lpv_data + 12) & 0xFFFFFFFF] if _in_bounds(lpv_data + 12, 1, memory_size) else None
+    btn1 = memory[(lpv_data + 13) & 0xFFFFFFFF] if _in_bounds(lpv_data + 13, 1, memory_size) else None
+    logger.error("cpu",
+        f"[getdevicestate-probe] POSTCALL lpv_data={lpv_data} lX={lx} lY={ly} "
+        f"btn0(left)={btn0} btn1(right)={btn1}")
+# cpu.add_logpoint(0x00a73d87, _getdevicestate_postcall_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+# GMouseInput::Do's own edge-detector (per-button loop, offsets +0x2c=raw
+# down state, +0x48=pending/edge counter, both indexed by button*4) --
+# logging entry state directly settles whether Do() ever even observes
+# raw_down!=0 during a confirmed-real button-down window, independent of
+# everything already traced downstream of it.
+def _mouseinput_do_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    raw_down0 = _read32(memory, (this + 0x2c) & 0xFFFFFFFF, memory_size)
+    pending0 = _read32(memory, (this + 0x48) & 0xFFFFFFFF, memory_size)
+    if raw_down0:
+        logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
+# cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+# GMouseInput::MouseSetButton(button_index, state) is the ONLY writer of
+# this+0x2c+i*4 (confirmed via decompile: writes (state!=0)). Do() has now
+# been shown to never observe raw_down0!=0 even across two real clicks held
+# 6.3s and 17.4s -- this settles whether the setter itself is ever called
+# with a real down value at all, independent of everything downstream.
+def _mousesetbutton_probe(eip, regs, memory, memory_size):
+    this = regs[ECX]
+    button_index = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+    state = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+    logger.error("cpu",
+        f"[mousesetbutton-probe] this=0x{this:08x} button_index={button_index} state={state}")
+# cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+
+# cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
+
+# GDialog::OnBegin (00b080c0) wires its own "default button" handles by name:
+#   +0x114 = FindChildHandle(this, "<OK>")
+#   +0x118 = FindChildHandle(this, "<CANCEL>")
+# GDialog::OnNotify later only fires OnAccept/OnCancel (GEVENT 0x27/0x28) if
+# the notifying button's handle matches one of these two fields -- if either
+# is still 0 (FindChildHandle found nothing) at click time, a perfectly
+# correct, perfectly delivered, perfectly captured click on START/QUIT would
+# be silently swallowed right here, with no log anywhere else in the chain.
+# Traced the whole path (click delivery -> capture -> GButton::OnMouseUp's
+# SendEvent(0x2a) -> GDialog::OnNotify's handle comparison) and everything
+# checks out structurally in the guest's own code -- per project convention,
+# assume the guest code is correct and the divergence is in tew's own
+# emulation (state.pe_resources / GDialogs.gui parsing, FindChildHandle's
+# name lookup, or something in how tew feeds the guest's own child-widget
+# tree) -- not a real MCO bug. This pair of probes captures `this` (ECX,
+# thiscall) at entry, then reads +0x114/+0x118 right after both
+# FindChildHandle calls have written them (0x00b08109, just before the
+# chained GWidget::OnBegin call) to see what they actually end up holding.
+_onbegin_this_capture = []
+def _gdialog_onbegin_entry_probe(eip, regs, memory, memory_size):
+    _onbegin_this_capture.append(regs[ECX])
+    logger.error("cpu", f"[onbegin-probe] ENTRY this=0x{regs[ECX]:08x}")
+# cpu.add_logpoint(0x00b080c0, _gdialog_onbegin_entry_probe)  # 2026-09-14: confirmed OK/CANCEL wiring correct for MPersonaSelectDlg (0x5f9/0x5fd), freeing slot
+
+def _gdialog_onbegin_afterwire_probe(eip, regs, memory, memory_size):
+    if not _onbegin_this_capture:
+        logger.error("cpu", "[onbegin-probe] AFTERWIRE fired with no prior ENTRY capture!")
+        return
+    this = _onbegin_this_capture.pop()
+    def read32(addr):
+        return memory[addr] | (memory[addr + 1] << 8) | (memory[addr + 2] << 16) | (memory[addr + 3] << 24)
+    ok_handle = read32((this + 0x114) & 0xFFFFFFFF)
+    cancel_handle = read32((this + 0x118) & 0xFFFFFFFF)
+    logger.error("cpu",
+        f"[onbegin-probe] AFTERWIRE this=0x{this:08x} "
+        f"+0x114(OK)=0x{ok_handle:08x} +0x118(CANCEL)=0x{cancel_handle:08x}")
+# cpu.add_logpoint(0x00b08109, _gdialog_onbegin_afterwire_probe)  # 2026-09-14: confirmed OK/CANCEL wiring correct for MPersonaSelectDlg (0x5f9/0x5fd), freeing slot
 
 # 2026-08-26: re-opening the "who actually writes field2_0x8" question an
 # earlier pre-compaction pass in this same investigation started but never
@@ -2627,6 +3099,118 @@ _last_heartbeat_wall_time = time.monotonic()
 _sample_countdown = 1_000_000
 _progress_countdown = 5_000_000
 
+# See the thread-time-probe comment at its preempt_slice() call site below.
+import collections as _collections_for_thread_probe
+_THREAD_TIME_TOTALS: dict = _collections_for_thread_probe.defaultdict(float)
+_THREAD_TIME_SAMPLE_COUNT = [0]
+# See the dll-time-probe comment at its preempt_slice() call site below.
+_DLL_TIME_TOTALS: dict = _collections_for_thread_probe.defaultdict(float)
+_DLL_TIME_SAMPLE_COUNT = [0]
+
+# Function-level flamegraph sampler (2026-09-14, temporary): EBP-chain stack
+# walk + nearest-preceding-export symbol resolution, per DLL. dll-time-probe
+# only says WHICH DLL is hot; this answers WHICH FUNCTION inside it, and
+# with what call structure -- Molly wants a real flamegraph of MSJET35.DLL's
+# hot path (Jet 3.5 loops repeatedly through result rows there, ~50%+ of
+# cumulative time -- see dll-time-probe). Frame-pointer walking (not DWARF
+# unwind info, which this old MSVC-era code doesn't ship) -- works because
+# 1990s-2000s MSVC debug/retail builds default to EBP-based frames unless
+# built with /Oy. Output is standard folded-stack format (root;...;leaf
+# count per line) so it can feed any flamegraph renderer.
+import bisect as _bisect_for_flame
+_FLAME_STACK_COUNTS: dict = _collections_for_thread_probe.Counter()
+_FLAME_SAMPLE_COUNT = [0]
+_FLAME_SAMPLE_STRIDE = 20  # EBP-walk is ~2 ctypes reads/frame * up to 24 frames -- too
+                            # expensive to do every single preempt_slice() call, unlike
+                            # the 1-read dll-time-probe; sample 1-in-20 instead.
+_FLAME_EXPORTS_BY_DLL: dict = {}  # dll_name -> sorted [(addr, name), ...], built lazily
+
+def _flame_exports_for(dll_name: str) -> list:
+    cached = _FLAME_EXPORTS_BY_DLL.get(dll_name)
+    if cached is not None:
+        return cached
+    dll = _dll_loader_ref.get_dll(dll_name)
+    entries = sorted((addr, name) for name, addr in dll.exports.items()) if dll else []
+    _FLAME_EXPORTS_BY_DLL[dll_name] = entries
+    return entries
+
+_FLAME_EXE_BASE = exe.optional_header.image_base
+_FLAME_EXE_END = _FLAME_EXE_BASE + exe.optional_header.size_of_image
+
+def _flame_resolve(addr: int) -> str:
+    # find_dll_for_address only tracks secondary DLLs (dll_loader.py) -- the
+    # main EXE's own image needs its own range check, or every frame inside
+    # MCity_d.exe itself (likely a large fraction of any sample set) would
+    # wrongly show up as generic "<unmapped>" instead of real exe code.
+    if _FLAME_EXE_BASE <= addr < _FLAME_EXE_END:
+        return f"MCity_d.exe+0x{addr - _FLAME_EXE_BASE:x}"
+    dll = _dll_loader_ref.find_dll_for_address(addr)
+    if dll is None:
+        return f"<unmapped>+0x{addr:08x}"
+    exports = _flame_exports_for(dll.name)
+    if not exports:
+        return f"{dll.name}+0x{addr - dll.base_address:x}"
+    idx = _bisect_for_flame.bisect_right(exports, (addr, chr(0x10FFFF))) - 1
+    if idx < 0:
+        return f"{dll.name}+0x{addr - dll.base_address:x}"
+    sym_addr, sym_name = exports[idx]
+    offset = addr - sym_addr
+    return f"{dll.name}!{sym_name}" if offset == 0 else f"{dll.name}!{sym_name}+0x{offset:x}"
+
+def _flame_walk_stack(cpu: "CPU", mem: "Memory", max_frames: int = 24) -> list:
+    # CAVEAT (2026-09-14, confirmed live): this walk trusts every frame to be
+    # a real EBP-based prologue. Nested calls into hand-tuned/optimized
+    # native code (not all of MSJET35.DLL's internals necessarily keep frame
+    # pointers -- inner loops sometimes repurpose EBP as a plain register)
+    # can silently break the chain: either a false-but-plausible-looking
+    # "caller" if EBP happens to look like a valid pointer at that moment, or
+    # an early stop. Confirmed: a real sample captured a literal
+    # "<unmapped>+0xcccccccc" frame -- MSVC's uninitialized-stack-fill byte
+    # pattern, meaning the chain walked into garbage, not a real caller. The
+    # LEAF frame (cpu.eip itself, read directly, no walking) stays reliable
+    # regardless; only the nesting/depth/recursion-looking structure beyond
+    # it should be treated as suggestive, not confirmed, once several calls
+    # deep into DLL internals.
+    frames = [_flame_resolve(cpu.eip & 0xFFFFFFFF)]
+    ebp = cpu.regs[EBP] & 0xFFFFFFFF
+    for _ in range(max_frames):
+        if ebp == 0 or not mem.is_valid_range(ebp, 8):
+            break
+        saved_ebp = mem.read32(ebp)
+        ret_addr = mem.read32(ebp + 4)
+        if ret_addr == 0:
+            break
+        frames.append(_flame_resolve(ret_addr))
+        if saved_ebp <= ebp:  # stack grows down -> caller frames sit at higher addresses;
+            break              # non-increasing EBP means a corrupt chain or the top of it
+        ebp = saved_ebp
+    frames.reverse()  # folded-stack convention: root first, leaf (current EIP) last
+    return frames
+
+# MSJET35.DLL ordinal #325 call counter (2026-09-14, temporary): Ghidra RE
+# identified 0x7a8b0c4c (static) as the real entry gate for Jet's
+# ValidationRule/Required/AllowZeroLength field-property machinery -- it
+# short-circuits immediately unless the property name is exactly one of
+# those three, then calls into the validation-query builder (ordinals
+# #156/#158) that showed up hot in the flamegraph sampler. Molly's question:
+# is this really only ~5 calls (once per table-open, and only one real
+# table gets written to in the login/persona-select flow), or do temp
+# tables inflate it? A plain call counter answers this directly, cheaper
+# than resampling. Registered once msjet35.dll is actually loaded (its
+# runtime base isn't known until then) -- see the registration check at
+# the top of the main loop below.
+_ORD325_CALL_COUNT = [0]
+_ORD325_LOGPOINT_ADDED = [False]
+
+def _ord325_call_counter(eip, regs, memory, memory_size):
+    _ORD325_CALL_COUNT[0] += 1
+    logger.error("cpu", f"[ord325-probe] call #{_ORD325_CALL_COUNT[0]}")
+
+_THREAD_TIME_SAMPLE_STRIDE = 1  # preempt_slice() is called once per OUTER loop iteration (once per
+                                 # up-to-100k-step cpu.run() batch, not per instruction) -- confirmed
+                                 # 2026-09-14 by reading the call site, so total calls over a whole
+                                 # run is only in the tens of thousands; no sampling needed
+
 try:
     while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
         if not _HISTORY_CAPTURE_ENABLED and not _HISTORY_CAPTURE_DONE and step_count >= _HISTORY_CAPTURE_START_STEP:
@@ -2643,6 +3227,67 @@ try:
         batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
         cpu.run(batch)
         step_count += batch
+
+        # ord325-probe disabled -- 2026-09-14/15 investigation closed: MSJET35.DLL
+        # ordinal #325 (the ValidationRule/Required/AllowZeroLength property-access
+        # gate) fired ZERO times across a full run to persona-select, ruling out
+        # the "per-record validation" theory. dblog.txt's real game-level trace
+        # (DBParts_GetBrandedPartDefInfo, 154 calls) turned out to be the actual
+        # answer -- see memory/status.md. Re-enable by uncommenting below if this
+        # ordinal needs rechecking under a different flow (e.g. actual gameplay
+        # writes, not just login/persona-select).
+        # if not _ORD325_LOGPOINT_ADDED[0]:
+        #     _msjet35_dll = _dll_loader_ref.get_dll("msjet35.dll")
+        #     if _msjet35_dll is not None:
+        #         cpu.add_logpoint((_msjet35_dll.base_address + 0x70c4c) & 0xFFFFFFFF, _ord325_call_counter)
+        #         _ORD325_LOGPOINT_ADDED[0] = True
+        #         logger.error("cpu", f"[ord325-probe] registered at 0x{(_msjet35_dll.base_address + 0x70c4c) & 0xFFFFFFFF:08x}")
+
+        if (_TEW_CLOSE_AFTER_SEC and not _close_injected
+                and time.monotonic() - _click_start_wall_time >= float(_TEW_CLOSE_AFTER_SEC)):
+            _inject_window_close()
+            _close_injected = True
+
+        if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_down_injected
+                and time.monotonic() - _click_start_wall_time >= float(_TEW_CLICK_AFTER_SEC)):
+            _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
+            _inject_click_down(_rel_x, _rel_y)
+            _click_down_injected = True
+            _click_down_wall_time = time.monotonic()
+        elif (_click_down_injected and not _click_up_injected
+                and time.monotonic() - _click_down_wall_time >= _TEW_CLICK_HOLD_SEC):
+            _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
+            _inject_click_up(_rel_x, _rel_y)
+            _click_up_injected = True
+
+        if (_TEW_DBLCLICK_AT and _TEW_DBLCLICK_AFTER_SEC
+                and _dblclick_attempt < _TEW_DBLCLICK_REPEAT):
+            _dx, _dy = (int(v) for v in _TEW_DBLCLICK_AT.split(","))
+            _elapsed = time.monotonic() - _click_start_wall_time
+            _attempt_start = float(_TEW_DBLCLICK_AFTER_SEC) + _dblclick_attempt * _TEW_DBLCLICK_RETRY_SEC
+            if _dblclick_step == 0 and _elapsed >= _attempt_start:
+                _inject_click_down(_dx, _dy)
+                _dblclick_step = 1
+                _dblclick_step_wall_time = time.monotonic()
+                logger.always(WARN, "startup",
+                    f"[dblclick] attempt {_dblclick_attempt + 1}/{_TEW_DBLCLICK_REPEAT} click 1 down")
+            elif (_dblclick_step == 1
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_HOLD_SEC):
+                _inject_click_up(_dx, _dy)
+                _dblclick_step = 2
+                _dblclick_step_wall_time = time.monotonic()
+            elif (_dblclick_step == 2
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_GAP_SEC):
+                _inject_click_down(_dx, _dy)
+                _dblclick_step = 3
+                _dblclick_step_wall_time = time.monotonic()
+                logger.always(WARN, "startup",
+                    f"[dblclick] attempt {_dblclick_attempt + 1}/{_TEW_DBLCLICK_REPEAT} click 2 down")
+            elif (_dblclick_step == 3
+                    and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_HOLD_SEC):
+                _inject_click_up(_dx, _dy)
+                _dblclick_step = 0
+                _dblclick_attempt += 1
 
         if cpu.faulted:
             # Give the game's own SEH chain a chance to handle this before
@@ -2737,7 +3382,64 @@ try:
             logger.error("cpu", f"[watchpoint-hit-live] EIP=0x{cpu.watchpoint_eip:08x} written=0x{cpu.watchpoint_val:02x} step={step_count}")
             cpu.set_watchpoint(_tew_watch_addr_int)
             cpu.halted = False
+        # Per-guest-thread (thread-time-probe), per-DLL (dll-time-probe), and
+        # function-level flamegraph (flame-probe) wall-clock probes all
+        # disabled below -- 2026-09-14/15 investigation closed. Confirmed:
+        # DB thread (tid=1011) dominant through startup (peaked ~82%),
+        # MSJET35.DLL dominant among DLLs (peaked ~56%), and the real "loop
+        # through results" cost is the game's own dbparts.c
+        # DBParts_GetBrandedPartDefInfo (154 calls, one per branded car
+        # part) per dblog.txt's real trace -- not a tew gap or a Jet
+        # internals problem. See memory/status.md. Re-enable any of these
+        # by uncommenting its block (only one may call preempt_slice(),
+        # currently the bare call directly below).
         crt_state.scheduler.preempt_slice(cpu, mem)
+        # _dll_time_t0 = time.perf_counter()
+        # _dll_at_batch_start = _dll_loader_ref.find_dll_for_address(cpu.eip & 0xFFFFFFFF)
+        # _dll_name_for_probe = _dll_at_batch_start.name if _dll_at_batch_start else "<exe/unmapped>"
+        # crt_state.scheduler.preempt_slice(cpu, mem)
+        # _DLL_TIME_TOTALS[_dll_name_for_probe] += time.perf_counter() - _dll_time_t0
+        # _DLL_TIME_SAMPLE_COUNT[0] += 1
+        # if _DLL_TIME_SAMPLE_COUNT[0] % 500 == 0:
+        #     _dll_grand_total = sum(_DLL_TIME_TOTALS.values()) or 1.0
+        #     _dll_breakdown = ", ".join(
+        #         f"{name}={100*v/_dll_grand_total:.1f}%"
+        #         for name, v in sorted(_DLL_TIME_TOTALS.items(), key=lambda kv: -kv[1])[:10]
+        #     )
+        #     logger.error("cpu", f"[dll-time-probe] total={_dll_grand_total:.2f}s {_dll_breakdown}")
+        # _FLAME_SAMPLE_COUNT[0] += 1
+        # if _FLAME_SAMPLE_COUNT[0] % _FLAME_SAMPLE_STRIDE == 0:
+        #     try:
+        #         _flame_stack = _flame_walk_stack(cpu, mem)
+        #         _FLAME_STACK_COUNTS[";".join(_flame_stack)] += 1
+        #     except Exception as _flame_exc:
+        #         logger.debug("cpu", f"[flame-probe] stack walk failed: {_flame_exc}")
+        #     if len(_FLAME_STACK_COUNTS) and sum(_FLAME_STACK_COUNTS.values()) % 200 == 0:
+        #         try:
+        #             with open("/tmp/flame_samples.txt", "w") as _flame_f:
+        #                 for _stack, _count in _FLAME_STACK_COUNTS.items():
+        #                     _flame_f.write(f"{_stack} {_count}\n")
+        #             logger.error("cpu", f"[flame-probe] wrote {sum(_FLAME_STACK_COUNTS.values())} samples, {len(_FLAME_STACK_COUNTS)} unique stacks to /tmp/flame_samples.txt")
+        #         except OSError as _flame_io_exc:
+        #             logger.debug("cpu", f"[flame-probe] write failed: {_flame_io_exc}")
+        # _THREAD_TIME_SAMPLE_COUNT[0] += 1
+        # if _THREAD_TIME_SAMPLE_COUNT[0] % _THREAD_TIME_SAMPLE_STRIDE == 0:
+        #     try:
+        #         _tid_before = crt_state.scheduler.current_thread().thread_id
+        #     except RuntimeError:
+        #         _tid_before = -1  # no current thread selected at this instant -- rare, don't crash the loop over it
+        #     _slice_t0 = time.perf_counter()
+        #     crt_state.scheduler.preempt_slice(cpu, mem)
+        #     _THREAD_TIME_TOTALS[_tid_before] += (time.perf_counter() - _slice_t0) * _THREAD_TIME_SAMPLE_STRIDE
+        # else:
+        #     crt_state.scheduler.preempt_slice(cpu, mem)
+        # if _THREAD_TIME_SAMPLE_COUNT[0] % 500 == 0:
+        #     _grand_total = sum(_THREAD_TIME_TOTALS.values()) or 1.0
+        #     _breakdown = ", ".join(
+        #         f"tid={t}:{100*v/_grand_total:.1f}%"
+        #         for t, v in sorted(_THREAD_TIME_TOTALS.items(), key=lambda kv: -kv[1])[:8]
+        #     )
+        #     logger.error("cpu", f"[thread-time-probe] total={_grand_total:.2f}s (extrapolated, 1-in-{_THREAD_TIME_SAMPLE_STRIDE} sampled) {_breakdown}")
 
         _heartbeat_countdown -= batch
         if _heartbeat_countdown <= 0:

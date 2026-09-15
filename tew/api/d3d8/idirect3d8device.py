@@ -108,7 +108,10 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+    from tew.api.window_manager import WindowManager
 
+import ctypes
+import os
 import struct as _struct
 
 from tew.hardware.cpu_zig import EAX, ECX, ESP
@@ -116,10 +119,34 @@ from tew.logger import logger
 from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
 from tew.api.d3d8._helpers import _alloc_resource_obj, _alloc_surface_obj, _alloc_texture_obj, _com_stub, _set_eax, vk_pump
 from tew.api.d3d8._caps import _fill_d3d_caps8
+from tew.api.win32_handlers import log_register_dump
+from tew.api.d3d8.idirect3d8resource import _ref_counts, _dec_ref_and_maybe_free
+from tew.api.d3d8.idirect3d8texture import _get_surface_ptr
+from tew.api.d3d8._helpers import _alloc_registry
 import tew.api.d3d8._state as _state
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
+    """Decode a D3DCOLOR DWORD (0xAARRGGBB) into (r, g, b, a) floats in
+    [0, 1], in the order a plain vec4 vertex attribute needs.
+
+    FIXED: previously the caller packed these as (b, g, r, a) to mirror
+    D3DCOLOR's byte layout, but the vertex attribute is a plain vec4 -- the
+    GPU just fills .xyzw in memory order, and the fragment shader
+    multiplies it straight into the output with no "this is BGRA"
+    reinterpretation. That silently swapped red and blue for any non-gray
+    vertex color (white/gray is swap-invariant, which is why it went
+    unnoticed). Returning (r, g, b, a) here means plain vec4 .xyzw order
+    already means the right thing.
+    """
+    r = ((dif >> 16) & 0xFF) / 255.0
+    g = ((dif >>  8) & 0xFF) / 255.0
+    b = ((dif >>  0) & 0xFF) / 255.0
+    a = ((dif >> 24) & 0xFF) / 255.0
+    return r, g, b, a
+
+
+def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
     """Return the 97 trampoline addresses for the IDirect3DDevice8 vtable."""
 
     def _ok(name: str, arg_bytes: int) -> int:
@@ -137,6 +164,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     def _halt(name: str, arg_bytes: int) -> int:
         def _handler(cpu: "CPU", mem: "Memory") -> None:
             logger.error("d3d8", f"UNIMPLEMENTED: {name} — halting")
+            log_register_dump(cpu, "d3d8")
             cpu.halted = True
             cpu.fatal_halt = True
         return _com_stub(stubs, "d3d8dev", name, _handler, arg_bytes, memory, D3DDEV_OBJ)
@@ -174,17 +202,222 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(p + 12, 0x40)    # BehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING
         cpu.regs[EAX] = S_OK
 
+    # [10] SetCursorProperties(XHotSpot, YHotSpot, IDirect3DSurface8*)
+    #
+    # FIXED (2026-09-05): was a lying no-op (`_ok`) that returned S_OK without
+    # ever telling anything to display a cursor image. Real D3D8 requires the
+    # surface to be D3DFMT_A8R8G8B8 (32-bit ARGB) -- same byte layout Clear()
+    # already assumes for D3DCOLOR (byte 0=B, 1=G, 2=R, 3=A, i.e. a little-
+    # endian 0xAARRGGBB u32) -- so no format-conversion is needed, just a
+    # direct read of the surface's pixel bytes into an SDL cursor.
+    def _set_cursor_properties(cpu: "CPU", mem: "Memory") -> None:
+        x_hot = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        y_hot = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        surf  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        if not surf:
+            logger.warn("d3d8", "SetCursorProperties: NULL surface")
+            cpu.regs[EAX] = S_OK
+            return
+
+        data_ptr = mem.read32((surf + 4)  & 0xFFFFFFFF)
+        width    = mem.read32((surf + 12) & 0xFFFFFFFF)
+        height   = mem.read32((surf + 16) & 0xFFFFFFFF)
+        if width == 0 or height == 0 or data_ptr == 0:
+            logger.warn("d3d8",
+                f"SetCursorProperties: degenerate surface {width}x{height} data_ptr=0x{data_ptr:x}")
+            cpu.regs[EAX] = S_OK
+            return
+
+        try:
+            from sdl2 import (
+                SDL_CreateRGBSurfaceFrom, SDL_FreeSurface,
+                SDL_CreateColorCursor, SDL_SetCursor, SDL_FreeCursor,
+            )
+            pitch = width * 4
+            # FIXED (2026-09-14): was width*height*4 individual read8()
+            # ctypes calls (over a million for a 512x512 texture) -- same
+            # disease as the HeapAlloc zero-fill fix, confirmed by profiling.
+            # read_bytes() reads the shared backing buffer directly in one call.
+            raw = mem.read_bytes(data_ptr & 0xFFFFFFFF, width * height * 4)
+            pixel_buf = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+            sdl_surface = SDL_CreateRGBSurfaceFrom(
+                ctypes.cast(pixel_buf, ctypes.c_void_p),
+                width, height, 32, pitch,
+                0x00FF0000,  # Rmask
+                0x0000FF00,  # Gmask
+                0x000000FF,  # Bmask
+                0xFF000000,  # Amask
+            )
+            if not sdl_surface:
+                logger.warn("d3d8", "SetCursorProperties: SDL_CreateRGBSurfaceFrom failed")
+                cpu.regs[EAX] = S_OK
+                return
+            cursor = SDL_CreateColorCursor(sdl_surface, x_hot, y_hot)
+            SDL_FreeSurface(sdl_surface)
+            if not cursor:
+                logger.warn("d3d8", "SetCursorProperties: SDL_CreateColorCursor failed")
+                cpu.regs[EAX] = S_OK
+                return
+            if _state._cursor_sdl_handle is not None:
+                SDL_FreeCursor(_state._cursor_sdl_handle)
+            _state._cursor_sdl_handle = cursor
+            SDL_SetCursor(cursor)
+            logger.info("d3d8",
+                f"SetCursorProperties: OK {width}x{height} hotspot=({x_hot},{y_hot})")
+        except Exception as exc:
+            logger.warn("d3d8", f"SetCursorProperties failed: {type(exc).__name__}: {exc}")
+        cpu.regs[EAX] = S_OK
+
+    # [12] ShowCursor(BOOL bShow) -> BOOL (previous visibility)
+    #
+    # FIXED (2026-09-05): was a lying no-op (`_uint`) that always returned 0
+    # without ever calling SDL_ShowCursor -- so even a correctly-set custom
+    # cursor image (once SetCursorProperties above is fixed) would never
+    # actually be shown.
+    def _show_cursor(cpu: "CPU", mem: "Memory") -> None:
+        from sdl2 import SDL_ShowCursor, SDL_ENABLE, SDL_DISABLE
+        b_show = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        previous = _state._cursor_shown
+        SDL_ShowCursor(SDL_ENABLE if b_show else SDL_DISABLE)
+        _state._cursor_shown = bool(b_show)
+        cpu.regs[EAX] = 1 if previous else 0
+
     # [14] Reset(D3DPRESENT_PARAMETERS*)
+    #
+    # FIXED (2026-09-13): was a lying no-op that never read pPresentationParameters,
+    # never resized the real window, and never recreated the swapchain -- so a
+    # mode change after CreateDevice (the game's setvideomode takes this path
+    # whenever DAT_6001c080 is 0, see this file's module docstring) left the
+    # window and swapchain frozen at whatever CreateDevice originally set,
+    # while the game rendered its next screen assuming the new BackBufferWidth/
+    # Height. Confirmed live: the persona-select dialog rendered larger than
+    # the still-640x480-native window, clipping "PLEASE SELECT FROM THE LIST
+    # BELOW" and the persona list past the window's right/bottom edge.
+    #
+    # The render pass, graphics pipeline, descriptor set/layout/pool, sampler,
+    # default texture and vertex buffer are all size- and format-independent
+    # (viewport/scissor are VK_DYNAMIC_STATE, not baked into the pipeline --
+    # see _pipeline.py's create_pipeline) so only the swapchain and its
+    # per-image views/framebuffers need destroying and recreating here,
+    # mirroring IDirect3D8::CreateDevice's own swapchain-creation block
+    # (idirect3d8.py) at the new size.
     def _reset(cpu: "CPU", mem: "Memory") -> None:
-        logger.info("d3d8", "IDirect3DDevice8::Reset")
+        import vulkan as vk
+        from tew.api.d3d8._pipeline import create_image_views, create_framebuffers
+
+        pp_params = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        back_w = mem.read32(pp_params & 0xFFFFFFFF)       if pp_params else 0
+        back_h = mem.read32((pp_params + 4) & 0xFFFFFFFF) if pp_params else 0
+        logger.info("d3d8", f"IDirect3DDevice8::Reset back={back_w}x{back_h}")
+
+        entry = window_manager.get_window(_state._vk_hwnd)
+        if entry is None or entry.sdl_window is None:
+            logger.error("d3d8",
+                f"Reset: no SDL window found for stored hwnd=0x{_state._vk_hwnd:x} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        sdl_window = entry.sdl_window
+
+        try:
+            vk.vkDeviceWaitIdle(_state._vk_device)
+
+            for fb in _state._vk_framebuffers:
+                vk.vkDestroyFramebuffer(_state._vk_device, fb, None)
+            for view in _state._vk_image_views:
+                vk.vkDestroyImageView(_state._vk_device, view, None)
+            if _state._vk_swapchain is not None:
+                _state._vk_fn_destroy_swapchain(_state._vk_device, _state._vk_swapchain, None)
+
+            # Same WINDOW_SCALE upscale as CreateDevice (idirect3d8.py) --
+            # the game's own coordinate math only ever sees the unscaled
+            # logical size via _vk_logical_width/height.
+            WINDOW_SCALE = int(os.environ.get("TEW_WINDOW_SCALE", "2"))
+            _state._vk_logical_width  = back_w
+            _state._vk_logical_height = back_h
+            phys_w = back_w * WINDOW_SCALE
+            phys_h = back_h * WINDOW_SCALE
+            if back_w > 0 and back_h > 0:
+                from sdl2 import SDL_SetWindowSize
+                SDL_SetWindowSize(sdl_window, phys_w, phys_h)
+
+            phys_dev = _state._vk_physical_devices[0]
+            caps = vk_pump(lambda: _state._vk_fn_get_surface_caps(
+                phys_dev, _state._vk_surface))
+            w = caps.currentExtent.width
+            h = caps.currentExtent.height
+            if w == 0xFFFFFFFF:
+                w = phys_w if phys_w > 0 else 800
+                h = phys_h if phys_h > 0 else 600
+
+            # Real mouse events report coordinates against the window's
+            # actual (possibly compositor-clamped, see `w`/`h` above) size,
+            # not the raw resize request -- record what the surface really
+            # ended up at, or _to_logical_xy's scale would be wrong on a
+            # clamped display.
+            if back_w > 0 and back_h > 0:
+                entry.logical_w, entry.logical_h = back_w, back_h
+                entry.phys_w, entry.phys_h = w, h
+
+            swapchain_ci = vk.VkSwapchainCreateInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+                surface=_state._vk_surface,
+                minImageCount=2,
+                imageFormat=_state._vk_swapchain_format,
+                imageColorSpace=0,  # VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+                imageExtent=vk.VkExtent2D(width=w, height=h),
+                imageArrayLayers=1,
+                imageUsage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+                queueFamilyIndexCount=0,
+                pQueueFamilyIndices=None,
+                preTransform=0x00000001,  # VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                presentMode=vk.VK_PRESENT_MODE_FIFO_KHR,
+                clipped=vk.VK_TRUE,
+                oldSwapchain=None,
+            )
+            _state._vk_swapchain = _state._vk_fn_create_swapchain(
+                _state._vk_device, swapchain_ci, None)
+            raw_imgs = _state._vk_fn_get_swapchain_images(
+                _state._vk_device, _state._vk_swapchain)
+            _state._vk_swapchain_images = list(raw_imgs)
+            _state._vk_swapchain_width  = w
+            _state._vk_swapchain_height = h
+
+            _state._vk_image_views = create_image_views(
+                _state._vk_device, _state._vk_swapchain_images, _state._vk_swapchain_format)
+            _state._vk_framebuffers = create_framebuffers(
+                _state._vk_device, _state._vk_render_pass, _state._vk_image_views, w, h)
+        except Exception as exc:
+            logger.error("d3d8", f"Reset: swapchain recreation failed: {exc!r} — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+
+        # Frame-sync bookkeeping and cached surface objects all referred to
+        # the now-destroyed swapchain/images -- real D3D8 requires the app to
+        # release its D3DPOOL_DEFAULT resources (including render targets)
+        # across Reset, so invalidating the cache is the correct behavior,
+        # not just a safety net.
+        _state._vk_current_image_idx = 0
+        _state._vk_frame_submitted = False
+        _state._vk_image_acquired = False
+        _state._vk_swapchain_images_used = set()
+        _state._vk_backbuffer_surface_obj = None
+        _state._vk_depth_stencil_surface_obj = None
+
+        logger.info("d3d8", f"Reset: swapchain recreated {w}x{h}")
         cpu.regs[EAX] = S_OK
 
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)
     def _get_back_buffer(cpu: "CPU", mem: "Memory") -> None:
         pp_surface = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        # Use swapchain dimensions if known, else fall back to 800×600
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        # Report the game's own logical resolution, not the (possibly
+        # WINDOW_SCALE-enlarged) physical swapchain -- see _state._vk_logical_width.
+        w = _state._vk_logical_width  or 800
+        h = _state._vk_logical_height or 600
         surf = _alloc_surface_obj(w, h, 0x16, mem)  # D3DFMT_X8R8G8B8 = 0x16
         if pp_surface:
             mem.write32(pp_surface, surf)
@@ -271,20 +504,40 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
     # [32] GetRenderTarget(IDirect3DSurface8**)
     def _get_render_target(cpu: "CPU", mem: "Memory") -> None:
+        # FIXED: previously allocated a brand-new surface object on every
+        # call. Real D3D8 AddRef's and returns the SAME underlying surface
+        # every time -- the caller's matching Release() only drops their own
+        # reference, since the device keeps its own internal one. Handing
+        # out a fresh, independently-ref-counted object each call meant the
+        # game's single, correct Release() immediately freed tew's only
+        # copy of it, then handed the same heap address to an unrelated
+        # later allocation -- confirmed live via a corrupted format field on
+        # a still-in-use 1536x1248 surface. Now: create once, AddRef after.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        if _state._vk_backbuffer_surface_obj is None:
+            w = _state._vk_logical_width  or 800
+            h = _state._vk_logical_height or 600
+            _state._vk_backbuffer_surface_obj = _alloc_surface_obj(w, h, 0x16, mem)
+        else:
+            obj = _state._vk_backbuffer_surface_obj
+            _ref_counts[obj] = _ref_counts.get(obj, 1) + 1
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w, h, 0x16, mem))
+            mem.write32(pp_surf, _state._vk_backbuffer_surface_obj)
         cpu.regs[EAX] = S_OK
 
     # [33] GetDepthStencilSurface(IDirect3DSurface8**)
     def _get_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+        # Same fix as _get_render_target -- see its comment.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        w = _state._vk_swapchain_width  or 800
-        h = _state._vk_swapchain_height or 600
+        if _state._vk_depth_stencil_surface_obj is None:
+            w = _state._vk_logical_width  or 800
+            h = _state._vk_logical_height or 600
+            _state._vk_depth_stencil_surface_obj = _alloc_surface_obj(w, h, 0x4F, mem)  # D3DFMT_D24S8 = 0x4F
+        else:
+            obj = _state._vk_depth_stencil_surface_obj
+            _ref_counts[obj] = _ref_counts.get(obj, 1) + 1
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w, h, 0x4F, mem))  # D3DFMT_D24S8 = 0x4F
+            mem.write32(pp_surf, _state._vk_depth_stencil_surface_obj)
         cpu.regs[EAX] = S_OK
 
     def _rebuild_swapchain() -> None:
@@ -333,6 +586,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         _state._vk_swapchain_images = list(raw_imgs)
         _state._vk_swapchain_width  = w
         _state._vk_swapchain_height = h
+        _state._vk_swapchain_images_used.clear()
         logger.info("d3d8",
             f"_rebuild_swapchain: {w}x{h} images={len(_state._vk_swapchain_images)}")
 
@@ -340,6 +594,21 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # Waits for the previous frame fence, acquires the next swapchain image, and
     # opens the command buffer.  Transitions the image to TRANSFER_DST_OPTIMAL so
     # Clear can vkCmdClearColorImage without an additional barrier.
+    #
+    # FIXED (2026-09-05): the real game calls BeginScene/EndScene multiple times
+    # per logical frame (confirmed live: ~18 BeginScene calls per real Present,
+    # e.g. once per widget draw batch), not once. This function used to
+    # unconditionally vkResetCommandBuffer + reacquire + re-transition on EVERY
+    # call, which discarded every prior BeginScene/EndScene bracket's recorded
+    # (but not yet submitted -- vkQueueSubmit only happens in Present) draw
+    # commands each time a new one started. Only ~1 in 18 scenes' content ever
+    # reached the screen; the rest were silently wiped, producing a black
+    # screen despite the game correctly loading and drawing its entire GUI.
+    # Fix: only do the acquire/reset/transition/begin-render-pass sequence when
+    # genuinely starting a new frame (no image currently acquired). If already
+    # mid-frame (continuing to accumulate draws before the eventual Present),
+    # this is a no-op -- the command buffer and render pass are already open
+    # and recording from the earlier BeginScene call in this same frame.
     def _begin_scene(cpu: "CPU", mem: "Memory") -> None:
         import vulkan as vk
 
@@ -349,7 +618,16 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             cpu.fatal_halt = True
             return
 
-        logger.info("d3d8", "BeginScene: ENTER")
+        _ret_eip = mem.read32(cpu.regs[ESP] & 0xFFFFFFFF)
+        logger.info("d3d8", f"BeginScene: ENTER called_from=0x{_ret_eip:08x}")
+
+        if _state._vk_image_acquired:
+            # Continuing the same unpresented frame -- command buffer and
+            # render pass are already open and recording. Do nothing.
+            logger.info("d3d8",
+                f"BeginScene: OK (continuing frame) image_idx={_state._vk_current_image_idx}")
+            cpu.regs[EAX] = S_OK
+            return
 
         def _wait_and_acquire():
             # vkWaitForFences can call wl_display_roundtrip on Mesa/Wayland WSI;
@@ -385,6 +663,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 else:
                     raise
             _state._vk_current_image_idx = int(idx)
+            _state._vk_vertex_cursor = 0
 
             vk.vkResetCommandBuffer(_state._vk_cmd_buf, 0)
             begin_info = vk.VkCommandBufferBeginInfo(
@@ -393,18 +672,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             )
             vk.vkBeginCommandBuffer(_state._vk_cmd_buf, begin_info)
 
-            # Transition swapchain image UNDEFINED → TRANSFER_DST_OPTIMAL
+            # Transition swapchain image to TRANSFER_DST_OPTIMAL. oldLayout is
+            # UNDEFINED only the first time this image index is ever used --
+            # a real "discard prior content" hint in Vulkan, wrong for every
+            # later re-acquire since D3D8's Clear() (not a frame boundary) is
+            # what's supposed to erase backbuffer content. See
+            # _state._vk_swapchain_images_used's docstring.
             image = _state._vk_swapchain_images[_state._vk_current_image_idx]
             subresource = vk.VkImageSubresourceRange(
                 aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
                 baseMipLevel=0, levelCount=1,
                 baseArrayLayer=0, layerCount=1,
             )
+            already_used = _state._vk_current_image_idx in _state._vk_swapchain_images_used
+            _state._vk_swapchain_images_used.add(_state._vk_current_image_idx)
             barrier = vk.VkImageMemoryBarrier(
                 sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 srcAccessMask=0,
                 dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
-                oldLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                oldLayout=(vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR if already_used
+                           else vk.VK_IMAGE_LAYOUT_UNDEFINED),
                 newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
                 dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
@@ -481,55 +768,65 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [35] EndScene()
-    # Ends the render pass and command buffer; the final image barrier (to
-    # PRESENT_SRC_KHR) is now handled by the render pass finalLayout.
+    #
+    # FIXED (2026-09-05): previously ended the render pass and command buffer
+    # here, every call. Since vkQueueSubmit only happens in Present, and the
+    # real game calls BeginScene/EndScene multiple times per logical frame
+    # (see _begin_scene's comment), ending the render pass here left the
+    # swapchain image in PRESENT_SRC_KHR (the render pass's own finalLayout)
+    # while the NEXT BeginScene's render pass still assumed the image was in
+    # COLOR_ATTACHMENT_OPTIMAL (its initialLayout) -- a real layout mismatch,
+    # on top of throwing away every earlier bracket's recorded draws. Real
+    # finalization (ending the render pass, ending the command buffer) now
+    # happens exactly once per frame, in Present, right before submission --
+    # see _finalize_frame_for_present. EndScene itself no longer needs to do
+    # anything beyond the existing device-initialized check.
     def _end_scene(cpu: "CPU", mem: "Memory") -> None:
-        import vulkan as vk
-
         if _state._vk_device is None:
             logger.error("d3d8", "EndScene: device not initialised — halting")
             cpu.halted = True
             cpu.fatal_halt = True
             return
 
-        try:
-            if _state._vk_in_render_pass:
-                vk.vkCmdEndRenderPass(_state._vk_cmd_buf)
-                _state._vk_in_render_pass = False
-            else:
-                # Fallback: manual barrier if render pass not yet ready
-                image = _state._vk_swapchain_images[_state._vk_current_image_idx]
-                subresource = vk.VkImageSubresourceRange(
-                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                    baseMipLevel=0, levelCount=1,
-                    baseArrayLayer=0, layerCount=1,
-                )
-                barrier = vk.VkImageMemoryBarrier(
-                    sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
-                    dstAccessMask=0,
-                    oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
-                    dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
-                    image=image,
-                    subresourceRange=subresource,
-                )
-                vk.vkCmdPipelineBarrier(
-                    _state._vk_cmd_buf,
-                    vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                    0, 0, None, 0, None, 1, [barrier],
-                )
-            vk.vkEndCommandBuffer(_state._vk_cmd_buf)
-        except Exception as exc:
-            logger.error("d3d8", f"EndScene failed: {exc} — halting")
-            cpu.halted = True
-            cpu.fatal_halt = True
-            return
-
         logger.info("d3d8", "EndScene: OK")
         cpu.regs[EAX] = S_OK
+
+    def _finalize_frame_for_present(cpu: "CPU", mem: "Memory") -> None:
+        """Ends the render pass (or applies the manual fallback barrier) and
+        the command buffer -- run once per frame, from Present, right before
+        vkQueueSubmit. See _begin_scene/_end_scene comments for why this
+        moved out of EndScene."""
+        import vulkan as vk
+
+        if _state._vk_in_render_pass:
+            vk.vkCmdEndRenderPass(_state._vk_cmd_buf)
+            _state._vk_in_render_pass = False
+        else:
+            # Fallback: manual barrier if render pass not yet ready
+            image = _state._vk_swapchain_images[_state._vk_current_image_idx]
+            subresource = vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0, levelCount=1,
+                baseArrayLayer=0, layerCount=1,
+            )
+            barrier = vk.VkImageMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask=0,
+                oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                newLayout=vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                image=image,
+                subresourceRange=subresource,
+            )
+            vk.vkCmdPipelineBarrier(
+                _state._vk_cmd_buf,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, None, 0, None, 1, [barrier],
+            )
+        vk.vkEndCommandBuffer(_state._vk_cmd_buf)
 
     # [36] Clear(Count, pRects, Flags, Color, Z, Stencil)
     # Stack (this at ESP+4):
@@ -600,11 +897,15 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             return
 
         logger.debug("d3d8",
-            f"Clear: ARGB=0x{argb:08x} rgba=({r:.2f},{g:.2f},{b:.2f},{a:.2f})")
+            f"Clear: ARGB=0x{argb:08x} rgba=({r:.2f},{g:.2f},{b:.2f},{a:.2f}) image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
     # [15] Present(pSrc, pDest, hWnd, pRegion)
     # Submits the command buffer and presents the current swapchain image.
+    # Finalizes the frame (ends render pass + command buffer -- see
+    # _finalize_frame_for_present) before submitting, since EndScene no
+    # longer does that itself (a logical frame may span multiple
+    # BeginScene/EndScene brackets before the real Present call).
     def _present(cpu: "CPU", mem: "Memory") -> None:
         import vulkan as vk
 
@@ -616,6 +917,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
 
         logger.info("d3d8", "Present: ENTER")
         try:
+            _finalize_frame_for_present(cpu, mem)
             submit_info = vk.VkSubmitInfo(
                 sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 waitSemaphoreCount=1,
@@ -681,18 +983,50 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             mem.write32(p_token, 0xD3D50002)
         cpu.regs[EAX] = S_OK
 
-    # [60] GetTexture(Stage, IDirect3DBaseTexture8**)
+    # [60] GetTexture(Stage, IDirect3DBaseTexture8** ppTexture)
     def _get_texture(cpu: "CPU", mem: "Memory") -> None:
+        stage  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         pp_tex = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        tex = _state._bound_textures.get(stage, 0)
+        if tex:
+            _ref_counts[tex] = _ref_counts.get(tex, 1) + 1
         if pp_tex:
-            mem.write32(pp_tex, 0)
+            mem.write32(pp_tex, tex)
+        cpu.regs[EAX] = S_OK
+
+    # [61] SetTexture(Stage, IDirect3DBaseTexture8* pTexture)
+    def _set_texture(cpu: "CPU", mem: "Memory") -> None:
+        stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        tex   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        prev = _state._bound_textures.get(stage, 0)
+        if prev and prev != tex:
+            _dec_ref_and_maybe_free(prev)
+        if tex:
+            _ref_counts[tex] = _ref_counts.get(tex, 1) + 1
+        _state._bound_textures[stage] = tex
+        # No GPU-side work here: which descriptor set to bind for stage 0 is
+        # resolved per-draw in DrawPrimitive, at command-buffer record time.
+        # A single shared descriptor set mutated here would be rewritten by
+        # every later SetTexture() in the same not-yet-submitted frame,
+        # so every draw would end up sampling whichever texture was bound
+        # last -- see _pipeline.py's docstring on _MAX_TEXTURE_DESCRIPTOR_SETS.
         cpu.regs[EAX] = S_OK
 
     # [62] GetTextureStageState(Stage, Type, DWORD* pValue)
     def _get_texture_stage_state(cpu: "CPU", mem: "Memory") -> None:
+        stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        typ   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         p_val = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         if p_val:
-            mem.write32(p_val, 0)
+            mem.write32(p_val, _state._texture_stage_state.get((stage, typ), 0))
+        cpu.regs[EAX] = S_OK
+
+    # [63] SetTextureStageState(Stage, Type, DWORD Value)
+    def _set_texture_stage_state(cpu: "CPU", mem: "Memory") -> None:
+        stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
+        typ   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        value = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
+        _state._texture_stage_state[(stage, typ)] = value
         cpu.regs[EAX] = S_OK
 
     # [64] ValidateDevice(DWORD* pNumPasses)
@@ -755,9 +1089,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 _get_display_mode, 4, memory, D3DDEV_OBJ)
     dev[9]  = _com_stub(stubs, "d3d8dev", "Dev::GetCreationParameters",
                 _get_creation_params, 4, memory, D3DDEV_OBJ)
-    dev[10] = _ok  ("Dev::SetCursorProperties",       12)
+    dev[10] = _com_stub(stubs, "d3d8dev", "Dev::SetCursorProperties",
+                _set_cursor_properties, 12, memory, D3DDEV_OBJ)
     dev[11] = _void("Dev::SetCursorPosition",         12)
-    dev[12] = _uint("Dev::ShowCursor",                 4, 0)
+    dev[12] = _com_stub(stubs, "d3d8dev", "Dev::ShowCursor",
+                _show_cursor, 4, memory, D3DDEV_OBJ)
     dev[13] = _ok  ("Dev::CreateAdditionalSwapChain",  8)
     dev[14] = _com_stub(stubs, "d3d8dev", "Dev::Reset",   _reset,   4, memory, D3DDEV_OBJ)
     dev[15] = _com_stub(stubs, "d3d8dev", "Dev::Present",
@@ -826,10 +1162,12 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev[59] = _ok  ("Dev::GetClipStatus", 4)
     dev[60] = _com_stub(stubs, "d3d8dev", "Dev::GetTexture",
                 _get_texture, 8, memory, D3DDEV_OBJ)
-    dev[61] = _ok  ("Dev::SetTexture", 8)
+    dev[61] = _com_stub(stubs, "d3d8dev", "Dev::SetTexture",
+                _set_texture, 8, memory, D3DDEV_OBJ)
     dev[62] = _com_stub(stubs, "d3d8dev", "Dev::GetTextureStageState",
                 _get_texture_stage_state, 12, memory, D3DDEV_OBJ)
-    dev[63] = _ok  ("Dev::SetTextureStageState", 12)
+    dev[63] = _com_stub(stubs, "d3d8dev", "Dev::SetTextureStageState",
+                _set_texture_stage_state, 12, memory, D3DDEV_OBJ)
     dev[64] = _com_stub(stubs, "d3d8dev", "Dev::ValidateDevice",
                 _validate_device, 4, memory, D3DDEV_OBJ)
     dev[65] = _ok  ("Dev::GetInfo",                   12)
@@ -837,6 +1175,30 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     dev[67] = _ok  ("Dev::GetPaletteEntries",          8)
     dev[68] = _ok  ("Dev::SetCurrentTexturePalette",   4)
     dev[69] = _ok  ("Dev::GetCurrentTexturePalette",   4)
+    def _fvf_layout(fvf: int) -> tuple[int | None, int]:
+        """Return (diffuse_byte_offset_or_None, uv_byte_offset_or_None) for the
+        given D3DFVF flags, assuming pre-transformed D3DFVF_XYZRHW position
+        (16 bytes: X,Y,Z,RHW) -- the only position format DrawPrimitive has
+        ever actually seen from the real game so far (UI/font quads use
+        screen-space pre-transformed vertices, not object-space + a matrix
+        pipeline tew doesn't implement). Normal/XYZ-only vertices would need a
+        different base offset; not yet observed in practice, so not handled.
+        """
+        D3DFVF_DIFFUSE  = 0x040
+        D3DFVF_SPECULAR = 0x080
+        D3DFVF_TEXCOUNT_MASK = 0xF00
+        offset = 16
+        diffuse_off = None
+        uv_off = None
+        if fvf & D3DFVF_DIFFUSE:
+            diffuse_off = offset
+            offset += 4
+        if fvf & D3DFVF_SPECULAR:
+            offset += 4
+        if (fvf & D3DFVF_TEXCOUNT_MASK) != 0:
+            uv_off = offset
+        return diffuse_off, uv_off
+
     # [70] DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount)
     def _draw_primitive(cpu: "CPU", mem: "Memory") -> None:
         prim_type  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -866,29 +1228,65 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         stride  = _state._draw_stream_stride
         n_verts = prim_count * 3
         src_off = _state._draw_stream_ptr + start_vert * stride
-        vp_w    = float(_state._vk_swapchain_width  or 1)
-        vp_h    = float(_state._vk_swapchain_height or 1)
+        # Normalize against the game's own logical resolution, not the
+        # (possibly WINDOW_SCALE-enlarged) physical swapchain -- the game
+        # computed these screen-space coordinates assuming its requested
+        # D3DPRESENT_PARAMETERS resolution. The Vulkan viewport (set from
+        # the physical swapchain size below) stretches the resulting NDC
+        # space to fill the larger real framebuffer.
+        vp_w    = float(_state._vk_logical_width  or 1)
+        vp_h    = float(_state._vk_logical_height or 1)
 
-        out_verts = bytearray(n_verts * 32)
+        diffuse_off, uv_off = _fvf_layout(_state._draw_vertex_fvf)
+
+        out_verts = bytearray(n_verts * 40)
         flat = mem._buffer   # raw bytearray for fast access
         for i in range(n_verts):
             base = src_off + i * stride
             x,   = _struct.unpack_from('<f', flat, base)
             y,   = _struct.unpack_from('<f', flat, base + 4)
             z,   = _struct.unpack_from('<f', flat, base + 8)
-            dif, = _struct.unpack_from('<I', flat, base + 16)
+            if diffuse_off is not None:
+                dif, = _struct.unpack_from('<I', flat, base + diffuse_off)
+            else:
+                dif = 0xFFFFFFFF
+            if uv_off is not None:
+                u, v = _struct.unpack_from('<ff', flat, base + uv_off)
+            else:
+                u, v = 0.0, 0.0
             xn = (x / vp_w) * 2.0 - 1.0
-            yn = 1.0 - (y / vp_h) * 2.0
-            b = ((dif >>  0) & 0xFF) / 255.0
-            g = ((dif >>  8) & 0xFF) / 255.0
-            r = ((dif >> 16) & 0xFF) / 255.0
-            a = ((dif >> 24) & 0xFF) / 255.0
-            _struct.pack_into('<ffffffff', out_verts, i * 32,
-                              xn, yn, z, 1.0, b, g, r, a)
+            # Vulkan NDC's Y axis points DOWN by default (opposite of OpenGL),
+            # same direction as D3D8 screen-space Y -- no flip needed here,
+            # just rescale to [-1,1]. A GL-style "1 - y/h*2" flip (which
+            # tew used before) renders everything upside down: a quad meant
+            # for the top of the screen lands at the bottom instead.
+            # Confirmed live via direct GPU pixel + vertex-buffer readback --
+            # correct vertex data, correct color, correct UV, rendering at
+            # the wrong screen location entirely.
+            yn = (y / vp_h) * 2.0 - 1.0
+            r, g, b, a = _d3dcolor_to_rgba(dif)
+            _struct.pack_into('<ffffffffff', out_verts, i * 40,
+                              xn, yn, z, 1.0, r, g, b, a, u, v)
 
         size = len(out_verts)
-        import cffi as _cffi
-        _cffi.FFI().memmove(_state._vk_vertex_mapped_ptr, bytes(out_verts), size)
+
+        # Each draw gets its own region of the shared vertex buffer instead
+        # of all overwriting offset 0 -- see _state._vk_vertex_cursor's
+        # docstring: vkCmdBindVertexBuffers/vkCmdDraw read buffer contents at
+        # GPU execution time (Present), not at record time, so every draw
+        # accumulated into one frame's command buffer needs its data to
+        # still be there, undisturbed by later draws in the same frame.
+        offset = _state._vk_vertex_cursor
+        if offset + size > _state._vk_vertex_buffer_size:
+            logger.error("d3d8",
+                f"DrawPrimitive: vertex buffer exhausted (offset={offset} + "
+                f"size={size} > {_state._vk_vertex_buffer_size}) — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        _state._vk_vertex_cursor = offset + size
+
+        _state._vk_vertex_mapped_ptr[offset:offset + size] = bytes(out_verts)
 
         cmd = _state._vk_cmd_buf
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -902,10 +1300,27 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                                        _state._vk_swapchain_height))
         vk.vkCmdSetViewport(cmd, 0, 1, [vp])
         vk.vkCmdSetScissor(cmd, 0, 1, [sc])
-        vk.vkCmdBindVertexBuffers(cmd, 0, 1, [_state._vk_vertex_buffer], [0])
+        vk.vkCmdBindVertexBuffers(cmd, 0, 1, [_state._vk_vertex_buffer], [offset])
+
+        # Resolve stage-0's descriptor set now, at record time, not by
+        # mutating a shared set -- see idirect3d8surface.py's UnlockRect
+        # (which owns creating/updating each texture's own descriptor set)
+        # and _pipeline.py's docstring on why a single shared set can't work
+        # here (its contents aren't read until the command buffer actually
+        # executes, well after this whole frame has finished recording).
+        desc_set = _state._vk_descriptor_set  # default: opaque white
+        tex = _state._bound_textures.get(0, 0)
+        if tex:
+            surf = _get_surface_ptr(tex, 0, mem)
+            entry = _alloc_registry.get(surf) if surf else None
+            if entry is not None and entry.get("vk_desc_set") is not None:
+                desc_set = entry["vk_desc_set"]
+        vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                   _state._vk_pipeline_layout, 0, 1,
+                                   [desc_set], 0, None)
         vk.vkCmdDraw(cmd, n_verts, 1, 0, 0)
         logger.debug("d3d8",
-            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count}")
+            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count} image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
     dev[70] = _com_stub(stubs, "d3d8dev", "Dev::DrawPrimitive",

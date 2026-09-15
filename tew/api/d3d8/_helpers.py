@@ -57,21 +57,137 @@ D3D8_HEAP_LIMIT: int = 0x10000000
 
 _next_heap_addr: int = D3D8_HEAP_BASE
 
+# ── Free-list, keyed by (kind, aligned_size) ────────────────────────────────
+# Reused blocks must match BOTH kind and size -- this allocator is shared
+# across D3D8 (resource/surface/texture objects and their data buffers) and
+# unrelated subsystems (dinput/dsound device objects, see dinput_handlers.py
+# / dsound_handlers.py) that never free their blocks. A bare size-keyed free
+# list let a freed D3D8 object block get handed back to satisfy an unrelated
+# allocation of the same rounded size -- confirmed live (2026-09-04) to cause
+# real type confusion (a reproducible fault at a bogus EIP). Tagging by kind
+# means a dinput/dsound allocation can never be satisfied from a D3D8 free
+# block (or vice versa) even when the sizes collide.
+_free_lists: dict[tuple[str, int], list[int]] = {}
 
-def _heap_alloc(size: int) -> int:
-    """Bump-allocate from the D3D8 private heap (16-byte aligned)."""
+# obj_addr -> allocation record, used by idirect3d8resource.py's Release()
+# to know what to give back when an object's refcount hits zero.
+_alloc_registry: dict[int, dict] = {}
+
+
+def _heap_alloc(size: int, kind: str = "misc") -> int:
+    """Allocate `size` bytes from the D3D8 private heap (16-byte aligned).
+
+    Reuses a freed block of the same `kind` and aligned size before bump-
+    allocating fresh memory. `kind` must be supplied consistently by both
+    the allocating and the freeing call site (see `_heap_free`).
+    """
     global _next_heap_addr
+    aligned_size = (size + 15) & ~15
+    free_list = _free_lists.get((kind, aligned_size))
+    if free_list:
+        return free_list.pop()
+
     addr = _next_heap_addr
     new_cursor = (_next_heap_addr + size + 15) & ~15
     if new_cursor > D3D8_HEAP_LIMIT:
         raise RuntimeError(
-            f"D3D8 private heap exhausted: alloc of {size} bytes at 0x{addr:x} "
+            f"D3D8 private heap exhausted: alloc of {size} bytes ({kind}) at 0x{addr:x} "
             f"would push the heap cursor to 0x{new_cursor:x}, past D3D8_HEAP_LIMIT "
             f"(0x{D3D8_HEAP_LIMIT:x}) -- this would silently alias the DLL range "
             f"instead of failing"
         )
     _next_heap_addr = new_cursor
     return addr
+
+
+def _heap_free(addr: int, size: int, kind: str = "misc") -> None:
+    """Return a block to the free-list for `kind` so a future same-kind,
+    same-size `_heap_alloc` can reuse it."""
+    aligned_size = (size + 15) & ~15
+    _free_lists.setdefault((kind, aligned_size), []).append(addr)
+
+
+# ── D3DFORMAT bytes-per-pixel + conversion to BGRA8 ─────────────────────────
+# The Vulkan image tew uploads textures into is always VK_FORMAT_B8G8R8A8_UNORM
+# (see _pipeline.upload_texture_image), but real D3D8 textures are frequently
+#16-bit or 8-bit formats -- confirmed live via fmt=0x17 (D3DFMT_R5G6B5) on an
+# actual UI icon texture. Surface::LockRect's reported Pitch (idirect3d8surface.py)
+# MUST match the real format's bytes-per-pixel, or the guest writes its pixel
+# data at the wrong stride and every row after the first is corrupted once we
+# reinterpret the buffer as BGRA8.
+_FORMAT_BYTES_PER_PIXEL: dict[int, int] = {
+    0x15: 4,  # D3DFMT_X8R8G8B8
+    0x16: 4,  # D3DFMT_A8R8G8B8
+    0x17: 2,  # D3DFMT_R5G6B5
+    0x18: 2,  # D3DFMT_X1R5G5B5
+    0x19: 2,  # D3DFMT_A1R5G5B5
+    0x1A: 2,  # D3DFMT_A4R4G4B4
+    0x1E: 1,  # D3DFMT_A8
+}
+
+
+def _format_bytes_per_pixel(fmt: int) -> int:
+    """Bytes per pixel for a D3DFORMAT; unrecognized formats default to 4
+    (the pre-existing behavior before per-format handling existed)."""
+    return _FORMAT_BYTES_PER_PIXEL.get(fmt, 4)
+
+
+def _convert_to_bgra8(fmt: int, width: int, height: int, raw: bytes) -> bytes:
+    """Convert raw pixel bytes in the given D3DFORMAT to tight BGRA8 bytes.
+
+    Formats without a specific converter below (including the already-BGRA8
+    D3DFMT_A8R8G8B8/X8R8G8B8) are passed through as-is -- correct for the
+    already-4-bytes-per-pixel formats, and the least-wrong fallback for any
+    other unrecognized format (matches the original always-BGRA8 assumption).
+    """
+    import struct as _struct
+
+    bpp = _format_bytes_per_pixel(fmt)
+    n = width * height
+    if bpp == 4:
+        return raw[:n * 4]
+
+    out = bytearray(n * 4)
+    if fmt == 0x17:  # D3DFMT_R5G6B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            r = ((px >> 11) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x3F) * 255 // 63
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, 255))
+    elif fmt == 0x18:  # D3DFMT_X1R5G5B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            r = ((px >> 10) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x1F) * 255 // 31
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, 255))
+    elif fmt == 0x19:  # D3DFMT_A1R5G5B5
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            a = 255 if (px & 0x8000) else 0
+            r = ((px >> 10) & 0x1F) * 255 // 31
+            g = ((px >> 5)  & 0x1F) * 255 // 31
+            b = ( px        & 0x1F) * 255 // 31
+            out[i*4:i*4+4] = bytes((b, g, r, a))
+    elif fmt == 0x1A:  # D3DFMT_A4R4G4B4
+        for i in range(n):
+            px, = _struct.unpack_from('<H', raw, i * 2)
+            a = ((px >> 12) & 0xF) * 255 // 15
+            r = ((px >> 8)  & 0xF) * 255 // 15
+            g = ((px >> 4)  & 0xF) * 255 // 15
+            b = ( px        & 0xF) * 255 // 15
+            out[i*4:i*4+4] = bytes((b, g, r, a))
+    elif fmt == 0x1E:  # D3DFMT_A8 (alpha-only, opaque white RGB)
+        for i in range(n):
+            a = raw[i]
+            out[i*4:i*4+4] = bytes((255, 255, 255, a))
+    else:
+        # Unrecognized non-4-byte format: no converter written yet. Return
+        # what we have rather than raising -- an honestly-wrong (garbled)
+        # texture beats halting the whole render pipeline over one format.
+        out[:min(len(raw), n * 4)] = raw[:n * 4]
+    return bytes(out)
 
 
 def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
@@ -104,7 +220,30 @@ def _com_stub(
                 cpu.halted = True
                 cpu.fatal_halt = True
                 return
+        # Every COM method call is visible at DEBUG level, no exceptions --
+        # added 2026-09-13 after burning real time on "does the game even
+        # call this at all" guesswork for DirectInput's mouse-click path.
+        # Most non-D3D8 COM interfaces here are one-line
+        # `lambda: _set_eax(cpu, SOME_CODE)` stubs with no logging of their
+        # own; a caller silently getting back a plausible-looking success
+        # code from one is indistinguishable, from the log, to it never
+        # being called at all. This makes the whole call surface
+        # observable in one place instead of instrumenting handlers
+        # one-by-one after the fact.
+        #
+        # Logged under "d3d8" for D3D8's own interfaces (dll_name starts
+        # with "d3d8": d3d8/d3d8dev/d3d8res/d3d8surf/d3d8tex) and
+        # "handlers" for everything else (DirectInput included) -- D3D8
+        # fires this hundreds of times per frame, so folding it into the
+        # same "handlers" category as everything else would make turning
+        # on non-D3D8 COM visibility (e.g. to see what the game actually
+        # calls on DirectInput) drag the whole per-frame D3D8 firehose
+        # back in too, which is most of what caused a run to get OOM-killed
+        # earlier this session.
+        _com_category = "d3d8" if dll_name.startswith("d3d8") else "handlers"
+        _logger.debug(_com_category, f"[COM] {dll_name}!{name} called")
         handler(cpu, memory)
+        _logger.debug(_com_category, f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
         _cleanup_com(cpu, memory, arg_bytes)
 
     stubs.register_handler(dll_name, name, _h)
@@ -116,11 +255,16 @@ def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
 
     Layout (12 bytes): [0] vtable ptr, [4] data ptr, [8] size.
     """
-    data_ptr = _heap_alloc(data_size or 4)
-    obj = _heap_alloc(12)
+    size = data_size or 4
+    data_ptr = _heap_alloc(size, "d3d8_res_data")
+    obj = _heap_alloc(12, "d3d8_res_obj")
     memory.write32(obj,     D3DRES_VTABLE)
     memory.write32(obj + 4, data_ptr)
     memory.write32(obj + 8, data_size)
+    _alloc_registry[obj] = {
+        "kind": "resource", "obj_size": 12,
+        "data_ptr": data_ptr, "data_size": size,
+    }
     return obj
 
 
@@ -130,14 +274,19 @@ def _alloc_surface_obj(w: int, h: int, fmt: int, memory: "Memory") -> int:
     Layout (24 bytes): [0] vtable ptr, [4] data ptr, [8] size,
                        [12] width, [16] height, [20] D3DFORMAT.
     """
-    data_ptr = _heap_alloc((w * h * 4) or 4)
-    obj = _heap_alloc(24)
+    size = (w * h * 4) or 4
+    data_ptr = _heap_alloc(size, "d3d8_surf_data")
+    obj = _heap_alloc(24, "d3d8_surf_obj")
     memory.write32(obj,      D3DSURF_VTABLE)
     memory.write32(obj + 4,  data_ptr)
     memory.write32(obj + 8,  w * h * 4)
     memory.write32(obj + 12, w)
     memory.write32(obj + 16, h)
     memory.write32(obj + 20, fmt)
+    _alloc_registry[obj] = {
+        "kind": "surface", "obj_size": 24,
+        "data_ptr": data_ptr, "data_size": size,
+    }
     return obj
 
 
@@ -152,13 +301,15 @@ def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") 
     """
     actual_levels = max(levels, 1)
     obj_size = 28 + actual_levels * 4
-    obj = _heap_alloc(obj_size)
+    obj = _heap_alloc(obj_size, "d3d8_tex_obj")
 
     # Allocate mip-level surface objects and store their addresses in the texture object.
+    mip_surfs = []
     for i in range(actual_levels):
         mip_w = max(w >> i, 1)
         mip_h = max(h >> i, 1)
         surf = _alloc_surface_obj(mip_w, mip_h, fmt, memory)
+        mip_surfs.append(surf)
         memory.write32(obj + 28 + i * 4, surf)
 
     # Populate header fields using mip-0 surface data.
@@ -173,6 +324,9 @@ def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") 
     memory.write32(obj + 16, h)
     memory.write32(obj + 20, fmt)
     memory.write32(obj + 24, actual_levels)
+    _alloc_registry[obj] = {
+        "kind": "texture", "obj_size": obj_size, "mips": mip_surfs,
+    }
     return obj
 
 

@@ -95,7 +95,23 @@ def _parse_categories(s: str | None) -> list[CategoryRule] | None:
 
 
 def _category_active(rules: list[CategoryRule], category: str, current_handler: str | None) -> bool:
-    active = False
+    # A category with no matching rule needs a default -- which one depends
+    # on whether this rule set is an ALLOWLIST (at least one whole-category
+    # "+category"/bare "category" rule exists, e.g. "handlers,cpu" or
+    # "+handlers,-handlers.CompareStringA" -- only listed categories show)
+    # or an EXCLUSION LIST (every top-level rule is a "-category", e.g. a
+    # lone "-registry" -- everything shows except what's listed). Per-
+    # function sub-rules (subname is not None) don't count as "whole-
+    # category" for this purpose -- a bare "-handlers.CompareStringA" with
+    # no "+handlers" doesn't turn handlers into an allowlist by itself.
+    # Confirmed bug (2026-09-04): before this fix, unmatched categories
+    # always defaulted to inactive, so a lone "-registry" silently
+    # suppressed every OTHER category too instead of just registry --
+    # only logger.always() calls survived, which is why hours of "the log
+    # is completely silent here" investigation turned out to be this, not
+    # genuine silence in the emulator.
+    is_allowlist = any(include and subname is None for include, _, subname in rules)
+    active = not is_allowlist
     for include, rule_category, rule_subname in rules:
         if rule_category != category:
             continue

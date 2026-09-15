@@ -55,7 +55,7 @@ def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRT
     memory.write32(D3D8_OBJ, D3D8_VTABLE)
 
     # ── IDirect3DDevice8 vtable + object ──────────────────────────────────────
-    dev_vtable = _make_dev_vtable(stubs, memory)
+    dev_vtable = _make_dev_vtable(stubs, memory, state.window_manager)
     for i, addr in enumerate(dev_vtable):
         memory.write32(D3DDEV_VTABLE + i * 4, addr or 0)
     memory.write32(D3DDEV_OBJ, D3DDEV_VTABLE)

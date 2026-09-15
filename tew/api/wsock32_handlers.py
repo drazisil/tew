@@ -437,7 +437,9 @@ def register_wsock32_handlers(
             cleanup_stdcall(cpu, memory, 16)
             return
 
-        data = bytes(memory.read8((lp_buf + i) & 0xFFFFFFFF) for i in range(length))
+        # FIXED (2026-09-14): was `length` individual read8() ctypes calls --
+        # same disease as the HeapAlloc zero-fill fix, confirmed by profiling.
+        data = memory.read_bytes(lp_buf & 0xFFFFFFFF, length)
         logger.debug("socket",
             f"send(0x{s:x} -> {entry.connected_to}, {length} bytes): {data[:64]!r}")
         try:
@@ -522,7 +524,9 @@ def register_wsock32_handlers(
                 cleanup_stdcall(cpu, memory, 24)
                 return
 
-        data = bytes(memory.read8((lp_buf + i) & 0xFFFFFFFF) for i in range(length))
+        # FIXED (2026-09-14): was `length` individual read8() ctypes calls --
+        # same disease as the HeapAlloc zero-fill fix, confirmed by profiling.
+        data = memory.read_bytes(lp_buf & 0xFFFFFFFF, length)
         logger.debug("socket", f"sendto(0x{s:x} -> {ip}:{port}, {length} bytes)")
         try:
             sent = entry.py_sock.sendto(data, (ip, port))

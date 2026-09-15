@@ -274,8 +274,12 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
     try:
         __crtheap = memory.read32(0x020EE08C)
         _heap_lock_cs = memory.read32(0x01280A3C + 9 * 4)
-        _heap_lock_owner = memory.read32((_heap_lock_cs + 0x0C) & 0xFFFFFFFF) if _heap_lock_cs else None
-        _heap_lock_count = memory.read32((_heap_lock_cs + 0x04) & 0xFFFFFFFF) if _heap_lock_cs else None
+        # 2026-09-14: critical-section state moved out of guest memory into
+        # state.critical_sections (see kernel32_sync.py) -- read that here
+        # instead of the now-stale raw struct fields.
+        _heap_lock_entry = state.critical_sections.get(_heap_lock_cs) if _heap_lock_cs else None
+        _heap_lock_owner = _heap_lock_entry.owner_tid if _heap_lock_entry else None
+        _heap_lock_count = _heap_lock_entry.lock_count if _heap_lock_entry else None
         _current_tid = state.tls_current_thread_id()
         logger.info("exception",
             f"[lock-diag] __crtheap=0x{__crtheap:08x} _HEAP_LOCK cs=0x{_heap_lock_cs:08x} "

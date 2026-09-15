@@ -29,20 +29,45 @@ from sdl2 import (
     SDL_QUIT,
     SDL_KEYDOWN, SDL_KEYUP,
     SDL_TEXTINPUT,
-    SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP,
+    SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP, SDL_MOUSEMOTION,
     SDL_WINDOWEVENT,
     SDL_WINDOWEVENT_CLOSE,
+    SDL_WINDOWEVENT_FOCUS_GAINED, SDL_WINDOWEVENT_FOCUS_LOST,
     SDL_GetWindowID,
     SDL_RaiseWindow,
     SDLK_BACKSPACE, SDLK_RETURN, SDLK_KP_ENTER, SDLK_TAB,
     SDLK_ESCAPE, SDLK_DELETE,
     SDL_BUTTON_LEFT,
+    SDL_BUTTON_LMASK, SDL_BUTTON_RMASK, SDL_BUTTON_MMASK,
+    SDL_GetMouseState,
 )
 
 from sdl2.hints import SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
 
 from tew.logger import logger
 from tew.api.pe_resources import DialogTemplate
+
+
+def _sdl_buttons_to_wparam(sdl_button_state: int) -> int:
+    """Real WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP always carry the live
+    MK_LBUTTON/MK_RBUTTON/MK_MBUTTON (etc.) modifier bits in wParam --
+    confirmed live via Ghidra that the guest's own legacy mouse-tracking
+    (seteacmouse, reached because this game's DirectInput mouse polling
+    never actually fires -- see status.md) reads button state exclusively
+    from these bits, not from DirectInput at all. This was hardcoded to 0
+    at every call site, so the guest's own click-tracking globals
+    (DAT_020e398c) were always being set to 0 regardless of the real
+    button state -- root cause of every persona-select click doing
+    nothing all session, confirmed via a live memory probe on the actual
+    GetDeviceState buffer and seteacmouse's own decompiled source."""
+    wparam = 0
+    if sdl_button_state & SDL_BUTTON_LMASK:
+        wparam |= 0x0001  # MK_LBUTTON
+    if sdl_button_state & SDL_BUTTON_RMASK:
+        wparam |= 0x0002  # MK_RBUTTON
+    if sdl_button_state & SDL_BUTTON_MMASK:
+        wparam |= 0x0010  # MK_MBUTTON
+    return wparam
 
 
 def _sdl_sym_to_vk(sym: int) -> int:
@@ -93,6 +118,9 @@ def _sdl_sym_to_vk(sym: int) -> int:
 
 WM_CREATE       = 0x0001
 WM_DESTROY      = 0x0002
+WM_ACTIVATE     = 0x0006
+WM_SETFOCUS     = 0x0007
+WM_KILLFOCUS    = 0x0008
 WM_PAINT        = 0x000F
 WM_SETTEXT      = 0x000C
 WM_GETTEXT      = 0x000D
@@ -173,6 +201,10 @@ class WindowEntry:
     sdl_window: Optional[object] = None        # SDL_Window* for top-level windows
     sdl_renderer: Optional[object] = None      # SDL_Renderer* for top-level windows
     bitmap_texture: Optional[object] = None    # SDL_Texture* for SS_BITMAP STATIC controls
+    logical_w: int = 0                         # window size (px) as CreateWindow/CreateWindowExA
+    logical_h: int = 0                         # requested it -- what the guest believes its window is
+    phys_w: int = 0                            # real SDL window size (px) right now; 0 = same as
+    phys_h: int = 0                            # logical_w/h (never rescaled by D3D8's WINDOW_SCALE)
 
 
 # ── Window manager ─────────────────────────────────────────────────────────────
@@ -338,11 +370,23 @@ class WindowManager:
         if is_top_level and is_visible:
             px_w = du_to_px_x(cx) if cx > 0 else 640
             px_h = du_to_px_y(cy) if cy > 0 else 480
+            entry.logical_w = px_w
+            entry.logical_h = px_h
             # Dialog windows (class #32770) use SDL renderer for drawing and hit-testing.
             # Non-dialog windows (the game's main rendering surface) need SDL_WINDOW_VULKAN
             # so that SDL_Vulkan_CreateSurface succeeds when D3D8 sets up its swapchain.
             is_dialog_class = (class_name == "#32770")
-            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN)
+            # RESIZABLE on the main window: IDirect3D8::CreateDevice
+            # (idirect3d8.py) later calls SDL_SetWindowSize to scale the
+            # real window/swapchain up (WINDOW_SCALE) from the game's
+            # requested D3DPRESENT_PARAMETERS size. Without this flag, a
+            # Wayland/xdg-shell toplevel is advertised as non-resizable at
+            # creation time, and KWin was observed clamping/rescaling the
+            # client's later size-change request back down to the window's
+            # original committed geometry instead of honoring it, even
+            # though SDL_GetWindowSize reported the resize as successful.
+            sdl_flags = SDL_WINDOW_SHOWN if is_dialog_class else (
+                SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE)
             sdl_win = SDL_CreateWindow(
                 title.encode("utf-8"),
                 x if x >= 0 else 100,
@@ -365,7 +409,9 @@ class WindowManager:
             win_id = SDL_GetWindowID(sdl_win)
             self._sdl_window_id_to_hwnd[win_id] = hwnd
             SDL_RaiseWindow(sdl_win)
-            logger.info("window", f"[WindowManager] Created SDL window '{title}' ({px_w}x{px_h}) hwnd=0x{hwnd:x}")
+            logger.info("window",
+                f"[WindowManager] Created SDL window '{title}' ({px_w}x{px_h}) "
+                f"hwnd=0x{hwnd:x} sdl_win_id={win_id}")
         else:
             logger.debug("window",
                 f"[WindowManager] CreateWindow '{title}' class='{class_name}' "
@@ -470,7 +516,7 @@ class WindowManager:
         SDL_RaiseWindow(sdl_win)
         logger.info("dialog",
             f"[WindowManager] Created dialog '{template.title}' "
-            f"hwnd=0x{hwnd:x} ({px_w}x{px_h})"
+            f"hwnd=0x{hwnd:x} ({px_w}x{px_h}) sdl_win_id={win_id}"
         )
 
         # Create child controls
@@ -649,13 +695,52 @@ class WindowManager:
     def pump_sdl_events(self) -> bool:
         """Poll SDL2 events, convert to Win32 messages, post to queue.
         Returns False if SDL_QUIT was received (caller should exit)."""
+        self._pump_call_count = getattr(self, "_pump_call_count", 0) + 1
+        # Throttled call-count log (every 50th call) -- separate question
+        # from "did SDL hand us an event": this answers "is anything even
+        # calling this function" at all during an idle screen. Only
+        # PeekMessageA/GetMessageA/the dialog render loop call this --
+        # if nothing does, SDL's own internal event queue can be full of
+        # real clicks tew never asks for.
+        if self._pump_call_count % 50 == 1:
+            logger.debug("window",
+                f"[WindowManager] pump_sdl_events call #{self._pump_call_count}")
         event = SDL_Event()
         while SDL_PollEvent(ctypes.byref(event)) != 0:
+            # Every event SDL actually hands us, logged unconditionally --
+            # added 2026-09-13 to settle "are we even getting clicks from
+            # SDL at all" independent of whether the game's own message
+            # loop calls PeekMessageA/GetMessageA (the only thing that
+            # invokes this function) often enough to notice them.
+            logger.debug("window", f"[WindowManager] SDL event type=0x{event.type:x}")
             if event.type == SDL_QUIT:
                 logger.info("window", "[WindowManager] SDL_QUIT received")
                 return False
             self._handle_sdl_event(event)
         return True
+
+    def _to_logical_xy(self, hwnd: int, x: int, y: int) -> tuple[int, int]:
+        """Translate a real SDL mouse coordinate (in the window's current,
+        possibly D3D8-WINDOW_SCALE-enlarged physical pixel size) back to the
+        logical pixel space the guest's window was actually created at --
+        matching real Windows, where WM_MOUSEMOVE/WM_LBUTTONDOWN and
+        DirectInput both report coordinates in the window's own client area,
+        never in some separate host display-scaling space the app never
+        asked for. Real Windows DPI-virtualizes exactly this way for a
+        non-DPI-aware app; tew's own WINDOW_SCALE upscale is the same kind
+        of host-side-only enlargement (see idirect3d8.py's CreateDevice
+        comment: the guest must never observe it anywhere, GetBackBuffer
+        size included) and mouse coordinates were the one place that
+        invariant wasn't applied yet. A window that's never been resized by
+        D3D8 (dialogs, or the main window before CreateDevice) has
+        phys_w/h == 0, so this is a no-op for it."""
+        entry = self._windows.get(hwnd)
+        if entry is None or not entry.phys_w or not entry.logical_w:
+            return x, y
+        return (
+            round(x * entry.logical_w / entry.phys_w),
+            round(y * entry.logical_h / entry.phys_h),
+        )
 
     def _handle_sdl_event(self, event: SDL_Event) -> None:
         """Convert a single SDL event to Win32 message(s) and post them."""
@@ -664,9 +749,65 @@ class WindowManager:
         if etype == SDL_WINDOWEVENT:
             we = event.window
             if we.event == SDL_WINDOWEVENT_CLOSE:
+                # FIXED (2026-09-14): silently dropped if windowID wasn't
+                # known -- no log at any level, unlike the mouse-button
+                # handlers' own "windowID not found" warnings. Found while
+                # testing a real window-close: the event vanished with zero
+                # trace anywhere in the log.
                 hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
                 if hwnd:
                     self._message_queue.append((hwnd, WM_CLOSE, 0, 0))
+                else:
+                    logger.warn("window",
+                        f"[WindowManager] WINDOWEVENT_CLOSE: windowID={we.windowID} not in "
+                        f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                        f"no WM_CLOSE posted")
+            elif we.event == SDL_WINDOWEVENT_FOCUS_GAINED:
+                hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
+                if hwnd:
+                    self._message_queue.append((hwnd, WM_ACTIVATE, 1, 0))
+                    self._message_queue.append((hwnd, WM_SETFOCUS, 0, 0))
+            elif we.event == SDL_WINDOWEVENT_FOCUS_LOST:
+                hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
+                if hwnd:
+                    self._message_queue.append((hwnd, WM_KILLFOCUS, 0, 0))
+                    self._message_queue.append((hwnd, WM_ACTIVATE, 0, 0))
+
+        elif etype == SDL_MOUSEMOTION:
+            motion = event.motion
+            hwnd = self._sdl_window_id_to_hwnd.get(motion.windowID, 0)
+            log_x, log_y = self._to_logical_xy(hwnd, motion.x, motion.y)
+            if hwnd:
+                wparam = _sdl_buttons_to_wparam(motion.state)
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
+                self._message_queue.append((hwnd, WM_MOUSEMOVE, wparam, lparam))
+            from tew.api.dinput_handlers import notify_mouse_motion
+            notify_mouse_motion(log_x, log_y)
+
+        elif etype == SDL_MOUSEBUTTONUP:
+            btn = event.button
+            if btn.button != SDL_BUTTON_LEFT:
+                # FIXED (2026-09-13): silently dropped, no log -- confirmed
+                # live this hid a real click that SDL_PollEvent picked up
+                # (logged as a bare "SDL event type=0x402") but that never
+                # produced any WM_LBUTTONUP or [dinput] reaction, with no
+                # trace of why in the log.
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONUP ignored: button={btn.button} (not SDL_BUTTON_LEFT)")
+                return
+            hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
+            if hwnd:
+                log_x, log_y = self._to_logical_xy(hwnd, btn.x, btn.y)
+                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
+                self._message_queue.append((hwnd, WM_LBUTTONUP, wparam, lparam))
+            else:
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONUP: windowID={btn.windowID} not in "
+                    f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                    f"no WM_LBUTTONUP posted, but DirectInput still notified below")
+            from tew.api.dinput_handlers import notify_mouse_button
+            notify_mouse_button(SDL_BUTTON_LEFT, False)
 
         elif etype == SDL_KEYDOWN:
             key = event.key
@@ -742,11 +883,39 @@ class WindowManager:
         elif etype == SDL_MOUSEBUTTONDOWN:
             btn = event.button
             if btn.button != SDL_BUTTON_LEFT:
+                # FIXED (2026-09-13): silently dropped, no log -- confirmed
+                # live this hid a real click that SDL_PollEvent picked up
+                # (logged as a bare "SDL event type=0x401") but that never
+                # produced any WM_LBUTTONDOWN or [dinput] reaction, with no
+                # trace of why in the log. See TODO.md's matching entry.
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONDOWN ignored: button={btn.button} (not SDL_BUTTON_LEFT)")
                 return
             win_hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
-            if win_hwnd == 0:
-                return
-            self._handle_mouse_click(win_hwnd, btn.x, btn.y)
+            # FIXED (2026-09-13): only SDL_MOUSEBUTTONUP/MOTION ever posted a
+            # real Win32 message to the window's own queue -- MOUSEBUTTONDOWN
+            # instead went straight into _handle_mouse_click's dialog-only
+            # child-control hit-test, which silently drops the event for any
+            # top-level window that isn't one of tew's own rendered dialogs
+            # (e.g. the main D3D8 game window). Real WM_LBUTTONDOWN is now
+            # posted unconditionally, same as WM_LBUTTONUP/WM_MOUSEMOVE
+            # already were -- confirmed live this was the actual reason a
+            # persona-select click never reached the game at all: none of
+            # WM_LBUTTONDOWN, DirectInput polling, or GetAsyncKeyState(
+            # VK_LBUTTON) were ever fed real click data for that window.
+            if win_hwnd:
+                log_x, log_y = self._to_logical_xy(win_hwnd, btn.x, btn.y)
+                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
+                lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
+                self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, wparam, lparam))
+                self._handle_mouse_click(win_hwnd, log_x, log_y)
+            else:
+                logger.debug("window",
+                    f"[WindowManager] MOUSEBUTTONDOWN: windowID={btn.windowID} not in "
+                    f"_sdl_window_id_to_hwnd (known ids: {list(self._sdl_window_id_to_hwnd)}) -- "
+                    f"no WM_LBUTTONDOWN posted, but DirectInput still notified below")
+            from tew.api.dinput_handlers import notify_mouse_button
+            notify_mouse_button(SDL_BUTTON_LEFT, True)
 
     def _handle_mouse_click(self, dlg_hwnd: int, px: int, py: int) -> None:
         """Determine which child control was clicked and post appropriate message."""

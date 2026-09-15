@@ -97,6 +97,49 @@ class TestAlwaysBypassesBothFilters:
         assert "[INFO]" in captured[0][1]
 
 
+class TestLoneExclusionDefaultsRestOn:
+    """A rule set containing only "-category" tokens (no whole-category
+    "+category"/bare "category" inclusion) is an EXCLUSION LIST: every
+    other category must default to shown. Before this fix, a lone
+    "-registry" silently suppressed every other category too -- see the
+    _category_active comment in logger.py for the real investigation
+    this caused."""
+
+    def test_lone_exclusion_leaves_other_categories_on(self, captured):
+        configure_logger(level="warn", categories="-registry")
+        logger.warn("fileio", "should appear -- fileio was never excluded")
+        assert len(captured) == 1
+
+    def test_lone_exclusion_still_excludes_its_own_category(self, captured):
+        configure_logger(level="warn", categories="-registry")
+        logger.warn("registry", "should not appear -- explicitly excluded")
+        assert captured == []
+
+    def test_multiple_exclusions_leave_everything_else_on(self, captured):
+        configure_logger(level="warn", categories="-registry,-memory")
+        logger.warn("d3d8", "should appear")
+        logger.warn("fileio", "should appear")
+        assert len(captured) == 2
+
+    def test_allowlist_semantics_unaffected_by_the_fix(self, captured):
+        # A bare "category" token (no +/-) is still an allowlist rule --
+        # unmentioned categories must stay off, exactly as before.
+        configure_logger(level="warn", categories="cpu")
+        logger.warn("seh", "should not appear -- not on the allowlist")
+        assert captured == []
+
+    def test_exclusion_alongside_explicit_inclusion_is_still_allowlist(self, captured):
+        # Mixing a "+category" with a "-category" signals allowlist intent
+        # (matches the existing "+handlers,-handlers.Func" per-function
+        # narrowing example in the module docstring) -- unmentioned
+        # categories stay off, same as pre-fix.
+        configure_logger(level="warn", categories="-registry,+fileio")
+        logger.warn("d3d8", "should not appear -- allowlist mode, not listed")
+        logger.warn("fileio", "should appear -- explicitly allowlisted")
+        assert len(captured) == 1
+        assert "fileio" in captured[0][1]
+
+
 class TestMemoryCategoryDefaultOff:
     """"memory" (per-allocation HeapAlloc/HeapFree noise) must stay silent
     unless explicitly opted into, unlike every other category -- see the

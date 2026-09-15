@@ -85,8 +85,13 @@ def register_kernel32_memory_handlers(
         state.heap_alloc_owner[addr] = h_heap
         logger.debug("memory", f"HeapAlloc({size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
         if dw_flags & _HEAP_ZERO_MEMORY:
-            for i in range(size):
-                memory.write8(addr + i, 0)
+            # FIXED (2026-09-14): was `size` individual write8() ctypes
+            # calls -- confirmed live via py-spy that this alone accounted
+            # for 23% of total sampled time in a steady-state profile,
+            # same disease as the already-documented WriteFile fix (see
+            # memory_zig.py's read_bytes() docstring): one bulk native
+            # call via load() instead of `size` round-trips through ctypes.
+            memory.load(addr, bytes(size))
         cpu.regs[EAX] = addr
         cleanup_stdcall(cpu, memory, 12)
 

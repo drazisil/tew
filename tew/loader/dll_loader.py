@@ -8,6 +8,7 @@ from typing import Callable, TYPE_CHECKING
 from tew.logger import logger
 from tew.fs import find_file_ci
 from tew.hardware.cpu_zig import FatalHaltError
+from tew.api.win32_handlers import log_register_dump
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -124,14 +125,7 @@ _LEGACY_DLL_ALIASES: dict[str, str] = {
 def _make_unimplemented_handler(dll_name: str, func_name: str):
     def _handler(cpu):
         logger.error("handlers", f"[UNIMPLEMENTED] {dll_name}!{func_name} — halting")
-        logger.error(
-            "cpu",
-            f"  EIP=0x{(cpu.eip) & 0xFFFFFFFF:08x}  "
-            f"EAX=0x{cpu.regs[0] & 0xFFFFFFFF:08x}  "
-            f"ECX=0x{cpu.regs[1] & 0xFFFFFFFF:08x}  "
-            f"ESP=0x{cpu.regs[4] & 0xFFFFFFFF:08x}  "
-            f"EBP=0x{cpu.regs[5] & 0xFFFFFFFF:08x}",
-        )
+        log_register_dump(cpu)
         cpu.halted = True
         cpu.fatal_halt = True
     return _handler

@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax
+from tew.api.d3d8._helpers import _com_stub, _set_eax, _heap_free, _alloc_registry
 
 # Per-object reference counts: obj_addr -> count (initial = 1 on first access)
 _ref_counts: dict[int, int] = {}
@@ -44,6 +44,39 @@ def _add_ref(cpu: "CPU", mem: "Memory") -> None:
     cpu.regs[EAX] = count
 
 
+def _dec_ref_and_maybe_free(addr: int) -> None:
+    """Release() semantics for an object address, without a stack frame --
+    used both by the COM Release() handler and by a texture releasing its
+    own ownership ref on each mip surface when the texture itself is freed.
+    """
+    count = _ref_counts.get(addr, 1) - 1
+    if count > 0:
+        _ref_counts[addr] = count
+        return
+    _ref_counts.pop(addr, None)
+    _free_object(addr)
+
+
+def _free_object(addr: int) -> None:
+    """Return an object's heap blocks once its refcount has reached zero."""
+    entry = _alloc_registry.pop(addr, None)
+    if entry is None:
+        return
+    kind = entry["kind"]
+    if kind == "resource":
+        _heap_free(entry["data_ptr"], entry["data_size"], "d3d8_res_data")
+        _heap_free(addr, entry["obj_size"], "d3d8_res_obj")
+    elif kind == "surface":
+        _heap_free(entry["data_ptr"], entry["data_size"], "d3d8_surf_data")
+        _heap_free(addr, entry["obj_size"], "d3d8_surf_obj")
+    elif kind == "texture":
+        _heap_free(addr, entry["obj_size"], "d3d8_tex_obj")
+        # Give up the texture's own ownership ref on each mip surface --
+        # a surface with an outstanding GetSurfaceLevel() ref stays alive.
+        for surf in entry["mips"]:
+            _dec_ref_and_maybe_free(surf)
+
+
 def _release(cpu: "CPU", mem: "Memory") -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) - 1
@@ -51,6 +84,7 @@ def _release(cpu: "CPU", mem: "Memory") -> None:
         _ref_counts[this] = count
     else:
         _ref_counts.pop(this, None)
+        _free_object(this)
     cpu.regs[EAX] = max(count, 0)
 
 
@@ -78,12 +112,26 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [12] Lock(OffsetToLock, SizeToLock, BYTE** ppbData, Flags) — writes data ptr
+    #
+    # FIXED: previously ignored OffsetToLock entirely, always handing back the
+    # buffer's base pointer. Real D3D8 apps append into large dynamic vertex/
+    # index buffers via Lock(offset, size, ..., D3DLOCK_NOOVERWRITE) at a
+    # growing offset each call, writing new data past what's already there
+    # without disturbing it. Handing back the base pointer regardless of
+    # offset meant every such write landed at offset 0 (clobbering the
+    # previous write), while DrawPrimitive -- using the real StartVertex the
+    # game passed to SetStreamSource -- correctly read from the real high
+    # offset, which had never actually been written: all-zero heap memory.
+    # Confirmed live: every DrawPrimitive with StartVertex > 0 read an
+    # all-zero vertex (position, color and UV all 0) from an otherwise
+    # correctly-populated buffer, while StartVertex == 0 read real data.
     def _buffer_lock(cpu: "CPU", mem: "Memory") -> None:
         this_ptr = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
+        offset   = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         ppb_data = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         data_ptr = mem.read32((this_ptr + 4) & 0xFFFFFFFF)
         if ppb_data:
-            mem.write32(ppb_data, data_ptr)
+            mem.write32(ppb_data, (data_ptr + offset) & 0xFFFFFFFF)
         cpu.regs[EAX] = S_OK
 
     from tew.logger import logger as _log

@@ -24,6 +24,7 @@ Returns D3D8_OBJ on success; halts loudly on any Vulkan failure.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -84,13 +85,18 @@ def _query_real_desktop_mode() -> tuple[int, int, int]:
     the real host's actual (likely modern, possibly ultrawide) desktop —
     live-verified that the game's own mode-validation code rejects unusual
     resolutions/aspect ratios with a "switch your desktop video mode to
-    800x600 ... and restart game" dialog. 1024x768 was a completely
-    ordinary XP-era desktop size and keeps this in sync with gdi32.dll's
-    GetDeviceCaps HORZRES/VERTRES fallback (user32_handlers.py), which the
-    game separately queries at startup — both must agree with each other
-    to look like one consistent, real monitor.
+    800x600 ... and restart game" dialog. Switched from 1024x768 to 800x600
+    (2026-09-14) to match FEDC's hardcoded GUI_InitView reference canvas
+    exactly (Screen_SetScreenMode passes GRect(0,0,800,600) as the view
+    rect) — at 800x600 the guest's own ScreenToView scale coefficients
+    collapse to an identity transform (1:1), eliminating reference-canvas
+    scaling as a variable in the persona-select click investigation. Keeps
+    this in sync with gdi32.dll's GetDeviceCaps HORZRES/VERTRES fallback
+    and GetSystemMetrics SM_CXSCREEN/SM_CYSCREEN (user32_handlers.py),
+    which the game separately queries at startup — all three must agree
+    with each other to look like one consistent, real monitor.
     """
-    return 1024, 768, 60
+    return 800, 600, 60
 
 
 def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
@@ -147,7 +153,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         import ctypes
         import vulkan as vk
         from vulkan import ffi
-        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion
+        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion, SDL_SetWindowSize
         from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
@@ -175,9 +181,56 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         sdl_window = entry.sdl_window
+        _state._vk_hwnd = hwnd
 
         # Top-level windows are created with SDL_WINDOW_VULKAN so no EGL
         # surface is attached to the wl_surface; no renderer to destroy here.
+
+        # FIXED: the SDL window was created earlier (from the game's
+        # CreateWindowExA call) at whatever size that call requested --
+        # unrelated to the resolution the game is now asking D3D8 for via
+        # D3DPRESENT_PARAMETERS. The swapchain below sizes itself from the
+        # Vulkan surface's real currentExtent (the actual OS window size),
+        # not from back_w/back_h directly, so a mismatched window size
+        # silently produced a swapchain at the wrong resolution -- confirmed
+        # live: the game requested back=640x480, but the window (and thus
+        # the swapchain) was still 1536x1248 from its original creation
+        # size, so every screen-space vertex position the game computed
+        # assuming a 640x480 viewport was rescaled against the wrong
+        # framebuffer dimensions. Resize the real window to match before
+        # querying the surface's capabilities.
+        #
+        # WINDOW_SCALE (Molly, 2026-09-06): the game's native 640x480 is too
+        # small to read comfortably on a modern display, so the real
+        # window/swapchain are sized at WINDOW_SCALEx the game's requested
+        # resolution -- everything the game itself can observe (vertex
+        # normalization in DrawPrimitive, GetBackBuffer/GetRenderTarget/
+        # GetDepthStencilSurface's reported surface size) still uses the
+        # unscaled logical size (_state._vk_logical_width/height) so the
+        # game's own coordinate math is untouched; only the Vulkan viewport
+        # stretches the resulting NDC space across the larger physical
+        # framebuffer.
+        WINDOW_SCALE = int(os.environ.get("TEW_WINDOW_SCALE", "2"))
+        _state._vk_logical_width  = back_w
+        _state._vk_logical_height = back_h
+        phys_w = back_w * WINDOW_SCALE
+        phys_h = back_h * WINDOW_SCALE
+        if back_w > 0 and back_h > 0:
+            SDL_SetWindowSize(sdl_window, phys_w, phys_h)
+            from sdl2 import SDL_GetWindowSize
+            real_w, real_h = ctypes.c_int(0), ctypes.c_int(0)
+            SDL_GetWindowSize(sdl_window, ctypes.byref(real_w), ctypes.byref(real_h))
+            # Real mouse events report coordinates against the window's
+            # actual size, which a compositor can clamp below the requested
+            # phys_w/h (documented elsewhere in this file) -- record what
+            # SDL_GetWindowSize really reports, not the request, or
+            # _to_logical_xy's scale would be wrong on a clamped display.
+            entry.logical_w, entry.logical_h = back_w, back_h
+            entry.phys_w, entry.phys_h = real_w.value, real_h.value
+            logger.info("d3d8",
+                f"CreateDevice: requested window resize to {phys_w}x{phys_h} "
+                f"(WINDOW_SCALE={WINDOW_SCALE}), actual SDL_GetWindowSize "
+                f"reports {real_w.value}x{real_h.value}")
 
         # ── Load instance-level KHR extension functions ────────────────────
         try:
@@ -360,8 +413,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             w = caps.currentExtent.width
             h = caps.currentExtent.height
             if w == 0xFFFFFFFF:
-                w = back_w if back_w > 0 else 800
-                h = back_h if back_h > 0 else 600
+                w = phys_w if phys_w > 0 else 800
+                h = phys_h if phys_h > 0 else 600
             _state._vk_swapchain_width  = w
             _state._vk_swapchain_height = h
             swapchain_ci = vk.VkSwapchainCreateInfoKHR(
@@ -457,6 +510,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                 _state._vk_swapchain_format,
                 _state._vk_swapchain_width,
                 _state._vk_swapchain_height,
+                _state._vk_command_pool,
+                _state._vk_graphics_queue,
             )
             _state._vk_image_views      = pipe["image_views"]
             _state._vk_render_pass      = pipe["render_pass"]
@@ -466,6 +521,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             _state._vk_vertex_buffer    = pipe["vertex_buffer"]
             _state._vk_vertex_memory    = pipe["vertex_memory"]
             _state._vk_vertex_mapped_ptr = pipe["vertex_mapped"]
+            _state._vk_vertex_buffer_size = pipe["vertex_buffer_size"]
+            _state._vk_descriptor_set_layout = pipe["descriptor_set_layout"]
+            _state._vk_descriptor_pool       = pipe["descriptor_pool"]
+            _state._vk_descriptor_set        = pipe["descriptor_set"]
+            _state._vk_sampler               = pipe["sampler"]
+            _state._vk_default_tex_image     = pipe["default_tex_image"]
+            _state._vk_default_tex_memory    = pipe["default_tex_memory"]
+            _state._vk_default_tex_view      = pipe["default_tex_view"]
         except Exception as exc:
             logger.error("d3d8",
                 f"CreateDevice: pipeline init failed: {exc} — halting")

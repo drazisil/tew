@@ -514,6 +514,7 @@ def register_user32_gdi32_handlers(
     # double-click; real Windows default is 500, user-configurable via
     # SPI_GETDOUBLECLICKTIME/registry, neither of which this emulator models)
     def _GetDoubleClickTime(cpu: "CPU") -> None:
+        logger.debug("handlers", "[Win32] GetDoubleClickTime() -> 500")
         cpu.regs[EAX] = 500
 
     stubs.register_handler("user32.dll", "GetDoubleClickTime", _GetDoubleClickTime)
@@ -725,6 +726,41 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetWindowRect", _GetWindowRect)
 
+    # GetWindowPlacement(HWND hWnd, WINDOWPLACEMENT *lpwndpl) -> BOOL
+    # WINDOWPLACEMENT: UINT length; UINT flags; UINT showCmd;
+    #                  POINT ptMinPosition; POINT ptMaxPosition; RECT rcNormalPosition;
+    # This project tracks no separate minimized/maximized state (see the
+    # ShowWindow/IsWindowVisible comment above), so showCmd only distinguishes
+    # SW_HIDE from SW_SHOWNORMAL, and ptMinPosition/ptMaxPosition report the
+    # real-Windows "never minimized/maximized" default of (-1, -1).
+    def _GetWindowPlacement(cpu: "CPU") -> None:
+        h_wnd    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        lp_wndpl = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        entry = wm.get_window(h_wnd)
+        length = memory.read32(lp_wndpl) if lp_wndpl else 0
+        if entry is not None and lp_wndpl and length == 44:
+            show_cmd = 1 if (entry.style & WS_VISIBLE) else 0  # SW_SHOWNORMAL : SW_HIDE
+            px_x  = du_to_px_x(entry.x)
+            px_y  = du_to_px_y(entry.y)
+            px_cx = du_to_px_x(entry.cx)
+            px_cy = du_to_px_y(entry.cy)
+            memory.write32(lp_wndpl + 4,  0)             # flags
+            memory.write32(lp_wndpl + 8,  show_cmd)       # showCmd
+            memory.write32(lp_wndpl + 12, 0xFFFFFFFF)     # ptMinPosition.x = -1
+            memory.write32(lp_wndpl + 16, 0xFFFFFFFF)     # ptMinPosition.y = -1
+            memory.write32(lp_wndpl + 20, 0xFFFFFFFF)     # ptMaxPosition.x = -1
+            memory.write32(lp_wndpl + 24, 0xFFFFFFFF)     # ptMaxPosition.y = -1
+            memory.write32(lp_wndpl + 28, px_x)           # rcNormalPosition.left
+            memory.write32(lp_wndpl + 32, px_y)           # rcNormalPosition.top
+            memory.write32(lp_wndpl + 36, px_x + px_cx)   # rcNormalPosition.right
+            memory.write32(lp_wndpl + 40, px_y + px_cy)   # rcNormalPosition.bottom
+            cpu.regs[EAX] = 1  # TRUE
+        else:
+            cpu.regs[EAX] = 0  # FALSE
+        cleanup_stdcall(cpu, memory, 8)
+
+    stubs.register_handler("user32.dll", "GetWindowPlacement", _GetWindowPlacement)
+
     # GetClientRect(HWND hWnd, LPRECT lpRect) -> BOOL
     def _GetClientRect(cpu: "CPU") -> None:
         h_wnd   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -743,10 +779,12 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "GetClientRect", _GetClientRect)
 
     # GetSystemMetrics(int nIndex) -> int
-    # Cap SM_CXSCREEN/SM_CYSCREEN at 1024x768; the game sets its render target from
-    # these values and a full-resolution window (e.g. 5160x2340) wastes resources.
-    _SM_CXSCREEN_MAX = 1024
-    _SM_CYSCREEN_MAX = 768
+    # Cap SM_CXSCREEN/SM_CYSCREEN at 800x600 (2026-09-14, was 1024x768) --
+    # must agree with idirect3d8.py's _query_real_desktop_mode and
+    # _GetDeviceCaps below; see idirect3d8.py's docstring for why 800x600
+    # specifically.
+    _SM_CXSCREEN_MAX = 800
+    _SM_CYSCREEN_MAX = 600
 
     def _GetSystemMetrics(cpu: "CPU") -> None:
         n_index = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -760,18 +798,55 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetSystemMetrics", _GetSystemMetrics)
 
-    # GetKeyState(int nVirtKey) -> SHORT
+    # GetKeyState(int nVirtKey) / GetAsyncKeyState(int vKey) -> SHORT
     # Returns key state: high bit set = key down, low bit = toggle state.
-    # We have no real keyboard input path; report all keys up and untoggled.
+    #
+    # FIXED (2026-09-13): unconditionally reported every key -- including
+    # the mouse-button virtual keys VK_LBUTTON/VK_RBUTTON/VK_MBUTTON -- as
+    # up, full stop. The three mouse-button VKs now report real state, fed
+    # by the same real SDL event pump dinput_handlers.py's
+    # notify_mouse_button tracks (see that module's 2026-09-13 redesign
+    # note). Real keyboard scancodes still report "up" -- no VK<->SDL-
+    # scancode table exists yet, and nothing has needed one (DirectInput's
+    # own real keyboard path already covers dinput_handlers.py's
+    # _SDL_SCANCODE_TO_DIK users) -- so this is deliberately scoped to
+    # mouse buttons, not a claim that keyboard VK queries are also real.
+    _VK_LBUTTON, _VK_RBUTTON, _VK_MBUTTON = 0x01, 0x02, 0x04
+
+    def _mouse_vk_state(vk: int) -> int | None:
+        if vk not in (_VK_LBUTTON, _VK_RBUTTON, _VK_MBUTTON):
+            return None
+        import sdl2 as _sdl2
+        from tew.api.dinput_handlers import get_mouse_buttons
+        buttons = get_mouse_buttons()
+        mask = {
+            _VK_LBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_LEFT),
+            _VK_RBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_RIGHT),
+            _VK_MBUTTON: _sdl2.SDL_BUTTON(_sdl2.SDL_BUTTON_MIDDLE),
+        }[vk]
+        return 0x8000 if buttons & mask else 0
+
+    # Every call logged, not just mouse-button hits -- see this section's
+    # 2026-09-13 fix note above: silently returning a plausible value is
+    # indistinguishable, from the log, to this never being called at all,
+    # which is exactly what made the persona-select click investigation
+    # take three wrong guesses in a row.
     def _GetKeyState(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        vk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
+        state = _mouse_vk_state(vk)
+        result = state if state is not None else 0
+        logger.debug("handlers", f"[Win32] GetKeyState(vk=0x{vk:02x}) -> 0x{result:04x}")
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetKeyState", _GetKeyState)
 
-    # GetAsyncKeyState(int vKey) -> SHORT — same as GetKeyState: all keys up
     def _GetAsyncKeyState(cpu: "CPU") -> None:
-        cpu.regs[EAX] = 0
+        vk = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
+        state = _mouse_vk_state(vk)
+        result = state if state is not None else 0
+        logger.debug("handlers", f"[Win32] GetAsyncKeyState(vk=0x{vk:02x}) -> 0x{result:04x}")
+        cpu.regs[EAX] = result
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("user32.dll", "GetAsyncKeyState", _GetAsyncKeyState)
@@ -2250,7 +2325,9 @@ def register_user32_gdi32_handlers(
         # game separately queries and cross-checks against this. Live-
         # verified: an unusual real resolution/aspect ratio here trips the
         # game's own mode-validation code into an early abort dialog.
-        screen_w, screen_h = 1024, 768
+        # 800x600 (2026-09-14, was 1024x768) — see idirect3d8.py's
+        # _query_real_desktop_mode docstring for why.
+        screen_w, screen_h = 800, 600
         if n_index == 8:
             val = screen_w
         elif n_index == 10:

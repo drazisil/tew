@@ -4,6 +4,669 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-14 — FIXED: four per-byte memory-access loops replaced with bulk reads/writes, found via py-spy profiling
+
+First real performance investigation, prompted by Molly's "let's make
+this faster" push. Profiled a normal (`LOG_LEVEL=info`, representative of
+real usage, not debugging) run with `py-spy record --native --rate 50`
+(needed `--native` to see through the Zig CPU core's `run()` call, which
+otherwise swallows ~97% of samples as a single opaque frame -- `--native`
+and `--nonblocking` are mutually exclusive, use `--native` alone).
+
+**Found**: `_heap_alloc`'s `HEAP_ZERO_MEMORY` handling (`kernel32_memory.py`)
+zero-filled allocated memory one byte at a time via `memory.write8()` in a
+Python loop -- confirmed via the flamegraph's actual stack (walked up from
+the hot frame using the SVG's own x/y rect coordinates, not guessed) that
+this sat directly under `_c_int_dispatch` -> `_handle_api_int` ->
+`_heap_alloc`, and alone accounted for **23% of all sampled time** in a
+60s window. Every `HeapAlloc(..., HEAP_ZERO_MEMORY)` call -- extremely
+common, and this project already has a documented 42MB single allocation
+-- was paying a full Python + ctypes round-trip per byte for what should
+be one native `memset`.
+
+**This is the same disease already fixed once before**: `memory_zig.py`'s
+`read_bytes()` bulk-read method exists specifically because of an
+identical bug found and fixed 2026-08-07 in `WriteFile` (`kernel32_io.py`)
+-- a `for i in range(n_bytes): buf[i] = memory.read8(...)` loop that alone
+accounted for a third of total runtime on a real profiled session (see
+that method's own docstring). Grepped for the same pattern
+(`for i in range(...)` wrapping `read8`/`write8`) across the whole
+codebase this session and found three more real instances worth fixing
+(several other hits were small fixed-size loops -- 16-byte GUIDs, 6-8
+stack args -- not worth touching):
+
+1. `kernel32_memory.py`'s `_heap_alloc` zero-fill loop -> replaced with
+   `memory.load(addr, bytes(size))` (a bulk-write primitive that already
+   existed, one `ctypes` call instead of `size`).
+2. `d3d8/idirect3d8device.py:236` (`SetCursorProperties`-adjacent texture
+   pixel read) -- was `width*height*4` individual `read8()` calls (over a
+   million for a 512x512 texture) -> `memory.read_bytes(...)`.
+3. `wsock32_handlers.py`'s `send()` handler -- was `length` individual
+   `read8()` calls per socket send -> `memory.read_bytes(...)`.
+4. `wsock32_handlers.py`'s `sendto()` handler -- same fix.
+
+**Verified with a before/after profile pair**, not just reasoning about
+it: after the `_heap_alloc` fix alone, `write8` no longer appears among
+significant frames at all (was 23%), and `_c_int_dispatch` (the whole
+Win32 API dispatch layer) dropped from 50.6% to 25.8% of all sampled
+time -- roughly half. Full suite green (1275 passed) after all four
+fixes.
+
+**Not yet re-profiled after the socket/texture fixes** (those loops don't
+fire during the passive startup/idle window a quick profile naturally
+samples -- would need a profile that actually exercises texture
+locks/socket sends to confirm their real-world impact the same rigorous
+way the heap fix was confirmed). Worth doing next time real gameplay
+network/texture activity can be captured.
+
+---
+
+## 2026-09-13 (cont'd, later still) — FIXED: real click coordinates weren't scaled back to the guest's logical window size
+
+Found while tracing the guest's own input-dispatch chain in Ghidra
+(`MCity_d.exe`, `debug_clean` project): `GUI_Main` -> `GUSER_DoInput` ->
+`GUser::DoInput` -> `MMouseInput::AppPollMouse` -> `GMouseInput::Do`, which
+edge-detects a button-down transition and posts `GEVENT=0xb` through
+`GEventQueue::Process` -> `GUI::OnEvent`'s vtable-offset dispatch (confirmed
+against the `GDialog::OnKeyDown`...`MPersonaSelectDlg::OnAccept`/`OnCancel`
+vtable Molly pasted at the start of this trace -- it's `MPersonaSelectDlg`'s
+own vtable).
+
+**Root cause**: `IDirect3DDevice8::CreateDevice`/`Reset` resize the *real*
+SDL window to `WINDOW_SCALE=2`x the guest's requested backbuffer purely for
+host-display readability (640x480 guest -> 1280x960 real window) -- their
+own comments are explicit the guest must never observe this anywhere
+(`GetBackBuffer` size, vertex math, all stay logical). But
+`window_manager.py`'s `_handle_sdl_event` posted the real window's raw SDL
+pixel coordinates straight into `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/
+`WM_LBUTTONUP`'s lParam and `dinput_handlers.notify_mouse_motion`, unscaled.
+Every click on the rescaled main window landed at exactly 2x its real
+logical position from the guest's point of view -- explaining exactly the
+observed split: the login dialog (a separate, native, never-rescaled SDL
+window) always worked; the main D3D8/FEDC window (rescaled after
+`CreateDevice`) is where clicks kept silently missing. `WM_LBUTTONDOWN` was
+genuinely delivered every time -- just at coordinates no real control was
+ever drawn at, so the guest's own hit-testing correctly found nothing there.
+
+**Fix**: `WindowEntry` gained `logical_w/h` (recorded at `CreateWindow`
+time) and `phys_w/h` (recorded whenever `CreateDevice`/`Reset` calls
+`SDL_SetWindowSize`; 0 if never rescaled). New
+`WindowManager._to_logical_xy(hwnd, x, y)` divides back to logical
+coordinates before they reach `WM_MOUSE*`'s lParam, `_handle_mouse_click`,
+or DirectInput's tracked position -- a no-op (not a special case) for any
+window with `phys_w == 0`, i.e. dialogs and the main window before
+`CreateDevice` ever runs.
+
+**Verified via new unit tests**, not a full run:
+`test_to_logical_xy_scales_down_for_enlarged_window`,
+`test_to_logical_xy_noop_for_never_rescaled_window`,
+`test_to_logical_xy_noop_for_unknown_hwnd`
+(`tests/unit/api/test_window_manager.py`). Two attempted full runs this
+session were killed early by the harness's background-task OOM guard
+before reaching persona-select (host `free` showed ~7GB available both
+times -- looked like cumulative desktop load, not a tew problem). Full
+suite green: 1275 passed.
+
+**Follow-up, same session (later still)**: Molly pointed out the persona is
+already selected by default (only entry) -- re-tested clicking START
+(`<OK>.GButton` [30,310] 96,27 dialog-relative -> logical (360,531) ->
+physical (720,936)) instead of the row. Delivery confirmed again by exact
+lParam match, but still no reaction. Grepping the run's own log found why:
+**1166 `GetDeviceState` calls, zero `GetDeviceData` calls** -- the guest
+polls DirectInput's live/immediate state only, at a measured ~385ms real
+interval, never buffered mode. `_inject_click` (`run_exe.py`) pushed
+`SDL_MOUSEBUTTONDOWN` immediately followed by `SDL_MOUSEBUTTONUP` (~3ms
+apart) -- shorter than a single poll gap, so no real poll could ever
+observe it. Not a DirectInput/game bug (real immediate-mode DirectInput can
+legitimately miss a transition that short too); the injected click just
+wasn't modeling a real click's hold time. Fixed: split into
+`_inject_click_down`/`_inject_click_up`, scheduled as two separately-timed
+real-wall-clock events (`TEW_CLICK_HOLD_SEC`, default 0.5s) so the main
+loop -- and therefore the guest's own polling -- keeps running during the
+hold, rather than a blocking `sleep()` which would stall CPU stepping too.
+Full suite green (1275 passed).
+
+**Re-tested with the hold fix**: held 621.341s-621.884s (543ms); confirmed
+two real `GetDeviceState` calls (621.439s, 621.825s) landed inside that
+window -- the guest's poll genuinely had the down state available this
+time. **Still zero reaction.** So all five bugs fixed this session (Reset,
+WM_LBUTTONDOWN unconditional post, DirectInput event-driven redesign,
+click-coordinate 2x scaling, click-injection hold duration) are real and
+confirmed, and input delivery is now provably correct end-to-end -- the
+remaining bug is further downstream.
+
+**Deep Ghidra trace, same session, Molly digging directly**: ruled out
+`MMouseInput::AppPollMouse` (confirmed at vtable+0xc, but only fails if
+DirectInput is uninitialized -- not the case here), the `_mfHitNext`
+`IsModal` gate (it's not even the real dispatch path -- `GetMouseFocus()`
+goes through `_mfHitFirst` instead, which isn't gated that way), and
+wrong-target-via-modal-resolution (`DoModal`'s own loop passes the dialog
+directly into `GUI_Main`, so `GetModalProcess()` can't matter here). Found
+the one live remaining suspect: `GMouseInput::Do` runs the mouse position
+through `ScreenToView` before any hit-testing touches it -- a scale+offset
+transform using four global float coefficients (`GUI_fS2VX/Y`,
+`GUI_fV2SXt/Yt`) whose writer hasn't been found yet. Very likely the real
+mechanism behind the empirically-derived 800x600->1024x768 (1.28x)
+`GDialogs.gui` scale factor found earlier tonight.
+
+**DECISIVE TEST**: synthetic click at physical (987,1097) -- directly
+measured via `xdotool` with the real cursor sitting dead-center on START
+(confirmed visually via screenshot, "Dr Brown" highlighted) -- held 524ms,
+with a `GetDeviceState` call confirmed landing squarely inside the
+down-to-up window. **Still zero reaction.** This rules out emulation
+speed/poll-timing as a factor entirely: coordinates, delivery, and timing
+are now all simultaneously proven correct in the same click, for the first
+time this investigation. The `ScreenToView` coefficient lead above is now
+the most likely place the real remaining bug hides.
+
+---
+
+## 2026-09-13 (cont'd, later) — click-coordinate fix CONFIRMED end to end against a real run
+
+**CONFIRMED end to end, same session (later)**: reached persona-select for
+real via a detached run (`nohup ... & disown` -- 3 harness-tracked
+background attempts got OOM-killed despite `free -h` showing 7-10GB
+available each time; detaching from the harness's tracked process tree
+worked around it). Actual active size at persona-select: logical 1024x768,
+physical 2048x1354 (clamped) -- confirmed via `Reset back=1024x768` /
+`Reset: swapchain recreated 2048x1354`, not 640x480. Computed a real click
+target from `dlg.persona`'s own layout (`<PERSONAS>.GListBox` [28,149]
+274,94, rowHeight=18, centered in 1024x768) -> logical (382,365) -> physical
+(764,644), injected via `TEW_CLICK_AT`/`TEW_CLICK_AFTER_SEC`. Log confirms:
+`[dinput] real mouse button 1 down at (382,365)` and `DispatchMessageA
+hwnd=0x1034 msg=0x0201 wp=0x0 lp=0x16d017e` (lParam decodes to exactly
+x=382, y=365) -- `WM_LBUTTONDOWN` really did reach the game's WndProc at the
+intended logical position. The scaling bug and its fix are both confirmed
+real, not hypothetical. See `status.md` for what's still open: whether a
+single click (vs. select-then-START, or double-click) is enough to actually
+advance the screen hasn't been tested yet.
+
+---
+
+## 2026-09-13 (cont'd, later) — found and instrumented a real silent-drop bug in mouse-click handling; not yet confirmed as root cause
+
+Continuing the click-delivery investigation after the "confirmed working"
+claim below turned out to be wrong. Extensive live testing (real manual
+clicks from Molly, not synthetic ones) confirmed SDL itself reliably
+delivers every click as a real `SDL_MOUSEBUTTONDOWN`/`UP` event
+(`pump_sdl_events` logs every event's raw `event.type` unconditionally
+now) and that `pump_sdl_events` is called continuously throughout --
+ruling out "the message pump stopped running" as an explanation. But most
+real clicks during persona-select still produced zero downstream
+`[dinput]`/`DispatchMessageA` reaction, while every click during the
+earlier login-dialog stage did.
+
+One specific instance was caught directly: `SDL event type=0x401`
+(a real click SDL handed us) with no `[dinput]` or `DispatchMessageA`
+line anywhere near it. Traced to `_handle_sdl_event`'s
+`SDL_MOUSEBUTTONDOWN`/`SDL_MOUSEBUTTONUP` branches
+(`window_manager.py`): both have two early-return paths -- `btn.button
+!= SDL_BUTTON_LEFT`, and `windowID` not found in
+`_sdl_window_id_to_hwnd` -- and **neither path logged anything**, making
+a real, silently-dropped click indistinguishable, from the log, from a
+click that was never delivered at all (the exact class of bug this
+session's earlier `_com_stub` unconditional-logging fix was meant to
+prevent, just in a different file).
+
+**Fixed**: both branches on both handlers now log explicitly -- the
+actual button value on a non-left click, or the unmapped `windowID` plus
+the full list of currently-known window IDs (`_sdl_window_id_to_hwnd`)
+on a window mismatch. `SDL_MOUSEBUTTONUP`'s and `SDL_MOUSEBUTTONDOWN`'s
+`notify_mouse_button` calls are now unconditional (matching each
+other -- previously `DOWN` skipped it entirely on an unmapped window
+while `UP` didn't), so DirectInput's tracked state stays consistent
+either way. Also added the actual `sdl_win_id` to both window-creation
+log lines (`create_window`'s top-level-window path and the dialog path),
+which previously logged only the `hwnd`, not the SDL window ID that
+would need to match a click's `windowID` -- there was no way to check
+one against the other from the log before this.
+
+Also split `_com_stub`'s unconditional COM-call logging (added earlier
+this session) by `dll_name`: D3D8's own interfaces now log under `d3d8`
+instead of `handlers`, so turning on `handlers` to see DirectInput/other
+COM activity no longer drags back D3D8's own hundreds-of-calls-per-frame
+firehose -- confirmed necessary after a full-`handlers` run got killed by
+the harness's background-task memory guard.
+
+**Not yet run** with this instrumentation against a real dropped click --
+next session should reproduce one and read which specific branch fired,
+which will finally show whether the click is a genuine non-left button,
+a focus/window-ID mismatch, or something not yet considered. Full suite
+green (1272 passed) after these changes.
+
+---
+
+## 2026-09-13 (cont'd) — CORRECTION to the entry below: the "click confirmed working" claim was wrong
+
+Later the same session: the "Connecting to localhost:8226" screen is the
+**login** server reconnecting (`LoginServerPort=8226` per the shard
+list), not the lobby (`LobbyServerPort=7003`) -- and further testing
+showed it's a periodic automatic refresh (the identical login/persona-
+fetch payload repeats roughly every 44s regardless of what's clicked),
+not something the click itself triggered. Extensive follow-up testing
+(both synthetic and Molly's own real manual clicks) found that a real
+click during persona-select mostly still produces **no** `[dinput]`/
+`DispatchMessageA` reaction at all, while clicks during the earlier
+login-dialog stage reliably do -- so the three fixes below were real and
+necessary, but not sufficient; click delivery to the game is still not
+confirmed working. The three underlying fixes (WM_LBUTTONDOWN posting,
+real SetEventNotification signaling, event-driven DirectInput state) are
+still correct and still needed -- see the newer 2026-09-13 entry above
+this one for what was found afterward and the real, still-open next step
+(a silent early-return in `_handle_sdl_event`'s mouse-button handlers,
+now instrumented but not yet re-tested).
+
+---
+
+## 2026-09-13 (cont'd) — real mouse click delivery to the game: three real bugs fixed, but persona-select clicks still mostly don't register (see correction above)
+
+Direct continuation of the same day's `Reset` fix, chasing the queued
+"try clicking the persona" step. Once the window/swapchain sizing was
+fixed, a click at the right pixel still produced *nothing* -- three
+separate real bugs stacked on top of each other, found the hard way
+(two earlier guesses this session -- XTest injection through a desktop
+permission portal, then a `GetKeyState`/`GetAsyncKeyState` patch -- were
+both premature: neither was confirmed to be what the game actually
+calls before being implemented, which just produced more silent
+non-reactions and wasted a full run each). Molly's framework for
+un-sticking this: there are only two ways for the game to learn about
+input at all -- poll for it, or register a listener and get told. Walking
+every real candidate against that split is what actually found the bugs:
+
+1. **`SDL_MOUSEBUTTONDOWN` never posted a real Win32 message to any
+   non-dialog window.** `window_manager.py`'s SDL event pump correctly
+   posts `WM_MOUSEMOVE`/`WM_LBUTTONUP` to *any* top-level window's real
+   message queue, generically -- but `SDL_MOUSEBUTTONDOWN` was instead
+   hijacked entirely into `_handle_mouse_click`, a dialog-only child-
+   control hit-tester that silently drops the event for any window that
+   isn't one of tew's own rendered dialogs (e.g. the main D3D8 game
+   window). `WM_LBUTTONDOWN` is now posted unconditionally first, exactly
+   like the other two already were, with the dialog hit-test still
+   running afterward for tew's own dialog windows.
+
+2. **`IDirectInputDevice2::SetEventNotification` accepted event-handle
+   registration and then did nothing with it.** A game thread doing
+   `WaitForSingleObject`/`WaitForMultipleObjects` on that handle to be
+   woken by real input would wait forever for that specific reason, while
+   still legitimately waking for its other wait conditions -- which is
+   exactly why a game stuck this way never looks hung. The handle is now
+   stored per-device and genuinely signaled (via the scheduler's existing
+   `EventHandle.signaled` + `unblock_handle` mechanism, the same one the
+   timer-heartbeat code already used) whenever real input arrives.
+
+3. **DirectInput's mouse state was sampled lazily, only when polled.**
+   `GetDeviceState`/`GetDeviceData` called `SDL_GetMouseState()` on
+   demand -- confirmed live the game calls neither during the persona
+   screen's own loop, so nothing ever sampled the mouse at all, making
+   (1) and (2) alone insufficient. Real DirectInput tracks state
+   continuously in the background regardless of whether the app asks;
+   `dinput_handlers.py` now works the same way --
+   `notify_mouse_motion`/`notify_mouse_button` are window_manager's real
+   SDL event pump calling straight into this module as events actually
+   arrive (the exact same event stream (1)'s Win32 messages come from,
+   not a separate side channel), updating tracked state, queuing
+   `GetDeviceData`'s buffered events, and calling into (2)'s signaling in
+   real time.
+
+Also removed: the debug click-injection tool (`TEW_CLICK_AT`/
+`TEW_CLICK_AFTER_SEC`, `run_exe.py`) previously faked input two different
+wrong ways in a row (XTest at the X11 level -- blocked silently by a
+desktop "remote control" permission portal neither this project nor
+`xdotool`/`ydotool` could get past; then a side-channel state override a
+poll would pick up next, which fixed nothing since nothing was polling).
+It now pushes a real `SDL_Event` via `SDL_PushEvent`, indistinguishable
+from a real click once it's in the queue -- exercising the exact same
+path fixes 1-3 above required to work for any input, not a shortcut
+around it.
+
+**Confirmed live, that one specific run**: clicking "Dr Brown" produced,
+in order: real `notify_mouse_button` button-down/up log lines, real
+`WM_LBUTTONDOWN`/UP `DispatchMessageA` calls against the main game window
+(confirmed via `entry.wnd_proc_addr` actually being invoked, not just
+logged), and the game visibly transitioning off persona-select to "MOTOR
+CITY / DEBUG: Connecting to localhost:8226 try 1". **See the correction
+entry above**: that screen turned out to be the login server, not the
+lobby, and the connection turned out to be a periodic automatic refresh
+unrelated to the click -- so this specific success was likely
+coincidental timing, not proof the click itself worked. Full 400s run
+completed with a clean shutdown, no fatal halt either way. All 1272 tests green
+after updating one test fixture
+(`test_dinput_handlers.py`) for `register_dinput_handlers`'s new `state`
+parameter.
+
+Also added: every `_com_stub`-registered COM method (`_helpers.py`,
+shared by D3D8 and DirectInput) now logs its call and return value at
+DEBUG level unconditionally -- most DirectInput methods were one-line
+`lambda: _set_eax(cpu, CODE)` stubs with no logging of their own, and a
+caller silently getting back a plausible success code from one was
+indistinguishable, from the log, to it never being called at all. That
+blind spot is what made the first two wrong guesses in this
+investigation possible; it shouldn't be possible to repeat.
+
+---
+
+## 2026-09-13 — RESOLVED: `IDirect3DDevice8::Reset` was a complete lying no-op -- window/swapchain never resized past `CreateDevice`, clipping the persona-select screen
+
+Found while trying the persona-select screen's mouse/keyboard interaction
+(this session's queued next step): the dialog rendered larger than the
+window, clipping "PLEASE SELECT FROM THE LIST BELOW" and the persona list
+past the window's right/bottom edge -- confirmed live via screenshot.
+
+Root cause: `Dev::Reset` (`idirect3d8device.py`) never read its
+`D3DPRESENT_PARAMETERS*` argument, never resized the real SDL window, and
+never recreated the Vulkan swapchain -- just logged and returned `S_OK`.
+The game's own `setvideomode` takes the `Reset` path (not `CreateDevice`)
+for every mode change after the first (`DAT_6001c080`, see this file's
+module docstring), so the window/swapchain stayed frozen at whatever
+`CreateDevice` set for the login screen while later screens rendered
+assuming their own requested `BackBufferWidth`/`Height`. Live log
+confirmed three `Reset(back=1024x768)` calls firing right after
+`CreateDevice: swapchain 1280x960` with zero effect.
+
+**Fixed**: `Dev::Reset` now does the real thing -- waits for the device to
+go idle, destroys the old framebuffers/image views/swapchain, resizes the
+real SDL window (same `WINDOW_SCALE=2` upscale `CreateDevice` uses),
+re-queries the surface's actual `currentExtent`, recreates the swapchain
+at the new size, and recreates image views + framebuffers against the
+*existing* render pass. The render pass, graphics pipeline, descriptor
+set/sampler/default texture and vertex buffer are all size- and
+format-independent (viewport/scissor are `VK_DYNAMIC_STATE`, not baked
+into the pipeline) so none of that needed touching. Frame-sync state and
+the cached backbuffer/depth-stencil surface objects are invalidated
+across Reset too, matching real D3D8's requirement that the app release
+its `D3DPOOL_DEFAULT` resources before calling it.
+
+Needed threading `window_manager` into `idirect3d8device.make_vtable`
+(previously only `stubs`/`memory`) and a new `_state._vk_hwnd`, since
+`Reset`'s `hDeviceWindow` is commonly 0 ("reuse `CreateDevice`'s window")
+and there was no existing way to look that window back up.
+
+**Confirmed live**: `Reset back=1024x768` now logs `Reset: swapchain
+recreated 2048x1354` (clamped by the real display, same class of
+compositor clamping already documented for `CreateDevice`'s own resize).
+Screenshot after `~/.emu32/Login.log` showed `Persona_DownloadList:
+Status=0` / `Persona added: Dr Brown on shard44` confirms a fully
+legible, correctly-sized persona-select screen -- header, full "PLEASE
+SELECT FROM THE LIST BELOW" text, persona row, and all four buttons
+entirely on-screen. Full suite green (1272 passed) after fixing one test
+(`test_d3d8_render_target_cache.py`) that called `make_vtable` directly
+without the new `window_manager` parameter.
+
+Also discovered and fixed, unrelated to tew: local login was failing with
+`[SSL: TLSV1_ALERT_INTERNAL_ERROR]` because a host-level `pyswitch`
+systemd service (a TLS/legacy-SSL classifying relay router) had taken
+real port 443 out from under the mco-server `nginx` container, which had
+drifted to publishing on `127.0.0.1:9443` instead. Not a tew bug --
+`pyswitch.service` stopped and `nginx` force-recreated to restore
+`0.0.0.0:443`.
+
+---
+
+## 2026-09-05 (cont'd again x3) — MILESTONE: RESOLVED, a fully legible, correctly-colored, correctly-sized persona-select screen. Two more real bugs found and fixed: vertex diffuse-color R/B channel swap, and alpha blending disabled entirely (broke all UI text) + swapchain/window resolution mismatch.
+
+Direct continuation of the same day's black-screen root-cause work. With
+real drawing finally reaching the screen, two more real bugs stood
+between that and an actually legible, usable screen:
+
+**Vertex diffuse-color R/B channel swap**: `_draw_primitive` packed
+D3DCOLOR into the vertex color attribute as `(b, g, r, a)` to mirror
+D3DCOLOR's `0xAARRGGBB` byte layout, but the vertex attribute is a plain
+`vec4` -- the GPU just fills `.xyzw` in memory order, and the fragment
+shader multiplies it straight into the output with no "this is BGRA"
+reinterpretation. Silently swapped red and blue for any non-gray vertex
+color; white/gray is swap-invariant, which is why it went unnoticed
+through the whole earlier texture-pipeline session. Fixed by extracting
+the decode into `_d3dcolor_to_rgba()` and returning `(r, g, b, a)`.
+Confirmed live: a toolbar element that had rendered blue now renders red,
+its correct color.
+
+**Alpha blending disabled entirely, which broke all UI text**: earlier
+the same session, `blendEnable=VK_FALSE` was set globally to fix a
+window-transparency bug, on the assumption that diffuse alpha "only ever
+meant something for in-engine blending, which is disabled here." Wrong:
+anti-aliased font glyphs are real alpha-blended quads (RGB = ink color,
+alpha = coverage). With blending off, every glyph quad rendered fully
+opaque using its raw RGB (typically black filler in a font atlas)
+instead of blending by coverage -- so every piece of UI text rendered as
+a solid black rectangle. Confirmed by cropping a live screenshot to full
+native resolution, ruling out "just blurry from window scaling": the
+black bars were pixel-exact solid rectangles. Fixed by re-enabling real
+RGB alpha blending while keeping the swapchain's alpha channel excluded
+from the write mask, so the original transparency fix still holds.
+
+**Swapchain/window resolution mismatch**: `CreateDevice` sized the
+swapchain from the Vulkan surface's actual `currentExtent` (the real OS
+window's current pixel size), not from the game's requested
+`D3DPRESENT_PARAMETERS` `BackBufferWidth`/`Height`. The SDL window was
+created earlier (from the game's own `CreateWindowExA` call) at an
+unrelated size, so the swapchain silently inherited that instead --
+confirmed live: game requested `back=640x480`, swapchain came out
+`1536x1248`. Fixed by resizing the real SDL window (`SDL_SetWindowSize`)
+to match before querying surface capabilities.
+
+**Both confirmed together, live, for the first time this whole effort**:
+a real, legible persona-select screen -- "CHOOSE YOUR PERSONA", "PLEASE
+SELECT FROM T[HE LIST BELOW]", column headers, and a real listed persona
+entry "Dr Brown" -- at the correct 640x480 window size, correct colors,
+no window transparency, no mosaic/corruption.
+
+Regression test added: `tests/unit/api/test_d3d8_diffuse_color_order.py`
+(the resolution fix needs live Vulkan/SDL and isn't unit-testable). Full
+suite green (1272 passed, up from 1266).
+
+---
+
+## 2026-09-05 (cont'd again x2) — RESOLVED: `GetRenderTarget`/`GetDepthStencilSurface` fabricated a fresh surface object every call, causing premature Release; also fixed `LockRect` ignoring `pRect`. Regression tests added for all three fixes from this session.
+
+While chasing what first looked like a texture-format bug (a background
+surface's format field flipping between two D3DFORMAT values across
+`UnlockRect` calls), root-caused it as a real COM object-lifetime bug
+instead: `Dev::GetRenderTarget` and `Dev::GetDepthStencilSurface`
+allocated a brand-new, independently ref-counted surface object on every
+call, rather than AddRef'ing and returning a stable, cached one as real
+D3D8 does (the caller's matching `Release()` only drops their own
+reference; the device keeps its own). The game's single, correct
+`Release()` therefore immediately freed tew's only copy of the object;
+the freed heap address was then handed to an unrelated later allocation,
+whose write into the object header's format field corrupted what the
+still-in-use original surface reported.
+
+Confirmed via temporary alloc/free diagnostics (added, used, then fully
+removed) correlated chronologically against `Surface::UnlockRect` calls
+for the same address: a `Surface::UnlockRect` call succeeded 23.8 seconds
+after tew's own bookkeeping had already freed that address, reading stale
+leftover memory from an unrelated object that had briefly reused it.
+
+**Fixed**: both accessors now cache one canonical surface object per
+device and AddRef on repeat calls instead of reallocating. Live
+re-verification confirmed the format corruption is gone.
+
+**Also fixed, real and correct but confirmed not the cause of this
+particular symptom**: `IDirect3DSurface8::LockRect` ignored the `pRect`
+sub-rectangle parameter entirely, always returning a pointer to the
+surface's absolute origin regardless of which sub-rectangle the game
+requested. Real D3D8 apps stream/decode large images in tiles via
+repeated `Lock(pRect)`/`Unlock` cycles on different sub-rects of the same
+surface; every tile's data would land at buffer offset 0 instead of its
+real position. Fixed by computing `pBits = data_ptr + top*pitch + left*bpp`.
+
+**What looked like a third, unrelated bug (a "mosaic of flat-colored
+blocks" on screen) was a misdiagnosis**, corrected by directly watching
+the live game window: it was hundreds of legitimately small (32x32) icon
+textures still populating a loading grid at the moment a screenshot was
+taken (1201 icon uploads logged in one run), not corrupted output — it
+resolved into real content once loading finished.
+
+Regression tests added for all three real fixes from this session
+(vertex-buffer Lock offset, render-target/depth-stencil caching,
+LockRect pRect): `tests/unit/api/test_d3d8_buffer_lock_offset.py`,
+`test_d3d8_render_target_cache.py`, `test_d3d8_lock_rect_prect.py`. Full
+suite green (1266 passed, up from 1249).
+
+---
+
+## 2026-09-05 (cont'd again) — RESOLVED: `IDirect3DVertexBuffer8::Lock`/`IndexBuffer8::Lock` ignored `OffsetToLock`, corrupting every dynamic vertex-buffer append — root cause of the persistent black screen; first non-black frame produced
+
+Root-caused by directly reading raw guest memory at draw time (not
+guessed): `idirect3d8resource.py::_buffer_lock` read the `OffsetToLock`
+argument off the stack but never used it, always writing back the
+buffer's base `data_ptr` regardless of the requested offset. Real D3D8
+apps append geometry into one large dynamic vertex/index buffer via
+repeated `Lock(offset, size, ..., D3DLOCK_NOOVERWRITE)` calls at a
+growing offset, writing new data past what's already there. Because tew
+always handed back the same base pointer, every such write landed at
+offset 0 (clobbering the previous write) instead of the real offset —
+while `DrawPrimitive` correctly read from `base + StartVertex*stride`,
+using the real `StartVertex` the game passed to `SetStreamSource`: an
+address that had never actually been written, so it read zeroed heap
+memory (position, color and UV all zero) for every draw after the first
+in a buffer.
+
+Confirmed live via temporary raw-hex diagnostics in `_draw_primitive`
+(added, used, then fully removed — not committed): of 905 sampled
+`DrawPrimitive` calls in one run, 904 with `StartVertex > 0` read
+all-zero vertex data from an otherwise correctly-populated buffer, while
+every `StartVertex == 0` call read real data.
+
+**Fixed**: `_buffer_lock` now returns `data_ptr + offset` instead of
+always `data_ptr`. Full suite green (1249 passed). Live re-verification
+with the same diagnostic showed all-zero reads drop from 904/905 to
+3/905, with previously-zero high-offset draws now reading real,
+distinct, incrementing vertex data.
+
+**This is the first time this whole multi-session effort has produced
+a non-black frame.** A live screenshot after the fix shows real UI
+content (a toolbar-like row of colored buttons) and a large image area,
+replacing solid black at every prior checkpoint. The image area itself
+renders as a blocky mosaic rather than clean art — a separate, still-open
+bug, likely a D3DFORMAT handling gap (see `status.md`'s current entry
+and `TODO.md`).
+
+---
+
+## 2026-09-05 (cont'd) — RESOLVED: real mouse/keyboard input now reaches the D3D8 window; crash at t≈41s identified as the game's own `_Nfs_DebugBreak` assert (not yet root-caused, rare/non-reproducible)
+
+Direct follow-on from the texture-pipeline session (same day): once the
+screen could actually show content, the next real gap was that nothing
+could be clicked. Fixed:
+
+- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` was a hardcoded
+  zero-fill stub; now really polls SDL. The one generic DirectInput device
+  object (`CreateDevice` never distinguished keyboard vs. mouse by REFGUID)
+  is disambiguated by `cbData` at `GetDeviceState` time -- 256 means the
+  keyboard (`SDL_GetKeyboardState` + a fixed SDL-scancode -> real `DIK_*`
+  table), anything else means the mouse (`SDL_GetMouseState`, reported as
+  DirectInput's default relative lX/lY deltas + button bytes).
+- `tew/api/window_manager.py`'s `_handle_sdl_event` never handled
+  `SDL_MOUSEMOTION`, `SDL_MOUSEBUTTONUP`, or window focus events at all
+  (only keydown/keyup/lbuttondown, and only for tew's own emulated
+  dialog-widget system, not the real top-level window). Added
+  `WM_MOUSEMOVE`/`WM_LBUTTONUP` posting and `WM_ACTIVATE`+
+  `WM_SETFOCUS`/`WM_KILLFOCUS` posting on SDL focus gain/loss.
+
+Full suite green (1249 passed); sanity-checked live (no exceptions from the
+new SDL event handling).
+
+**Separately investigated** (not fixed, see `TODO.md`): a real guest crash
+seen a few times this session (`EIP=0x00688c68`) was identified via Ghidra
+as `_Nfs_DebugBreak`, called from `Nfs_exitCallback` (`nfspc.c`) asserting
+`hMutexNfsRunning != NULL` during the game's own exit sequence -- a real,
+named assert, not a random fault. Could not be reproduced again across 5+
+fresh runs to trace further live; root cause (real game bug vs. a tew
+`CreateMutex`/`CloseHandle` bug) not yet determined.
+
+## 2026-09-05 (full session) — RESOLVED: D3D8 texture-sampling pipeline built end-to-end; real textured content confirmed ON SCREEN via a live screenshot
+
+Follow-on from the 2026-09-05 overnight session, which found (but didn't fix)
+that D3D8 had no texture-sampling pipeline at all. This session built one and
+found seven more real bugs before anything was actually visible — see
+`status_archive.md`'s "Previous status (2026-09-05, overnight)" entry and
+`TODO.md`'s matching RESOLVED item for full narrative detail; this entry is
+the durable summary.
+
+**1. Real texture-upload path traced via Ghidra + confirmed via call tracing**:
+the real game/`dx8z.dll` "thrash driver" middleware genuinely drives the real
+D3D8 device (`CreateTexture` at vtable offset `0x50`, `SetTexture` at `0xF4`
+— cross-checked against tew's own vtable layout via `Release`/`GetBackBuffer`/
+`GetRenderTarget`/`BeginScene` offsets, not guessed). Live call tracing
+(`LOG_LEVEL=trace LOG_CATEGORIES=calls`) then showed the real per-pixel
+upload happens through `IDirect3DSurface8::LockRect`/`UnlockRect` on the
+mip-0 surface obtained via `GetSurfaceLevel` — never the texture's own
+`LockRect`/`UnlockRect` (0 calls vs. 1211 on the surface, in one real run).
+
+**2–8. Bugs found and fixed, in the order found**:
+- `CreateTexture`/`SetTexture`/`GetTextureStageState`/`SetTextureStageState`
+  (`tew/api/d3d8/idirect3d8device.py`) converted from lying no-op stubs
+  (`_ok`) to real state-tracking implementations.
+- Real GPU texture upload wired into `IDirect3DSurface8::UnlockRect`
+  (`tew/api/d3d8/idirect3d8surface.py`) — `upload_texture_image` in
+  `_pipeline.py` does a real `vkCreateImage` + staging-buffer copy.
+- D3DFORMAT-aware pitch + BGRA8 conversion (`_format_bytes_per_pixel`/
+  `_convert_to_bgra8`, `tew/api/d3d8/_helpers.py`): `LockRect`'s `Pitch`
+  was hardcoded to `width*4` regardless of the real declared format —
+  confirmed live via `fmt=0x17` (`D3DFMT_R5G6B5`, 16-bit, no alpha) on a
+  real UI icon texture, corrupting every row after the first. Handles
+  R5G6B5/X1R5G5B5/A1R5G5B5/A4R4G4B4/A8; unrecognized formats fall back to
+  the old raw-passthrough behavior rather than halting.
+- Window-transparency bug: degenerate draws with `dif=0x00000000` (alpha=0)
+  were, with blending disabled, writing real transparency into the
+  swapchain's alpha channel — the Wayland compositor honored it, showing
+  the desktop wallpaper through the game window instead of solid black.
+  Fixed by excluding `VK_COLOR_COMPONENT_A_BIT` from the pipeline's
+  `colorWriteMask` (`_pipeline.py`) — D3D8 has no concept of "make my own
+  window transparent," so backbuffer alpha should never reach the OS.
+- Descriptor-set race: `_set_texture` mutated one shared `VkDescriptorSet`
+  in place. Vulkan reads descriptor contents at command-buffer *execution*
+  time (`Present`'s `vkQueueSubmit`), not at record time — since many
+  `BeginScene`/`DrawPrimitive` calls accumulate into one command buffer
+  before a `Present` ever happens, every draw ended up sampling whichever
+  texture the *last* `SetTexture()` of that frame had bound. Fixed with one
+  persistent descriptor set per texture, allocated once in
+  `IDirect3DSurface8::UnlockRect` and cached in `_alloc_registry`, resolved
+  and bound per-draw at record time in `_draw_primitive`.
+- Same class of bug, for vertex data: `_draw_primitive` always wrote fresh
+  vertex data to the shared vertex buffer's offset 0, so every draw
+  accumulated in a frame overwrote the previous one's data before the GPU
+  ever executed any of the recorded `vkCmdDraw` calls. Fixed with a
+  per-frame cursor (`_state._vk_vertex_cursor`), reset once per new frame
+  acquire in `_begin_scene`, giving each draw its own buffer region.
+- **The Y-flip bug — the actual last blocker, found only because Molly
+  refused to accept a provably-correct GPU pixel readback as proof of a
+  working screen** ("I'd love to see something on the screen. I'm still not
+  agreeing that a blank screen is working."). Vulkan's NDC Y-axis points
+  DOWN by default (opposite of OpenGL), but `_draw_primitive`'s
+  screen-to-NDC math used the OpenGL-style flip (`yn = 1 - y/h*2`),
+  rendering everything upside-down/off-screen relative to any screenshot.
+  Fixed: `yn = (y/vp_h)*2 - 1` — D3D8 screen-space Y-down already matches
+  Vulkan NDC Y-down, no flip needed.
+- A related, separately-real Vulkan bug found while chasing the above:
+  `_begin_scene`'s per-frame swapchain-image re-acquire barrier used
+  `oldLayout=VK_IMAGE_LAYOUT_UNDEFINED` unconditionally — a real
+  content-discard hint some drivers honor literally, correct only the very
+  first time each swapchain image index is used (D3D8's `Clear()`, not
+  every frame boundary, is what's supposed to erase backbuffer content).
+  Fixed by tracking used image indices (`_state._vk_swapchain_images_used`,
+  reset on swapchain rebuild) and using `oldLayout=PRESENT_SRC_KHR` for
+  every re-acquire after the first.
+
+**Verification chain, strongest to weakest**: (a) a real textured quad
+directly visible in a live screenshot, confirmed only after temporarily
+injecting a standing per-frame debug draw to escape the one-shot timing of
+the real game's own draws (removed before finishing); (b) a full-screen
+solid-red `Clear()` confirmed reaching the actual composited window,
+proving the presentation pipeline itself independent of any draw-content
+bug; (c) direct GPU pixel readback (`vkCmdCopyImageToBuffer` into a
+host-visible staging buffer, read back in Python) showing real
+non-clear-color texture data at the expected screen location; (d) full
+test suite green (1249 passed) after every single change, all session.
+
+**Also found, not fixed this session** (see `TODO.md` for two new items):
+a real guest-code crash around t≈41s in live runs (`EIP=0x00688c68`,
+unrelated to D3D8); and the D3D8 game window receiving no real mouse
+movement, button-up, or focus-change events at all, plus
+`DirectInput::GetDeviceState` being a hardcoded zero-fill stub — meaning
+even a fully visible persona-select screen currently can't be clicked.
+
 ## 2026-09-02 (cont'd x52) — RESOLVED: `DS::DuplicateSoundBuffer` "invalid this" halt was never a DirectSound bug — a real DirectInput `Poll()` call was landing on DirectSound's trampoline because their fixed COM vtable regions silently overlapped
 
 **Root cause**: `DI_DEV_VTABLE` (`tew/api/dinput_handlers.py`) was extended from 18 to 26 slots at x51, growing its real end from `0x00220368` to `0x00220388` — but `DS_VTABLE` (`tew/api/dsound_handlers.py`) still started at the old boundary, `0x00220370`, 24 bytes (6 slots) inside DI_DEV_VTABLE's new range. Since `register_dsound_handlers` runs after `register_dinput_handlers` (`tew/api/crt_handlers.py`), DS_VTABLE's writes silently clobbered DI_DEV_VTABLE's last 6 slots (`GetEffectInfo` through `Poll`) with DS_VTABLE's first 6 (`QueryInterface` through `DuplicateSoundBuffer`) — exact address match: `DI_DEV_VTABLE+25*4 = DS_VTABLE+5*4 = 0x220384`.

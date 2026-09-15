@@ -51,8 +51,9 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
-from tew.api.d3d8._helpers import _com_stub, _set_eax
-from tew.api.d3d8.idirect3d8resource import _add_ref, _release
+from tew.api.d3d8._helpers import _com_stub, _set_eax, _alloc_registry
+from tew.api.d3d8.idirect3d8resource import _add_ref, _release, _ref_counts
+import tew.api.d3d8._state as _state
 
 # D3DSURFACE_DESC field offsets (matches idirect3d8surface.py)
 _DESC_FORMAT      = 0
@@ -162,6 +163,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             cpu.halted = True
             cpu.fatal_halt = True
             return
+        # GetSurfaceLevel() hands out a new reference per COM convention --
+        # without this, the texture's own Release() (which drops its one
+        # ownership ref on each mip) could free a surface the caller still
+        # holds and is about to Release() itself, double-freeing the block.
+        _ref_counts[surf] = _ref_counts.get(surf, 1) + 1
         if pp_surf:
             mem.write32(pp_surf, surf)
         _log.debug("d3d8", f"Texture::GetSurfaceLevel level={level} -> surf=0x{surf:08x}")
@@ -181,6 +187,48 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             data_ptr = mem.read32((surf + _SURF_DATA)  & 0xFFFFFFFF)
             mem.write32(p_locked,     w * 4)     # Pitch
             mem.write32(p_locked + 4, data_ptr)  # pBits
+        cpu.regs[EAX] = S_OK
+
+    # [17] UnlockRect(UINT Level) -- uploads the surface's raw BGRA bytes
+    # (written by the guest via LockRect's returned pointer) into a real
+    # Vulkan image so SetTexture can actually bind something the shader can
+    # sample, instead of the pixel data landing in an inert heap buffer.
+    # Destroys and replaces any previous image for this surface, so a
+    # texture that's locked/updated more than once (animation, streaming)
+    # doesn't leak a VkImage per update.
+    def _unlock_rect(cpu: "CPU", mem: "Memory") -> None:
+        this  = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        level = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        surf = _get_surface_ptr(this, level, mem)
+        if not surf or _state._vk_device is None:
+            _log.debug("d3d8",
+                f"UnlockRect this=0x{this:08x} level={level} surf=0x{surf:08x} "
+                f"skipped (no surface or device not ready)")
+            cpu.regs[EAX] = S_OK
+            return
+        w    = mem.read32((surf + _SURF_WIDTH)    & 0xFFFFFFFF)
+        h    = mem.read32((surf + _SURF_HEIGHT)   & 0xFFFFFFFF)
+        data_ptr = mem.read32((surf + _SURF_DATA) & 0xFFFFFFFF)
+        pixel_bytes = bytes(mem._buffer[data_ptr:data_ptr + w * h * 4])
+        _log.debug("d3d8",
+            f"UnlockRect this=0x{this:08x} level={level} surf=0x{surf:08x} "
+            f"w={w} h={h} uploading real Vulkan image")
+
+        from tew.api.d3d8._pipeline import upload_texture_image
+        import vulkan as vk
+        entry = _alloc_registry.get(surf)
+        if entry is not None and entry.get("vk_image") is not None:
+            old_img, old_mem, old_view = entry["vk_image"]
+            vk.vkDestroyImageView(_state._vk_device, old_view, None)
+            vk.vkDestroyImage(_state._vk_device, old_img, None)
+            vk.vkFreeMemory(_state._vk_device, old_mem, None)
+
+        image, image_mem, view = upload_texture_image(
+            _state._vk_device, _state._vk_physical_devices[0],
+            _state._vk_command_pool, _state._vk_graphics_queue,
+            w, h, pixel_bytes)
+        if entry is not None:
+            entry["vk_image"] = (image, image_mem, view)
         cpu.regs[EAX] = S_OK
 
     return [
@@ -237,5 +285,5 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             _lock_rect, 16, memory),
         # [17] UnlockRect(UINT Level)
         _com_stub(stubs, "d3d8tex", "Texture::UnlockRect",
-            lambda cpu, mem: _set_eax(cpu, S_OK), 4, memory),
+            _unlock_rect, 4, memory),
     ]

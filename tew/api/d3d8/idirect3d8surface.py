@@ -39,8 +39,12 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
-from tew.api.d3d8._helpers import _com_stub, _set_eax
+from tew.api.d3d8._helpers import (
+    _com_stub, _set_eax, _alloc_registry,
+    _format_bytes_per_pixel, _convert_to_bgra8,
+)
 from tew.api.d3d8.idirect3d8resource import _add_ref, _release
+import tew.api.d3d8._state as _state
 
 # D3DSURFACE_DESC field offsets
 _DESC_FORMAT        = 0   # D3DFORMAT
@@ -100,16 +104,90 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     def _lock_rect(cpu: "CPU", mem: "Memory") -> None:
         this       = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p_locked   = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
-        # pRect (ESP+12) and Flags (ESP+16) ignored — we always lock the whole surface
+        p_rect     = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        # Flags (ESP+16) ignored.
         if p_locked:
-            w        = mem.read32((this + _OBJ_WIDTH) & 0xFFFFFFFF)
-            data_ptr = mem.read32((this + _OBJ_DATA)  & 0xFFFFFFFF)
-            mem.write32(p_locked,     w * 4)      # Pitch: width × 4 bytes/pixel
-            mem.write32(p_locked + 4, data_ptr)   # pBits
+            w        = mem.read32((this + _OBJ_WIDTH)  & 0xFFFFFFFF)
+            fmt      = mem.read32((this + _OBJ_FORMAT) & 0xFFFFFFFF)
+            data_ptr = mem.read32((this + _OBJ_DATA)   & 0xFFFFFFFF)
+            # Pitch MUST match the real D3DFORMAT's bytes-per-pixel -- a
+            # hardcoded ×4 here corrupts every row after the first for any
+            # non-32bpp texture (confirmed live: fmt=0x17/D3DFMT_R5G6B5 UI
+            # icons, written by the guest at half our assumed stride).
+            bpp = _format_bytes_per_pixel(fmt)
+            pitch = w * bpp
+            # FIXED: pRect was ignored entirely, always handing back a
+            # pointer to the surface's absolute origin (0,0) regardless of
+            # which sub-rectangle the game actually requested. Real D3D8
+            # apps stream/decode large images in tiles via repeated
+            # Lock(pRect)/Unlock cycles on different sub-rects of the same
+            # surface -- every tile's real pixel data landed at buffer
+            # offset 0 instead of its real (left, top) position, since we
+            # never applied pRect's offset. Confirmed live: a background
+            # image built from 8 separate Lock/Unlock cycles rendered as a
+            # blocky mosaic (each tile overwriting the same top-left region)
+            # instead of a complete image.
+            left, top = 0, 0
+            if p_rect:
+                left = mem.read32((p_rect + 0) & 0xFFFFFFFF)
+                top  = mem.read32((p_rect + 4) & 0xFFFFFFFF)
+            offset = top * pitch + left * bpp
+            mem.write32(p_locked,     pitch)                          # Pitch
+            mem.write32(p_locked + 4, (data_ptr + offset) & 0xFFFFFFFF)  # pBits
         cpu.regs[EAX] = S_OK
 
-    # [10] UnlockRect()
+    # [10] UnlockRect() -- uploads the surface's raw BGRA bytes (written by
+    # the guest via LockRect's returned pointer) into a real Vulkan image.
+    # This is the actual real-game upload path: dx8z.dll calls
+    # IDirect3DSurface8::LockRect/UnlockRect on the mip-0 surface obtained
+    # via IDirect3DTexture8::GetSurfaceLevel, never the texture's own
+    # LockRect/UnlockRect (confirmed via call tracing -- 1211 Surface
+    # LockRect/UnlockRect calls vs. 0 Texture LockRect/UnlockRect calls in a
+    # real run). Destroys and replaces any previous image for this surface
+    # so repeated locks (animation, streaming) don't leak a VkImage each time.
     def _unlock_rect(cpu: "CPU", mem: "Memory") -> None:
+        this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        w = mem.read32((this + _OBJ_WIDTH) & 0xFFFFFFFF)
+        h = mem.read32((this + _OBJ_HEIGHT) & 0xFFFFFFFF)
+        data_ptr = mem.read32((this + _OBJ_DATA) & 0xFFFFFFFF)
+        if _state._vk_device is not None and w and h and data_ptr:
+            fmt = mem.read32((this + _OBJ_FORMAT) & 0xFFFFFFFF)
+            bpp = _format_bytes_per_pixel(fmt)
+            raw = bytes(mem._buffer[data_ptr:data_ptr + w * h * bpp])
+            bgra_bytes = _convert_to_bgra8(fmt, w, h, raw)
+            _log.debug("d3d8",
+                f"Surface::UnlockRect this=0x{this:08x} w={w} h={h} fmt=0x{fmt:x} "
+                f"bpp={bpp} -> uploading real Vulkan image")
+
+            from tew.api.d3d8._pipeline import (
+                upload_texture_image, allocate_descriptor_set, update_descriptor_set,
+            )
+            import vulkan as vk
+            entry = _alloc_registry.get(this)
+            if entry is not None and entry.get("vk_image") is not None:
+                old_img, old_mem, old_view = entry["vk_image"]
+                vk.vkDestroyImageView(_state._vk_device, old_view, None)
+                vk.vkDestroyImage(_state._vk_device, old_img, None)
+                vk.vkFreeMemory(_state._vk_device, old_mem, None)
+
+            image, image_mem, view = upload_texture_image(
+                _state._vk_device, _state._vk_physical_devices[0],
+                _state._vk_command_pool, _state._vk_graphics_queue,
+                w, h, bgra_bytes)
+            if entry is not None:
+                entry["vk_image"] = (image, image_mem, view)
+                # One descriptor set per texture, allocated once and reused
+                # across re-locks (animation/streaming) -- see _pipeline.py's
+                # module docstring on why a single shared, mutated-in-place
+                # set doesn't work for per-draw texture binding.
+                desc_set = entry.get("vk_desc_set")
+                if desc_set is None:
+                    desc_set = allocate_descriptor_set(
+                        _state._vk_device, _state._vk_descriptor_pool,
+                        _state._vk_descriptor_set_layout)
+                    entry["vk_desc_set"] = desc_set
+                update_descriptor_set(_state._vk_device, desc_set,
+                                       _state._vk_sampler, view)
         cpu.regs[EAX] = S_OK
 
     from tew.logger import logger as _log
