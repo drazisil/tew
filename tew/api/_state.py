@@ -213,7 +213,7 @@ def load_registry_json(
         return result
     except Exception as e:
         from tew.logger import logger
-        logger.warn("registry", f"Could not load registry.json: {e} — using empty registry")
+        logger.error("registry", f"Could not load registry.json: {e} — using empty registry")
         return {}
 
 
@@ -246,7 +246,7 @@ def save_registry_json(registry_values: RegistryMap) -> None:
             json.dump(result, f, indent=2)
         logger.debug("registry", f"Persisted {len(registry_values)} keys to registry.json")
     except Exception as e:
-        logger.warn("registry", f"Could not save registry.json: {e}")
+        logger.error("registry", f"Could not save registry.json: {e}")
 
 
 def load_emulator_config() -> EmulatorConfig:
