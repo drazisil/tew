@@ -3099,6 +3099,15 @@ _last_heartbeat_wall_time = time.monotonic()
 _sample_countdown = 1_000_000
 _progress_countdown = 5_000_000
 
+# See the thread-time-probe comment at its preempt_slice() call site below.
+import collections as _collections_for_thread_probe
+_THREAD_TIME_TOTALS: dict = _collections_for_thread_probe.defaultdict(float)
+_THREAD_TIME_SAMPLE_COUNT = [0]
+_THREAD_TIME_SAMPLE_STRIDE = 1  # preempt_slice() is called once per OUTER loop iteration (once per
+                                 # up-to-100k-step cpu.run() batch, not per instruction) -- confirmed
+                                 # 2026-09-14 by reading the call site, so total calls over a whole
+                                 # run is only in the tens of thousands; no sampling needed
+
 try:
     while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
         if not _HISTORY_CAPTURE_ENABLED and not _HISTORY_CAPTURE_DONE and step_count >= _HISTORY_CAPTURE_START_STEP:
@@ -3255,7 +3264,32 @@ try:
             logger.error("cpu", f"[watchpoint-hit-live] EIP=0x{cpu.watchpoint_eip:08x} written=0x{cpu.watchpoint_val:02x} step={step_count}")
             cpu.set_watchpoint(_tew_watch_addr_int)
             cpu.halted = False
+        # Lightweight per-guest-thread wall-clock accounting -- 2026-09-14:
+        # confirmed DB thread (tid=1011) dominant through startup (peaked
+        # ~82% of cumulative time), then used to verify the
+        # CriticalSectionEntry fix in kernel32_sync.py. Freeing for the next
+        # investigation; re-enable by uncommenting the block below (and
+        # restoring the bare crt_state.scheduler.preempt_slice(cpu, mem)
+        # call to the commented form).
         crt_state.scheduler.preempt_slice(cpu, mem)
+        # _THREAD_TIME_SAMPLE_COUNT[0] += 1
+        # if _THREAD_TIME_SAMPLE_COUNT[0] % _THREAD_TIME_SAMPLE_STRIDE == 0:
+        #     try:
+        #         _tid_before = crt_state.scheduler.current_thread().thread_id
+        #     except RuntimeError:
+        #         _tid_before = -1  # no current thread selected at this instant -- rare, don't crash the loop over it
+        #     _slice_t0 = time.perf_counter()
+        #     crt_state.scheduler.preempt_slice(cpu, mem)
+        #     _THREAD_TIME_TOTALS[_tid_before] += (time.perf_counter() - _slice_t0) * _THREAD_TIME_SAMPLE_STRIDE
+        # else:
+        #     crt_state.scheduler.preempt_slice(cpu, mem)
+        # if _THREAD_TIME_SAMPLE_COUNT[0] % 500 == 0:
+        #     _grand_total = sum(_THREAD_TIME_TOTALS.values()) or 1.0
+        #     _breakdown = ", ".join(
+        #         f"tid={t}:{100*v/_grand_total:.1f}%"
+        #         for t, v in sorted(_THREAD_TIME_TOTALS.items(), key=lambda kv: -kv[1])[:8]
+        #     )
+        #     logger.error("cpu", f"[thread-time-probe] total={_grand_total:.2f}s (extrapolated, 1-in-{_THREAD_TIME_SAMPLE_STRIDE} sampled) {_breakdown}")
 
         _heartbeat_countdown -= batch
         if _heartbeat_countdown <= 0:

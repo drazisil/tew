@@ -13,6 +13,8 @@ Architecture:
 from __future__ import annotations
 
 import re
+import time
+import collections
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -36,6 +38,18 @@ STUB_INT: int = 0xFE
 
 # Stub names suppressed from trace-level call logging (too noisy to be useful)
 _TRACE_SUPPRESS: frozenset[str] = frozenset({"EnterCriticalSection", "LeaveCriticalSection"})
+
+# Per-handler wall-clock accounting (2026-09-14, temporary): answers "is the
+# DB thread's time inside Python handler code (incl. ctypes/Zig crossings)
+# or in native CPU execution between calls" -- Molly's boundary-crossing
+# question after the thread-time-probe showed tid=1011 dominating. Keyed by
+# func_name only (no scheduler access at this dispatch point) -- since the
+# DB thread already dominates overall, fileio-handler totals here are a
+# reasonable proxy for its own I/O-handler cost even without per-thread
+# breakdown.
+_HANDLER_TIME_TOTALS: dict = collections.defaultdict(float)
+_HANDLER_CALL_COUNTS: dict = collections.defaultdict(int)
+_HANDLER_TIME_SAMPLE_COUNT = [0]
 
 # Trampolines used by dialog / DllMain bootstrap sequences
 DIALOG_TRAMPOLINE: int = 0x00210000
@@ -446,5 +460,25 @@ class Win32Handlers:
             # Execute the Python handler
             # EIP already points at RET, so the CPU will execute RET next.
             entry.handler(cpu)
+            # Per-handler wall-clock probe -- 2026-09-14: fix verified (see
+            # kernel32_sync.py's CriticalSectionEntry change) and committed,
+            # freeing this for the next investigation. Re-enable by
+            # restoring the perf_counter wrap + probe print below.
+            # _t0 = time.perf_counter()
+            # entry.handler(cpu)
+            # _HANDLER_TIME_TOTALS[entry.func_name] += time.perf_counter() - _t0
+            # _HANDLER_CALL_COUNTS[entry.func_name] += 1
+            # _HANDLER_TIME_SAMPLE_COUNT[0] += 1
+            # if _HANDLER_TIME_SAMPLE_COUNT[0] % 500 == 0:
+            #     _grand_total = sum(_HANDLER_TIME_TOTALS.values()) or 1.0
+            #     _top = sorted(_HANDLER_TIME_TOTALS.items(), key=lambda kv: -kv[1])[:10]
+            #     _breakdown = ", ".join(
+            #         f"{name}={t:.3f}s(n={_HANDLER_CALL_COUNTS[name]})"
+            #         for name, t in _top
+            #     )
+            #     logger.error(
+            #         "cpu",
+            #         f"[handler-time-probe] total={_grand_total:.3f}s calls={_HANDLER_TIME_SAMPLE_COUNT[0]} {_breakdown}",
+            #     )
         finally:
             set_current_handler(previous_handler)

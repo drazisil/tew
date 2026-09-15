@@ -109,6 +109,13 @@ def file_entry_size(entry: "FileHandleEntry") -> int:
 # ── Kernel object types ───────────────────────────────────────────────────────
 
 @dataclass
+class CriticalSectionEntry:
+    lock_count: int = 0xFFFFFFFF   # -1 (0xFFFFFFFF) == free
+    recursion_count: int = 0
+    owner_tid: int = 0             # 0 == unowned
+
+
+@dataclass
 class MutexHandle:
     type: str = "mutex"
     locked: bool = False
@@ -354,6 +361,23 @@ class CRTState:
         # ── Kernel objects ────────────────────────────────────────────────
         self.kernel_handle_map: dict[int, KernelHandle] = {}
         self.next_kernel_handle: int = 0x7000
+
+        # ── Critical sections ────────────────────────────────────────────
+        # Keyed by the guest CRITICAL_SECTION pointer. Guest code only ever
+        # touches a CS through the documented Win32 API (Enter/Leave/
+        # TryEnter/Initialize/Delete) -- MSVC-compiled code treats the
+        # struct layout as opaque, it's never read directly except by our
+        # own handlers -- so state lives here in Python instead of being
+        # read/written through guest memory on every call. 2026-09-14:
+        # measured live that batching the guest-memory reads/writes into
+        # fewer bulk ctypes crossings (read_bytes/load instead of several
+        # read32/write32) made no measurable difference (~27us/call either
+        # way) -- the crossings themselves, not their count, aren't what's
+        # expensive here, or something else dominates -- so this drops them
+        # entirely instead of trying to make them cheaper. Confirmed live:
+        # EnterCriticalSection dropped from ~22-27us/call to ~14us/call,
+        # LeaveCriticalSection from ~14us to ~9us.
+        self.critical_sections: dict[int, "CriticalSectionEntry"] = {}
 
         # ── Dynamic modules ───────────────────────────────────────────────
         self.dynamic_modules: dict[int, DynamicModule] = {}   # handle → module

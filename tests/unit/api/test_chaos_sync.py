@@ -76,8 +76,11 @@ def _call(stubs, cpu, mem, dll, name, *args):
 def cs(stubs, cpu, mem, name):
     return _call(stubs, cpu, mem, "kernel32.dll", name, CS_ADDR)
 
-def cs_field(mem, offset):
-    return mem.read32(CS_ADDR + offset)
+def cs_field(state, offset):
+    # 2026-09-14: CS state (LockCount/RecursionCount/OwningThread) moved out
+    # of guest memory into state.critical_sections -- see kernel32_sync.py.
+    attr = {OFF_LOCK: "lock_count", OFF_REC: "recursion_count", OFF_OWNER: "owner_tid"}[offset]
+    return getattr(state.critical_sections[CS_ADDR], attr)
 
 def create_mutex(stubs, cpu, mem, initial_owner=0, name_ptr=0):
     return _call(stubs, cpu, mem, "kernel32.dll", "CreateMutexA", 0, initial_owner, name_ptr)
@@ -103,9 +106,9 @@ def test_cs_balanced_enter_leave_always_frees(n):
         cs(stubs, cpu, mem, "EnterCriticalSection")
     for _ in range(n):
         cs(stubs, cpu, mem, "LeaveCriticalSection")
-    assert cs_field(mem, OFF_LOCK)  == LOCK_FREE
-    assert cs_field(mem, OFF_REC)   == 0
-    assert cs_field(mem, OFF_OWNER) == 0
+    assert cs_field(state, OFF_LOCK)  == LOCK_FREE
+    assert cs_field(state, OFF_REC)   == 0
+    assert cs_field(state, OFF_OWNER) == 0
 
 
 @given(st.integers(min_value=1, max_value=16))
@@ -115,8 +118,8 @@ def test_cs_recursion_count_tracks_depth(n):
     cs(stubs, cpu, mem, "InitializeCriticalSection")
     for _ in range(n):
         cs(stubs, cpu, mem, "EnterCriticalSection")
-    assert cs_field(mem, OFF_REC) == n
-    assert cs_field(mem, OFF_OWNER) == MAIN_TID
+    assert cs_field(state, OFF_REC) == n
+    assert cs_field(state, OFF_OWNER) == MAIN_TID
 
 
 @given(st.integers(min_value=1, max_value=16))
@@ -127,7 +130,7 @@ def test_try_enter_recursive_depth_matches(n):
     for _ in range(n):
         result = cs(stubs, cpu, mem, "TryEnterCriticalSection")
         assert result == 1
-    assert cs_field(mem, OFF_REC) == n
+    assert cs_field(state, OFF_REC) == n
 
 
 @given(st.integers(min_value=0, max_value=0xFFFFFFFF))
@@ -148,9 +151,9 @@ def test_init_cs_overwrites_garbage(garbage):
     for i, b in enumerate(garbage):
         mem.write8(CS_ADDR + i, b)
     cs(stubs, cpu, mem, "InitializeCriticalSection")
-    assert cs_field(mem, OFF_LOCK)  == LOCK_FREE
-    assert cs_field(mem, OFF_REC)   == 0
-    assert cs_field(mem, OFF_OWNER) == 0
+    assert cs_field(state, OFF_LOCK)  == LOCK_FREE
+    assert cs_field(state, OFF_REC)   == 0
+    assert cs_field(state, OFF_OWNER) == 0
 
 
 # ── 3. @given: Mutex invariants ───────────────────────────────────────────────
@@ -233,7 +236,7 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     @invariant()
     def lock_count_consistent(self):
-        lock = self.mem.read32(CS_ADDR + OFF_LOCK)
+        lock = cs_field(self.state, OFF_LOCK)
         if self.depth == 0:
             assert lock == LOCK_FREE, f"depth=0 but LockCount={lock:#010x}"
         else:
@@ -241,7 +244,7 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     @invariant()
     def owner_consistent(self):
-        owner = self.mem.read32(CS_ADDR + OFF_OWNER)
+        owner = cs_field(self.state, OFF_OWNER)
         if self.depth == 0:
             assert owner == 0, f"depth=0 but OwningThread={owner}"
         else:
@@ -249,7 +252,7 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     @invariant()
     def recursion_count_matches_depth(self):
-        rec = self.mem.read32(CS_ADDR + OFF_REC)
+        rec = cs_field(self.state, OFF_REC)
         assert rec == self.depth, f"RecursionCount={rec} != model depth={self.depth}"
 
 

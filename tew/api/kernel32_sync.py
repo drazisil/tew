@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import cleanup_stdcall
-from tew.api._state import TEB_BASE
+from tew.api._state import TEB_BASE, CriticalSectionEntry
 from tew.logger import logger
 
 
@@ -25,14 +25,30 @@ def register_kernel32_sync_handlers(
 
     # ── Critical sections ─────────────────────────────────────────────────────
 
+    # 2026-09-14: critical-section state (LockCount/RecursionCount/
+    # OwningThread) now lives in state.critical_sections, keyed by the guest
+    # pointer, instead of being read/written through guest memory on every
+    # call. Guest code only ever touches a CS through this documented Win32
+    # API -- MSVC-compiled code treats CRITICAL_SECTION as opaque, nothing
+    # reads its raw fields except our own handlers (exception_diagnostics.py
+    # was the one exception and was switched to read this dict too) -- so
+    # there's no correctness reason to keep it in guest memory at all.
+    # Measured live first: batching the same reads/writes into fewer bulk
+    # ctypes crossings (read_bytes/load instead of several read32/write32)
+    # made no measurable difference (~27us/call either way) -- dropping the
+    # crossings entirely, not just their count, is what actually helps.
+    def _cs_entry(ptr: int) -> CriticalSectionEntry:
+        entry = state.critical_sections.get(ptr)
+        if entry is None:
+            # Guest used the CS without calling Initialize -- real Windows
+            # behavior is undefined here; degrade gracefully as free rather
+            # than raising, matching this handler's past leniency.
+            entry = state.critical_sections[ptr] = CriticalSectionEntry()
+        return entry
+
     def _init_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        memory.write32(ptr + 0x00, 0)
-        memory.write32(ptr + 0x04, 0xFFFFFFFF)
-        memory.write32(ptr + 0x08, 0)
-        memory.write32(ptr + 0x0C, 0)
-        memory.write32(ptr + 0x10, 0)
-        memory.write32(ptr + 0x14, 0)
+        state.critical_sections[ptr] = CriticalSectionEntry()
         # kernel32's InitializeCriticalSection is void; ntdll's own
         # RtlInitializeCriticalSection (same struct layout, same effect --
         # real kernel32 just forwards to it) returns NTSTATUS STATUS_SUCCESS.
@@ -40,18 +56,12 @@ def register_kernel32_sync_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _write_cs_with_spin(ptr: int, spin_count: int) -> None:
-        memory.write32(ptr + 0x00, 0)
-        memory.write32(ptr + 0x04, 0xFFFFFFFF)
-        memory.write32(ptr + 0x08, 0)
-        memory.write32(ptr + 0x0C, 0)
-        memory.write32(ptr + 0x10, 0)
-        memory.write32(ptr + 0x14, spin_count)
-
     def _init_cs_spin(cpu: "CPU") -> None:
-        ptr        = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        spin_count = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        _write_cs_with_spin(ptr, spin_count)
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        # spin_count (arg at ESP+8) is read by real Windows but only used by
+        # its own spin-wait loop before blocking -- this emulation blocks
+        # cooperatively instead of spinning, so the value has no effect here.
+        state.critical_sections[ptr] = CriticalSectionEntry()
         cpu.regs[EAX] = 1  # BOOL TRUE
         cleanup_stdcall(cpu, memory, 8)
 
@@ -59,69 +69,68 @@ def register_kernel32_sync_handlers(
     # effect as kernel32's version above (which forwards to it on real
     # Windows), but returns NTSTATUS (0 = STATUS_SUCCESS) instead of BOOL.
     def _rtl_init_cs_spin(cpu: "CPU") -> None:
-        ptr        = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        spin_count = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
-        _write_cs_with_spin(ptr, spin_count)
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.critical_sections[ptr] = CriticalSectionEntry()
         cpu.regs[EAX] = 0  # STATUS_SUCCESS
         cleanup_stdcall(cpu, memory, 8)
 
     def _enter_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         tid = state.tls_current_thread_id()
-        owner = memory.read32((ptr + 0x0C) & 0xFFFFFFFF)
-        if owner == tid:
+        cs = _cs_entry(ptr)
+        if cs.owner_tid == tid:
             # Recursive entry — same thread, deepen RecursionCount only.
-            memory.write32((ptr + 0x08) & 0xFFFFFFFF,
-                           (memory.read32((ptr + 0x08) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF)
+            cs.recursion_count += 1
         else:
-            lock_count = (memory.read32((ptr + 0x04) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF
-            memory.write32((ptr + 0x04) & 0xFFFFFFFF, lock_count)
-            if lock_count == 0:
+            new_lock_count = (cs.lock_count + 1) & 0xFFFFFFFF
+            if new_lock_count == 0:
                 # Acquired (LockCount was -1 → 0): first entry.
-                memory.write32((ptr + 0x08) & 0xFFFFFFFF, 1)
-                memory.write32((ptr + 0x0C) & 0xFFFFFFFF, tid)
+                cs.lock_count = 0
+                cs.recursion_count = 1
+                cs.owner_tid = tid
             else:
-                # CS is held by another thread — undo increment and block.
-                memory.write32((ptr + 0x04) & 0xFFFFFFFF, (lock_count - 1) & 0xFFFFFFFF)
+                # CS is held by another thread — LockCount is left
+                # untouched and we block.
                 retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
                 logger.debug("kernel32",
                     f"[EnterCriticalSection] 0x{ptr:08x} contested: "
-                    f"owner=0x{owner:08x} tid=0x{tid:08x} — blocking")
+                    f"owner=0x{cs.owner_tid:08x} tid=0x{tid:08x} — blocking")
                 state.scheduler.block_current_on_cs(cpu, memory, ptr, retry_eip)
                 return  # no cleanup_stdcall: EIP set to retry_eip by scheduler
         cleanup_stdcall(cpu, memory, 4)
 
     def _leave_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        rec = (memory.read32((ptr + 0x08) & 0xFFFFFFFF) - 1) & 0xFFFFFFFF
-        memory.write32((ptr + 0x08) & 0xFFFFFFFF, rec)
-        if rec == 0:
+        cs = _cs_entry(ptr)
+        cs.recursion_count = (cs.recursion_count - 1) & 0xFFFFFFFF
+        if cs.recursion_count == 0:
             # Full release: reset to free state and wake any blocked threads.
-            memory.write32((ptr + 0x0C) & 0xFFFFFFFF, 0x00000000)  # OwningThread = 0
-            memory.write32((ptr + 0x04) & 0xFFFFFFFF, 0xFFFFFFFF)  # LockCount = -1 (free)
+            cs.lock_count = 0xFFFFFFFF  # LockCount = -1 (free)
+            cs.owner_tid = 0
             state.scheduler.unblock_cs(ptr)
         cleanup_stdcall(cpu, memory, 4)
 
     def _delete_cs(cpu: "CPU") -> None:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        state.critical_sections.pop(ptr, None)
         cleanup_stdcall(cpu, memory, 4)
 
     # TryEnterCriticalSection(LPCRITICAL_SECTION) -> BOOL
     # Acquires if free or already owned by this thread; returns FALSE without
     # blocking if held by another thread.
     def _try_enter_cs(cpu: "CPU") -> None:
-        ptr   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        tid   = state.tls_current_thread_id()
-        owner = memory.read32((ptr + 0x0C) & 0xFFFFFFFF)
-        if owner == tid:
+        ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        tid = state.tls_current_thread_id()
+        cs = _cs_entry(ptr)
+        if cs.owner_tid == tid:
             # Recursive entry — owning thread deepens RecursionCount.
-            rec = (memory.read32((ptr + 0x08) & 0xFFFFFFFF) + 1) & 0xFFFFFFFF
-            memory.write32((ptr + 0x08) & 0xFFFFFFFF, rec)
+            cs.recursion_count += 1
             cpu.regs[EAX] = 1  # TRUE
-        elif memory.read32((ptr + 0x04) & 0xFFFFFFFF) == 0xFFFFFFFF:
+        elif cs.lock_count == 0xFFFFFFFF:
             # CS is free (LockCount == -1): acquire it.
-            memory.write32((ptr + 0x04) & 0xFFFFFFFF, 0)    # LockCount = 0
-            memory.write32((ptr + 0x08) & 0xFFFFFFFF, 1)    # RecursionCount = 1
-            memory.write32((ptr + 0x0C) & 0xFFFFFFFF, tid)  # OwningThread = tid
+            cs.lock_count = 0
+            cs.recursion_count = 1
+            cs.owner_tid = tid
             cpu.regs[EAX] = 1  # TRUE
         else:
             # Held by another thread — return FALSE without blocking.
