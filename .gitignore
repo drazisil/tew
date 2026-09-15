@@ -216,3 +216,6 @@ memdump.txt
 trace*.txt
 stdout.txt
 .vscode/settings.json
+
+# Claude Code local permission/settings overrides -- personal, not shared
+.claude/settings.local.json
