@@ -322,6 +322,13 @@ class CRTState:
         # GetModuleFileNameA handler to return the Windows-style exe path.
         self.exe_path: str = ""
 
+        # ── Guest memory (set by register_crt_handlers right after
+        # construction) ────────────────────────────────────────────────────
+        # Needed by simple_alloc/simple_free to fill handed-out/freed memory
+        # with the MSVC debug-heap's own guard patterns -- see simple_alloc's
+        # docstring for why.
+        self.memory: "Memory | None" = None
+
         # ── Heap allocator ────────────────────────────────────────────────
         self.next_heap_alloc: int = 0x04000000
         self.heap_alloc_sizes: dict[int, int] = {}   # addr → user size
@@ -515,6 +522,28 @@ class CRTState:
 
     # ── Heap allocation ───────────────────────────────────────────────────────
 
+    # MSVC debug-heap guard-byte fill patterns (dbgheap.h): 0xCD ("Clean
+    # Land") for memory just handed to the caller, 0xDD ("Dead Land") for
+    # memory just freed. Real Windows' debug CRT heap fills memory with
+    # these deterministically -- they never look like a valid pointer or
+    # code address. simple_alloc/simple_free used to hand out/return raw,
+    # unfilled memory (whatever tew's flat address space happened to
+    # already hold there), so a real game bug that reads a few bytes past
+    # what it actually received (harmless on real Windows -- it reads inert
+    # 0xCD filler) could instead read tew's own leftover heap contents,
+    # which can coincidentally be a real, dereferenceable code address.
+    # Confirmed live 2026-09-17: a `DBRES_Login` read past a short (but
+    # real, unchanged-in-years) `LoginComplete` MCOTS reply picked up a
+    # stale value that happened to equal `_CLayer_DetectDebugger`'s entry
+    # point in tew, causing a real crash for a read that's always been
+    # harmless on real Windows. See status.md's 2026-09-17 entry.
+    _DEBUG_HEAP_CLEAN_FILL = 0xCD
+    _DEBUG_HEAP_DEAD_FILL  = 0xDD
+
+    def _fill_memory(self, addr: int, size: int, fill_byte: int) -> None:
+        if self.memory is not None and size > 0:
+            self.memory.load(addr & 0xFFFFFFFF, bytes([fill_byte]) * size)
+
     def simple_alloc(self, size: int) -> int:
         """Bump-allocator for HeapAlloc/malloc/etc. Cursor math is done by
         libcpu.so's bump_alloc_next (cpu/src/alloc.zig); the cursor itself
@@ -532,6 +561,7 @@ class CRTState:
                     remainder_size = free_size - aligned_size
                     self.heap_free_list.append((remainder_addr, remainder_size))
                 self.heap_alloc_sizes[free_addr] = size
+                self._fill_memory(free_addr, size, self._DEBUG_HEAP_CLEAN_FILL)
                 return free_addr
 
         addr = self.next_heap_alloc
@@ -545,6 +575,7 @@ class CRTState:
             )
         self.next_heap_alloc = new_cursor
         self.heap_alloc_sizes[addr] = size
+        self._fill_memory(addr, size, self._DEBUG_HEAP_CLEAN_FILL)
         return addr
 
     def simple_free(self, addr: int) -> None:
@@ -560,6 +591,7 @@ class CRTState:
             )
         size = self.heap_alloc_sizes.pop(addr)
         self.heap_alloc_owner.pop(addr, None)
+        self._fill_memory(addr, size, self._DEBUG_HEAP_DEAD_FILL)
         self.heap_free_list.append((addr, size))
 
     # ── Path translation ──────────────────────────────────────────────────────
