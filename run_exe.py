@@ -1439,35 +1439,6 @@ def _mouseinput_do_probe(eip, regs, memory, memory_size):
         logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
 # cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
-# GMouseInput::MouseSetButton(button_index, state) is the ONLY writer of
-# this+0x2c+i*4 (confirmed via decompile: writes (state!=0)). Do() has now
-# been shown to never observe raw_down0!=0 even across two real clicks held
-# 6.3s and 17.4s -- this settles whether the setter itself is ever called
-# with a real down value at all, independent of everything downstream.
-def _mousesetbutton_probe(eip, regs, memory, memory_size):
-    this = regs[ECX]
-    button_index = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
-    state = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
-    logger.error("cpu",
-        f"[mousesetbutton-probe] this=0x{this:08x} button_index={button_index} state={state}")
-cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)  # 2026-09-17: re-enabled -- 2026-09-14 found
-# state always 0 across two real clicks BEFORE today's GetCursorPos fix; re-checking
-# now that it's fixed (though getmousepos() below reads separate globals GetCursorPos
-# itself doesn't touch, so this may still be 0 -- that's exactly what we're checking).
-
-# 2026-09-17: _MOUSE_getstate(6) (00a72d20) branches on global mode flag DAT_0128af04
-# -- ==4 means position/buttons come from getmousepos() (00a73a60), which just reads
-# 3 globals (DAT_020e398c=buttons, DAT_020e3990/3994=x/y) written by SOME OTHER
-# handler entirely (not DirectInput, not the GetCursorPos fixed today) -- anything
-# else means the DirectInput-buffered-data path (_INPUT_getdevicedata) is live
-# instead. Need the real mode to know which of the two totally different button-
-# state sources actually matters for the current investigation.
-def _mouse_getstate_mode_probe(eip, regs, memory, memory_size):
-    mode = _read32(memory, 0x0128af04, memory_size)
-    param_1 = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
-    logger.error("cpu", f"[mouse-getstate-probe] param_1={param_1} DAT_0128af04(mode)={mode}")
-cpu.add_logpoint(0x00a72d20, _mouse_getstate_mode_probe)
-
 # cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
 
 # GDialog::OnBegin (00b080c0) wires its own "default button" handles by name:
@@ -3542,6 +3513,19 @@ try:
                 # is the address that actually failed to decode, not fault_eip.
                 logger.always(WARN, "seh",
                     f"Unknown opcode: 0x{cpu.last_opcode:02x} at EIP=0x{cpu.last_instr_eip:08x}")
+                # An unimplemented opcode is a hole in THIS emulator, not a
+                # guest exception -- running the game's own SEH chain over it
+                # (as a fake access violation) only muddies the trail: found
+                # live 2026-09-18 when XLAT (0xD7) sent the game's handlers
+                # off to a second, meaningless fault at 0x7fffe797 in the
+                # stack region. Halt right here, fail loudly, no SEH.
+                logger.error("seh",
+                    f"halting immediately: opcode 0x{cpu.last_opcode:02x} at "
+                    f"0x{cpu.last_instr_eip:08x} is not implemented by the CPU core "
+                    f"(game SEH chain deliberately NOT run)")
+                cpu.faulted = True
+                cpu.halted = True
+                break
             logger.always(WARN, "seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
             handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
             if handled:

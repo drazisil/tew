@@ -15,7 +15,7 @@ crash -- see status.md's current entry. `0xD0` (SHR AL,1 etc.) and `0x34`
 (XOR AL,imm8) were the two real gaps fixed that session; these are not:
 `0x27`/`0x2F`/`0x37`/`0x3F` (DAA/DAS/AAA/AAS, BCD adjust -- rare in modern
 codegen), `0x8E` (MOV Sreg,rm -- segment register load), `0xD4`/`0xD5`/
-`0xD6`/`0xD7` (AAM/AAD/SALC/XLAT -- XLAT plausible in CRT string code),
+`0xD6` (AAM/AAD/SALC; **`0xD7` XLAT was fixed 2026-09-18** -- it turned out to be in the CRT's `__trandisp2`, behind `fmod`/`atan2`),
 `0x9A`/`0xEA` (far CALL/JMP -- plausible if any anti-debug trick uses
 segment switching), `0x62`/`0x63`/`0x82`/`0xCA`/`0xCB`/`0xCE`/`0xCF`/
 `0xE4`-`0xE7`/`0xEC`-`0xEF`/`0xFA`/`0xFB` (BOUND/ARPL/far RET/INTO/IRET/
@@ -30,7 +30,64 @@ actually shows up in a real run's log.
 
 ---
 
-## NEW (2026-09-17/18): synthetic clicks never register as a real click at the game's own legacy mouse-tracking layer -- likely `SDL_GetMouseState()` never reflecting `SDL_PushEvent`-injected button state
+## NEW (2026-09-18): the game asserts `screen.c(475) width>=0&&height>=0` right after the lobby loads -- `FeDC::DoClip` hands `Screen_SetClip` an inverted rect
+
+Reached only now that clicks, `DBRES_Login`, `strpbrk` and the FPU panic are fixed. ~110s after the port-43300 connect (lobby up: `LFrame.cpp Refreshing Buddy List`, `INet_Mail Calling Mail Poll`) the game prints `ASSERT: screen.c(475) width>=0&&height>=0` (in `~/.emu32/MCity/stdout.txt`; no `except.txt`, inline `_Nfs_DebugBreak`) and tew halts on the unhandled `INT3` at `0x00688c68` -- correct per the standing no-auto-continue rule. Chain (crash JSON): `Screen_SetClip(x,y,w,h)` `0x0073d4b5` <- `FeDC::DoClip` `0x0053e089` (intersects the widget rect with `GUI_ViewRect` via `GRect::operator&`, `ViewToScreen`, and if it differs from the cached rect at `this+0x7cc` calls `Screen_SetClip`) <- `0x543a77` <- `0xb43285` <- `0xaed019` (`GUI::OnEvent`). Meaning: a widget's rect does not overlap the view rect, so the intersection is inverted.
+
+**Next steps (not started)**: log `GUI_ViewRect` and the widget rect at `FeDC::DoClip` (entry `0x0053e0..`; args are `this` in ECX) to see the real numbers, and work out which input comes from tew (window/client size, `GetTextMetrics`/font metrics, D3D8 viewport, `GetSystemMetrics`). Real game code is assumed correct, so the divergence is expected to be tew's. Also still unverified live: whether the `XLAT`/`FISTP`/`FSCALE` fixes carry the animation (`fmod`) path, which the run would have reached ~25s after this halt.
+
+---
+
+## NEW (2026-09-18): the game's own `dprintf` debug output is almost entirely swallowed by three gates -- only an entry logpoint exists so far
+
+Found while tracing the click chain in Ghidra. `FUN_00780d80` (the
+`WM_*BUTTON*` handler, wParam `MK_*` bits -> `button_mask` -> `seteacmouse`)
+calls `dprintf(&_winmsgdebugflag, 2, "lib_mbutton")` first, and that message
+never appears anywhere. Full path (all confirmed by decompile):
+
+    dprintf(int *flag, int level, fmt, ...)          00a34c40
+      if (flag == NULL || level <= *flag)             gate 1: _winmsgdebugflag @ 016f3658 (needs >= 2 here)
+        vsprintf(buf) -> _DEBUG_trace(buf)            game's own static CRT vsprintf @ 009f4d30 (guest code, not tew's msvcrt handler)
+          __vsnprintf -> _PRINT_string(2, text)       re-formats the already-formatted text (a stray '%' would garble it)
+            if (byte @ 01282a1c + channel*2) & 1      gate 2: channel 2 reads 0x24 @ 01282a20 -> bit 0 clear, looks DISABLED (single-byte read, not double-checked)
+              vsprintf again; call each enabled sink   gate 3: table @ 01282ebc, 12-byte entries {callback, flags, ?} -- not examined
+
+**Done 2026-09-18, then DELETED the same day (click investigation resolved; re-add from this description if needed)**: `_dprintf_entry_probe` (`run_exe.py`, logpoint at
+`0x00a34c40`, uses 1 of the 8 logpoint slots) logs level, `*flag`, and the
+RAW format string at entry, before any gate; bounded to the first 3 hits
+per distinct fmt string. Args are not expanded (`%d` stays `%d`).
+
+**Not done (todo)**:
+- Formatted-text tap: a logpoint on `_DEBUG_trace` entry sees the already-
+  formatted string, but only for calls that pass gate 1. Or open the gates
+  from tew: poke `_winmsgdebugflag` (016f3658) >= 2, set bit 0 of the channel-2
+  byte (01282a20), and identify/enable a sink in the 01282ebc table.
+- Read the sink table (gate 3) -- what the callbacks actually do (debugger
+  output? file? on-screen console?) decides where a re-enabled message would land.
+- (ANSWERED 2026-09-18: `lib_mbutton` fired for BOTH real and synthetic clicks, so the handler was always reached; the difference was wParam's `MK_LBUTTON` bit -- see the resolved synthetic-clicks entry. Kept for reference.) The decisive click test using this: does `"lib_mbutton"` show up in
+  `[dprintf-probe]` for a REAL click and NOT for a synthetic one? If so,
+  synthetic clicks never reach `FUN_00780d80` at all (bug is earlier than
+  wParam). If it shows for both, the handler runs and wParam's `MK_LBUTTON`
+  bit is the suspect (see the synthetic-clicks entry below). A direct wParam
+  logpoint at `0x00780d80` (`[ESP+0x10]`=wParam, `[ESP+8]`=hwnd, `[ESP+0x14]`=
+  lParam) settles that independently; also not added yet.
+- `FUN_00780d80` also gates on `DAT_016f3628 == param_2` (presumably the
+  registered mouse hwnd) -- not verified.
+
+Side note from the same session: the `BTS` crash (fault EIP `0x009f3ffd`,
+real instruction at `0x009f3ffb`) is inside the game's own STATIC CRT
+(`vsprintf` is `009f4d30`, same 0x009fxxxx neighbourhood) -- the bytes
+`8a 06 0a c0 74 0a 46 0f a3` look like a `strspn`/`strcspn`/`strpbrk`-style
+char-set bitmap loop, i.e. plain CRT string code, not game logic.
+
+---
+
+## RESOLVED (2026-09-18): synthetic clicks never registered -- `wParam` lacked `MK_LBUTTON` because `SDL_GetMouseState()` ignores `SDL_PushEvent`-injected events (original write-up kept below)
+
+**RESOLVED 2026-09-18.** The hypothesis below was correct and is now measured: a guest logpoint on `FUN_00780d80` showed real `WM_LBUTTONDOWN` `wParam=0x1` vs synthetic `wParam=0x0`, every other field identical (hwnd `0x1034`, lParam (387,491), message `0x201`, the `DAT_016f3628` gate). Fixed in `tew/api/window_manager.py` by tracking pressed buttons from the events themselves (`_mouse_buttons_down`), never from `SDL_GetMouseState()`; 8 tests in `tests/unit/api/test_window_manager_mouse_wparam.py`. Live-confirmed: a synthetic START click now logs in (port 43300, lobby user list). Also fixes a latent race for REAL clicks (`SDL_GetMouseState()` is poll-time state; under emulator lag a quick click could already be released). Corrections to details below: `MouseSetButton`'s first arg is a real button index (0..3 over `rgbButtons[4]`), not a `GInput` type (those are 2/3/4); the guest's mask bits are `1/2/4` (left/right/middle) remapped from `MK_LBUTTON 1/MK_RBUTTON 2/MK_MBUTTON 0x10`. The click-investigation probes were deleted after this.
+
+Original write-up:
+
 
 **The actual root cause of "clicks don't work," found via live logpoints +
 a side-by-side real-vs-synthetic click on the same running process.** Full
