@@ -4,6 +4,16 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-18 (later) — FIXED: synthetic clicks (wParam `MK_LBUTTON`); BT/BTS/BTR/BTC + Group 8 operand handling; XLAT; FISTP/FSCALE host panic; unknown opcode now halts immediately
+
+**Clicks.** `window_manager.py` derived `WM_LBUTTONDOWN/UP/MOUSEMOVE` wParam from `SDL_GetMouseState()` (poll-time state, never updated by `SDL_PushEvent`), so synthetic clicks carried `wParam=0` and the guest's button mask (built from wParam's `MK_LBUTTON` alone: `FUN_00780d80` `0x00780d80` -> `seteacmouse` -> `_MOUSE_getstate` `0x00a72d20`, snapshot bytes `DAT_020e3620..23` = `mask bit ? 0x70 : 0`) stayed 0. Measured (real `wParam=0x1` vs synthetic `0x0`, all else identical) before fixing; now tracked from the events (`_mouse_buttons_down`). 8 tests (4 fail on the old code). Live: synthetic START click logs in. Probes used and deleted: `GMouseInput::MouseSetButton` `0x00b1b2c0`, `_MOUSE_getstate` `0x00a72d20`, `dprintf` `0x00a34c40`, `FUN_00780d80` `0x00780d80`.
+
+**CPU core (`cpu/`, 182 Zig tests).** `BTS/BTR/BTC rm32,r32` were missing and `BT` truncated memory bit offsets mod 32 (real x86 addresses `base+4*(off>>5)`); my first `BTS` also fetched the SIB byte twice (`readRmFixed32`+`writeRmFixed32` each re-resolve) and faulted a byte into the next instruction -- shared `bitTestReg` now resolves once. Group 8 (`0F BA`) had the same double-resolve plus imm8 fetched before the SIB; rewritten, undefined `/0../3` fault loudly. `XLAT` (`D7`) added (found in `__trandisp2`, behind `fmod`/`atan2`, via `AnimationDefinition::GetAnimationTime`). `FIST/FISTP/FISTTP m16/m32/m64` and `FSCALE` used `@intFromFloat`, which aborts the whole host process (SIGABRT) on NaN/Inf/out-of-range; now store the integer indefinite, set IE, and honor the control word's rounding bits (default nearest-even). `run_exe.py` halts immediately on an unknown opcode instead of running the game's SEH chain.
+
+**Where it stops now:** the game's own `ASSERT: screen.c(475) width>=0&&height>=0` after the lobby loads (`FeDC::DoClip` -> `Screen_SetClip`); see TODO.md.
+
+---
+
 ## 2026-09-18 — FIXED: missing `0xD0`/`0x34` CPU opcodes (real root cause of the `DBRES_Login`/`0x0099ed78` crash); restored the "Unknown opcode" diagnostic the Zig port had silently dropped
 
 `cpu/src/engine.zig`'s `dispatch_table` had `0xD1`/`0xD2`/`0xD3` wired but
