@@ -340,6 +340,40 @@ _click_start_wall_time = time.monotonic()
 _TEW_CLICK_PREMOVE_SEC = float(os.environ.get("TEW_CLICK_PREMOVE_SEC", "1.0"))
 _click_premove_injected = False
 
+# 2026-09-18: click when the GAME says a screen is ready, not after a guessed
+# wall-clock delay (the DAO/Jet startup window varies from ~330s to 500s+).
+# Watches a log file for text appended after startup, then clicks TEW_CLICK_AT
+# TEW_CLICK_WHEN_DELAY_SEC (default 30.0) later through the same premove/down/
+# hold/up sequence TEW_CLICK_AFTER_SEC uses. Only bytes appended after the
+# process starts count (the game's logs persist across runs).
+# The delay matters: found live 2026-09-18 that a click 3s after "Done Getting
+# Personas" (with the premove correctly onto the button) was silently ignored --
+# the log line is written when the persona list finishes downloading, but the
+# dialog isn't accepting input yet; manual clicks ~30s later worked every time.
+#   TEW_CLICK_WHEN_FILE=<path>   e.g. ~/.emu32/MCity/MCity_Log.txt
+#   TEW_CLICK_WHEN_TEXT=<text>   e.g. "Done Getting Personas"
+#   TEW_CLICK_WHEN_DELAY_SEC     seconds between seeing the text and the click
+# Requires TEW_CLICK_AT; mutually exclusive with TEW_CLICK_AFTER_SEC.
+from tew.file_trigger import FileTextTrigger
+_TEW_CLICK_WHEN_FILE = os.environ.get("TEW_CLICK_WHEN_FILE")
+_TEW_CLICK_WHEN_TEXT = os.environ.get("TEW_CLICK_WHEN_TEXT")
+_TEW_CLICK_WHEN_DELAY_SEC = float(os.environ.get("TEW_CLICK_WHEN_DELAY_SEC", "30.0"))
+_click_file_trigger: FileTextTrigger | None = None
+if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
+    if not (_TEW_CLICK_WHEN_FILE and _TEW_CLICK_WHEN_TEXT and _TEW_CLICK_AT):
+        raise SystemExit(
+            "TEW_CLICK_WHEN_FILE, TEW_CLICK_WHEN_TEXT and TEW_CLICK_AT must all be set together")
+    if _TEW_CLICK_AFTER_SEC:
+        raise SystemExit(
+            "set either TEW_CLICK_AFTER_SEC (time-based) or TEW_CLICK_WHEN_FILE/TEXT (file-based), not both")
+    _click_file_trigger = FileTextTrigger(
+        os.path.expanduser(_TEW_CLICK_WHEN_FILE), _TEW_CLICK_WHEN_TEXT)
+
+# 2026-09-18: out-of-range x87 FIST/FISTP stores are silent on real hardware
+# (integer indefinite) but here they mean upstream float math produced
+# NaN/Inf/garbage -- see TODO.md's screen.c(475) entry. Reported as they happen.
+_fist_seen = 0
+
 # 2026-09-14: double-click injection, added after Molly's real manual
 # testing found the persona-select dialog genuinely CAN dismiss (to a
 # "please wait..." screen, followed ~1min later by the LEAK_printclassf
@@ -3366,10 +3400,32 @@ try:
             _inject_window_close()
             _close_injected = True
 
+        if _click_file_trigger is not None and not _click_file_trigger.fired and _click_file_trigger.poll():
+            _TEW_CLICK_AFTER_SEC = str(
+                time.monotonic() - _click_start_wall_time + _TEW_CLICK_WHEN_DELAY_SEC)
+            logger.error("startup",
+                f"[click-trigger] {_TEW_CLICK_WHEN_TEXT!r} appeared in {_TEW_CLICK_WHEN_FILE} -- "
+                f"clicking at {_TEW_CLICK_AT} in {_TEW_CLICK_WHEN_DELAY_SEC}s")
+
+        _fist_n = cpu.fist_invalid_count
+        if _fist_n != _fist_seen:
+            if _fist_n <= 20 or _fist_n % 1000 == 0:
+                logger.error("cpu",
+                    f"[fist-invalid] out-of-range FIST/FISTP store(s): total={_fist_n}, "
+                    f"last at EIP=0x{cpu.fist_invalid_eip:08x}, source={cpu.fist_invalid_val!r}, "
+                    f"callers={['0x%08x' % r for r in cpu.fist_invalid_callers]} "
+                    f"(guest was given the integer indefinite)")
+            _fist_seen = _fist_n
+
         if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_premove_injected
                 and time.monotonic() - _click_start_wall_time
                 >= float(_TEW_CLICK_AFTER_SEC) - _TEW_CLICK_PREMOVE_SEC):
-            _inject_mouse_motion(0, 0)
+            # Move ONTO the target, like the manual-click path does (found live
+            # 2026-09-18: this used to push motion to literal (0,0), so the
+            # button-down teleported onto START with no hover ever established
+            # over it and the game silently ignored the click, while the
+            # manual x,y,hold trigger -- which premoves to the target -- worked).
+            _inject_mouse_motion(*(int(v) for v in _TEW_CLICK_AT.split(",")))
             _click_premove_injected = True
 
         if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_down_injected
@@ -3767,6 +3823,10 @@ if crt_state.fatal_dialogs:
         logger.error("startup", f'  "{caption}": {text.splitlines()[0] if text else ""}')
 else:
     logger.info("startup", "=== Emulation Complete (clean exit) ===")
+    if cpu.fist_invalid_count:
+        logger.error("cpu",
+            f"[fist-invalid] TOTAL out-of-range FIST/FISTP stores this run: {cpu.fist_invalid_count}, "
+            f"last at EIP=0x{cpu.fist_invalid_eip:08x}, source={cpu.fist_invalid_val!r}")
 logger.info("startup", f"Steps executed: {cpu._step_count}")
 
 logger.debug("handlers", "--- Win32 Stub Call Log (last 50) ---")

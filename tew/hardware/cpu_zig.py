@@ -133,6 +133,14 @@ def _bind_lib() -> ctypes.CDLL:
     lib.cpu_is_unknown_opcode.restype   = _b
     lib.cpu_get_last_instr_eip.argtypes = [_vp]
     lib.cpu_get_last_instr_eip.restype  = _u32
+    lib.cpu_get_fist_invalid_count.argtypes = [_vp]
+    lib.cpu_get_fist_invalid_count.restype  = _u32
+    lib.cpu_get_fist_invalid_eip.argtypes   = [_vp]
+    lib.cpu_get_fist_invalid_eip.restype    = _u32
+    lib.cpu_get_fist_invalid_val.argtypes   = [_vp]
+    lib.cpu_get_fist_invalid_val.restype    = _f64
+    lib.cpu_get_fist_invalid_ret.argtypes   = [_vp, _u32]
+    lib.cpu_get_fist_invalid_ret.restype    = _u32
 
     lib.cpu_set_fs_base.argtypes = [_vp, _u32]
     lib.cpu_set_fs_base.restype  = None
@@ -558,6 +566,32 @@ class ZigCPU:
         occurred, since `.eip` has already advanced past the missing
         opcode byte by the time the fault is observed."""
         return _lib.cpu_get_last_instr_eip(self._state)
+
+    @property
+    def fist_invalid_count(self) -> int:
+        """How many FIST/FISTP/FISTTP stores so far had a NaN/Inf/out-of-range
+        source (hardware silently stores the "integer indefinite"; the Zig
+        core counts them so a garbage value upstream is not invisible)."""
+        return _lib.cpu_get_fist_invalid_count(self._state)
+
+    @property
+    def fist_invalid_eip(self) -> int:
+        """Instruction-start EIP of the most recent such store."""
+        return _lib.cpu_get_fist_invalid_eip(self._state)
+
+    @property
+    def fist_invalid_val(self) -> float:
+        """Source value of the most recent such store (f80 narrowed to f64)."""
+        return _lib.cpu_get_fist_invalid_val(self._state)
+
+    @property
+    def fist_invalid_callers(self) -> list[int]:
+        """Up to three caller return addresses (EBP-chain walk) captured at the
+        moment of the most recent such store; trailing zeros dropped."""
+        rets = [_lib.cpu_get_fist_invalid_ret(self._state, i) for i in range(3)]
+        while rets and rets[-1] == 0:
+            rets.pop()
+        return rets
 
     @property
     def step_count(self) -> int:
