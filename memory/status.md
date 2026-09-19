@@ -8,7 +8,9 @@ Intel 80386 Programmer's Reference Manual, 1986
 Path: ~/Documents/i386.pdf (421 pages)
 
 ---
-*This file: current blocker, queued issues, run command, architecture. Holds only the single most-recent `## Current status` entry — do not let `## Previous status` entries accumulate here again; rotate them into `status_archive.md` instead (see below) once a new "Current status" replaces them. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
+*This file: current blocker, queued issues, run command, architecture. Holds only the single most-recent `## Open investigation (2026-09-19): HOME hub avatar not drawn -- game builds facets but its own `EASCLIP_drawtri` rejects them (screen x ~ -515, off the left edge); `animTime` stuck at 0.0. Hands-off run reaches the hub, ~49 min stable, splash textures render correctly. Full trace + probe addresses in changelog.md (2026-09-19). Avatar probes (8/8 logpoint slots) are still registered in `run_exe.py` -- delete when resolved. Next: probe who writes vertex x / viewport+matrix before `EASCLIP_drawtri`.
+
+## Current status` entry — do not let `## Previous status` entries accumulate here again; rotate them into `status_archive.md` instead (see below) once a new "Current status" replaces them. Completed work goes in changelog.md — do not add "what's fixed" sections here.*
 
 *Full investigation history lives in two places, both newest-first — do not re-derive any of it from scratch, grep instead: `changelog.md` (durable, organized by fix) and `status_archive.md` (rotated-out `## Previous status` entries, 2026-08-02 through 2026-08-28, some session-in-progress detail not duplicated in changelog.md).*
 ---

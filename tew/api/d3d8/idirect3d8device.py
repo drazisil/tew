@@ -1319,8 +1319,14 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
                                    _state._vk_pipeline_layout, 0, 1,
                                    [desc_set], 0, None)
         vk.vkCmdDraw(cmd, n_verts, 1, 0, 0)
+        if n_verts:
+            _x0, _y0, _z0 = _struct.unpack_from('<fff', flat, src_off)
+        else:
+            _x0 = _y0 = _z0 = 0.0
         logger.debug("d3d8",
-            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count} image_idx={_state._vk_current_image_idx}")
+            f"DrawPrimitive: TRIANGLELIST prim_count={prim_count} start={start_vert} stride={stride} "
+            f"fvf=0x{_state._draw_vertex_fvf:x} tex=0x{tex:x} v0=({_x0:.1f},{_y0:.1f},{_z0:.3f}) "
+            f"image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
     dev[70] = _com_stub(stubs, "d3d8dev", "Dev::DrawPrimitive",

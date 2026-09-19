@@ -6,6 +6,12 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-19): HOME hub avatar not drawn (in progress)
+
+Game builds the avatar facets but `EASCLIP_drawtri` (`0x0052e5c0`) outcode-rejects every triangle (verts at screen x ~ -515). Find the writer of vertex x before it (viewport X origin / projection matrix / widget origin) and probe. Also: why `AnimationDefinition::GetAnimationTime` yields 0.0 forever, and why `LFrame_Profile*` idle handlers get no events (`0x12`/`0x15`). Then delete the 8 probes in `run_exe.py`. Unrelated D3D8 gaps: LINELIST skipped, no depth/alpha test, `SetRenderState` no-op, indexed/UP draws fatal-halt; `[fist-invalid] source=inf` events at `0x00a03e69`; odd hub data (`PlayerName` placeholder, "Avg. Player Level: 83,886,080").
+
+---
+
 ## NEW (2026-09-18): ~28 more real x86 opcodes still missing from `dispatch_table`, silently falling through to `opFault`
 
 Found via a full enumeration of `cpu/src/engine.zig`'s `dispatch_table`
