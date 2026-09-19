@@ -519,6 +519,17 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetDoubleClickTime", _GetDoubleClickTime)
 
+    # GetCaretBlinkTime() -> UINT  (no args -- the caret's blink interval in ms;
+    # real Windows default is 530, user-configurable, which this emulator does not
+    # model). Found live 2026-09-18: ~15s after clicking CONTINUE on the post-login
+    # welcome letter the game reached a text-input caret and halted on this being
+    # unimplemented -- the first Win32 gap past the lobby.
+    def _GetCaretBlinkTime(cpu: "CPU") -> None:
+        logger.debug("handlers", "[Win32] GetCaretBlinkTime() -> 530")
+        cpu.regs[EAX] = 530
+
+    stubs.register_handler("user32.dll", "GetCaretBlinkTime", _GetCaretBlinkTime)
+
     # GetWindow(hWnd, uCmd) -> HWND
     _GW_HWNDFIRST = 0
     _GW_HWNDLAST  = 1
