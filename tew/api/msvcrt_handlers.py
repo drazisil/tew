@@ -507,13 +507,14 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_malloc_crt", _malloc_crt)
 
     # calloc(size_t num, size_t size) -> void* [cdecl]
-    # simpleAlloc memory is already zeroed by the bump allocator.
+    # calloc's contract is zeroed memory; simple_alloc's default fill is 0xCD,
+    # so ask for zeros explicitly.
     def _calloc(cpu: "CPU") -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         num  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         total = (num * size) & 0xFFFFFFFF
-        addr = state.simple_alloc(total) if total > 0 else 0
+        addr = state.simple_alloc(total, fill=0) if total > 0 else 0
         logger.debug("handlers", f"calloc({num}, {size}) -> 0x{addr:08x}  called from 0x{caller:08x}")
         cpu.regs[EAX] = addr
 

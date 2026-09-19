@@ -544,11 +544,18 @@ class CRTState:
         if self.memory is not None and size > 0:
             self.memory.load(addr & 0xFFFFFFFF, bytes([fill_byte]) * size)
 
-    def simple_alloc(self, size: int) -> int:
+    def simple_alloc(self, size: int, fill: int = _DEBUG_HEAP_CLEAN_FILL) -> int:
         """Bump-allocator for HeapAlloc/malloc/etc. Cursor math is done by
         libcpu.so's bump_alloc_next (cpu/src/alloc.zig); the cursor itself
         and the size-tracking dict stay Python-owned, same split as
-        ZigMemory leaving the buffer Python-owned in memory_zig.py."""
+        ZigMemory leaving the buffer Python-owned in memory_zig.py.
+
+        `fill` is the byte the returned block is filled with. The default is
+        the MSVC debug heap's 0xCD "Clean Land", correct for callers whose
+        contract is "uninitialized" (malloc, operator new, ...). A caller
+        whose contract promises something else -- calloc and anonymous
+        mappings promise zeros, a COM out-parameter must read NULL until the
+        callee writes it -- passes `fill=0` itself."""
         for i, (free_addr, free_size) in enumerate(self.heap_free_list):
             if free_size >= size:
                 del self.heap_free_list[i]
@@ -561,7 +568,7 @@ class CRTState:
                     remainder_size = free_size - aligned_size
                     self.heap_free_list.append((remainder_addr, remainder_size))
                 self.heap_alloc_sizes[free_addr] = size
-                self._fill_memory(free_addr, size, self._DEBUG_HEAP_CLEAN_FILL)
+                self._fill_memory(free_addr, size, fill)
                 return free_addr
 
         addr = self.next_heap_alloc
@@ -575,7 +582,7 @@ class CRTState:
             )
         self.next_heap_alloc = new_cursor
         self.heap_alloc_sizes[addr] = size
-        self._fill_memory(addr, size, self._DEBUG_HEAP_CLEAN_FILL)
+        self._fill_memory(addr, size, fill)
         return addr
 
     def simple_free(self, addr: int) -> None:

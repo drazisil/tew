@@ -860,7 +860,10 @@ def register_kernel32_io_handlers(
             cleanup_stdcall(cpu, memory, 20)
             return
 
-        base = state.simple_alloc(size)
+        # A mapped view is zero-filled by the OS: an anonymous mapping starts
+        # all zero, and a file-backed one is zero past whatever the file
+        # supplies. simple_alloc's default fill is 0xCD, so ask for zeros.
+        base = state.simple_alloc(size, fill=0)
         if file_entry is not None:
             if file_entry.fd is not None:
                 data = os.pread(file_entry.fd, size, offset)
@@ -868,7 +871,6 @@ def register_kernel32_io_handlers(
                 data = file_entry.data[offset:offset + size]
             if data:
                 memory.load(base & 0xFFFFFFFF, data)
-        # else: anonymous mapping -- simple_alloc's bump memory is already zeroed
 
         writable = (mapping.protect == _PAGE_READWRITE) and bool(
             desired_access & (_FILE_MAP_WRITE | _FILE_MAP_ALL_ACCESS)
