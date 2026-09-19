@@ -34,7 +34,7 @@ from tew.api.pe_resources import PEResources
 from tew.api._state import EmulatorConfig
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
-from tew.logger import logger, set_thread_id_provider, WARN
+from tew.logger import logger, set_thread_id_provider, WARN, configure_logger
 
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
@@ -326,6 +326,54 @@ _click_up_injected = False
 _click_down_wall_time: float | None = None
 _click_start_wall_time = time.monotonic()
 
+# 2026-09-16: every synthetic click so far has teleported the cursor straight
+# to the target in the same event as the button-down -- no motion history
+# leading up to it, unlike a real mouse arriving from wherever it last was.
+# Molly's suggestion: push a real SDL_MOUSEMOTION to (0,0) a moment before
+# the click, on the chance GMouseInput::Do's hit-testing (or something
+# upstream of it) cares about the cursor having actually moved into place
+# rather than appearing there instantaneously. Not confirmed necessary --
+# a cheap thing to also vary while every other synthetic-click bug already
+# found and fixed still doesn't explain the null reaction.
+#   TEW_CLICK_PREMOVE_SEC=<secs>  real seconds before TEW_CLICK_AFTER_SEC to
+#                                 push a MOUSEMOTION to (0,0); default 1.0
+_TEW_CLICK_PREMOVE_SEC = float(os.environ.get("TEW_CLICK_PREMOVE_SEC", "1.0"))
+_click_premove_injected = False
+
+# 2026-09-18: click when the GAME says a screen is ready, not after a guessed
+# wall-clock delay (the DAO/Jet startup window varies from ~330s to 500s+).
+# Watches a log file for text appended after startup, then clicks TEW_CLICK_AT
+# TEW_CLICK_WHEN_DELAY_SEC (default 30.0) later through the same premove/down/
+# hold/up sequence TEW_CLICK_AFTER_SEC uses. Only bytes appended after the
+# process starts count (the game's logs persist across runs).
+# The delay matters: found live 2026-09-18 that a click 3s after "Done Getting
+# Personas" (with the premove correctly onto the button) was silently ignored --
+# the log line is written when the persona list finishes downloading, but the
+# dialog isn't accepting input yet; manual clicks ~30s later worked every time.
+#   TEW_CLICK_WHEN_FILE=<path>   e.g. ~/.emu32/MCity/MCity_Log.txt
+#   TEW_CLICK_WHEN_TEXT=<text>   e.g. "Done Getting Personas"
+#   TEW_CLICK_WHEN_DELAY_SEC     seconds between seeing the text and the click
+# Requires TEW_CLICK_AT; mutually exclusive with TEW_CLICK_AFTER_SEC.
+from tew.file_trigger import FileTextTrigger
+_TEW_CLICK_WHEN_FILE = os.environ.get("TEW_CLICK_WHEN_FILE")
+_TEW_CLICK_WHEN_TEXT = os.environ.get("TEW_CLICK_WHEN_TEXT")
+_TEW_CLICK_WHEN_DELAY_SEC = float(os.environ.get("TEW_CLICK_WHEN_DELAY_SEC", "30.0"))
+_click_file_trigger: FileTextTrigger | None = None
+if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
+    if not (_TEW_CLICK_WHEN_FILE and _TEW_CLICK_WHEN_TEXT and _TEW_CLICK_AT):
+        raise SystemExit(
+            "TEW_CLICK_WHEN_FILE, TEW_CLICK_WHEN_TEXT and TEW_CLICK_AT must all be set together")
+    if _TEW_CLICK_AFTER_SEC:
+        raise SystemExit(
+            "set either TEW_CLICK_AFTER_SEC (time-based) or TEW_CLICK_WHEN_FILE/TEXT (file-based), not both")
+    _click_file_trigger = FileTextTrigger(
+        os.path.expanduser(_TEW_CLICK_WHEN_FILE), _TEW_CLICK_WHEN_TEXT)
+
+# 2026-09-18: out-of-range x87 FIST/FISTP stores are silent on real hardware
+# (integer indefinite) but here they mean upstream float math produced
+# NaN/Inf/garbage -- see TODO.md's screen.c(475) entry. Reported as they happen.
+_fist_seen = 0
+
 # 2026-09-14: double-click injection, added after Molly's real manual
 # testing found the persona-select dialog genuinely CAN dismiss (to a
 # "please wait..." screen, followed ~1min later by the LEAK_printclassf
@@ -366,6 +414,61 @@ _dblclick_attempt = 0
 _dblclick_step = 0
 _dblclick_step_wall_time: float | None = None
 
+# 2026-09-17: TEW_CLICK_AT/TEW_CLICK_AFTER_SEC only support a click
+# pre-scheduled at a fixed wall-clock offset picked before the run even
+# starts -- Molly: "the lag makes pressing that button fairly unstable",
+# and this project's own click-repro history (see memory/status.md's
+# 2026-09-17 entries) is full of runs where a blind pre-scheduled click
+# missed because the game wasn't actually at the expected screen yet, with
+# no way to check first. This lets an operator (or Claude, screenshotting
+# the live SDL window between polls) trigger a click on demand, once the
+# right moment is actually confirmed, instead of guessing a timestamp in
+# advance. Always polled (cheap -- one os.path.exists() per outer-loop
+# iteration, same cadence as the TEW_CLICK_AT checks below); a no-op
+# whenever the trigger file doesn't exist.
+#
+# Usage: write a single line "x,y[,hold_sec[,premove_sec]]" (window-
+# relative PHYSICAL pixel coordinates -- same convention as TEW_CLICK_AT;
+# derive from the target's logical coordinate times the current run's own
+# scale factor, read back from a `[dinput]`/`CreateDevice` log line, never
+# a memorized physical value) to the trigger path below, e.g.:
+#   echo "774,982,2.0" > /tmp/tew_click_trigger
+# hold_sec defaults to 0.5, premove_sec (real seconds of motion-only lead
+# time before the button-down, same idea as TEW_CLICK_PREMOVE_SEC) to 0.3.
+# The file is consumed (deleted) as soon as it's read, so it only ever
+# fires once per write. Only one manual click can be in flight at a time --
+# a new trigger file written while one is still pending (premove injected
+# but button-up not yet pushed) is ignored until the in-flight one finishes.
+_TEW_MANUAL_CLICK_TRIGGER = os.environ.get("TEW_MANUAL_CLICK_TRIGGER", "/tmp/tew_click_trigger")
+_manual_click_xy: tuple[int, int] | None = None
+_manual_click_hold_sec: float = 0.5
+_manual_click_premove_sec: float = 0.3
+_manual_click_step = 0  # 0=idle, 1=premove pushed (waiting), 2=down pushed (waiting for hold)
+_manual_click_step_wall_time: float | None = None
+
+# 2026-09-17 (cont'd again): LOG_LEVEL/LOG_CATEGORIES were previously only
+# settable at process launch -- reaching a useful investigation point (e.g.
+# persona-select) can take 350s+, so re-running just to change what's being
+# logged is expensive. Same trigger-file pattern as the click API: write
+# "level,categories" (either half optional -- "debug," to change only the
+# level, ",cpu,handlers" to change only categories) to turn on/adjust
+# logging live without restarting and losing a slow run's progress. Molly:
+# "your scripting toolbox needs 'turn on logging'".
+_TEW_LOG_TRIGGER = os.environ.get("TEW_LOG_TRIGGER", "/tmp/tew_log_trigger")
+
+# 2026-09-17 (cont'd again x2): pause/single-step, same session, same
+# reasoning -- Molly: "and a pause and single-step commands :D". Write
+# "pause"/"resume" (case-insensitive) to _TEW_PAUSE_TRIGGER to stop/restart
+# the CPU actually advancing (the outer loop keeps iterating and polling
+# every trigger file below even while paused -- click/log/step all still
+# work; only cpu.run() itself is skipped). While paused, write a step count
+# (blank = 1) to _TEW_STEP_TRIGGER to advance exactly that many instructions
+# once and stay paused afterward -- for walking through a live click one
+# instruction (or a handful) at a time instead of only pause-then-inspect.
+_TEW_PAUSE_TRIGGER = os.environ.get("TEW_PAUSE_TRIGGER", "/tmp/tew_pause_trigger")
+_TEW_STEP_TRIGGER = os.environ.get("TEW_STEP_TRIGGER", "/tmp/tew_step_trigger")
+_tew_paused = False
+
 
 def _get_click_sdl_window_id():
     import sdl2
@@ -404,7 +507,29 @@ def _inject_window_close() -> None:
     logger.always(WARN, "startup", "[close] pushed real SDL_WINDOWEVENT_CLOSE")
 
 
-def _inject_click_down(rel_x: int, rel_y: int) -> None:
+def _inject_mouse_motion(rel_x: int, rel_y: int) -> None:
+    import sdl2
+
+    win_id = _get_click_sdl_window_id()
+    if win_id is None:
+        return
+
+    motion = sdl2.SDL_Event()
+    motion.type = sdl2.SDL_MOUSEMOTION
+    motion.motion.windowID = win_id
+    motion.motion.which = 0
+    motion.motion.state = 0
+    motion.motion.x = rel_x
+    motion.motion.y = rel_y
+    motion.motion.xrel = 0
+    motion.motion.yrel = 0
+    sdl2.SDL_PushEvent(ctypes.byref(motion))
+
+    logger.always(WARN, "startup",
+        f"[click] pushed real SDL motion-only to window-relative ({rel_x},{rel_y})")
+
+
+def _inject_click_down(rel_x: int, rel_y: int, hold_sec_for_log: float = _TEW_CLICK_HOLD_SEC) -> None:
     import sdl2
 
     win_id = _get_click_sdl_window_id()
@@ -435,7 +560,7 @@ def _inject_click_down(rel_x: int, rel_y: int) -> None:
 
     logger.always(WARN, "startup",
         f"[click] pushed real SDL button-down at window-relative ({rel_x},{rel_y}), "
-        f"holding for {_TEW_CLICK_HOLD_SEC}s")
+        f"holding for {hold_sec_for_log}s")
 
 
 def _inject_click_up(rel_x: int, rel_y: int) -> None:
@@ -1348,18 +1473,144 @@ def _mouseinput_do_probe(eip, regs, memory, memory_size):
         logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
 # cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
-# GMouseInput::MouseSetButton(button_index, state) is the ONLY writer of
-# this+0x2c+i*4 (confirmed via decompile: writes (state!=0)). Do() has now
-# been shown to never observe raw_down0!=0 even across two real clicks held
-# 6.3s and 17.4s -- this settles whether the setter itself is ever called
-# with a real down value at all, independent of everything downstream.
-def _mousesetbutton_probe(eip, regs, memory, memory_size):
-    this = regs[ECX]
-    button_index = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
-    state = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+# 2026-09-19: left-frame player avatar investigation. The animated player model under
+# "PlayerName" is an MAvatar widget (Data/GUI/camera.lframe) driven by the idle handler
+# LFrame_ProfileAvatar (008240c0) -> MAvatar::Set(&tCarIDs) -> MAvatar::Set(type, hair,
+# skin, pants, shirt) (00843400; silently returns if type > 0x20) -> MAnim::LoadModel
+# (00842170, reads bam.viv). The left-panel stats show view.lframe.persona's DEFAULT text,
+# so LFrame_Profile* idle handlers look dead too. These four probes show how far the
+# chain gets: hits are bounded, and a totals line is printed at the end of the run.
+_lf_hits: dict[str, int] = {}
+_lf_draw_window = [0]
+_lf_avatar = [None]   # the MAvatar widget pointer, learned from the idle-handler probe
+def _lf_first(key, limit):
+    n = _lf_hits.get(key, 0) + 1
+    _lf_hits[key] = n
+    return n <= limit, n
+def _lf_s32(v):
+    return None if v is None else (v - 0x100000000 if v & 0x80000000 else v)
+
+def _lframe_avatar_handler_probe(eip, regs, memory, memory_size):   # FUN_008240c0(GUI*)
+    ok, n = _lf_first("LFrame_ProfileAvatar", 5)
+    if ok:
+        gui = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+        logger.error("cpu", f"[lframe-probe] LFrame_ProfileAvatar idle handler #{n} gui={gui if gui is None else hex(gui)}")
+    _lf_avatar[0] = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+
+def _mavatar_set_probe(eip, regs, memory, memory_size):   # MAvatar::Set(type, hair, skin, pants, shirt), thiscall
+    ok, n = _lf_first("MAvatar::Set", 8)
+    if not ok:
+        return
+    esp = regs[ESP]
+    mtype = _lf_s32(_read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size))
+    cols = []
+    for i in range(4):
+        ptr = _read32(memory, (esp + 8 + 4 * i) & 0xFFFFFFFF, memory_size)
+        val = _read32(memory, ptr, memory_size) if ptr else None
+        cols.append("None" if val is None else f"0x{val:08x}")
     logger.error("cpu",
-        f"[mousesetbutton-probe] this=0x{this:08x} button_index={button_index} state={state}")
-# cpu.add_logpoint(0x00b1b2c0, _mousesetbutton_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
+        f"[lframe-probe] MAvatar::Set #{n} this=0x{regs[ECX]:08x} modelType={mtype} "
+        f"(>0x20 => returns without loading) hair/skin/pants/shirt={cols}")
+
+cpu.add_logpoint(0x008240c0, _lframe_avatar_handler_probe)
+cpu.add_logpoint(0x00843400, _mavatar_set_probe)
+
+def _lf_cstr(memory, ptr, memory_size, limit=80):
+    if not ptr or not _in_bounds(ptr, 1, memory_size):
+        return None
+    end = ptr
+    while end - ptr < limit and _in_bounds(end, 1, memory_size) and memory[end] != 0:
+        end += 1
+    return bytes(memory[i] for i in range(ptr, end)).decode("latin-1")
+
+def _anim_getdef_probe(eip, regs, memory, memory_size):   # ANIMATION_GetAnimationDefinitionNew(AnimationDefinition**, const char*)
+    ok, n = _lf_first("ANIMATION_GetAnimationDefinitionNew", 12)
+    if ok:
+        name_ptr = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+        logger.error("cpu", f"[lframe-probe] GetAnimationDefinitionNew #{n} name={_lf_cstr(memory, name_ptr, memory_size)!r}")
+
+
+def _manim_ondraw_probe(eip, regs, memory, memory_size):   # MAnim::OnDraw(GDC*), thiscall
+    if regs[ECX] != _lf_avatar[0]:
+        return
+    _lf_draw_window[0] = 4   # log the next few MrC_DrawListInserted calls (they belong to this avatar draw)
+    ok, n = _lf_first("avatar MAnim::OnDraw", 4)
+    if ok:
+        esp = regs[ESP]
+        this = regs[ECX]
+        inst = _read32(memory, (this + 0x158) & 0xFFFFFFFF, memory_size)
+        gdc = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+        vt = _read32(memory, gdc, memory_size) if gdc else None
+        fn = _read32(memory, (vt + 0xdc) & 0xFFFFFFFF, memory_size) if vt else None
+        logger.error("cpu",
+            f"[lframe-probe] avatar MAnim::OnDraw #{n} this=0x{this:08x} animInstance={inst if inst is None else hex(inst)} "
+            f"gdc={gdc if gdc is None else hex(gdc)} gdc.vtable[0xdc]={fn if fn is None else hex(fn)} "
+            f"(if that call returns 0 the 3D draw is skipped)")
+
+cpu.add_logpoint(0x0042fa50, _anim_getdef_probe)
+
+def _manim_gate_probe(eip, regs, memory, memory_size):   # 0084287a: `test eax,eax` after gdc->Message(1,0,0)  (FeDC::DoClip result)
+    this = _read32(memory, (regs[EBP] - 4) & 0xFFFFFFFF, memory_size)
+    if this != _lf_avatar[0]:
+        return
+    val = regs[EAX]
+    _lf_first(f"avatar OnDraw gate eax={'0' if val == 0 else 'nonzero'}", 1)
+    if val == 0:
+        ok, n = _lf_first("avatar gate ZERO (draw skipped)", 3)
+        if ok:
+            logger.error("cpu", f"[lframe-probe] avatar MAnim::OnDraw gate returned 0 -> 3D draw SKIPPED (#{n})")
+cpu.add_logpoint(0x0084287a, _manim_gate_probe)
+cpu.add_logpoint(0x00842810, _manim_ondraw_probe)
+
+import struct as _st2
+def _mrc_drawlist_probe(eip, regs, memory, memory_size):   # MrC_DrawListInserted(DRender_tView*, DRender_tListfacet*, float)
+    if _lf_draw_window[0] <= 0:
+        return
+    _lf_draw_window[0] -= 1
+    ok, n = _lf_first("MrC_DrawListInserted (avatar window)", 10)
+    if not ok:
+        return
+    esp = regs[ESP]
+    view = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+    lst = _read32(memory, (esp + 8) & 0xFFFFFFFF, memory_size)
+    kind = _read32(memory, view, memory_size) if view else None
+    d = [_read32(memory, (lst + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(4)] if lst else None
+    dd = ["None" if v is None else f"0x{v:08x}" for v in (d or [])]
+    head = d[0] if d else None
+    first = [ _read32(memory, (head + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(6)] if head else None
+    fd = None if first is None else ["None" if v is None else f"0x{v:08x}" for v in first]
+    logger.error("cpu", f"[lframe-probe] MrC_DrawListInserted #{n} view=0x{(view or 0):x} view[0]={kind} list={dd} list[0]->{fd}")
+
+def _animdef_insertfacets_probe(eip, regs, memory, memory_size):   # AnimationDefinition::InsertListFacets(view, float time, ...)  thiscall
+    ok, n = _lf_first("AnimationDefinition::InsertListFacets", 6)
+    if ok:
+        esp = regs[ESP]
+        view = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+        tbits = _read32(memory, (esp + 8) & 0xFFFFFFFF, memory_size)
+        t = None if tbits is None else _st2.unpack('<f', _st2.pack('<I', tbits))[0]
+        kind = _read32(memory, view, memory_size) if view else None
+        logger.error("cpu", f"[lframe-probe] AnimationDefinition::InsertListFacets #{n} this=0x{regs[ECX]:08x} view[0]={kind} animTime={t!r}")
+
+cpu.add_logpoint(0x005d92a0, _mrc_drawlist_probe)
+cpu.add_logpoint(0x0043c3c0, _animdef_insertfacets_probe)
+
+def _easclip_drawtri_probe(eip, regs, memory, memory_size):   # EASCLIP_drawtri(v0, v1, v2) cdecl; outcode byte at v+0x50
+    if _lf_draw_window[0] <= 0 or _lf_draw_window[0] == 4:
+        return   # only calls made from inside an avatar MrC_DrawListInserted (window is 3 or 2 there)
+    ok, n = _lf_first("EASCLIP_drawtri", 12)
+    if not ok:
+        return
+    esp = regs[ESP]
+    vs = [_read32(memory, (esp + 4 + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(3)]
+    codes, xyz = [], []
+    for v in vs:
+        codes.append(None if v is None or not _in_bounds(v + 0x50, 1, memory_size) else memory[v + 0x50])
+        f = [_read32(memory, (v + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(4)] if v else []
+        xyz.append([None if w is None else round(_st2.unpack('<f', _st2.pack('<I', w))[0], 2) for w in f])
+    thrash = _read32(memory, 0x020f00f8, memory_size)
+    logger.error("cpu", f"[lframe-probe] EASCLIP_drawtri #{n} outcodes={codes} verts[0..3]={xyz} "
+                        f"_THRASH_drawtri=0x{(thrash or 0):08x}")
+cpu.add_logpoint(0x0052e5c0, _easclip_drawtri_probe)
 
 # cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
 
@@ -3223,10 +3474,50 @@ try:
             _HISTORY_CAPTURE_ENABLED = False
             _HISTORY_CAPTURE_DONE = True
             logger.always(WARN, "startup", f"[history] ClickHouse capture disabled at step {step_count:,} (window closed)")
+        if os.path.exists(_TEW_PAUSE_TRIGGER):
+            try:
+                with open(_TEW_PAUSE_TRIGGER, "r") as _f:
+                    _pause_cmd = _f.readline().strip().lower()
+                os.remove(_TEW_PAUSE_TRIGGER)
+            except OSError as _e:
+                logger.error("startup", f"[pause-trigger] failed to read/consume trigger: {_e}")
+                _pause_cmd = ""
+            if _pause_cmd == "pause":
+                _tew_paused = True
+                logger.always(WARN, "startup", f"[pause] paused at step={step_count:,} EIP=0x{cpu.eip & 0xFFFFFFFF:08x}")
+            elif _pause_cmd == "resume":
+                _tew_paused = False
+                logger.always(WARN, "startup", f"[pause] resumed at step={step_count:,}")
+            else:
+                logger.error("startup", f"[pause-trigger] unrecognized command: {_pause_cmd!r} (expected pause/resume)")
+
+        if _tew_paused and os.path.exists(_TEW_STEP_TRIGGER):
+            try:
+                with open(_TEW_STEP_TRIGGER, "r") as _f:
+                    _step_line = _f.readline().strip()
+                os.remove(_TEW_STEP_TRIGGER)
+            except OSError as _e:
+                logger.error("startup", f"[step-trigger] failed to read/consume trigger: {_e}")
+                _step_line = ""
+            try:
+                _step_n = int(_step_line) if _step_line else 1
+            except ValueError:
+                _step_n = 0
+                logger.error("startup", f"[step-trigger] unparseable step count: {_step_line!r}")
+            if _step_n > 0:
+                _step_n = min(_step_n, MAX_STEPS - step_count)
+                cpu.run(_step_n)
+                step_count += _step_n
+                logger.always(WARN, "startup",
+                    f"[step] advanced {_step_n} step(s) -> step={step_count:,} EIP=0x{cpu.eip & 0xFFFFFFFF:08x}")
+
         eip_before = cpu.eip
-        batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
-        cpu.run(batch)
-        step_count += batch
+        if _tew_paused:
+            time.sleep(0.05)  # idle-wait for a resume/step trigger, don't busy-spin a core
+        else:
+            batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
+            cpu.run(batch)
+            step_count += batch
 
         # ord325-probe disabled -- 2026-09-14/15 investigation closed: MSJET35.DLL
         # ordinal #325 (the ValidationRule/Required/AllowZeroLength property-access
@@ -3248,6 +3539,34 @@ try:
             _inject_window_close()
             _close_injected = True
 
+        if _click_file_trigger is not None and not _click_file_trigger.fired and _click_file_trigger.poll():
+            _TEW_CLICK_AFTER_SEC = str(
+                time.monotonic() - _click_start_wall_time + _TEW_CLICK_WHEN_DELAY_SEC)
+            logger.error("startup",
+                f"[click-trigger] {_TEW_CLICK_WHEN_TEXT!r} appeared in {_TEW_CLICK_WHEN_FILE} -- "
+                f"clicking at {_TEW_CLICK_AT} in {_TEW_CLICK_WHEN_DELAY_SEC}s")
+
+        _fist_n = cpu.fist_invalid_count
+        if _fist_n != _fist_seen:
+            if _fist_n <= 20 or _fist_n % 1000 == 0:
+                logger.error("cpu",
+                    f"[fist-invalid] out-of-range FIST/FISTP store(s): total={_fist_n}, "
+                    f"last at EIP=0x{cpu.fist_invalid_eip:08x}, source={cpu.fist_invalid_val!r}, "
+                    f"callers={['0x%08x' % r for r in cpu.fist_invalid_callers]} "
+                    f"(guest was given the integer indefinite)")
+            _fist_seen = _fist_n
+
+        if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_premove_injected
+                and time.monotonic() - _click_start_wall_time
+                >= float(_TEW_CLICK_AFTER_SEC) - _TEW_CLICK_PREMOVE_SEC):
+            # Move ONTO the target, like the manual-click path does (found live
+            # 2026-09-18: this used to push motion to literal (0,0), so the
+            # button-down teleported onto START with no hover ever established
+            # over it and the game silently ignored the click, while the
+            # manual x,y,hold trigger -- which premoves to the target -- worked).
+            _inject_mouse_motion(*(int(v) for v in _TEW_CLICK_AT.split(",")))
+            _click_premove_injected = True
+
         if (_TEW_CLICK_AT and _TEW_CLICK_AFTER_SEC and not _click_down_injected
                 and time.monotonic() - _click_start_wall_time >= float(_TEW_CLICK_AFTER_SEC)):
             _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
@@ -3260,13 +3579,93 @@ try:
             _inject_click_up(_rel_x, _rel_y)
             _click_up_injected = True
 
+        if os.path.exists(_TEW_LOG_TRIGGER):
+            try:
+                with open(_TEW_LOG_TRIGGER, "r") as _f:
+                    _log_trigger_line = _f.readline().strip()
+                os.remove(_TEW_LOG_TRIGGER)
+            except OSError as _e:
+                logger.error("startup", f"[log-trigger] failed to read/consume trigger: {_e}")
+                _log_trigger_line = ""
+            _log_parts = _log_trigger_line.split(",", 1)
+            _new_level = _log_parts[0].strip() or None
+            _new_categories = _log_parts[1].strip() if len(_log_parts) > 1 else None
+            _new_categories = _new_categories if _new_categories else None
+            if _new_level or _new_categories:
+                configure_logger(level=_new_level, categories=_new_categories)
+                logger.always(WARN, "startup",
+                    f"[log-trigger] level={_new_level!r} categories={_new_categories!r}")
+            else:
+                logger.error("startup",
+                    f"[log-trigger] trigger file had unparseable content: {_log_trigger_line!r}")
+
+        if _manual_click_step == 0 and os.path.exists(_TEW_MANUAL_CLICK_TRIGGER):
+            try:
+                with open(_TEW_MANUAL_CLICK_TRIGGER, "r") as _f:
+                    _trigger_line = _f.readline().strip()
+                os.remove(_TEW_MANUAL_CLICK_TRIGGER)
+            except OSError as _e:
+                logger.error("startup", f"[click] failed to read/consume manual-click trigger: {_e}")
+                _trigger_line = ""
+            _trigger_parts = [p.strip() for p in _trigger_line.split(",") if p.strip()]
+            _trigger_cmd = _trigger_parts[0].upper() if _trigger_parts else ""
+            # 2026-09-17 (cont'd): the bundled premove+down+hold+up sequence
+            # below pushes one teleporting MOUSEMOTION, which confirmed live
+            # does NOT reliably produce the real hover-focus state the
+            # game's own DirectInput polling depends on to highlight a
+            # control (the cursor visibly sat right on START in a
+            # screenshot with the button still unhighlighted) -- Molly:
+            # "wiggle it, click, hold, up when it's yellow". These three
+            # immediate, un-sequenced commands let an operator (or Claude,
+            # screenshotting between calls) drive that by hand: several
+            # MOVE writes approaching the target like real mouse travel,
+            # checked for the focus highlight, THEN a separate DOWN once
+            # confirmed, held for as long as wanted, THEN UP -- instead of
+            # the single fire-and-forget bundle's fixed timing.
+            #   MOVE,x,y   push one MOUSEMOTION to x,y, nothing else
+            #   DOWN,x,y   push a button-down at x,y (does not auto-release)
+            #   UP,x,y     push a button-up at x,y
+            if _trigger_cmd in ("MOVE", "DOWN", "UP") and len(_trigger_parts) >= 3:
+                _mx, _my = int(_trigger_parts[1]), int(_trigger_parts[2])
+                if _trigger_cmd == "MOVE":
+                    _inject_mouse_motion(_mx, _my)
+                elif _trigger_cmd == "DOWN":
+                    _inject_click_down(_mx, _my, hold_sec_for_log=0.0)
+                else:
+                    _inject_click_up(_mx, _my)
+                logger.always(WARN, "startup", f"[manual click] {_trigger_cmd} at ({_mx},{_my})")
+            elif len(_trigger_parts) >= 2 and _trigger_cmd not in ("MOVE", "DOWN", "UP"):
+                _mx, _my = int(_trigger_parts[0]), int(_trigger_parts[1])
+                _manual_click_hold_sec = float(_trigger_parts[2]) if len(_trigger_parts) >= 3 else 0.5
+                _manual_click_premove_sec = float(_trigger_parts[3]) if len(_trigger_parts) >= 4 else 0.3
+                _manual_click_xy = (_mx, _my)
+                _inject_mouse_motion(_mx, _my)
+                _manual_click_step = 1
+                _manual_click_step_wall_time = time.monotonic()
+                logger.always(WARN, "startup",
+                    f"[manual click] triggered at ({_mx},{_my}), premove={_manual_click_premove_sec}s "
+                    f"hold={_manual_click_hold_sec}s")
+            else:
+                logger.error("startup",
+                    f"[click] manual-click trigger file had unparseable content: {_trigger_line!r}")
+        elif (_manual_click_step == 1 and _manual_click_xy is not None
+                and time.monotonic() - _manual_click_step_wall_time >= _manual_click_premove_sec):
+            _inject_click_down(*_manual_click_xy, hold_sec_for_log=_manual_click_hold_sec)
+            _manual_click_step = 2
+            _manual_click_step_wall_time = time.monotonic()
+        elif (_manual_click_step == 2 and _manual_click_xy is not None
+                and time.monotonic() - _manual_click_step_wall_time >= _manual_click_hold_sec):
+            _inject_click_up(*_manual_click_xy)
+            _manual_click_step = 0
+            _manual_click_xy = None
+
         if (_TEW_DBLCLICK_AT and _TEW_DBLCLICK_AFTER_SEC
                 and _dblclick_attempt < _TEW_DBLCLICK_REPEAT):
             _dx, _dy = (int(v) for v in _TEW_DBLCLICK_AT.split(","))
             _elapsed = time.monotonic() - _click_start_wall_time
             _attempt_start = float(_TEW_DBLCLICK_AFTER_SEC) + _dblclick_attempt * _TEW_DBLCLICK_RETRY_SEC
             if _dblclick_step == 0 and _elapsed >= _attempt_start:
-                _inject_click_down(_dx, _dy)
+                _inject_click_down(_dx, _dy, hold_sec_for_log=_TEW_DBLCLICK_HOLD_SEC)
                 _dblclick_step = 1
                 _dblclick_step_wall_time = time.monotonic()
                 logger.always(WARN, "startup",
@@ -3278,7 +3677,7 @@ try:
                 _dblclick_step_wall_time = time.monotonic()
             elif (_dblclick_step == 2
                     and time.monotonic() - _dblclick_step_wall_time >= _TEW_DBLCLICK_GAP_SEC):
-                _inject_click_down(_dx, _dy)
+                _inject_click_down(_dx, _dy, hold_sec_for_log=_TEW_DBLCLICK_HOLD_SEC)
                 _dblclick_step = 3
                 _dblclick_step_wall_time = time.monotonic()
                 logger.always(WARN, "startup",
@@ -3296,6 +3695,32 @@ try:
             # CPU core currently produces (see core.zig's memRead8/memWrite8),
             # so it's the honest default rather than a guess.
             fault_eip = cpu.eip & 0xFFFFFFFF
+            if cpu.unknown_opcode:
+                # Restores a diagnostic the TS original (CPU.ts/Decoder.ts)
+                # used to throw as a real error and the Zig port silently
+                # dropped -- an unhandled opcode looked identical to a real
+                # guest fault (see status_archive.md's 2026-09-17 "wild
+                # pointer in DBRES_Login" misdiagnosis, later found to
+                # actually be this: a missing 0xD0 dispatch-table entry).
+                # cpu.eip has already advanced past the missing opcode byte
+                # by this point, so last_instr_eip (captured at the start
+                # of cpuStep, before any prefix/opcode bytes are consumed)
+                # is the address that actually failed to decode, not fault_eip.
+                logger.always(WARN, "seh",
+                    f"Unknown opcode: 0x{cpu.last_opcode:02x} at EIP=0x{cpu.last_instr_eip:08x}")
+                # An unimplemented opcode is a hole in THIS emulator, not a
+                # guest exception -- running the game's own SEH chain over it
+                # (as a fake access violation) only muddies the trail: found
+                # live 2026-09-18 when XLAT (0xD7) sent the game's handlers
+                # off to a second, meaningless fault at 0x7fffe797 in the
+                # stack region. Halt right here, fail loudly, no SEH.
+                logger.error("seh",
+                    f"halting immediately: opcode 0x{cpu.last_opcode:02x} at "
+                    f"0x{cpu.last_instr_eip:08x} is not implemented by the CPU core "
+                    f"(game SEH chain deliberately NOT run)")
+                cpu.faulted = True
+                cpu.halted = True
+                break
             logger.always(WARN, "seh", f"CPU fault at EIP=0x{fault_eip:08x} -- attempting SEH dispatch")
             handled = dispatch_exception(cpu, mem, STATUS_ACCESS_VIOLATION, fault_eip)
             if handled:
@@ -3537,6 +3962,11 @@ if crt_state.fatal_dialogs:
         logger.error("startup", f'  "{caption}": {text.splitlines()[0] if text else ""}')
 else:
     logger.info("startup", "=== Emulation Complete (clean exit) ===")
+    logger.error("cpu", f"[lframe-probe] hit totals this run: {_lf_hits}")
+    if cpu.fist_invalid_count:
+        logger.error("cpu",
+            f"[fist-invalid] TOTAL out-of-range FIST/FISTP stores this run: {cpu.fist_invalid_count}, "
+            f"last at EIP=0x{cpu.fist_invalid_eip:08x}, source={cpu.fist_invalid_val!r}")
 logger.info("startup", f"Steps executed: {cpu._step_count}")
 
 logger.debug("handlers", "--- Win32 Stub Call Log (last 50) ---")

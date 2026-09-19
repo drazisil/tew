@@ -129,6 +129,19 @@ def _bind_lib() -> ctypes.CDLL:
     lib.cpu_get_last_opcode.argtypes = [_vp]
     lib.cpu_get_last_opcode.restype  = _u8
 
+    lib.cpu_is_unknown_opcode.argtypes  = [_vp]
+    lib.cpu_is_unknown_opcode.restype   = _b
+    lib.cpu_get_last_instr_eip.argtypes = [_vp]
+    lib.cpu_get_last_instr_eip.restype  = _u32
+    lib.cpu_get_fist_invalid_count.argtypes = [_vp]
+    lib.cpu_get_fist_invalid_count.restype  = _u32
+    lib.cpu_get_fist_invalid_eip.argtypes   = [_vp]
+    lib.cpu_get_fist_invalid_eip.restype    = _u32
+    lib.cpu_get_fist_invalid_val.argtypes   = [_vp]
+    lib.cpu_get_fist_invalid_val.restype    = _f64
+    lib.cpu_get_fist_invalid_ret.argtypes   = [_vp, _u32]
+    lib.cpu_get_fist_invalid_ret.restype    = _u32
+
     lib.cpu_set_fs_base.argtypes = [_vp, _u32]
     lib.cpu_set_fs_base.restype  = None
     lib.cpu_set_gs_base.argtypes = [_vp, _u32]
@@ -532,6 +545,53 @@ class ZigCPU:
             _lib.cpu_clear_halted(self._state)
         else:
             self._py_faulted = True
+
+    @property
+    def last_opcode(self) -> int:
+        return _lib.cpu_get_last_opcode(self._state)
+
+    @property
+    def unknown_opcode(self) -> bool:
+        """True only when the current fault came from dispatch_table
+        having no handler for the opcode (opFault) -- distinct from a
+        real memory-access/SEH-worthy fault. Cleared alongside faulted/
+        halted by cpu_clear_halted."""
+        return _lib.cpu_is_unknown_opcode(self._state)
+
+    @property
+    def last_instr_eip(self) -> int:
+        """EIP at the start of the current/most-recent instruction
+        (before prefix/opcode bytes were consumed) -- use this, not
+        `.eip`, to report where an unknown-opcode fault actually
+        occurred, since `.eip` has already advanced past the missing
+        opcode byte by the time the fault is observed."""
+        return _lib.cpu_get_last_instr_eip(self._state)
+
+    @property
+    def fist_invalid_count(self) -> int:
+        """How many FIST/FISTP/FISTTP stores so far had a NaN/Inf/out-of-range
+        source (hardware silently stores the "integer indefinite"; the Zig
+        core counts them so a garbage value upstream is not invisible)."""
+        return _lib.cpu_get_fist_invalid_count(self._state)
+
+    @property
+    def fist_invalid_eip(self) -> int:
+        """Instruction-start EIP of the most recent such store."""
+        return _lib.cpu_get_fist_invalid_eip(self._state)
+
+    @property
+    def fist_invalid_val(self) -> float:
+        """Source value of the most recent such store (f80 narrowed to f64)."""
+        return _lib.cpu_get_fist_invalid_val(self._state)
+
+    @property
+    def fist_invalid_callers(self) -> list[int]:
+        """Up to three caller return addresses (EBP-chain walk) captured at the
+        moment of the most recent such store; trailing zeros dropped."""
+        rets = [_lib.cpu_get_fist_invalid_ret(self._state, i) for i in range(3)]
+        while rets and rets[-1] == 0:
+            rets.pop()
+        return rets
 
     @property
     def step_count(self) -> int:

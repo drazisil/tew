@@ -519,6 +519,17 @@ def register_user32_gdi32_handlers(
 
     stubs.register_handler("user32.dll", "GetDoubleClickTime", _GetDoubleClickTime)
 
+    # GetCaretBlinkTime() -> UINT  (no args -- the caret's blink interval in ms;
+    # real Windows default is 530, user-configurable, which this emulator does not
+    # model). Found live 2026-09-18: ~15s after clicking CONTINUE on the post-login
+    # welcome letter the game reached a text-input caret and halted on this being
+    # unimplemented -- the first Win32 gap past the lobby.
+    def _GetCaretBlinkTime(cpu: "CPU") -> None:
+        logger.debug("handlers", "[Win32] GetCaretBlinkTime() -> 530")
+        cpu.regs[EAX] = 530
+
+    stubs.register_handler("user32.dll", "GetCaretBlinkTime", _GetCaretBlinkTime)
+
     # GetWindow(hWnd, uCmd) -> HWND
     _GW_HWNDFIRST = 0
     _GW_HWNDLAST  = 1
@@ -1125,11 +1136,25 @@ def register_user32_gdi32_handlers(
     stubs.register_handler("user32.dll", "SetCursor", _SetCursor)
 
     # GetCursorPos(LPPOINT lpPoint) -> BOOL
+    #
+    # FIXED (2026-09-17): used to hardcode (0,0) unconditionally, regardless
+    # of where the real (or synthetic) cursor actually was -- confirmed live
+    # this can leave a GUI hover-highlight that checks GetCursorPos, rather
+    # than polling DirectInput, permanently believing the cursor sits at the
+    # top-left corner, matching a real observed symptom: a synthetic click
+    # dispatched WM_LBUTTONDOWN/UP correctly at the right coordinates (real
+    # dinput tracked state agreed too), but the target button's visual
+    # hover-highlight never lit up. Real Win32 GetCursorPos reports screen
+    # coordinates; our emulated session's window origin is always (0,0)
+    # (see ScreenToClient/ClientToScreen below), so the dinput-tracked
+    # logical position is directly usable here with no further conversion.
     def _GetCursorPos(cpu: "CPU") -> None:
         lp_point = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if lp_point:
-            memory.write32(lp_point,     0)   # x
-            memory.write32(lp_point + 4, 0)   # y
+            from tew.api.dinput_handlers import get_mouse_pos
+            x, y = get_mouse_pos()
+            memory.write32(lp_point,     x & 0xFFFFFFFF)
+            memory.write32(lp_point + 4, y & 0xFFFFFFFF)
         cpu.regs[EAX] = 1   # TRUE
         cleanup_stdcall(cpu, memory, 4)
 

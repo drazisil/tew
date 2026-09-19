@@ -4,6 +4,73 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-19 — INVESTIGATION (in progress): HOME hub avatar (player model under the name) never draws; game builds facets, its own clipper rejects them (screen x ~ -515)
+
+Hands-off run reaches the HOME hub and stays stable ~49 min. The left-panel avatar (`MAvatar` widget from `Data/GUI/view.lframe.persona`, `*GEVENT_IDLE=LFrame_ProfileAvatar`) is blank. Traced with logpoints (all still registered in `run_exe.py`, 8/8 slots, "left-frame avatar investigation" block; delete when resolved): `0x008240c0` LFrame_ProfileAvatar handler (38 hits), `0x00843400` `MAvatar::Set` (38; modelType valid), `0x0042fa50` `ANIMATION_GetAnimationDefinitionNew` (1), `0x00842810` avatar `MAnim::OnDraw` (37), `0x0084287a` OnDraw gate (`FeDC::DoClip`; nonzero, draw not skipped), `0x0043c3c0` `AnimationDefinition::InsertListFacets` (37, always `view[0]=2`, `animTime=0.0`), `0x005d92a0` `MrC_DrawListInserted` (call 1 non-empty type-1 facet list, call 2 empty), `0x0052e5c0` `EASCLIP_drawtri`.
+
+**Finding.** `MrC_DrawListInserted` -> `Draw_StopRenderingView` -> `Draw_RenderingLoop` -> type-1 handler `0x0050b2a0` -> `EASCLIP_drawtri`, which discards a triangle when the three vertices' outcode bytes (`+0x50`) AND to nonzero. Every logged avatar triangle is rejected that way: already-screen-space verts at x ~ -510..-545, y ~ 226.8, z ~ 0.01, w ~ 0.27, i.e. hundreds of px left of the window. `_THRASH_drawtri` (`0x020f00f8`) is never reached, so this is NOT a tew D3D8 gap; the bad number comes from the game's transform stage (viewport X origin / projection matrix / widget origin). `animTime` stays 0.0 on every call (animation clock not advancing) -- unexplained. Also unexplained: `LFrame_Profile*` stat handlers never receive events (`0x12`/`0x15`), the left-panel stats show the `.lframe.persona` default text. Next: find who writes vertex x before `EASCLIP_drawtri` and probe the viewport/matrix values.
+
+**Also this stretch.** `idirect3d8device.py` `_draw_primitive` debug log now prints start/stride/fvf/tex/`v0=(x,y,z)`. Side effect of the x87 fix: splash screen textures now render correctly. D3D8 gaps noted (unrelated to the avatar): LINELIST skipped, no depth/alpha-test, no-op `SetRenderState`, indexed/UP draws fatal-halt.
+
+---
+
+## 2026-09-18 (end of day) — FIXED: host x87 stack leak (`_ = fpuPop(s)` discarded an `f80` return) = the `screen.c(475)` assert and the 2-week FMUL-NaN mystery; plus GetCaretBlinkTime, file-text click trigger, FIST-invalid counter
+
+**Root cause (`cpu/src/fpu.zig`).** `fpuPop()` returned `f80`; every popping x87 handler called it as `_ = fpuPop(s);`. An `f80` return value lives in ST(0) of the HOST x87 stack and Zig does not pop a discarded one, so each `FSTP`/`FISTP`/`FCOMP`/`FADDP`/... leaked one host x87 entry; tew's `f80` math runs on the host's real x87 unit, so the 9th leak overflowed the stack and the next host `fld` produced a QNaN. Downstream: `ViewToScreen` -> `round(float)` -> `FISTP` -> `INT_MIN` -> `Screen_SetClip(h=-2147483648)` -> the game's own `ASSERT: screen.c(475) width>=0&&height>=0` -> tew's correct halt on the unhandled `INT3`. Same bug as the unresolved 2026-09-03/04 "`FMUL` returns NaN on one call in many" investigation. Fixed with a void `fpuDrop()`; `fpuPop` deleted. Regression test (`expected 0, found 20` before). Verified: no-reset run, 0 dirty host-x87 observations (was 699,784), 0 out-of-range FISTP events (NaN was at 13.7s). Found via an `fxsave` dirty check at every x87 handler entry + per-handler culprit counts (100% of the popping handlers, 0% of the rest); all scaffolding deleted (`captureHostFpuState`, the `fxsave`/`fninit` experiment, three `Screen_SetClip`/`ViewToScreen`/`GUI_InitView` probes); a test-only `hostFpuCheck` remains.
+
+**Other.** `user32.dll!GetCaretBlinkTime` implemented (530ms, +3 tests). `cpu.fist_invalid_count`/`_eip`/`_val`/`_callers` (+ Zig test): out-of-range FIST/FISTP stores are counted with the instruction EIP, source value and 3 EBP-chain callers captured at the moment of the store, reported live as `[fist-invalid]`. `TEW_CLICK_WHEN_FILE`/`_TEXT`/`_DELAY_SEC` file-text click trigger (`tew/file_trigger.py`, 7 tests; delay defaults to 30s -- a click 3s after `Done Getting Personas` is ignored); scheduled click premove now moves onto the target instead of `(0,0)`. Result: the game runs hands-off from launch to the real main UI (welcome letter + CONTINUE), first time ever; clicking CONTINUE works.
+
+---
+
+## 2026-09-18 (later) — FIXED: synthetic clicks (wParam `MK_LBUTTON`); BT/BTS/BTR/BTC + Group 8 operand handling; XLAT; FISTP/FSCALE host panic; unknown opcode now halts immediately
+
+**Clicks.** `window_manager.py` derived `WM_LBUTTONDOWN/UP/MOUSEMOVE` wParam from `SDL_GetMouseState()` (poll-time state, never updated by `SDL_PushEvent`), so synthetic clicks carried `wParam=0` and the guest's button mask (built from wParam's `MK_LBUTTON` alone: `FUN_00780d80` `0x00780d80` -> `seteacmouse` -> `_MOUSE_getstate` `0x00a72d20`, snapshot bytes `DAT_020e3620..23` = `mask bit ? 0x70 : 0`) stayed 0. Measured (real `wParam=0x1` vs synthetic `0x0`, all else identical) before fixing; now tracked from the events (`_mouse_buttons_down`). 8 tests (4 fail on the old code). Live: synthetic START click logs in. Probes used and deleted: `GMouseInput::MouseSetButton` `0x00b1b2c0`, `_MOUSE_getstate` `0x00a72d20`, `dprintf` `0x00a34c40`, `FUN_00780d80` `0x00780d80`.
+
+**CPU core (`cpu/`, 182 Zig tests).** `BTS/BTR/BTC rm32,r32` were missing and `BT` truncated memory bit offsets mod 32 (real x86 addresses `base+4*(off>>5)`); my first `BTS` also fetched the SIB byte twice (`readRmFixed32`+`writeRmFixed32` each re-resolve) and faulted a byte into the next instruction -- shared `bitTestReg` now resolves once. Group 8 (`0F BA`) had the same double-resolve plus imm8 fetched before the SIB; rewritten, undefined `/0../3` fault loudly. `XLAT` (`D7`) added (found in `__trandisp2`, behind `fmod`/`atan2`, via `AnimationDefinition::GetAnimationTime`). `FIST/FISTP/FISTTP m16/m32/m64` and `FSCALE` used `@intFromFloat`, which aborts the whole host process (SIGABRT) on NaN/Inf/out-of-range; now store the integer indefinite, set IE, and honor the control word's rounding bits (default nearest-even). `run_exe.py` halts immediately on an unknown opcode instead of running the game's SEH chain.
+
+**Where it stops now:** the game's own `ASSERT: screen.c(475) width>=0&&height>=0` after the lobby loads (`FeDC::DoClip` -> `Screen_SetClip`); see TODO.md.
+
+---
+
+## 2026-09-18 — FIXED: missing `0xD0`/`0x34` CPU opcodes (real root cause of the `DBRES_Login`/`0x0099ed78` crash); restored the "Unknown opcode" diagnostic the Zig port had silently dropped
+
+`cpu/src/engine.zig`'s `dispatch_table` had `0xD1`/`0xD2`/`0xD3` wired but
+never `0xD0` (8-bit shift-group-1, e.g. `SHR AL,1`) -- a real, previously
+undiscovered gap. Falling through to `opFault` after `fetch8` had already
+advanced EIP past the missing opcode byte made the resulting halt look
+like a jump into garbage at the next byte (which happened to be `0xE8`,
+colliding with the real `CALL rel32` opcode) -- this was misdiagnosed for
+a full prior session (2026-09-17) as a wild pointer inside `DBRES_Login`,
+then as a server-side payload-size bug, before Molly decoded the actual
+bytes at the fault EIP in Ghidra and recognized a real, valid instruction.
+Also found and fixed `0x34` (XOR AL,imm8), a clear copy-paste skip between
+the wired `0x33`/`0x35`, during a full dispatch-table coverage audit
+prompted by the same investigation (~28 more real gaps found, not yet
+fixed -- see TODO.md).
+
+**Root cause of the root cause**: `opFault` (`cpu/src/core.zig`) recorded
+no information about which opcode triggered it -- every dispatch-table gap
+has been indistinguishable from a real guest fault since the Zig port; the
+TS original (`CPU.ts`/`Decoder.ts`) used to throw a real `Unknown opcode:
+0xXX at EIP=...` error, and that diagnostic was silently lost in the port.
+Restored: `CpuState` gained `unknown_opcode`/`last_instr_eip` (the latter
+captured before prefix/opcode bytes are consumed, since `s.eip` has
+already advanced past the missing byte by fault time), new FFI exports
+`cpu_is_unknown_opcode`/`cpu_get_last_instr_eip`, and `run_exe.py`'s fault
+handler now logs `Unknown opcode: 0xXX at EIP=...` distinctly instead of
+the generic "CPU fault... attempting SEH dispatch" line.
+
+**Live-verified 2026-09-18**: a fresh run reached `MC_LOGIN_COMPLETE` ->
+`DBRES_Login` and continued cleanly into persona-physical + parts loading
+with zero faults anywhere in the log (except the one expected, harmless,
+SEH-caught `_CLayer_DetectDebugger` self-test). Confirmed the click-
+delivery bug (see TODO.md) is unrelated -- no `Unknown opcode` fires during
+a synthetic click attempt. Zig regression tests added for `opD0`/`op34`
+and the diagnostic itself; full Zig suite + Python suite (1234 tests)
+pass clean.
+
+---
+
 ## 2026-09-14 — FIXED: four per-byte memory-access loops replaced with bulk reads/writes, found via py-spy profiling
 
 First real performance investigation, prompted by Molly's "let's make
