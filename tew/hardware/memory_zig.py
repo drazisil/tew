@@ -67,7 +67,13 @@ class ZigMemory:
         # idiom ZigCPU uses (tew/hardware/cpu_zig.py) to hand the identical
         # buffer to cpu_create, so ZigMemory and ZigCPU share one buffer.
         self._ctypes_buf = (ctypes.c_uint8 * size_bytes).from_buffer(self._buffer)
-        self._ptr = ctypes.cast(self._ctypes_buf, ctypes.POINTER(ctypes.c_uint8))
+        # Cast from the raw address, not from the array object:
+        # ctypes.cast(array, ...) stores the array in the result's _objects
+        # and forms a reference cycle, so the whole buffer (272 MB in some
+        # tests) is only freed by the cyclic GC -- which counts objects, not
+        # bytes, and effectively never runs. Lifetime is still safe: this
+        # object owns both _buffer and _ctypes_buf for as long as _ptr exists.
+        self._ptr = ctypes.cast(ctypes.addressof(self._ctypes_buf), ctypes.POINTER(ctypes.c_uint8))
 
     @property
     def size(self) -> int:
@@ -150,7 +156,9 @@ class ZigMemory:
 
     def load(self, addr: int, data: bytes | bytearray) -> None:
         buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
-        data_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+        # Cast from the address (see __init__): casting the array itself would
+        # leave this per-call copy of `data` in a reference cycle.
+        data_ptr = ctypes.cast(ctypes.addressof(buf), ctypes.POINTER(ctypes.c_uint8))
         if addr < 0 or not _lib.mem_load(self._ptr, self.size, addr, data_ptr, len(data)):
             raise ValueError(
                 f"load: cannot fit {len(data)} bytes at 0x{addr & 0xFFFFFFFF:08x}, "
