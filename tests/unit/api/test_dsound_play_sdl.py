@@ -175,13 +175,16 @@ class TestOpenSdlAudio:
 
     def test_closing_releases_the_callback_and_is_idempotent(self, captured_logs):
         dev = _open_sdl_audio(bytearray(4096), 44100, 2, 16)
-        assert dev in dsh._callback_refs
+        try:
+            assert dev in dsh._callback_refs
 
-        dsh._close_sdl_audio(dev)
-        assert dev not in dsh._callback_refs
+            dsh._close_sdl_audio(dev)
+            assert dev not in dsh._callback_refs
 
-        dsh._close_sdl_audio(dev)  # closing twice must not raise
-        dsh._close_sdl_audio(0)    # the "never opened" sentinel is a no-op
+            dsh._close_sdl_audio(dev)  # closing twice must not raise
+            dsh._close_sdl_audio(0)    # the "never opened" sentinel is a no-op
+        finally:
+            dsh._close_sdl_audio(dev)
 
     def test_open_device_failure_returns_zero(self, captured_logs):
         mem_buf = bytearray(4096)
