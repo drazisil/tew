@@ -134,8 +134,54 @@ class TestOpenSdlAudio:
     def test_dummy_driver_opens_a_device(self, captured_logs):
         mem_buf = bytearray(4096)
         dev = _open_sdl_audio(mem_buf, 44100, 2, 16)
-        assert dev > 0
-        assert any("SDL audio opened" in line for line in captured_logs)
+        try:
+            assert dev > 0
+            assert any("SDL audio opened" in line for line in captured_logs)
+        finally:
+            # Close it before the test ends. Its callback is a closure over
+            # this test's local mem_buf; the per-test gc.collect() in
+            # conftest.py can free that closure the moment nothing references
+            # it, and this device's SDL audio thread keeps calling into it
+            # until _close_sdl_audio joins that thread. Leaving it open let a
+            # later test's _open_sdl_audio call race the collector against a
+            # still-running thread calling a freed ctypes thunk -- a
+            # use-after-free segfault, not a catchable Python exception.
+            dsh._close_sdl_audio(dev)
+
+    def test_a_second_open_attempt_does_not_drop_the_first_devices_callback(
+        self, captured_logs
+    ):
+        """Regression for the _callback_ref[0]-overwrite bug. The dummy driver
+        only allows one device open at a time (SDL_OpenAudioDevice fails
+        "Audio device already open" for a second default-device request), and
+        that's exactly the shape of the real bug: the old code built and
+        stored a fresh CFUNCTYPE into the single _callback_ref[0] slot before
+        checking whether SDL_OpenAudioDevice even succeeded, so a *failed*
+        second open still dropped the first, still-live device's callback --
+        a use-after-free the moment its SDL audio thread called in again, not
+        a Python exception (see tests/unit/conftest.py's per-test
+        gc.collect() for how this became a real crash instead of a leak that
+        outlived the process)."""
+        dev_a = _open_sdl_audio(bytearray(4096), 44100, 2, 16)
+        try:
+            assert dev_a > 0
+            assert dev_a in dsh._callback_refs
+
+            dev_b = _open_sdl_audio(bytearray(4096), 22050, 1, 8)
+            assert dev_b == 0  # dummy driver: only one device at a time
+            assert dev_a in dsh._callback_refs  # the failed attempt didn't touch it
+        finally:
+            dsh._close_sdl_audio(dev_a)
+
+    def test_closing_releases_the_callback_and_is_idempotent(self, captured_logs):
+        dev = _open_sdl_audio(bytearray(4096), 44100, 2, 16)
+        assert dev in dsh._callback_refs
+
+        dsh._close_sdl_audio(dev)
+        assert dev not in dsh._callback_refs
+
+        dsh._close_sdl_audio(dev)  # closing twice must not raise
+        dsh._close_sdl_audio(0)    # the "never opened" sentinel is a no-op
 
     def test_open_device_failure_returns_zero(self, captured_logs):
         mem_buf = bytearray(4096)

@@ -92,7 +92,14 @@ _ds_buffers: dict[int, _DSBuffer]   = {}
 _ds_buf_lock:   threading.Lock       = threading.Lock()
 _next_buf_idx:  list[int]            = [0]
 _sdl_audio_dev: list[int]            = [0]    # 0 = not opened
-_callback_ref:  list                 = [None]  # keep CFUNCTYPE alive
+# Keyed by device id, not a single overwritable slot: a second _open_sdl_audio
+# call (only real caller today: tests, via TestOpenSdlAudio; production opens
+# at most one device, guarded by _sdl_audio_dev[0]) must not drop the previous
+# device's CFUNCTYPE thunk while its SDL audio thread can still call into it.
+# ctypes frees the underlying trampoline once nothing references the wrapper,
+# and SDL's audio thread calling a freed thunk is a use-after-free segfault,
+# not a Python exception -- it doesn't raise, it corrupts memory.
+_callback_refs: dict[int, object]    = {}
 
 
 # ── SDL audio helpers ─────────────────────────────────────────────────────────
@@ -163,7 +170,6 @@ def _open_sdl_audio(mem_buf: bytearray,
             ctypes.memmove(stream_addr, out.tobytes(), length)
 
         cb = SDL_AudioCallback(_callback)
-        _callback_ref[0] = cb   # prevent GC
 
         spec = SDL_AudioSpec(freq=sample_rate, aformat=fmt,
                              channels=channels, samples=2048)
@@ -176,6 +182,11 @@ def _open_sdl_audio(mem_buf: bytearray,
             err = SDL_GetError()
             logger.warn("handlers", f"DirectSound: SDL_OpenAudioDevice failed: {err}")
             return 0
+        # Store only after a successful open, keyed by dev_id -- see _callback_refs'
+        # comment. Nothing prevented GC before this line ran, but nothing could have
+        # called the callback yet either (SDL_OpenAudioDevice hasn't started the
+        # device's audio thread until SDL_PauseAudioDevice(dev_id, 0) below).
+        _callback_refs[dev_id] = cb
         SDL_PauseAudioDevice(dev_id, 0)
         logger.info("handlers",
             f"DirectSound: SDL audio opened {sample_rate}Hz/{channels}ch/{bits}bit "
@@ -184,6 +195,19 @@ def _open_sdl_audio(mem_buf: bytearray,
     except Exception as exc:
         logger.warn("handlers", f"DirectSound: SDL audio init failed: {exc}")
         return 0
+
+
+def _close_sdl_audio(dev_id: int) -> None:
+    """Stop and close an SDL audio device opened by _open_sdl_audio, and release
+    its callback. Closing the device joins its audio thread first (SDL2's
+    documented behaviour for SDL_CloseAudioDevice), so it can no longer be
+    calling the callback once this returns -- safe to drop the reference after.
+    """
+    if dev_id == 0:
+        return
+    from sdl2 import SDL_CloseAudioDevice
+    SDL_CloseAudioDevice(dev_id)
+    _callback_refs.pop(dev_id, None)
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
