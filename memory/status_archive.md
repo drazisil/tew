@@ -4,6 +4,446 @@ Rotated-out `## Previous status` entries from `status.md`, oldest history preser
 
 ---
 
+## Previous status (2026-09-17, later) — both WinSock host-blocking bugs (`_recv`, `_select`) LIVE-CONFIRMED fixed; new real crash found in `DBRES_Login` right after a live `MC_LOGIN_COMPLETE`; full per-thread scheduler visibility now exists
+
+Rotated out 2026-09-18 once the real root cause of the `DBRES_Login` crash (a missing CPU opcode, not a heap-fill issue) was found — see `status.md`'s current entry.
+
+**The two socket freeze bugs are done.** `_recv` and `_select` (`tew/api/wsock32_handlers.py`) both used to hand the guest's real blocking/timeout socket calls straight to Python's blocking syscalls, freezing the whole emulator (single shared host thread, no real OS threads per guest). Both now peek with a zero-timeout `select()` and cooperatively yield/retry via `sleep_current` instead. **Live-confirmed 2026-09-17** against the real original-bug scenario (MCOTS connect to port 43300): `recv()` correctly waited ~1s and resolved without freezing anything; `_select` fired correctly across several threads with real requested timeouts (1.0s, 5.0s) and resolved cleanly too. No host-level `poll_schedule_timeout` freeze. `_closesocket` and non-blocking-`WSAEWOULDBLOCK` paths also gained success-path logging (were previously silent).
+
+**Real crash, misdiagnosed as tew's own heap allocator (later corrected 2026-09-18 -- see status.md)**: right after `dblog.txt` confirms a genuine `DBServiceResultQ msg #213 MC_LOGIN_COMPLETE Seq:3`, `DBRES_Login` (`DBResultQ.C`, reached via `DBServiceResultQ`'s indirect message-dispatch table) faulted trying to access memory at `0x4d980f` (the *unrelated* `_CLayer_DetectDebugger` function's entry point). Molly's correction after the initial (wrong) server-side theory: **assume real MS/game code and real Windows are correct; the divergence is tew's own emulation** (per this project's own long-standing "bug can only be in tew" prior). The real `LoginComplete` MCOTS reply (72-byte body) genuinely is this short and has been unchanged for years -- `DBRES_Login` reading a few fixed-offset fields past it is harmless on real Windows, because the **MSVC debug CRT heap deterministically fills newly-allocated memory with `0xCD` ("Clean Land") and freed memory with `0xDD` ("Dead Land")** -- neither ever looks like a real, dereferenceable code address. `tew`'s `simple_alloc`/`simple_free` (`tew/api/_state.py`, backing `malloc`/`operator new`/`calloc`/`HeapAlloc` for the whole game) used to hand out and return **raw, unfilled memory** -- whatever tew's flat address space happened to already hold -- so the exact same harmless out-of-bounds-but-in-buffer read could instead pick up tew's own leftover heap contents, which coincidentally equaled a real code address this time. **Fixed the heap fill anyway** (a real, independent correctness improvement even though it turned out not to be this crash's cause): `simple_alloc` now fills every newly-handed-out block with `0xCD`, `simple_free` fills every freed block with `0xDD`, both via a new `state.memory` reference. **Live-verification at the time: inconclusive after two attempts** -- two repro runs with the fix in place both ran to their full step budget and exited cleanly with no crash, no fault, but neither reached the actual login-complete/port-43300 stage that triggers the bug. **2026-09-18 update: re-verified live, crash reproduced again at the same fault site with the heap fill in place -- the fill fix did NOT resolve it.** Real root cause found the same session: `0x0099ed78` (not `0x4d980f`, which was the *attempted memory-access address*, not the fault EIP -- see below) is `D0 E8` (`SHR AL,1`), and `0xD0` was never wired into the CPU core's `dispatch_table` at all -- an unhandled-opcode fault, not a wild pointer. Fixed by adding `opD0`; see status.md's current entry for the full writeup.
+
+Two pre-existing test fixtures (`test_lock_file.py`, `test_read_write_file_handle.py`, plus `test_cmdline_nomovie.py` found slightly earlier) used `Memory` buffers too small to cover the real `0x04000000` heap base -- harmless before (since `simple_alloc` never touched real memory), now real failures once every allocation performs a real bounds-checked write; fixed by enlarging their `MEM_SIZE` to 96MB. Full suite (1281 tests, run in two pieces due to unrelated session memory pressure interacting badly with `test_dinput_handlers.py`'s per-test 272MB allocations) passes clean.
+
+**New capability: on-demand manual click trigger (2026-09-17)**, added after two consecutive click-repro attempts failed to reproduce the actual login flow at all (`MCity_Log.txt` stopped right at "Done Getting Personas" both times -- the click plausibly never registered, matching Molly's "not sure about that click, the lag makes pressing that button fairly unstable"). Every prior click mechanism (`TEW_CLICK_AT`/`AFTER_SEC`, `TEW_DBLCLICK_*`) requires picking a wall-clock delay *before the run starts* -- pure guesswork about what screen the game will actually be on. `run_exe.py` now also polls (cheap, once per outer-loop iteration) for a trigger file at `TEW_MANUAL_CLICK_TRIGGER` (default `/tmp/tew_click_trigger`). Two formats: the original bundled `x,y[,hold_sec[,premove_sec]]` (one write, auto-sequenced premove+down+hold+up), and three separate immediate commands added the same session -- `MOVE,x,y` / `DOWN,x,y` / `UP,x,y` -- for driving each step by hand (screenshot between calls to confirm real hover/focus before committing to down/up). `_inject_click_down`'s log line also got a real bugfix: it used to always say "holding for {TEW_CLICK_HOLD_SEC}s" regardless of which caller/mechanism actually invoked it.
+
+**`GetCursorPos` fixed (2026-09-17)**: was hardcoded since the project's very first DirectInput stub (2026-05-31) to always write `(0,0)` and return TRUE, completely ignoring real/synthetic mouse position. Now returns `dinput_handlers.get_mouse_pos()` (the same event-driven `_mouse_pos` DirectInput itself uses, fed by the real SDL event pump -- applies identically to real human mouse input, not just synthetic). A real, verified bug; not yet confirmed whether any persona-select code path actually reads it.
+
+**Live click-repro campaign (2026-09-17, later still) -- STILL UNRESOLVED at the time, four attempts, real leads ruled out one by one; re-confirmed still open 2026-09-18**: with the manual-trigger API + `GetCursorPos` fix in place, drove several attempts by hand (screenshotting between steps): wiggled the cursor through real intermediate points to the START button (not a teleport), confirmed `WM_MOUSEMOVE` lands correctly at each point, confirmed `WM_LBUTTONDOWN`/`WM_LBUTTONUP` dispatch to hwnd=0x1034 with byte-for-byte identical logical coordinates (387,491) to Molly's own real click that worked earlier the same session -- **and still zero downstream reaction, no visual hover-highlight, no progress past "Done Getting Personas" in `MCity_Log.txt`, in every attempt**. A `general-purpose` agent researched `status_archive.md`/`changelog.md` for prior work on this exact question and came back with a detailed, Ghidra-address-referenced writeup (real dispatch chain `GMouseInput::Do` (00b1b360) -> `GEventQueue::Process`/`GUI::OnEvent` (00aed150) -> `GUI::GetMouseFocus`/`_mfHitFirst` (00aef350/00aef1b0) -> `GButton::OnMouseDown`/`OnMouseUp` (00b47630/00b47720)) -- full detail not reproduced here, see the agent's report in this session's transcript or re-derive via the same targeted grep of the archives (search terms: GMouseInput, GEventQueue, OnEvent, hit-test, WEVENT_ACCEPT, GetCursorPos, hover, highlight, OnLButtonDown, MPersonaSelectDlg). Two leads tested and ruled out this session: (1) the *scheduled* `TEW_CLICK_AT` premove really does push motion to literal (0,0) not the target (a real, separate bug, but unused by the manual-trigger attempts, which wiggled through real points) -- confirmed in current source, not yet fixed; (2) hold duration -- one attempt held 14s (accidental, screenshots eating real time) matching the archive's still-unverified "2026-09-14 strongest remaining lead" (`GButton::OnMouseUp` only registers if mouse capture is STILL held at release; anything touching the button's focus/enable/visible state mid-hold via `OnKillFocus`/`SetEnable`/`SetVisible` clears it) -- retried with a tight ~7.8s hold, **still no reaction**, so this isn't the (or at least not the whole) explanation either. **2026-09-18 confirmation**: retested with `opD0`/`op34` fixed and the new `unknown_opcode` diagnostic live -- a synthetic DOWN still shows `mousesetbutton-probe button_index=0 state=0` throughout the hold, and no `Unknown opcode` line fired anywhere in the log, so this is confirmed unrelated to any CPU opcode gap. Real, still-open, next step unchanged: the agent's Priority 1 -- live CPU logpoints (not more black-box clicking) at `GButton::OnMouseDown`/`OnMouseUp` to see whether `OnMouseDown` fires at all (resolves whether `GetMouseFocus`/hit-testing ever finds the button) and whether capture is still held at `OnMouseUp` time; Priority 2 -- decompile `GButton`'s `OnMouseMove` vtable slot (0x94 per the `GUI::OnEvent` switch) to find the actual highlight/rollover logic, never named or decompiled in any prior session, and check whether it's purely cosmetic or whether it sets state the click-acceptance path also reads.
+
+**Click delivery is a solved problem**: physical click target = current run's logical coordinate (confirmed good: `(387,491)`, START) times the *current* run's actual scale factor (read back from a `[dinput]`/`CreateDevice` log line) -- never reuse a memorized physical value. Reaching a real, interactive screen needs `TEW_MAX_STEPS=1200000000` and `timeout` of at least 900-1200s (several hundred real seconds through the DAO/Jet DB-thread startup window before anything's safely clickable). Use `LOG_CATEGORIES` including `startup,cpu,exception,socket,handlers,threads` (see below) on any repro run meant to explain *why* a run ends.
+
+**Full per-thread scheduler visibility now exists.** Two pieces: (1) a `threads` LOG_CATEGORIES *group* token (`tew/logger.py`) expands to both `thread` and `scheduler` without collapsing their distinct per-line prefixes (Zig core vs. Win32-API layer) -- pure Python-side filtering alias, no Zig-side change. (2) `scheduler_zig.py`'s actual context-switch chokepoints (`switch_to`, `preempt_slice`, `block_current_on_cs/handles`, `sleep_current`, `mark_current_dead`, `terminate_thread`) now log every real `tid=X -> tid=Y (context)` transition -- previously **zero** logging existed at the actual switch mechanism (everything seen before was from the Win32-handler layer, not the scheduler itself), so a thread running a stretch of pure computation, including silent 100k-instruction `preempt_slice` batch-boundary preemptions, was invisible. Already used for real analysis: on the crash run, `tid=1000` (render/main) and `tid=1011` both needed forced batch-boundary preemption ~57% of the time they released the CPU -- the long-suspected DB thread (`tid=1015`, confirmed via Ghidra as `DB_Init`'s `DBThread`) was actually better-behaved at 44%. `CreateThread`/etc. now correctly show up under `thread`/`threads` (was invisible before if `LOG_CATEGORIES` omitted it, which is easy to do since it's separate from `scheduler`).
+
+**Test suite mouse-lockup fixed**: no `tests/conftest.py` existed; `SDL_VIDEODRIVER=dummy` was only set ad-hoc in three individual test files, fine for the whole suite but fragile for a narrower selection (could open a real SDL window and grab real mouse focus -- Molly's exact symptom). Fixed with a root `tests/conftest.py`. Verified via narrow + full-suite (1281 tests) runs. **Re-confirmed still fragile 2026-09-18**: invoking `pytest` with a mismatched cwd/rootdir (absolute target path from outside the repo) caused `--deselect`/`--ignore` on `test_dinput_handlers.py` to silently no-op due to nodeid mismatch, and locked Molly's real mouse again when the OOM-killed dinput batch left an SDL window grabbed. Fix: always `cd` into the repo root before invoking `pytest`, and pass `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy` explicitly on the command line as a second layer, not just relying on `conftest.py`.
+
+Full blow-by-blow (including the mosaic misdiagnosis, the tid=1003-silence false alarm, the accidental thread/scheduler-category flat-rename-then-revert, and the new crash trace) is in `status_archive.md`'s 2026-09-16/17 entries -- not repeated here.
+
+---
+
+## Previous status (2026-09-16/17, full investigation) — recv-freeze fix, click-reproduction saga, and the real root cause (a sibling WinSock `select()` bug) found underneath it all
+
+Full play-by-play, rotated out 2026-09-17 once the real root cause (below) was found and `status.md`'s current entry was rewritten to be a tight forward-looking summary instead of this whole narrative. Kept verbatim since several intermediate wrong turns (the recv-freeze theory, the mosaic-corruption misdiagnosis, the closesocket-silence theory) are exactly the kind of false-lead detail worth having on record if any of them look tempting again.
+
+**Coordinate bug found and worked around**: every synthetic-click coordinate memorized from prior sessions (e.g. physical (987,1097) for START) is worthless across a differently-clamped display -- `WindowEntry.phys_w/h` is set fresh at `CreateDevice`/`Reset` to whatever the *current* screen clamps the window to, so a hardcoded physical pixel target silently lands on the wrong control the moment the real display/compositor state differs from the session that measured it. Confirmed directly: this session's synthetic click at the old (987,1097) landed at logical (494,548) -- nowhere near START. Molly's own real manual click landed at logical (387,491) (confirmed via `[dinput] real mouse button 1 down/up` + matching `DispatchMessageA` lParam) -- that's the real button. Physical equivalent this session: ~(774,982) (387*2, 491*2 -- this session's scale factor, confirmed via the synthetic click's own physical->logical ratio, was still a clean 2x). **Takeaway**: always derive the physical click target from logical coordinates times the *current* run's actual scale factor (read back from a `[dinput]` log line or `WindowEntry.phys_w/logical_w`), never reuse a memorized physical pixel value.
+
+**`TEW_CLICK_PREMOVE_SEC` added** (`run_exe.py`, default 1.0s) -- pushes a real `SDL_MOUSEMOTION` to (0,0) a moment before the click, so the cursor has real arrival motion instead of teleporting onto the target in the same event as button-down. Kept as the default going forward -- cheap, matches real mouse behavior more closely.
+
+**Real result, first time this project got this far**: single click on START (corrected coordinates + premove), held 2.0s, produced a full working transition -- confirmed via `~/.emu32/MCity/Lobby_Log.txt`: real crypto session key negotiated, login sent for `Dr Brown` (userId=21), full `NPS_MINI_RIFF_LIST` response with 25 real room entries. Cross-confirmed against the real mco-server's own JSON gateway log: the login-server round trip (port 7003) succeeded, and a *second* connection opened right after the click on port 43300 (MCOTS) -- sent `MC_CLIENT_CONNECT_MSG` and got a same-millisecond reply back (`DBResultQ_Attach(21)` confirmed in `dblog.txt`).
+
+**New blocker found (later shown to be `_recv`, and later still shown to be incomplete -- see below)**: after that successful DB-attach exchange, the whole run went completely silent for 1000+s until `timeout` killed it -- no crash, no fault, no RUNAWAY. Root cause, confirmed live via `/proc/<pid>/task/*/syscall`: the main host thread was blocked in a real `recvfrom` syscall on the port-43300 socket (confirmed via `ss -tin`, `Recv-Q:0` -- genuinely waiting, not stuck on unread data). `tew/api/wsock32_handlers.py`'s `_recv` called the real host socket's blocking `entry.py_sock.recv(length)` directly, on tew's single shared CPU-stepping host thread -- so any guest thread's `recv()` finding no data froze the *entire* emulator, not just that thread.
+
+**FIXED (2026-09-16)**: `_recv` now does a zero-timeout `select()` readiness check first. Guest-nonblocking sockets keep returning `WSAEWOULDBLOCK` immediately. A guest-blocking socket with nothing ready rewinds EIP to the `INT 0xFE` and calls `state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 5)` to yield and retry in 5ms -- same retry-via-rewound-EIP pattern `WaitForSingleObject`/`WaitForMultipleObjects` already use. Also fixed the per-byte `write8()` receive loop -> `memory.load(lp_buf, data)`.
+
+**Three reproduction attempts (90-150s timeouts, `AFTER_SEC` 20-45s) all failed to trigger any socket activity**, despite one of them confirming byte-for-byte correct click delivery. **Root cause, found via screenshot** (Molly asked directly whether one had been taken -- it hadn't; taking one immediately surfaced this): screenshots at t=43s/t=76s showed an unchanging "blocky mosaic" on the game window, initially misread as a rendering-corruption bug. **This is itself a documented false lead** (see `status.md`'s "Known false leads"): a mosaic is real, correctly-loading content caught mid-load (the DAO/Jet DB-thread slow window), not corruption -- reaching persona-select needs `TEW_MAX_STEPS=1200000000`/`timeout 500`, around virtual t≈327-330s, an order of magnitude past what the three attempts allowed.
+
+**Corrected repro run (`TEW_MAX_STEPS=1200000000`, `timeout 900`, `AFTER_SEC=380`)**: click landed correctly against a confirmed-legible "CHOOSE YOUR PERSONA" screen, triggered real login traffic against ports 8226/8228, server returned `Dr Brown`'s persona data. **But the process exited around real t≈500-600s, not froze** -- `dblog.txt` showed a real `DBResultQ_Send` disconnect sequence, `stdout.txt` showed `cnps_roomserver.cpp` connection-kill retries -- a real disconnect, not a hang/crash/RUNAWAY. Port 43300 (the actual original-bug socket) was never reached this run either.
+
+**Own mistake flagged**: that run's `LOG_CATEGORIES` omitted `startup`/`cpu`/`exception`, so the exact halt trigger (`Emulation Complete`/`Final EIP`/`diagnose_halt` output, all INFO-level under excluded categories) went unrecorded -- confirmed the process reached the *normal* completion path (`--- Win32 Stub Call Log (last 50) ---` dump, only printed there) rather than a signal-kill (a real `Received signal N` would have shown regardless, ERROR-level bypasses category filtering).
+
+**Two logging gaps found and fixed while chasing a per-thread-silence lead that turned out to be two false alarms**: per-thread last-activity diffing showed `tid=1003` went silent right after the port-8228 exchange while other threads kept running for ~118s until the halt -- initially misread as the recv-freeze bug recurring in miniature (one thread quietly spinning in the new retry path). **Corrected twice**: (1) socket 0x101 was already guest-`ioctlsocket(FIONBIO)`'d non-blocking, so the new blocking-retry path never applied to it -- a non-blocking `WSAEWOULDBLOCK` return just had zero logging, which was the real (fixable) source of the silence. (2) The server's own JSON log showing `Disconnected on port 8228` 17ms after sending data first looked server-initiated -- Molly corrected: mco-server never closes connections proactively, all socket lifecycle is guest-driven, so that's the server noticing *our* FIN (a real, correct, short-lived connect->send->recv->close sequence), and `closesocket()`'s success path logged nothing at all either. **Fixed both**: `_recv`'s actual wait/retry path now logs first-stall/periodic-still-waiting/resolved; `_closesocket` now logs on success too.
+
+**The real root cause, found live via `/proc` at the user's direct request ("check proc, see if it's in recv still?")**: reran with `LOG_CATEGORIES=startup,cpu,exception,socket,handlers,scheduler,d3d8`, `TEW_MAX_STEPS=1200000000`, `timeout 1200`. This time the click genuinely reached the port-43300 MCOTS exchange -- `tid=1017` sent the real `MC_CLIENT_CONNECT_MSG` (`Dr Brown`), `tid=1019`'s `recv(0x104 <- 127.0.0.1:43300)` correctly logged "no data ready... yielding" via the new fix, and **the process stayed alive** with every other thread (1004/1005/1009/1011/1017/1018) continuing to run normally -- the original whole-emulator-freeze symptom is gone, confirmed live. But ~60s later the whole thing froze again anyway (0% CPU, log stalled, confirmed via `/proc/<pid>/task/*/syscall` and `/proc/<pid>/stat` utime/stime deltas across repeated samples). Checked `ss -tinp`: both the port-7003 and port-43300 sockets showed `Recv-Q:0` with real `bytes_received` counts already >0 -- **the data had already arrived and been consumed**, ruling out "still waiting for data" as the explanation this time. The main host thread's wchan was `poll_schedule_timeout` (a real blocking poll/select syscall), not `recvfrom` -- **the actual bug is `_select` (`tew/api/wsock32_handlers.py`), the game's own WinSock `select()` call, which had the exact same disease as the pre-fix `_recv`**: it parsed the guest's real `timeval` and handed it straight to Python's blocking `select.select(..., timeout)`, blocking the single shared host thread for however long the guest asked to wait. `_recv`'s fix never touched this sibling function.
+
+**FIXED (2026-09-17)**: `_select` now always peeks with a zero-timeout `select()` first. If nothing's ready and the guest's own requested wait (a real duration, or `None` for "block indefinitely" per NULL timeval) hasn't elapsed yet, it yields via `sleep_current` and retries, tracked per-thread (`_select_wait_since_ms`/`_select_wait_last_logged_ms` dicts, keyed by tid since one `select()` call spans multiple sockets, unlike `_recv`'s per-socket tracking) since a `timeval`-bearing call has to genuinely time out and return 0-ready once the guest's real requested duration passes, not wait forever just because it no longer blocks the host. Logs first-stall/periodic-still-waiting/resolved, matching `_recv`'s pattern. **Not yet live-verified** -- the run that found this bug was killed once the diagnosis was confirmed; next repro run should show the port-43300 exchange complete without any `poll_schedule_timeout` host-level freeze.
+
+**Test-suite mouse-lockup bug found and fixed the same session**: Molly reported the test suite causing "complete mouse lockup" when run. Found: no `conftest.py` existed anywhere in `tests/`; the `SDL_VIDEODRIVER=dummy`/`SDL_AUDIODRIVER=dummy` safety net was set ad-hoc via `os.environ.setdefault(...)` inside only three individual test files. Safe when running the whole suite (pytest imports everything before running anything), but fragile for any narrower selection (e.g. just `test_idirect3d8_refcount.py`, which triggers a real D3D8 device/window resize) that doesn't happen to collect one of those three files -- that opens a real SDL window on the actual display and can grab real mouse/keyboard focus. **Fixed**: added `tests/conftest.py` setting both env vars unconditionally at collection time, before any test module in `tests/` is imported, regardless of which specific test(s) are selected. Verified: a narrow single-file run and two full-suite runs (1281 tests) all passed cleanly with no pre-set env vars needed.
+
+**Both socket fixes LIVE-CONFIRMED (2026-09-17, later still)**: a corrected repro run (`TEW_MAX_STEPS=1200000000`, `timeout 1200`, click at `AFTER_SEC=380`, `LOG_CATEGORIES=threads,socket,handlers,d3d8,startup,cpu,exception`) reached the exact original-bug scenario -- real MCOTS connect to port 43300, `tid=1019`'s `recv()` finding nothing ready (`"no data ready... waiting since virtual t=579769ms"`, then `"data ready again after 998ms wait"`) -- and the process stayed fully alive and responsive throughout. `_select` also fired correctly and extensively across several other threads (1002/1003/1018) with real requested timeouts (1.0s, 5.0s, even 5e-05s), each yielding and resolving cleanly with no host-level `poll_schedule_timeout` freeze. Both fixes work as designed under real conditions, not just code review.
+
+**New, separate, real fault found the same run**: at t=442.580s (well before the 1200s timeout -- confirmed not a timeout kill, the log shows the normal fault-handling path running to completion: crash JSON written, `Execution stopped`, then a clean Vulkan-teardown shutdown), `tid=1011` hit `CPU fault at EIP=0x004d980f opcode=0xa0`. This is the known `_CLayer_DetectDebugger` address (`c:\mcity\game\clayer.c`) that deliberately triggers a real access violation as a self-test, normally caught by the game's own two nested SEH frames (see the much-earlier 2026-09-14 archived entry describing this same address as an expected, harmless, SEH-caught event) -- this time it was NOT caught and became a genuine unhandled fault, ending the run. Not yet investigated further; a real, new, separate bug from anything fixed today.
+
+**Scheduler visibility work done the same session, at Molly's explicit request (after first reverting an unrequested flat rename -- see her correction "I should have clearly stated I expected to discuss it first")**: added a `threads` LOG_CATEGORIES *group* token (`tew/logger.py`'s `_CATEGORY_GROUPS`) that expands to both `thread` and `scheduler` without collapsing their distinct per-line prefixes -- pure Python-side filtering-layer alias, zero Zig-side changes (confirmed live: `[thread]`-prefixed and `[scheduler]`-prefixed lines both show, and `-scheduler` alone still overrides correctly). Separately, found and fixed a real, much bigger visibility gap: `scheduler_zig.py`'s actual context-switch chokepoints (`switch_to`, `preempt_slice`, `block_current_on_cs`, `block_current_on_handles`, `sleep_current`, `mark_current_dead`, `terminate_thread`) had **zero logging anywhere** -- every `[scheduler]` line seen before this was from the Win32-API-handler layer (kernel32_io.py/wsock32_handlers.py), not the actual switch mechanism, so a thread running a stretch of pure computation with no logged API call (including the silent 100k-instruction `preempt_slice` batch-boundary preemption) was invisible between whatever log lines happened to bracket it. Fixed with a pure Python-side before/after tid read (existing `scheduler_current_idx`/`scheduler_current_handle`/`scheduler_get_thread_id` accessors, no new FFI export, no C-ABI contract change -- confirmed Zig has literally zero `std.log`/`std.debug.print` calls anywhere before implementing, per Molly's explicit question) wrapping all 7 switch-capable methods, logging `[switch] tid=X -> tid=Y (context)` on every real transition. **Live-verified 2026-09-17**: 1630 switch lines in a 25s smoke run; used for real analysis same session -- see below.
+
+**"Who's not sharing" -- a real, load-bearing use of the new switch log**: compared batch-boundary-forced-preemption ratio vs. voluntary-yield ratio per thread on the crash run above. `tid=1000` (render/main) and `tid=1011` (spawns 2 more worker threads at t=41.674s, itself created via the generic `__beginthreadex` path -- exact caller not yet identified) both sat around **57% forced** (scheduler had to hit the batch boundary to reclaim the CPU more than half the time they released it). `tid=1015`, identified via Ghidra as the literal DB thread (`DB_Init`'s `__beginthreadex(0,0,DBThread,0,0,&local_c)`, `dbcode.c`) -- the subject of this project's own extensively-documented "DB-thread starvation" false lead -- was actually *better behaved*, 44% forced. `tid=1007`/`tid=1009` were 100% voluntary, never once needing forced preemption. Counter to the DB thread's reputation, the render/main thread and tid=1011 are the actual non-sharers in this run.
+
+**Cosmetic fix found via the switch-log smoke test's own output**: `OutputDebugStringA`'s handler (`kernel32_io.py`) used to log the guest's raw debug string verbatim, including whatever trailing `\n`/`\r\n` the game's own string literal already had, producing a stray blank line in `/tmp/emu.log` right after every such entry (Molly caught it by name: "Kill that newline?", spotted in a smoke test log's first 13 lines). Fixed: strips `\r\n` only for the single-line log message; the unstripped `text` still goes to `write_guest_stdout` unaffected.
+
+**New real crash found investigating the "who's not sharing" switch-log data (2026-09-17, later still)**: after the click-repro run's port-43300 exchange (both `_recv`/`_select` fixes confirmed working live, see above), `tid=1011` faulted at real EIP `0x0099ed78` -- confirmed via the crash JSON's `eip`/`ebp_chain` (NOT `0x004d980f`, which was a red herring: that's the address of an EARLIER, separate, successfully-SEH-caught `_CLayer_DetectDebugger` self-test; the log's `[exception] CPU fault at EIP=0x004d980f opcode=0xa0` line is a different, later, `memory_access.attempted_address` field in the same crash JSON, not the fault EIP itself). Real EBP chain (7 frames, `ret6=0x1fe000` = `THREAD_SENTINEL`, confirming a genuine, uncorrupted thread-start-to-fault chain, not garbage) traces cleanly through Ghidra decompiles: `DBServiceResultQ` (`DBHandlers.c`) looked up `MC_LOGIN_COMPLETE`'s handler in its message-dispatch table and called it indirectly (invisible to static XREF analysis, which is why the naive "only caller is WinMain" read for `0x4d980f` was a dead end -- that was the wrong function entirely) -- landing in `DBRES_Login` (`DBResultQ.C`). `dblog.txt` corroborates the exact real sequence: DB attached, `MC_LOGIN` sent, `DBServiceResultQ msg #213 MC_LOGIN_COMPLETE Seq:3` is the last line before the crash. Right before the fault, a real MSVC debug-CRT leak dump printed several car/shape/bam-related allocated blocks (`names of bams`, `names of shapes`, `sizeof shape fi`, `sizeof bam file`) -- initially misread as shutdown/`atexit` noise, but far more likely part of `DBRES_Login`'s own asset-loading-for-persona path given the real, live `MC_LOGIN_COMPLETE` context just confirmed via `dblog.txt`. **The actual bug**: while legitimately executing inside `DBRES_Login`, the CPU attempted a memory access at `0x4d980f` (`_CLayer_DetectDebugger`'s entry point, per `memory_access.attempted_address`) -- an unrelated function, strongly indicating a wild/corrupted pointer dereference from `DBRES_Login`'s heavy raw pointer arithmetic over the message buffer (`param_4`), not a deliberate jump. Not yet investigated further -- next step is tracing which specific field/offset access inside `DBRES_Login`'s ~200-line decompile computes this wild address (malformed/undersized real `MC_LOGIN_COMPLETE` payload vs. a tew-side buffer-size bug are both still open).
+
+---
+
+## Previous status (2026-09-14, very late) — real unhandled CPU fault inside the game's own memory-leak walker, ~50s after last real click; four synthetic click approaches (single START, single QUIT, double-click persona) all produced zero reaction at that session's coordinates/display state
+
+Found while diagnosing a crash from a run left running after the decisive
+click-timing test (see the persona-select click-delivery entry below).
+**Not caused by clicking Start, the background dead-zone, or the window
+close button** — none of those match the timing: last real click at
+771.5s, fault at 821.267s (a ~50s gap), no `WM_CLOSE`/`SDL_QUIT` anywhere
+in the log at all.
+
+**Two separate events, easy to conflate**:
+1. `5.817s` — `_CLayer_DetectDebugger` (0x4d980f, `c:\mcity\game\clayer.c`)
+   deliberately reads from address `0x190` to self-test for a debugger
+   (`SetErrorMode(2)` + a real access violation on purpose, caught by two
+   nested SEH frames -- `_CLayer_CatchSEH` wraps it). This is the
+   already-documented benign "Found Debugger!" false positive. SEH catches
+   it fine here (no "unhandled" error follows) -- **not the bug**.
+2. `821.267s` — a genuine, independent, **unhandled** fault at `0x5a7bfc`,
+   inside `LEAK_printclassf` (the game's own custom memory-leak reporter,
+   *not* the MSVC CRT debug heap -- this is guest code: `_memclass`,
+   `checksentinel`, `_MEM_name`, `_MEMSYS_validaddress`, all real,
+   unmodified `c:\mcity\game`/frontend source). `dispatch_exception()` was
+   attempted and genuinely found no handler: `"unhandled by SEH chain --
+   halting"`. **This is the real bug.**
+3. `831.419s` — tew's own post-fault diagnostic step (re-running the
+   guest's leak-dump for extra crash context) lands back at `0x4d980f` --
+   a secondary, diagnostic-only re-hit, not a third independent fault.
+
+**Mechanism, confirmed via disassembly**: the exact faulting instruction is
+the `MOV` at `005a7bf8` (EIP `0x5a7bfc` is the *next* instruction, `AND
+EDX,0x4000`, register-only -- the fault is reported one instruction late),
+reading `local_1c[+2]` while walking `LEAK_printclassf`'s tracked-allocation
+linked list (`for (local_1c = ...; local_1c != NULL; local_1c =
+*(local_1c+8))`). `crash.json`'s `attempted_address` is `0x4d980f` -- a
+**code** address (right next to `_CLayer_DetectDebugger`), not a heap
+address. Since the read target is `local_1c+2`, `local_1c` itself must be
+≈`0x4d980d` -- the list's `next` pointer holds a code/return address instead
+of a valid heap-block pointer. Classic wild-write signature: something
+overwrote this list node's linkage well before the crash surfaced; the
+walker just happened to be what finally dereferenced it.
+
+**Root cause NOT yet found -- this is a real, live lead, not closed.**
+Ruled out: this is not the MSVC CRT's own debug heap (tew doesn't need to
+maintain `_memclass`'s format at all -- it's guest-code-maintained), so it's
+*not* a "tew's malloc header format is wrong" bug. More likely: tew's
+emulation of some *other* memory-writing operation (a string/buffer
+function, a `REP STOSD` zero-fill, anything with an off-by-some bounds bug)
+overran into an adjacent allocation and clobbered this list node's `next`
+field. **Next step**: reproduce live with a memory watchpoint on the
+corrupted node's `next`-pointer field (see [[feedback_stalk_memory_over_decompile_guessing]]
+-- dump live objects at every hit rather than keep guessing from the
+decompile) to catch the actual corrupting write in the act. Don't blind-guess
+which handler is responsible without that.
+
+**Traced one level further (still 2026-09-14, very late)**: the crash isn't
+random -- `stdout.txt`/`/tmp/emu.log` both confirm `_NFSabortmessage`
+(0x687bd8, the game's real assert/abort handler) is entered right before
+the `LEAK_printclassf` fault (`OutputDebugString` lines `"NFSAM -1"`,
+`"NFSAM 0"`, `"checking for memory leaks..."` are the last guest output
+before the crash). So a REAL assert/abort fired first; the leak-dump
+crash is a *secondary* failure while the game tries to report it -- and
+because the crash lands before `_NFSabortmessage` ever formats/prints its
+message, **the actual reason for the abort has been lost every time this
+has happened so far**. Ruled out the three click-based hypotheses (Molly's
+original guesses: clicking Start, clicking the dead-zone background,
+clicking the window close button) -- none match the timing (last real
+click 771.5s, fault 821.267s, no `WM_CLOSE`/`SDL_QUIT` anywhere in the
+log). A window-focus-loss event (`SDL_WINDOWEVENT` + `SDL_CLIPBOARDUPDATE`,
+`WM_KILLFOCUS`/`WM_ACTIVATE`) at 795.4s is closer in time (~26s before) but
+recurs many other times earlier in the same run with no crash following,
+so it's not confirmed as the trigger either -- just the closest candidate
+found so far.
+
+**FIXED the visibility gap, not yet the root cause**: added
+`_nfsabortmessage_probe` (`run_exe.py`, logpoint at `_NFSabortmessage`'s
+entry 0x687bd8, one of 8 available `cpu.add_logpoint` slots -- 0 others
+currently active) that reads the abort message format string (cdecl arg1)
+plus `_REALabortfilename`/`_REALabortlinenum` the instant the function is
+entered, before `LEAKS_CheckForMemoryLeaks` can crash and destroy that
+context. Logs under the `cpu` category. Full suite still green (1275
+passed). **Launched a fresh detached run (PID 186323, `nohup`+`disown`,
+`LOG_CATEGORIES=window,startup,handlers,cpu`, no synthetic click since
+the previous crash happened independent of any click) to try to
+reproduce and finally capture the real trigger.**
+
+**Did NOT reproduce, 2026-09-14 very late, same session**: that run ran
+the full 900s and shut down cleanly via `timeout`'s own SIGTERM -- no
+`nfsabortmessage-probe` line, no `unhandled by SEH chain`, no
+`LEAK_printclassf`/`0x5a7bfc` anywhere in the log. Plain non-result, not
+evidence the bug is fixed or gone -- the original occurrence happened
+~820s into a run that included real manual clicks and at least one
+window-focus-loss event; this run had neither. **The probe (`run_exe.py`,
+`_nfsabortmessage_probe` at 0x687bd8) stays in place** -- next session,
+reproduce with more real interaction (clicks, alt-tabbing away and back)
+during a long run rather than a passive idle one, since the one confirmed
+occurrence happened during/after exactly that kind of session, not a
+quiet one.
+
+**Second attempt, also did NOT reproduce (2026-09-14, very late, same
+session)**: Molly's suggestion -- click START (physical 987,1097,
+confirmed-correct coords) at 620s, then run a full 1500s (~13 more
+minutes after the click) instead of just 900s total, with the probe
+active and real-time screenshots taken every ~2.5min for a visual
+timeline (`/tmp/claude-.../scratchpad/shot_<elapsed>.png`, 8 shots from
+97s to 1352s). Clean 1500s run, SIGTERM shutdown, **no crash, probe never
+fired**. Click delivered correctly (`lp=0x26e01ee` decodes to logical
+(494,622), matches START) but -- consistent with every previous attempt
+tonight -- still produced no screen transition. Two open, unreproduced
+questions now, not one: (1) why a correctly-delivered click on START
+still doesn't advance the game (open since earlier tonight, see the
+click-delivery entry above), and (2) what triggers the intermittent
+`LEAK_printclassf` fault (2-for-2 non-reproductions now, both with and
+without a click). No evidence either is fixed -- both remain live,
+unreproduced leads for next session. The probe and the visual-timeline
+screenshots are a reusable technique for the next attempt; screenshots
+were not deleted (`shot_97.png` through `shot_1352.png` in this
+session's scratchpad, harness-managed cleanup applies as usual).
+
+**Real breakthrough, Molly's own recollection (2026-09-14, very late,
+same session)**: from her earlier manual testing, the persona-select
+dialog genuinely CAN dismiss -- but only after a sequence that included
+double-clicking the persona name ("Dr Brown"), not a single click on any
+button alone. After it dismissed, the screen behind it read "please
+wait...", and **~1 minute later it faulted** -- this matches the original
+`LEAK_printclassf` crash's own timing almost exactly. This reframes the
+whole investigation: the single-click-does-nothing puzzle and the
+intermittent-fault puzzle are very likely the SAME bug at two different
+stages -- a real, working transition (dialog dismiss -> "please wait") that
+then crashes about a minute in, not two unrelated problems.
+
+Root mechanism, confirmed in `dlg.persona`: `<PERSONAS>.GListBox` has
+`*WEVENT_ACCEPT=GWidget_ACCEPT_PARENT` -- a double-click on the list IS the
+real accept gesture, not a single click on START. This also fits why
+single START/QUIT clicks (correctly delivered, correctly timed, confirmed
+multiple ways tonight) never did anything: they were never going to --
+wrong control.
+
+**Genuine timing tension found while implementing this**: real
+double-click detection (`GMouseInput::Do`, Ghidra-confirmed) measures
+down-edge to down-edge and must land inside `GetDoubleClickTime` (confirmed
+live: 500ms) -- but a single click needs ~400ms+ hold to reliably survive
+this emulator's ~385ms DirectInput poll gap (see the `TEW_CLICK_HOLD_SEC`
+fix above). Two such "safe" holds back-to-back can't fit inside a 500ms
+double-click window -- these two requirements are nearly mutually
+exclusive at this poll rate. A real human double-click (short holds,
+~80-150ms per click) only has partial odds of being caught by any one
+poll, which fits Molly's own account ("when I was about to give up") --
+it likely took her several tries too, not one deterministic double-click.
+
+**Added `TEW_DBLCLICK_*` env vars to `run_exe.py`** (`_AT`, `_AFTER_SEC`,
+`_HOLD_SEC` default 0.15s, `_GAP_SEC` default 0.05s between the two
+clicks, `_REPEAT` default 3 attempts, `_RETRY_SEC` default 1.0s between
+attempts) -- fires the whole attempt multiple times in a row rather than
+pretending one synthetic attempt is guaranteed to land on favorable poll
+timing, matching the inherently timing-sensitive real mechanism. Full
+suite green (1275 passed). Persona-name click target (logical ~532,417,
+dialog-relative ~100,158 scaled 1.28x from `<PERSONAS>.GListBox`'s own
+bounds) -> physical ~(1064,735) at this session's 1024x768/2048x1354
+sizing.
+
+**Also did NOT reproduce (2026-09-14, very late, same session)**: full
+1200s run, all 3 double-click attempts fired cleanly (621.4s-623.7s per
+the new `[dblclick]` log lines), clean SIGTERM shutdown at 1200s, no
+crash, probe never fired. Screenshots at 741s/921s/1101s/final all show
+the dialog still up, "Dr Brown" still highlighted, zero visible change --
+confirmed visually, not just from logs. **Three separate synthetic
+approaches have now all failed** to reproduce what Molly saw manually
+(single click START, single click QUIT, double-click persona name) --
+that's a real signal, not bad luck. Something about the real manual
+interaction differs from what these synthetic attempts model beyond just
+"which control was clicked."
+
+**Live lead found via Ghidra while this ran, not yet tested**: `GButton`
+has real `OnMouseDown`/`OnMouseUp` overrides (00b47630/00b47720) --
+`OnMouseDown` (normal case) just does `SetFocus`+`CaptureMouse`, no press
+event; `OnMouseUp` only fires the real press (`SendEvent(0x2a)`) if
+`HasMouseCapture(this)` is STILL true at release time and a hit-test
+confirms the mouse is still over the button. Found that `ReleaseMouse`
+(which clears `_mCapture`) is called not only from the expected
+`OnMouseUp` path but also from `OnKillFocus`, `SetEnable`, and
+`SetVisible` -- Molly's own suspicion: if anything else (a periodic
+UI-refresh/redraw pass touching these buttons' enabled/visible state, or
+another widget stealing focus) fires during our necessarily-long
+(~0.5s+, to survive the ~385ms DirectInput poll gap) hold, capture could
+be silently dropped mid-hold, and `OnMouseUp` would take the do-nothing
+fallback path. **Not yet verified** whether this actually happens live --
+would need to trace `_mCapture`'s value across a real held click, not
+just reason about it from the decompile. This is the strongest remaining
+lead: it would explain why a hold long enough to satisfy the polling
+requirement might specifically defeat the button's own capture-based
+press mechanism, independent of which button/control is targeted.
+
+**QUIT also confirmed NOT to work (2026-09-14, very late, same
+session)**: re-ran cleanly to full 1200s completion (the first attempt
+had been killed early at 4min to pivot to the double-click test, so QUIT
+was never actually validated until now). Click fired correctly
+(621.36s-621.87s, confirmed via log), screenshots at 676s/856s/1036s/final
+all show the cursor sitting right on QUIT with zero reaction -- no
+confirm dialog, no dismiss, dialog fully intact throughout. No crash, no
+probe fire, no orphaned process.
+
+**Session-end consolidated conclusion**: four separate synthetic
+approaches tested tonight -- single click START, single click QUIT,
+double-click persona name, and (implicitly) the persona row itself being
+pre-selected -- all correctly delivered (confirmed via coordinates,
+timing, and/or screenshots) and all producing **zero reaction**. This is
+a strong, consistent result, not bad luck across multiple attempts.
+Something is genuinely broken in how synthetic input reaches this
+screen's accept logic that Molly's real manual interaction apparently got
+past at least once (her recollection: dialog eventually dismissed to
+"please wait...", crashed ~1min later). The strongest still-untested lead
+going into next session is the capture-instability theory above
+(`ReleaseMouse` firing from `OnKillFocus`/`SetEnable`/`SetVisible`,
+possibly clearing `_mCapture` mid-hold) -- verify live by tracing
+`_mCapture`'s actual value across a held click rather than reasoning from
+the decompile alone.
+
+**CRITICAL CORRECTION, Molly's own recollection (2026-09-14, later
+still)**: none of the four things tested tonight (Start, QUIT game-button,
+persona double-click, persona row pre-selection) were ever the real
+trigger. What actually dismissed the dialog in her original manual
+session was pressing the **window's OS-level close button (X)** -- and
+that was her *only* click that session. This is a completely different
+code path (`SDL_WINDOWEVENT_CLOSE` -> `WM_CLOSE` posted to the dialog,
+per `window_manager.py`'s `_handle_sdl_event`), not a GUI button click at
+all -- explains why every GUI-internal click attempt failed identically,
+since none of them were ever going to be the real trigger.
+
+**Important open question this raises**: `WM_CLOSE` on a modal dialog
+commonly maps to a *Cancel* path, not Accept/Start, in many dialog
+implementations. If that's what's happening here, the "please wait"
+screen and the ~1min-later crash may be a **cancel/disconnect flow bug**,
+not a bug in the normal persona-accept flow this whole investigation has
+been chasing. Needs live testing to determine which. **Next step**: inject
+a real `SDL_WINDOWEVENT_CLOSE` (not a mouse click) at the right time and
+observe -- `run_exe.py`'s click-injection tool doesn't support this yet,
+would need a new `TEW_CLOSE_AFTER_SEC`-style env var pushing a real
+`SDL_WINDOWEVENT`/`SDL_WINDOWEVENT_CLOSE` event instead of a mouse event.
+
+**RESOLVED the open question above, same session, via Ghidra**: `WM_CLOSE`
+(0x10) on the main window is handled by `FUN_00780550`, which just calls
+`PostQuitMessage(0)` -- a full application-quit request. **Not a dialog
+Cancel path at all.** This means Molly's original manual dismissal was her
+telling the whole game to shut down, not accepting or cancelling the
+persona dialog through any normal gameplay path. The "please wait" screen
+and the crash ~1min later are very likely part of **shutdown/teardown**,
+not persona-select's accept flow -- this entire night's framing (find the
+right control to accept the persona and advance normally) may have been
+chasing the wrong mechanism. Still need to actually inject a real
+`SDL_WINDOWEVENT_CLOSE` to confirm this live (not yet done).
+
+**Independent, major finding, same session**: the `LEAK_printclassf`
+fault (see the entry above) **reproduced spontaneously with zero clicks
+and no manual interaction** during an unrelated passive profiling run
+(404.7s guest time, right after a `CreateFile("trace006.txt")` failure --
+read-only open, file not found). This is real evidence the crash is NOT
+tied to any specific click, the window-close event, or any UI action at
+all -- it's a real, periodic/intermittent bug reachable just by playing
+normally for long enough. Confirms this is worth treating as its own,
+separate investigation from "how do you get past persona-select."
+
+**Also found, same session**: the `_nfsabortmessage_probe` logpoint (added
+earlier to capture the real abort message) did NOT fire on this
+reproduction, even though `_NFSabortmessage` demonstrably ran (`NFSAM 0`
+printed to stdout.txt as expected). Only one logpoint was registered (not
+the documented 8-slot-cap issue), so this is a real, separate,
+not-yet-understood bug in the logpoint tooling itself -- the callback
+either isn't being invoked at the registered address, or is failing
+silently (ctypes callback exceptions can be swallowed at the FFI
+boundary). Needs its own investigation before relying on this probe again.
+
+**Window-close TESTED live, same session -- ruled out as a unique cause,
+but led to the real lead.** Added `TEW_CLOSE_AFTER_SEC` (pushes a real
+`SDL_WINDOWEVENT_CLOSE`) plus a fix for a genuinely silent bug in
+`window_manager.py`'s `_handle_sdl_event` (`WINDOWEVENT_CLOSE` dropped
+with zero logging at any level if the windowID lookup failed -- fixed to
+warn like the mouse-button handlers already did). Two live tests:
+1. Synthetic `SDL_WINDOWEVENT_CLOSE` at 300s -- windowID matched fine
+   (new warning never fired, so `WM_CLOSE` genuinely was queued), but
+   **no reaction of any kind**, ran 400+ more seconds with nothing
+   happening. (NOTE: `DispatchMessageA` logging is DEBUG-only, not
+   captured at this run's `LOG_LEVEL=info` -- can't yet confirm whether
+   the guest actually *dispatched* the queued `WM_CLOSE`; next session
+   should re-test with `LOG_LEVEL=debug LOG_CATEGORIES=handlers,window,startup`
+   specifically to check.)
+2. **Molly's real physical click** on the same live window (at ~420s) --
+   **crashed for real**, same fault, `NFSAM -1` at 420.172s ->
+   unhandled SEH fault at 420.207s (35ms later).
+
+**CORRECTED same session, before acting on it**: initially misread
+`CreateFile("traceNNN.txt")` (immediately before `NFSAM -1` both times)
+as a *precondition* that fails and triggers the abort. Molly corrected
+this: the trace file "gets created, and it's fired in abort" -- i.e. this
+`CreateFile` is `_NFSabortmessage`'s **own diagnostic logging**, opened
+as part of already being inside the abort handler, not something that ran
+*before* and caused entry into it. So the incrementing trace file number
+(`trace006.txt` -> `trace007.txt`) is a **symptom**, not a lead -- don't
+waste time chasing why it fails to open, that's expected/correct for
+whatever `_NFSabortmessage` does with a probably-never-backed guest path.
+
+**The real open question, unresolved**: what actually triggers entry into
+`_NFSabortmessage` in the first place, *before* any of this. Still
+completely hidden -- the message-format-string argument that would answer
+this directly is only available at the function's own entry (before
+`LEAKS_CheckForMemoryLeaks` can crash and destroy the context), which is
+exactly what `_nfsabortmessage_probe` was built to catch -- and it still
+hasn't fired across two real reproductions. **Fixing the logpoint probe
+itself is now the highest-value next step** -- without it, the actual
+trigger is undiscoverable from static analysis alone, since the crash
+that follows destroys the evidence every time before it can be printed.
+Diagnostic version added (unconditional entry log + exception-wrapped
+body, since a ctypes-callback exception can be silently swallowed at the
+FFI boundary) but not yet tested against a real reproduction.
+
+**Screenshot comparison against real MCO footage, CORRECTED after
+re-checking the actual resource data (2026-09-14, very late)**: Molly
+supplied a reference screenshot of the real persona-select screen showing
+what looked like two side-by-side panels (existing personas on the left,
+a "create new persona" server-selection list with POP./PIND columns on
+the right, QUIT centered alone between them). Initial read: tew was
+missing/collapsing this two-panel layout -- **WRONG, caught by Molly**.
+Re-checking `dlg.persona`'s actual bounds: all four buttons
+(`<OK>`=START, `<DELETE>`, `<CANCEL>`=QUIT, `<CREATE>`) sit at the exact
+same y=310, spread evenly across the full 461-wide panel (x=30/129/228/
+334) -- **one row of four, structurally identical to what tew already
+renders**, not "QUIT alone, centered between two panels" as first
+(over-)read from the screenshot. There is no second `GListBox` anywhere
+in this file for server selection -- the right side only has a
+hidden-by-default description text (`txt_variety`) and a visible "Select
+Below" label pointing at the CREATE button, nothing resembling the
+server/POP/PIND list the reference screenshot shows.
+
+**Corrected conclusion**: the discrepancy isn't a tew rendering bug
+collapsing two panels -- it's that this specific `dlg.persona` (this
+debug build's resource) has **no definition at all** for the
+server-selection list the reference screenshot shows. Most likely a
+version mismatch (the screenshot may be from a later retail patch with an
+updated resource that added that feature) rather than something tew is
+doing wrong. **Do not chase "restore the missing right panel" as a tew
+bug** -- check first whether this debug build's real, unmodified
+`dlg.persona` ever had that feature at all before assuming tew dropped
+it.
+
+---
+
+---
+
+## Previous status (2026-09-15) — DB-thread cost profiled and explained; two real perf/rendering bugs fixed and committed
+
+**Two real fixes, committed on `fix/d3d8-reset-swapchain`** (both verified live, full suite green 1275 passed):
+1. **`b8d5bae`** — `EnterCriticalSection`/`LeaveCriticalSection` moved off guest-memory reads/writes into a Python `CriticalSectionEntry` dataclass (`tew/api/kernel32_sync.py`, `_state.py`) keyed by the guest CS pointer. Guest code only ever touches a CS through the documented Win32 API, never by reading the raw struct directly (the one exception, `exception_diagnostics.py`'s heap-lock diagnostic, updated to read the new dict too). Measured live: Enter dropped from ~22-27us/call to ~15us/call, Leave from ~14us to ~9.5us, both flat under contention instead of climbing.
+2. **`fe5508c`** — visible ~1-2px seams between tiled UI images (`scn.login`'s `back` shape, `page.login`'s `A0`/`A1`/`A2` persona animations) fixed by changing the shared Vulkan sampler's address mode from `REPEAT` to `CLAMP_TO_EDGE` (`tew/api/d3d8/_pipeline.py`). Confirmed via live vertex-data capture that the guest's own tile geometry is exact/gapless (integer pixel boundaries meeting perfectly) -- the seam was a texture-sampling artifact (linear filtering at a tile's UV edge wrapping to the tile's own far side under `REPEAT`), not a geometry bug. Confirmed fixed with matched before/after screenshots at the same tile boundary.
+
+**Profiling investigation, DB-thread cost explained** (answers "is it worth improving, and where"):
+- Per-DLL wall-clock sampling (`dll-time-probe`, now disabled in `run_exe.py`, technique: sample `cpu.eip` at each outer-loop `preempt_slice()` boundary, resolve via `DLLLoader.find_dll_for_address`) through a full run to persona-select: `MSJET35.DLL` peaked ~56% of cumulative time mid-run, settling to ~37% by persona-select as GUI/main-exe work picks back up; `DAO350.DLL` ~9-14% throughout; `expsrv.dll` (Expression Service) never exceeded ~0.7%, settling to ~0.3-0.4% -- **not** the cost driver some earlier reasoning assumed.
+- Function-level flamegraph (`flame-probe`, EBP-chain stack walk + nearest-preceding-export symbol resolution per DLL, now disabled) published as an interactive artifact: https://claude.ai/artifact/MC1SheypLdfohbX1VdzhvG. **Caveat confirmed live and documented in the code/artifact**: MSJET35.DLL/DAO350.DLL export by ordinal number only (no names survive), so labels are "nearest preceding ordinal + offset" and can alias unrelated internal functions across large unexported regions (confirmed concretely: `DAO350.DLL!Ordinal #3+0x69b51` resolved via Ghidra to a completely unrelated internal heap free-list-coalescing routine, 433KB past the real `DllRegisterServer`). **Second caveat, also confirmed live**: the EBP-chain walk itself can silently follow garbage once inside hand-tuned native code without frame pointers -- one real captured sample landed on the literal frame `<unmapped>+0xcccccccc` (MSVC's uninitialized-stack-fill pattern). Leaf-frame attribution (`cpu.eip` read directly) stays reliable regardless; nesting/recursion-looking structure beyond a few frames should be treated as suggestive, not confirmed.
+- Ghidra RE on the two real, small-offset (trustworthy) hot ordinals, `MSJET35.DLL!Ordinal #156`/`#158`: #156 is a small validate-handle-and-dispatch gatekeeper wrapper; #158 is real, substantial work -- Jet's internal table/cursor-open implementation (references the `"Tables"` system catalog, a `.MU.` temp-object marker, and real cursor-creation calls). Traced #158's three real callers: one (`FUN_7a8b0d16`, reached only via ordinal #325's `ValidationRule`/`Required`/`AllowZeroLength` property-access gate) was **ruled out** with a live call-counter logpoint -- fired **zero times** across a full run to persona-select, so per-record validation is not what's happening here. The other confirmed-real caller, `FUN_86e5b2`, is a schema-action dispatcher (creates fields/indexes/relationships, queries `"Tables"`) -- i.e. genuine Jet `CREATE TABLE`/schema-application work, not per-write validation.
+- **The real, ground-truth answer** came from `~/.emu32/dblog.txt` -- not Jet's low-level `-dbEnableLog` engine trace as assumed, but the **game's own application-level DB request/result-queue trace** (real MCity source filenames: `dbparts.c`, `dbcode.c`, `DBResultQ.C`, `DBHandlers.c`, `DBAsyncEvent.C`, `DBMem.cpp`). It shows the game's own `dbparts.c::DBParts_GetBrandedPartDefInfo` called **154 times**, once per branded car part (Ford/Chevrolet/Pontiac/Plymouth/Cadillac/Buick/Oldsmobile/Shelby/Mercury/Dodge/AMC -- the full car catalog), each presumably its own DB round-trip rather than one batched query. This is the real "loop through results" -- a bounded (not scaling), genuine N+1-query-style pattern in the **game's own compiled logic**, not a tew gap or a Jet inefficiency. Not safe to "fix" without touching real gameplay-critical code; would cost roughly the same on real period hardware.
+- Also confirmed via `dblog.txt`: DAO's default Workspace exists and works correctly (`Workspace type is Jet.`, `Workspace count=1`, `Default Workspace: name=#Default Workspace#, username=admin`) -- rules out any "tew doesn't set up a security workspace" theory as the explanation for anything seen this session.
+- **`dblog.txt` is a much richer source than its "Jet engine trace" reputation suggests** -- it carries the game's own real function/file names for DB request handling, not just Jet's internal `dbcode.c` line numbers. Check it FIRST for any future "what is the DB thread actually doing" question, before reaching for Ghidra RE on ordinal-only DLL exports.
+
+**Instrumentation added this session, all disabled (commented out) in `run_exe.py` per established convention, reusable for next investigation**: `dll-time-probe` (per-DLL wall-clock, `find_dll_for_address`-based), `flame-probe` (EBP-walk function-level sampler, folded-stack output to `/tmp/flame_samples.txt`), `ord325-probe` (single-address call counter, currently targets MSJET35.DLL's ValidationRule-property-gate ordinal -- repoint the hardcoded address to reuse for a different ordinal).
+
+**Earlier in this session** (see `status_archive.md`'s matching entry for full detail): the persona-select click bug (real root cause: `wParam` hardcoded to 0 in `window_manager.py`, breaking the guest's legacy non-DirectInput mouse-button tracking) was resolved and confirmed live end-to-end.
+
+Not yet tried: DXT/S3TC decompression, multitexturing (stage > 0). tew is currently hardcoded to decline any "run in fullscreen?" prompt the game shows -- known, deliberate, not a bug. Not yet done: `vkQueueWaitIdle` stall after every texture upload (`_pipeline.py:523`) is still the likely dominant remaining graphics-speed bottleneck, scoped but untouched this session.
+
+**Housekeeping, still live from earlier sessions**:
+- ClickHouse execution-history capture (`~/pe-walker/history-poc` docker-compose) does **not** survive a reboot/power-cut -- needs `docker compose up -d` again (schema/data persist on the bind-mounted volume, just the container needs restarting). Same for `ghidra-mcp.service`'s project state -- survives service restart via systemd, but needs a fresh MCP handshake (new session ID) and re-opening the project/program.
+- Ghidra's full auto-analysis crashes on `expsrv.dll` but works fine on `msjet35.dll` -- both are in the `mcity` project (separate from this project's own default, `debug_clean`; remember to switch back and forth as needed, and to switch back to `debug_clean` when done so `mcity` isn't left locked).
+
+---
+
 ## Previous status (2026-09-14, very late) — persona-select click bug RESOLVED, root cause and fix confirmed live end-to-end
 
 **Root cause**: real `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` always carry the live `MK_LBUTTON`/`MK_RBUTTON`/`MK_MBUTTON` bits in `wParam`. `window_manager.py`'s `_handle_sdl_event` hardcoded `wParam=0` at all three post sites. The guest's mouse tracking turned out to be on a **legacy path** (`seteacmouse`, reached via `_MESSAGE_handler`→`FUN_00780d80`→`seteacmouse`) rather than DirectInput -- this game's DirectInput `GetDeviceState` mouse branch (`DAT_0128af04 != 4` gate in `_MOUSE_getstate`) never actually fires; only the keyboard's 256-byte polls do. `FUN_00780d80` reads button state exclusively from `wParam`'s `MK_*` bits, so with `wParam` always 0 the guest's own click-tracking global (`DAT_020e398c`) was always set to "not pressed" regardless of the real button state -- explaining every earlier "correctly delivered, correctly timed, still zero reaction" result this session.

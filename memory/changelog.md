@@ -4,6 +4,45 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-18 — FIXED: missing `0xD0`/`0x34` CPU opcodes (real root cause of the `DBRES_Login`/`0x0099ed78` crash); restored the "Unknown opcode" diagnostic the Zig port had silently dropped
+
+`cpu/src/engine.zig`'s `dispatch_table` had `0xD1`/`0xD2`/`0xD3` wired but
+never `0xD0` (8-bit shift-group-1, e.g. `SHR AL,1`) -- a real, previously
+undiscovered gap. Falling through to `opFault` after `fetch8` had already
+advanced EIP past the missing opcode byte made the resulting halt look
+like a jump into garbage at the next byte (which happened to be `0xE8`,
+colliding with the real `CALL rel32` opcode) -- this was misdiagnosed for
+a full prior session (2026-09-17) as a wild pointer inside `DBRES_Login`,
+then as a server-side payload-size bug, before Molly decoded the actual
+bytes at the fault EIP in Ghidra and recognized a real, valid instruction.
+Also found and fixed `0x34` (XOR AL,imm8), a clear copy-paste skip between
+the wired `0x33`/`0x35`, during a full dispatch-table coverage audit
+prompted by the same investigation (~28 more real gaps found, not yet
+fixed -- see TODO.md).
+
+**Root cause of the root cause**: `opFault` (`cpu/src/core.zig`) recorded
+no information about which opcode triggered it -- every dispatch-table gap
+has been indistinguishable from a real guest fault since the Zig port; the
+TS original (`CPU.ts`/`Decoder.ts`) used to throw a real `Unknown opcode:
+0xXX at EIP=...` error, and that diagnostic was silently lost in the port.
+Restored: `CpuState` gained `unknown_opcode`/`last_instr_eip` (the latter
+captured before prefix/opcode bytes are consumed, since `s.eip` has
+already advanced past the missing byte by fault time), new FFI exports
+`cpu_is_unknown_opcode`/`cpu_get_last_instr_eip`, and `run_exe.py`'s fault
+handler now logs `Unknown opcode: 0xXX at EIP=...` distinctly instead of
+the generic "CPU fault... attempting SEH dispatch" line.
+
+**Live-verified 2026-09-18**: a fresh run reached `MC_LOGIN_COMPLETE` ->
+`DBRES_Login` and continued cleanly into persona-physical + parts loading
+with zero faults anywhere in the log (except the one expected, harmless,
+SEH-caught `_CLayer_DetectDebugger` self-test). Confirmed the click-
+delivery bug (see TODO.md) is unrelated -- no `Unknown opcode` fires during
+a synthetic click attempt. Zig regression tests added for `opD0`/`op34`
+and the diagnostic itself; full Zig suite + Python suite (1234 tests)
+pass clean.
+
+---
+
 ## 2026-09-14 — FIXED: four per-byte memory-access loops replaced with bulk reads/writes, found via py-spy profiling
 
 First real performance investigation, prompted by Molly's "let's make
