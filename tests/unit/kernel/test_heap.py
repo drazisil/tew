@@ -95,3 +95,50 @@ class TestSimpleAllocFree:
         # the remaining 96 bytes (at addr1+32) must still be reusable
         addr3 = state.simple_alloc(96)
         assert addr3 == addr1 + 32
+
+
+class TestSimpleAllocFill:
+    """simple_alloc's `fill` parameter: default 0xCD (MSVC debug-heap "Clean
+    Land", right for callers whose contract is "uninitialized"), and a
+    caller whose contract promises something else passes its own byte."""
+
+    HEAP_START = 0x500000
+
+    @pytest.fixture
+    def filled_state(self):
+        from tew.hardware.memory import Memory
+        state = CRTState()
+        state.memory = Memory(8 * 1024 * 1024)
+        state.next_heap_alloc = self.HEAP_START
+        return state
+
+    def test_default_fill_is_0xcd(self, filled_state):
+        addr = filled_state.simple_alloc(32)
+        assert filled_state.memory.read_bytes(addr, 32) == b"\xcd" * 32
+
+    def test_explicit_zero_fill_overwrites_dirty_bump_memory(self, filled_state):
+        addr = filled_state.next_heap_alloc
+        filled_state.memory.load(addr, b"\xaa" * 32)
+        assert filled_state.simple_alloc(32, fill=0) == addr
+        assert filled_state.memory.read_bytes(addr, 32) == b"\x00" * 32
+
+    def test_explicit_fill_applies_to_reused_free_list_block(self, filled_state):
+        addr = filled_state.simple_alloc(64)
+        filled_state.simple_free(addr)
+        assert filled_state.memory.read_bytes(addr, 64) == b"\xdd" * 64  # dead fill
+
+        reused = filled_state.simple_alloc(64, fill=0)
+
+        assert reused == addr
+        assert filled_state.memory.read_bytes(addr, 64) == b"\x00" * 64
+
+    def test_default_fill_applies_to_reused_free_list_block(self, filled_state):
+        addr = filled_state.simple_alloc(64)
+        filled_state.simple_free(addr)
+
+        assert filled_state.simple_alloc(64) == addr
+        assert filled_state.memory.read_bytes(addr, 64) == b"\xcd" * 64
+
+    def test_arbitrary_fill_byte(self, filled_state):
+        addr = filled_state.simple_alloc(16, fill=0x7F)
+        assert filled_state.memory.read_bytes(addr, 16) == b"\x7f" * 16

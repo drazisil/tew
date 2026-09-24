@@ -4,6 +4,14 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-19 — FIXED: `simple_alloc`/`simple_free` MSVC debug-heap fills (0xCD/0xDD), with a `fill` parameter so zero-contract callers get zeros
+
+**Fills (2026-09-17).** `state.simple_alloc`/`simple_free` (`tew/api/_state.py`) used to hand out and take back raw memory, so a game read a few bytes past its allocation saw tew's leftover heap contents instead of the debug CRT's inert `0xCD` filler -- confirmed live when a `DBRES_Login` over-read picked up a value equal to a real code address. Allocated blocks are now filled with `0xCD` and freed blocks with `0xDD`, matching `dbgheap.h`. `CRTState.memory` is set by `register_crt_handlers` so the allocator can write. Three test fixtures (`test_cmdline_nomovie.py`, `test_lock_file.py`, `test_read_write_file_handle.py`) had `Memory` buffers too small to cover the `0x04000000` heap base and now use 96MB. (That over-read turned out NOT to be the `DBRES_Login` crash's cause -- a missing CPU opcode was -- but the fill is a real correctness fix on its own.)
+
+**Contract regression, caught in review (2026-09-19).** Filling every block with `0xCD` broke callers whose contract is not "uninitialized": `calloc` (must return zeros; its handler assumed the bump allocator already zeroed, which was never true for reused free-list blocks), `MapViewOfFile` (the OS zero-fills views, anonymous and past the file data), and `CoCreateInstanceEx`'s `factory_ppv`/`unk_ppv` out-parameters (must read NULL until the callee writes them). `simple_alloc(size, fill=0xCD)` keeps `0xCD` as the default for `malloc`/`operator new`/`realloc`/`CoTaskMemAlloc`; those callers now pass `fill=0`. `HeapAlloc`/`HeapReAlloc`, `LocalAlloc`/`GlobalAlloc` and the env blocks already honored their contracts explicitly and are unchanged. Tests (`tests/unit/kernel/test_heap.py`, new `tests/unit/api/test_simple_alloc_contracts.py`) attach `state.memory` so the fill actually runs and dirty-then-free a block first so reuse can't hide a missing zero-fill; the calloc and anonymous-mapping tests fail on the old handlers. Still unchecked: DirectSound PCM buffers (`dsound_handlers.py`) get no explicit init -- confirm what real `dsound.dll` does.
+
+---
+
 ## 2026-09-14 — FIXED: four per-byte memory-access loops replaced with bulk reads/writes, found via py-spy profiling
 
 First real performance investigation, prompted by Molly's "let's make
