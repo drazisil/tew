@@ -6,6 +6,198 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-18): ~28 more real x86 opcodes still missing from `dispatch_table`, silently falling through to `opFault`
+
+Found via a full enumeration of `cpu/src/engine.zig`'s `dispatch_table`
+(excluding loop-populated ranges `0x40-0x5F`/`0x70-0x7F`/`0x90-0x97`/
+`0xB0-0xBF` and real prefix bytes) while root-causing the `DBRES_Login`
+crash -- see status.md's current entry. `0xD0` (SHR AL,1 etc.) and `0x34`
+(XOR AL,imm8) were the two real gaps fixed that session; these are not:
+`0x27`/`0x2F`/`0x37`/`0x3F` (DAA/DAS/AAA/AAS, BCD adjust -- rare in modern
+codegen), `0x8E` (MOV Sreg,rm -- segment register load), `0xD4`/`0xD5`/
+`0xD6`/`0xD7` (AAM/AAD/SALC/XLAT -- XLAT plausible in CRT string code),
+`0x9A`/`0xEA` (far CALL/JMP -- plausible if any anti-debug trick uses
+segment switching), `0x62`/`0x63`/`0x82`/`0xCA`/`0xCB`/`0xCE`/`0xCF`/
+`0xE4`-`0xE7`/`0xEC`-`0xEF`/`0xFA`/`0xFB` (BOUND/ARPL/far RET/INTO/IRET/
+port I/O/CLI/STI -- mostly rare or privileged in usermode compiled code).
+
+Not urgent to fix preemptively -- the 2026-09-18 `unknown_opcode`/
+`last_instr_eip` diagnostic (see status.md) means any of these that
+actually fires will now report cleanly as `Unknown opcode: 0xXX at
+EIP=...` instead of masquerading as a wild-pointer crash, the way `0xD0`
+did for a full session. Worth a dedicated pass if any of them ever
+actually shows up in a real run's log.
+
+---
+
+## NEW (2026-09-17/18): synthetic clicks never register as a real click at the game's own legacy mouse-tracking layer -- likely `SDL_GetMouseState()` never reflecting `SDL_PushEvent`-injected button state
+
+**The actual root cause of "clicks don't work," found via live logpoints +
+a side-by-side real-vs-synthetic click on the same running process.** Full
+chain traced in Ghidra: `MMouseInput::AppPollMouse` (0075fae0) calls
+`_MOUSE_getstate(6)` (00a72d20), confirmed live via logpoint to run in mode
+`DAT_0128af04==4` (the `getmousepos()`/00a73a60 absolute-position path, not
+DirectInput's buffered `_INPUT_getdevicedata`). `getmousepos()` just reads
+3 globals (`DAT_020e398c`=buttons, `DAT_020e3990`/`3994`=x/y) written by
+exactly one function, `seteacmouse` (00a73b90) -- confirmed via Ghidra
+XREFs, no other writer exists. `seteacmouse` gates its entire body behind
+`_mouseflag != 0 && _winmsgmutex != NULL`; if either is unset it silently
+no-ops on every call.
+
+**Live-confirmed** (logpoint on `GMouseInput::MouseSetButton`, 0x00b1b2c0,
+the only writer downstream of `AppPollMouse`): a real manual click (Molly,
+same running process) produced `state=112` sustained across 10+
+consecutive polls for the whole real hold duration. Every synthetic click
+attempted the same session (392 logged polls total, multiple attempts,
+various hold durations/wiggle patterns) produced `state=0`, always. This
+rules out `_mouseflag`/`_winmsgmutex` init as the problem (real clicks
+clearly work on the same live process) -- the divergence is specifically
+synthetic vs. real input, upstream of `seteacmouse` itself.
+
+**Most likely mechanism (not yet fixed or further verified)**:
+`window_manager.py`'s `_handle_sdl_event` computes
+`wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))` for
+`WM_LBUTTONDOWN`/`WM_LBUTTONUP`. `SDL_GetMouseState()` reads SDL's own
+internally-tracked mouse-button state, updated via `SDL_SendMouseButton` --
+the same internal call real hardware-driven events go through. Our
+synthetic clicks build a raw `SDL_Event` and call `SDL_PushEvent()`
+directly, which enqueues the event but does **not** call
+`SDL_SendMouseButton` -- so SDL's own tracked button state never updates
+for a synthetic press, and `SDL_GetMouseState()` keeps reporting "nothing
+down" even during a synthetic button-down. That would make the computed
+`wparam` always miss `MK_LBUTTON` for synthetic events specifically -- a
+clean explanation for the real-vs-synthetic split just observed, though not
+yet directly confirmed by reading the live wParam value itself (cheap next
+step: one more logpoint/log line at the wparam computation site, real vs.
+synthetic).
+
+**Fix direction (not yet implemented)**: stop deriving wParam's button bits
+from `SDL_GetMouseState()`; track pressed-button state directly inside
+`window_manager.py` from the events `_handle_sdl_event` itself already
+processes (real and synthetic both flow through this one function), and
+compute `wparam` from that self-tracked state instead. This would very
+likely also explain every prior click-delivery investigation this project
+has done (the 2026-09-14 "OnMouseUp never entered" dead end, the whole
+multi-session click-coordinate saga) -- none of those synthetic clicks
+would have carried correct wParam either, regardless of how correct their
+coordinates were.
+
+See `status.md`'s 2026-09-17/18 entry and `status_archive.md` for the full
+session narrative (manual click-trigger API, `GetCursorPos` fix, the
+research-agent history dig, and this live logpoint chain).
+
+**Ruled out 2026-09-18**: confirmed unrelated to the `0xD0`/`0x34` CPU
+opcode gaps fixed the same session -- a synthetic DOWN still shows
+`state=0` throughout the hold with the fixes in, and the new
+`unknown_opcode` diagnostic never fires during a click attempt. The
+`SDL_GetMouseState()`/`SDL_PushEvent` mechanism above remains the real,
+still-unfixed lead.
+
+---
+
+## RESOLVED (2026-09-18, this entry's 2026-09-17 conclusion was WRONG -- corrected below): real crash right after a live `MC_LOGIN_COMPLETE` -- a genuine tew CPU-core bug (missing 0xD0 opcode), not a server payload issue
+
+**Correction (2026-09-18): everything below the original write-up is wrong.**
+This entry originally concluded "not a tew bug, fix belongs in mco-server's
+`LoginCompletePayload`" and recommended adding shard/server-list fields
+server-side. **Do not act on that.** The crash was re-verified live with
+the heap-fill fix in place (see status.md's 2026-09-17 entry) and
+reproduced again at the exact same fault site, with no server change --
+ruling out the payload-size theory entirely. Real root cause, found the
+same session Molly decoded the actual bytes at the fault EIP in Ghidra:
+`0x0099ed78` is `D0 E8` (`SHR AL,1`), and `cpu/src/engine.zig`'s
+`dispatch_table` never had `0xD0` wired in (`0xD1`/`0xD2`/`0xD3` were, `0xD0`
+was skipped) -- a genuine missing-opcode gap in tew's own CPU core, not a
+wild pointer and not a server bug. Fixed by adding `opD0`. **Live-confirmed
+2026-09-18**: a fresh run sailed straight through `MC_LOGIN_COMPLETE` ->
+`DBRES_Login` into persona-physical + `MC_GET_OWNED_PARTS` with zero faults.
+See status.md's current entry for the full writeup, including why `opFault`
+never reporting which opcode triggered it is what let this go unnoticed,
+and the resulting ~29-opcode coverage audit.
+
+Original (now-superseded) write-up kept below for the false-lead detail --
+the `0x4d980f`-vs-real-fault-EIP confusion it describes is still real and
+worth knowing, just not the actual root cause.
+
+On the click-repro run that live-confirmed the `_recv`/`_select` fixes,
+right after `dblog.txt` shows a genuine `DBServiceResultQ msg #213
+MC_LOGIN_COMPLETE Seq:3`, `tid=1011` faulted inside `DBRES_Login`
+(`DBResultQ.C`, reached via `DBServiceResultQ`'s indirect message-dispatch
+table -- invisible to static Ghidra XREF, which is why naively chasing the
+logged fault address's "only caller" led to the wrong function entirely).
+Crash JSON's real `eip`/`ebp_chain` (7 clean frames to `THREAD_SENTINEL`)
+put EIP genuinely inside `DBRES_Login`; `memory_access.attempted_address`
+was `0x4d980f` -- the unrelated `_CLayer_DetectDebugger`'s entry point -- a
+wild/corrupted pointer read, not a deliberate jump.
+
+**Root cause, confirmed against mco-server's own log**
+(`/data/Code/server/data/application-2026-09-17-12.log`, port 43300,
+connectionId `43fcb52f`): the server's `LoginCompletePayload` response body
+is only 72 bytes, but `DBRES_Login` unconditionally reads fixed struct
+fields out to offset `0xa9+4 = 173` bytes into that buffer -- no length or
+bounds check, matching the real original client's expected (longer)
+message format. The server's own decoded log shows `serverList: ` empty --
+it never fills in the shard/server-list entries `DBRES_Login` expects
+(it later loops over what should be 4 server-list entries using fields read
+from those far-past-buffer-end offsets). **Not a tew emulation bug** --
+nothing to fix here; the fix belongs in mco-server's `LoginCompletePayload`
+generation (add the missing shard/server-list fields to match the real
+client's expected fixed-size struct). See `status_archive.md`'s
+"2026-09-17, later still" entry for the byte-for-byte comparison.
+
+**False-lead trap hit once while root-causing this**: the log's own
+`[exception] CPU fault at EIP=0x004d980f` line is NOT the fault EIP --
+that's the `memory_access.attempted_address` field from the crash JSON; the
+real fault EIP (`0x0099ed78`) is a separate field. Don't re-chase
+`0x4d980f`/`_CLayer_DetectDebugger` (WinMain's one-time debugger self-test,
+normally SEH-caught, unrelated) as a crash site again -- check `eip` in
+`/tmp/emu_crash.json` directly, not the log line.
+
+---
+
+## RESOLVED (2026-09-16, fixed later same day): guest `recv()` blocking with no data ready freezes the ENTIRE emulator, not just the calling guest thread
+
+`tew/api/wsock32_handlers.py`'s `_recv` (~line 459) calls the real host
+socket's blocking `entry.py_sock.recv(length)` directly. Guest "threads"
+have no real host OS thread each -- `CreateThread` doesn't spawn one;
+they're cooperatively scheduled via `crt_state.scheduler.preempt_slice(cpu,
+mem)` on tew's single shared CPU-stepping host thread (same thread
+`run_exe.py`'s one `[alive]` log site lives in). So when any guest thread's
+`recv()` has no data ready, it blocks that single shared thread -- freezing
+every other guest thread and the heartbeat log too, not just the caller.
+Confirmed live 2026-09-16: after a successful DB-attach handshake on a new
+MCOTS connection (port 43300), the whole run went completely silent (no log
+growth anywhere) for 1000+s until killed by our own timeout -- root-caused
+via `/proc/<pid>/task/*/syscall` showing the main host thread parked in a
+real blocking `recvfrom`, confirmed via `ss -tin` that this was NOT stuck
+unread data (`Recv-Q:0`) but a genuine wait for a message that never came.
+See `status.md`'s 2026-09-16 entry for the full trace. Fix direction: make
+the host socket non-blocking (or poll with a short timeout cooperating with
+`preempt_slice`) so one guest thread's network wait yields instead of
+wedging the whole machine.
+
+Also noticed while in `_recv`, lower priority: it still writes received
+bytes into guest memory one byte at a time (`for i, b in enumerate(data):
+memory.write8(...)`, ~lines 476-477) -- the same per-byte anti-pattern
+already fixed elsewhere (`_heap_alloc`, `sendto`'s read, 2026-09-14) but
+missed here. Bulk-write while fixing the blocking issue above.
+
+**Both fixed and LIVE-CONFIRMED (2026-09-17)**: `_recv` now does a
+zero-timeout `select()` check and, for a guest-blocking socket with nothing
+ready, yields via `state.scheduler.sleep_current(cpu, memory, retry_eip, 0,
+5)` (same retry-via-rewound-EIP pattern as `WaitForSingleObject`) instead
+of calling the real blocking `recv()`; the per-byte write loop is now
+`memory.load(...)`. A sibling bug in `_select` (same file) had the
+identical disease -- fixed the same way, tracked per-thread since one
+`select()` call spans multiple sockets. Reproduced the exact original
+scenario live (real MCOTS connect to port 43300, `recv()`/`select()` both
+finding nothing ready) and the process stayed fully alive with every other
+thread continuing normally -- no more `poll_schedule_timeout`/`recvfrom`
+host freeze. See `status.md`'s current entry and `status_archive.md`'s
+2026-09-16/17 entries for the full trace.
+
+---
+
 ## NEW (2026-09-13): persona-select list's selection-highlight bar overdraws the PERSONA/SERVER-vs-POP. column divider
 
 On the persona-select screen, every unselected row shows a visible
