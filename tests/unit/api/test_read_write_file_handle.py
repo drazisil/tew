@@ -27,7 +27,7 @@ from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
 from tew.hardware.memory import Memory
 
 INVALID_HANDLE = 0xFFFFFFFF
-MEM_SIZE = 4 * 1024 * 1024
+MEM_SIZE = 96 * 1024 * 1024
 STACK = 0x00030000
 
 GENERIC_READ  = 0x80000000
