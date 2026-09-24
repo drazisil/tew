@@ -1473,6 +1473,145 @@ def _mouseinput_do_probe(eip, regs, memory, memory_size):
         logger.error("cpu", f"[mouseinput-do-probe] this=0x{this:08x} raw_down0={raw_down0} pending0={pending0}")
 # cpu.add_logpoint(0x00b1b360, _mouseinput_do_probe)  # 2026-09-14: fix verified and committed, freeing for next investigation
 
+# 2026-09-19: left-frame player avatar investigation. The animated player model under
+# "PlayerName" is an MAvatar widget (Data/GUI/camera.lframe) driven by the idle handler
+# LFrame_ProfileAvatar (008240c0) -> MAvatar::Set(&tCarIDs) -> MAvatar::Set(type, hair,
+# skin, pants, shirt) (00843400; silently returns if type > 0x20) -> MAnim::LoadModel
+# (00842170, reads bam.viv). The left-panel stats show view.lframe.persona's DEFAULT text,
+# so LFrame_Profile* idle handlers look dead too. These four probes show how far the
+# chain gets: hits are bounded, and a totals line is printed at the end of the run.
+_lf_hits: dict[str, int] = {}
+_lf_draw_window = [0]
+_lf_avatar = [None]   # the MAvatar widget pointer, learned from the idle-handler probe
+def _lf_first(key, limit):
+    n = _lf_hits.get(key, 0) + 1
+    _lf_hits[key] = n
+    return n <= limit, n
+def _lf_s32(v):
+    return None if v is None else (v - 0x100000000 if v & 0x80000000 else v)
+
+def _lframe_avatar_handler_probe(eip, regs, memory, memory_size):   # FUN_008240c0(GUI*)
+    ok, n = _lf_first("LFrame_ProfileAvatar", 5)
+    if ok:
+        gui = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+        logger.error("cpu", f"[lframe-probe] LFrame_ProfileAvatar idle handler #{n} gui={gui if gui is None else hex(gui)}")
+    _lf_avatar[0] = _read32(memory, (regs[ESP] + 4) & 0xFFFFFFFF, memory_size)
+
+def _mavatar_set_probe(eip, regs, memory, memory_size):   # MAvatar::Set(type, hair, skin, pants, shirt), thiscall
+    ok, n = _lf_first("MAvatar::Set", 8)
+    if not ok:
+        return
+    esp = regs[ESP]
+    mtype = _lf_s32(_read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size))
+    cols = []
+    for i in range(4):
+        ptr = _read32(memory, (esp + 8 + 4 * i) & 0xFFFFFFFF, memory_size)
+        val = _read32(memory, ptr, memory_size) if ptr else None
+        cols.append("None" if val is None else f"0x{val:08x}")
+    logger.error("cpu",
+        f"[lframe-probe] MAvatar::Set #{n} this=0x{regs[ECX]:08x} modelType={mtype} "
+        f"(>0x20 => returns without loading) hair/skin/pants/shirt={cols}")
+
+cpu.add_logpoint(0x008240c0, _lframe_avatar_handler_probe)
+cpu.add_logpoint(0x00843400, _mavatar_set_probe)
+
+def _lf_cstr(memory, ptr, memory_size, limit=80):
+    if not ptr or not _in_bounds(ptr, 1, memory_size):
+        return None
+    end = ptr
+    while end - ptr < limit and _in_bounds(end, 1, memory_size) and memory[end] != 0:
+        end += 1
+    return bytes(memory[i] for i in range(ptr, end)).decode("latin-1")
+
+def _anim_getdef_probe(eip, regs, memory, memory_size):   # ANIMATION_GetAnimationDefinitionNew(AnimationDefinition**, const char*)
+    ok, n = _lf_first("ANIMATION_GetAnimationDefinitionNew", 12)
+    if ok:
+        name_ptr = _read32(memory, (regs[ESP] + 8) & 0xFFFFFFFF, memory_size)
+        logger.error("cpu", f"[lframe-probe] GetAnimationDefinitionNew #{n} name={_lf_cstr(memory, name_ptr, memory_size)!r}")
+
+
+def _manim_ondraw_probe(eip, regs, memory, memory_size):   # MAnim::OnDraw(GDC*), thiscall
+    if regs[ECX] != _lf_avatar[0]:
+        return
+    _lf_draw_window[0] = 4   # log the next few MrC_DrawListInserted calls (they belong to this avatar draw)
+    ok, n = _lf_first("avatar MAnim::OnDraw", 4)
+    if ok:
+        esp = regs[ESP]
+        this = regs[ECX]
+        inst = _read32(memory, (this + 0x158) & 0xFFFFFFFF, memory_size)
+        gdc = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+        vt = _read32(memory, gdc, memory_size) if gdc else None
+        fn = _read32(memory, (vt + 0xdc) & 0xFFFFFFFF, memory_size) if vt else None
+        logger.error("cpu",
+            f"[lframe-probe] avatar MAnim::OnDraw #{n} this=0x{this:08x} animInstance={inst if inst is None else hex(inst)} "
+            f"gdc={gdc if gdc is None else hex(gdc)} gdc.vtable[0xdc]={fn if fn is None else hex(fn)} "
+            f"(if that call returns 0 the 3D draw is skipped)")
+
+cpu.add_logpoint(0x0042fa50, _anim_getdef_probe)
+
+def _manim_gate_probe(eip, regs, memory, memory_size):   # 0084287a: `test eax,eax` after gdc->Message(1,0,0)  (FeDC::DoClip result)
+    this = _read32(memory, (regs[EBP] - 4) & 0xFFFFFFFF, memory_size)
+    if this != _lf_avatar[0]:
+        return
+    val = regs[EAX]
+    _lf_first(f"avatar OnDraw gate eax={'0' if val == 0 else 'nonzero'}", 1)
+    if val == 0:
+        ok, n = _lf_first("avatar gate ZERO (draw skipped)", 3)
+        if ok:
+            logger.error("cpu", f"[lframe-probe] avatar MAnim::OnDraw gate returned 0 -> 3D draw SKIPPED (#{n})")
+cpu.add_logpoint(0x0084287a, _manim_gate_probe)
+cpu.add_logpoint(0x00842810, _manim_ondraw_probe)
+
+import struct as _st2
+def _mrc_drawlist_probe(eip, regs, memory, memory_size):   # MrC_DrawListInserted(DRender_tView*, DRender_tListfacet*, float)
+    if _lf_draw_window[0] <= 0:
+        return
+    _lf_draw_window[0] -= 1
+    ok, n = _lf_first("MrC_DrawListInserted (avatar window)", 10)
+    if not ok:
+        return
+    esp = regs[ESP]
+    view = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+    lst = _read32(memory, (esp + 8) & 0xFFFFFFFF, memory_size)
+    kind = _read32(memory, view, memory_size) if view else None
+    d = [_read32(memory, (lst + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(4)] if lst else None
+    dd = ["None" if v is None else f"0x{v:08x}" for v in (d or [])]
+    head = d[0] if d else None
+    first = [ _read32(memory, (head + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(6)] if head else None
+    fd = None if first is None else ["None" if v is None else f"0x{v:08x}" for v in first]
+    logger.error("cpu", f"[lframe-probe] MrC_DrawListInserted #{n} view=0x{(view or 0):x} view[0]={kind} list={dd} list[0]->{fd}")
+
+def _animdef_insertfacets_probe(eip, regs, memory, memory_size):   # AnimationDefinition::InsertListFacets(view, float time, ...)  thiscall
+    ok, n = _lf_first("AnimationDefinition::InsertListFacets", 6)
+    if ok:
+        esp = regs[ESP]
+        view = _read32(memory, (esp + 4) & 0xFFFFFFFF, memory_size)
+        tbits = _read32(memory, (esp + 8) & 0xFFFFFFFF, memory_size)
+        t = None if tbits is None else _st2.unpack('<f', _st2.pack('<I', tbits))[0]
+        kind = _read32(memory, view, memory_size) if view else None
+        logger.error("cpu", f"[lframe-probe] AnimationDefinition::InsertListFacets #{n} this=0x{regs[ECX]:08x} view[0]={kind} animTime={t!r}")
+
+cpu.add_logpoint(0x005d92a0, _mrc_drawlist_probe)
+cpu.add_logpoint(0x0043c3c0, _animdef_insertfacets_probe)
+
+def _easclip_drawtri_probe(eip, regs, memory, memory_size):   # EASCLIP_drawtri(v0, v1, v2) cdecl; outcode byte at v+0x50
+    if _lf_draw_window[0] <= 0 or _lf_draw_window[0] == 4:
+        return   # only calls made from inside an avatar MrC_DrawListInserted (window is 3 or 2 there)
+    ok, n = _lf_first("EASCLIP_drawtri", 12)
+    if not ok:
+        return
+    esp = regs[ESP]
+    vs = [_read32(memory, (esp + 4 + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(3)]
+    codes, xyz = [], []
+    for v in vs:
+        codes.append(None if v is None or not _in_bounds(v + 0x50, 1, memory_size) else memory[v + 0x50])
+        f = [_read32(memory, (v + 4 * i) & 0xFFFFFFFF, memory_size) for i in range(4)] if v else []
+        xyz.append([None if w is None else round(_st2.unpack('<f', _st2.pack('<I', w))[0], 2) for w in f])
+    thrash = _read32(memory, 0x020f00f8, memory_size)
+    logger.error("cpu", f"[lframe-probe] EASCLIP_drawtri #{n} outcodes={codes} verts[0..3]={xyz} "
+                        f"_THRASH_drawtri=0x{(thrash or 0):08x}")
+cpu.add_logpoint(0x0052e5c0, _easclip_drawtri_probe)
+
 # cpu.add_logpoint(0x0073e470, _screen_setscreenmode_probe)  # 2026-09-14: confirmed fires once, resolution never actually changes across the 3 Resets in the same run -- staleness theory dead, freeing slot
 
 # GDialog::OnBegin (00b080c0) wires its own "default button" handles by name:
@@ -3823,6 +3962,7 @@ if crt_state.fatal_dialogs:
         logger.error("startup", f'  "{caption}": {text.splitlines()[0] if text else ""}')
 else:
     logger.info("startup", "=== Emulation Complete (clean exit) ===")
+    logger.error("cpu", f"[lframe-probe] hit totals this run: {_lf_hits}")
     if cpu.fist_invalid_count:
         logger.error("cpu",
             f"[fist-invalid] TOTAL out-of-range FIST/FISTP stores this run: {cpu.fist_invalid_count}, "
