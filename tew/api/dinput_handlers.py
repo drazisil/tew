@@ -152,6 +152,20 @@ def get_mouse_buttons() -> int:
     return _mouse_buttons[0]
 
 
+def get_mouse_pos() -> tuple[int, int]:
+    """Current real mouse position, in the same logical (game-resolution)
+    coordinate space window_manager.py's _to_logical_xy already converts
+    WM_MOUSEMOVE/WM_LBUTTONDOWN's lParam into before calling
+    notify_mouse_motion -- for consumers that want the real classic-Win32
+    cursor position, not DirectInput's own GetDeviceState/GetDeviceData
+    surface. e.g. user32_handlers.py's GetCursorPos, which used to
+    hardcode (0,0) unconditionally -- confirmed live 2026-09-17 that this
+    can leave a GUI hover-highlight (anything checking GetCursorPos rather
+    than polling DirectInput) permanently believing the cursor sits at the
+    top-left corner regardless of where synthetic or real clicks land."""
+    return _mouse_pos[0], _mouse_pos[1]
+
+
 def notify_mouse_motion(x: int, y: int) -> None:
     """Real SDL_MOUSEMOTION arrived (window_manager.py's event pump) --
     not a polling entrypoint. Updates tracked position, queues an axis

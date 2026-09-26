@@ -90,6 +90,11 @@ class SocketEntry:
     py_sock: _socket_module.socket | None = None
     nonblocking: bool = False
     connected_to: str = ""               # "host:port" for logging
+    recv_wait_since_ms: int | None = None  # virtual-clock ms a blocking recv()
+                                            # started waiting on no-data-ready;
+                                            # None when not currently waiting.
+    recv_wait_last_logged_ms: int | None = None  # throttles the periodic
+                                                  # "still waiting" log below
 
 
 # ── Module-level socket table ─────────────────────────────────────────────────
@@ -97,6 +102,14 @@ class SocketEntry:
 _next_handle: int = 0x100
 _socket_map: dict[int, SocketEntry] = {}
 _wsa_last_error: int = 0
+
+# Per-thread cooperative-wait tracking for the WinSock select() handler
+# (see _select below) -- keyed by guest thread id since a single select()
+# call watches multiple sockets at once, unlike _recv's per-SocketEntry
+# tracking. Cleared once the call resolves (something ready, or the
+# guest's own requested timeout genuinely elapses).
+_select_wait_since_ms: dict[int, int] = {}
+_select_wait_last_logged_ms: dict[int, int] = {}
 
 
 def _alloc_socket(af: int, type_: int, proto: int) -> int:
@@ -331,6 +344,14 @@ def register_wsock32_handlers(
         if entry and entry.py_sock:
             try:
                 entry.py_sock.close()
+                # FIXED (2026-09-17): the success path used to log nothing at
+                # all, indistinguishable from the guest never calling
+                # closesocket() -- confirmed live: a real, correct, game-
+                # initiated close (persona-login socket, connect->send->recv
+                # ->close) left zero trace in the log, making it look like
+                # the connection might still be open/hung when grepped for.
+                logger.info("socket",
+                    f"closesocket(0x{s:x} <- {entry.connected_to})")
             except OSError as e:
                 logger.warn("socket", f"closesocket: py_sock.close() failed: {e}")
         cpu.regs[EAX] = 0
@@ -470,11 +491,70 @@ def register_wsock32_handlers(
             cleanup_stdcall(cpu, memory, 16)
             return
 
+        # FIXED (2026-09-16): a blocking guest recv() used to call the real
+        # host socket's blocking recv() directly. tew's guest "threads" are
+        # cooperatively scheduled on one shared host thread (CreateThread
+        # doesn't spawn real OS threads), so that blocking call froze the
+        # entire emulator -- every guest thread and the scheduler heartbeat
+        # itself -- not just the calling one, whenever no data was ready
+        # yet. Peek readiness with a zero-timeout select() first; a
+        # guest-blocking socket with nothing ready yields this thread via
+        # sleep_current and retries the same INT 0xFE shortly after,
+        # instead of blocking the host. A guest-nonblocking socket keeps
+        # its original WSAEWOULDBLOCK-immediately behavior.
+        ready, _, _ = _select_module.select([entry.py_sock], [], [], 0)
+        if not ready:
+            if entry.nonblocking:
+                _wsa_last_error = WSAEWOULDBLOCK
+                cpu.regs[EAX] = SOCKET_ERROR
+                cleanup_stdcall(cpu, memory, 16)
+                return
+            # NOTE (2026-09-17): a thread waiting here forever (real data
+            # never arrives) no longer freezes the whole emulator, but it
+            # was still silently invisible -- confirmed live the fix above
+            # can leave exactly one guest thread quietly retrying forever
+            # while every other thread keeps running normally, masking a
+            # real stuck-waiting-on-network-data bug as "everything's fine".
+            # Log the first stall and then periodically (every ~1s virtual)
+            # while it persists, so a silently-spinning thread shows up in
+            # the log instead of requiring a per-thread last-seen-timestamp
+            # diff to notice.
+            now_ms = state.virtual_ticks_ms
+            tid = state.tls_current_thread_id()
+            if entry.recv_wait_since_ms is None:
+                entry.recv_wait_since_ms = now_ms
+                entry.recv_wait_last_logged_ms = now_ms
+                logger.warn("socket",
+                    f"recv(0x{s:x} <- {entry.connected_to}): no data ready, "
+                    f"guest thread {tid} yielding (blocking socket) -- "
+                    f"waiting since virtual t={now_ms}ms")
+            elif (entry.recv_wait_last_logged_ms is None
+                    or now_ms - entry.recv_wait_last_logged_ms >= 1000):
+                waited_ms = now_ms - entry.recv_wait_since_ms
+                entry.recv_wait_last_logged_ms = now_ms
+                logger.warn("socket",
+                    f"recv(0x{s:x} <- {entry.connected_to}): still no data "
+                    f"ready, guest thread {tid} still waiting after "
+                    f"{waited_ms}ms")
+            retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+            state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 5)
+            return
+
+        if entry.recv_wait_since_ms is not None:
+            waited_ms = state.virtual_ticks_ms - entry.recv_wait_since_ms
+            logger.warn("socket",
+                f"recv(0x{s:x} <- {entry.connected_to}): data ready again "
+                f"after {waited_ms}ms wait")
+            entry.recv_wait_since_ms = None
+            entry.recv_wait_last_logged_ms = None
+
         try:
             data = entry.py_sock.recv(length)
             if data:
-                for i, b in enumerate(data):
-                    memory.write8((lp_buf + i) & 0xFFFFFFFF, b)
+                # FIXED (2026-09-16): was `length` individual write8() ctypes
+                # calls -- same disease as the HeapAlloc/send/sendto fixes on
+                # 2026-09-14, missed here at the time.
+                memory.load(lp_buf & 0xFFFFFFFF, data)
                 _wsa_last_error = 0
                 cpu.regs[EAX] = len(data)
                 logger.debug("socket",
@@ -608,7 +688,8 @@ def register_wsock32_handlers(
         """select(nfds, readfds, writefds, exceptfds, timeout) -> int.
 
         Reads Win32 fd_set structs from memory, maps handles to Python sockets,
-        calls select.select(), then writes the ready sets back.
+        peeks readiness with a zero-timeout select.select(), then writes the
+        ready sets back.
         """
         global _wsa_last_error
         rd_ptr  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -650,12 +731,34 @@ def register_wsock32_handlers(
             cleanup_stdcall(cpu, memory, 20)
             return
 
+        # FIXED (2026-09-17): this used to hand the guest's own timeout
+        # straight to Python's select.select(), blocking tew's single
+        # shared host thread for however long the guest asked to wait --
+        # same disease as the pre-fix _recv (see its 2026-09-16 note), just
+        # in this sibling WinSock call. Confirmed live: the main host
+        # thread sat in a real `poll_schedule_timeout` syscall wait with
+        # zero CPU/log progress for 60+s, right where a real select() call
+        # after the MCOTS connect (port 43300) would land -- the earlier
+        # "recv-freeze" theory was wrong (that socket's data had already
+        # been read; Recv-Q was 0), this is the actual culprit.
+        #
+        # Always peek with a zero-timeout select() first. If the guest's
+        # own requested wait (None = forever, or a real duration) hasn't
+        # elapsed yet, yield this thread via sleep_current and retry the
+        # same INT 0xFE shortly after -- same retry-via-rewound-EIP pattern
+        # as _recv, but this call (unlike a bare recv()) has a real
+        # caller-specified timeout to honor, so elapsed wait time is
+        # tracked per-thread (a select() call spans multiple sockets, so it
+        # can't hang this off one SocketEntry the way _recv does) and the
+        # call genuinely times out (returns 0 ready, like real WinSock)
+        # once that requested duration passes -- it does not wait forever
+        # just because it no longer blocks the host.
         try:
             rd_ready, wr_ready, _ = _select_module.select(
                 [s for _, s in rd_pairs],
                 [s for _, s in wr_pairs],
                 [],
-                timeout if timeout is not None else 0,
+                0,
             )
         except OSError as exc:
             logger.warn("socket", f"select() failed: {exc}")
@@ -663,6 +766,54 @@ def register_wsock32_handlers(
             cpu.regs[EAX] = SOCKET_ERROR
             cleanup_stdcall(cpu, memory, 20)
             return
+
+        tid = state.tls_current_thread_id()
+
+        if not rd_ready and not wr_ready:
+            now_ms = state.virtual_ticks_ms
+            since_ms = _select_wait_since_ms.get(tid)
+            if since_ms is None:
+                since_ms = now_ms
+                _select_wait_since_ms[tid] = now_ms
+                _select_wait_last_logged_ms[tid] = now_ms
+                if timeout != 0:
+                    logger.warn("socket",
+                        f"select(): no sockets ready, guest thread {tid} "
+                        f"yielding -- waiting since virtual t={now_ms}ms "
+                        f"(requested timeout={timeout!r})")
+            elapsed_ms = now_ms - since_ms
+            if timeout is not None and elapsed_ms >= timeout * 1000:
+                # Guest's own requested wait genuinely elapsed -- real
+                # WinSock select() returns 0 (timed out, nothing ready),
+                # not an error.
+                _select_wait_since_ms.pop(tid, None)
+                _select_wait_last_logged_ms.pop(tid, None)
+                if rd_ptr:
+                    _write_fd_set(rd_ptr, [], memory)
+                if wr_ptr:
+                    _write_fd_set(wr_ptr, [], memory)
+                if ex_ptr:
+                    _write_fd_set(ex_ptr, [], memory)
+                cpu.regs[EAX] = 0
+                cleanup_stdcall(cpu, memory, 20)
+                return
+            last_logged = _select_wait_last_logged_ms.get(tid)
+            if timeout != 0 and (last_logged is None or now_ms - last_logged >= 1000):
+                _select_wait_last_logged_ms[tid] = now_ms
+                logger.warn("socket",
+                    f"select(): still no sockets ready, guest thread {tid} "
+                    f"still waiting after {elapsed_ms}ms")
+            retry_eip = (cpu.eip - 2) & 0xFFFFFFFF
+            state.scheduler.sleep_current(cpu, memory, retry_eip, 0, 5)
+            return
+
+        if tid in _select_wait_since_ms:
+            waited_ms = state.virtual_ticks_ms - _select_wait_since_ms[tid]
+            logger.warn("socket",
+                f"select(): sockets ready again after {waited_ms}ms wait "
+                f"(guest thread {tid})")
+            _select_wait_since_ms.pop(tid, None)
+            _select_wait_last_logged_ms.pop(tid, None)
 
         rd_out = [h for h, s in rd_pairs if s in rd_ready]
         wr_out = [h for h, s in wr_pairs if s in wr_ready]

@@ -9,6 +9,9 @@ Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
             graphics, fileio, registry, exception, startup, scheduler, winsock, calls,
             window, dialog, channel, memory
 
+Group tokens (LOG_CATEGORIES filtering only, not real categories -- see
+`_CATEGORY_GROUPS`): threads = thread + scheduler.
+
 Each comma-separated LOG_CATEGORIES token may be prefixed with `+` (default,
 if omitted) or `-`, and may target a single Win32 function within a category
 via `category.FuncName` (the function's own name, e.g. `CompareStringA` --
@@ -18,6 +21,16 @@ category except CompareStringA". A per-function rule only takes effect for
 logging done while that function's own registered handler is on the call
 stack (see set_current_handler / win32_handlers.py's dispatch loop) -- log
 lines from anywhere else only ever match on the bare category.
+
+Group tokens (see `_CATEGORY_GROUPS`) expand to several real categories at
+once as a filtering convenience, without changing what any log line prints
+under -- `threads` (plural, 2026-09-17) requests both `thread` (Win32 API
+layer: CreateThread/ExitThread/etc.) and `scheduler` (Zig core) together;
+each line still logs and filters under its own real, singular category, so
+`-thread` or `-scheduler` alone still works exactly as before, and a line's
+`[thread]`/`[scheduler]` prefix always reflects which layer actually
+emitted it. Add more groups to `_CATEGORY_GROUPS` the same way if another
+pair of categories turns out to usually be wanted together.
 
 `memory` and `registry` are excluded even under the bare `*`/unset default
 (unlike every other category) -- `memory` is per-allocation HeapAlloc/
@@ -73,6 +86,15 @@ def _parse_level(s: str | None) -> int:
 # match wins.
 CategoryRule = tuple[bool, str, str | None]
 
+# LOG_CATEGORIES group tokens -- a plural, purely-filtering-layer alias that
+# expands to several real (singular) categories with the same include/
+# exclude sign, so both can be requested with one intuitive token. Doesn't
+# change what any log line's own category/prefix is -- see the module
+# docstring's "Group tokens" paragraph.
+_CATEGORY_GROUPS: dict[str, tuple[str, ...]] = {
+    "threads": ("thread", "scheduler"),
+}
+
 
 def _parse_categories(s: str | None) -> list[CategoryRule] | None:
     if not s or s == "*":
@@ -90,7 +112,14 @@ def _parse_categories(s: str | None) -> list[CategoryRule] | None:
             category, subname = tok.split(".", 1)
         else:
             category, subname = tok, None
-        rules.append((include, category.strip().lower(), subname.strip() if subname else None))
+        category = category.strip().lower()
+        subname = subname.strip() if subname else None
+        members = _CATEGORY_GROUPS.get(category)
+        if members is not None:
+            for member in members:
+                rules.append((include, member, subname))
+        else:
+            rules.append((include, category, subname))
     return rules
 
 
