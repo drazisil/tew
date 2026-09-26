@@ -15,9 +15,8 @@ from tew.api.win32_handlers import Win32Handlers
 from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
 from tew.hardware.memory import Memory
 
-MEM_SIZE = 16 * 1024 * 1024
+MEM_SIZE = 96 * 1024 * 1024
 STACK = 0x00030000
-HEAP_START = 0x00600000  # default (0x04000000) is past MEM_SIZE here
 
 
 def _read_cstr(mem: Memory, addr: int, max_len: int = 128) -> str:
@@ -49,7 +48,6 @@ def _env():
     mem.write32(STACK, 0xDEAD)
     stubs = Win32Handlers(mem)
     state = register_crt_handlers(stubs, mem)
-    state.next_heap_alloc = HEAP_START  # after registration, before any handler runs
     return mem, cpu, stubs, state
 
 
