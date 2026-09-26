@@ -12,10 +12,9 @@ Architecture:
 
 from __future__ import annotations
 
-import re
 import time
 import collections
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -69,6 +68,14 @@ class HandlerEntry:
     address: int     # address of the stub trampoline in memory
     handler_id: int  # index for INT 0xFE dispatch
     handler: ApiHandler
+    # Precomputed once at registration so the per-call dispatch path does no
+    # string formatting or substring scanning (INT 0xFE is the hottest path).
+    log_entry: str = field(init=False)
+    trace_suppressed: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.log_entry = f"{self.name} @ 0x{self.address:x}"
+        self.trace_suppressed = any(s in self.name for s in _TRACE_SUPPRESS)
 
 
 # ── Timer type ───────────────────────────────────────────────────────────────
@@ -168,8 +175,11 @@ class Win32Handlers:
         self._next_handler_addr: int = HANDLER_BASE
         self._memory: "Memory" = memory
         self._installed: bool = False
-        self._call_log: list[str] = []
+        # Recent stub calls as [entry, repeat_count]; consecutive calls to the
+        # same entry bump the count instead of appending. Formatted to strings
+        # only when read (get_call_log), never on the dispatch path.
         self._call_log_size: int = 2000
+        self._call_log: collections.deque[list] = collections.deque(maxlen=self._call_log_size)
         self._nt_dispatcher: NtSyscallDispatcher = NtSyscallDispatcher(memory)
 
     @property
@@ -314,8 +324,15 @@ class Win32Handlers:
         ]
 
     def get_call_log(self) -> list[str]:
-        """Return a copy of the recent stub call log."""
-        return list(self._call_log)
+        """Return the recent stub call log, oldest first, as display strings.
+
+        Consecutive repeats of the same stub collapse to one line with an
+        `` xN`` suffix.
+        """
+        return [
+            entry.log_entry if count == 1 else f"{entry.log_entry} x{count}"
+            for entry, count in self._call_log
+        ]
 
     @property
     def count(self) -> int:
@@ -444,18 +461,13 @@ class Win32Handlers:
         previous_handler = set_current_handler(entry.func_name)
         try:
             # Log the stub call; deduplicate consecutive identical calls with a counter
-            log_entry = f"{entry.name} @ 0x{handler_addr:x}"
-            if not any(s in entry.name for s in _TRACE_SUPPRESS):
-                logger.trace("calls", log_entry)
-            if self._call_log and self._call_log[-1].startswith(log_entry):
-                last = self._call_log[-1]
-                count_match = re.search(r" x(\d+)$", last)
-                count = (int(count_match.group(1)) + 1) if count_match else 2
-                self._call_log[-1] = f"{log_entry} x{count}"
+            if not entry.trace_suppressed:
+                logger.trace("calls", entry.log_entry)
+            call_log = self._call_log
+            if call_log and call_log[-1][0] is entry:
+                call_log[-1][1] += 1
             else:
-                self._call_log.append(log_entry)
-                if len(self._call_log) > self._call_log_size:
-                    self._call_log.pop(0)
+                call_log.append([entry, 1])
 
             # Execute the Python handler
             # EIP already points at RET, so the CPU will execute RET next.
