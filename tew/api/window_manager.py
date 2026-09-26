@@ -37,9 +37,8 @@ from sdl2 import (
     SDL_RaiseWindow,
     SDLK_BACKSPACE, SDLK_RETURN, SDLK_KP_ENTER, SDLK_TAB,
     SDLK_ESCAPE, SDLK_DELETE,
-    SDL_BUTTON_LEFT,
+    SDL_BUTTON_LEFT, SDL_BUTTON_MIDDLE, SDL_BUTTON_RIGHT,
     SDL_BUTTON_LMASK, SDL_BUTTON_RMASK, SDL_BUTTON_MMASK,
-    SDL_GetMouseState,
 )
 
 from sdl2.hints import SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
@@ -68,6 +67,18 @@ def _sdl_buttons_to_wparam(sdl_button_state: int) -> int:
     if sdl_button_state & SDL_BUTTON_MMASK:
         wparam |= 0x0010  # MK_MBUTTON
     return wparam
+
+
+def _sdl_button_to_mask(button: int) -> int:
+    """SDL button number (SDL_BUTTON_LEFT/MIDDLE/RIGHT) -> its SDL_BUTTON_*MASK
+    bit; 0 for the extra buttons (X1/X2), which have no MK_* bit we forward."""
+    if button == SDL_BUTTON_LEFT:
+        return SDL_BUTTON_LMASK
+    if button == SDL_BUTTON_MIDDLE:
+        return SDL_BUTTON_MMASK
+    if button == SDL_BUTTON_RIGHT:
+        return SDL_BUTTON_RMASK
+    return 0
 
 
 def _sdl_sym_to_vk(sym: int) -> int:
@@ -221,6 +232,17 @@ class WindowManager:
         self._next_atom: int = 0xC001
         # Message queue: (hwnd, msg, wparam, lparam)
         self._message_queue: deque[tuple[int, int, int, int]] = deque()
+        # SDL_BUTTON_*MASK bits for the mouse buttons currently held, tracked
+        # from the button events themselves. wParam's MK_* bits must reflect
+        # the state AT THE EVENT, but SDL_GetMouseState() (what this used to
+        # read) is (a) the state at poll time -- under emulator lag a quick
+        # real click can already be released by then -- and (b) NEVER updated
+        # by an SDL_PushEvent()-injected event, so every synthetic click
+        # carried wParam=0 and the guest's button mask (built from wParam's
+        # MK_LBUTTON alone -- see TODO.md / status.md 2026-09-18) stayed 0.
+        # Confirmed live with a guest-side probe: real WM_LBUTTONDOWN wParam=1,
+        # synthetic wParam=0, everything else (hwnd, lParam, gate) identical.
+        self._mouse_buttons_down: int = 0
         # Currently focused edit control hwnd (receives keyboard input)
         self._focused_hwnd: int = 0
         # One-shot programmatic dialog interaction hook -- see
@@ -768,6 +790,9 @@ class WindowManager:
                     self._message_queue.append((hwnd, WM_ACTIVATE, 1, 0))
                     self._message_queue.append((hwnd, WM_SETFOCUS, 0, 0))
             elif we.event == SDL_WINDOWEVENT_FOCUS_LOST:
+                # Real Windows releases mouse capture on focus loss; a button-up
+                # delivered to another window would otherwise leave a stuck bit.
+                self._mouse_buttons_down = 0
                 hwnd = self._sdl_window_id_to_hwnd.get(we.windowID, 0)
                 if hwnd:
                     self._message_queue.append((hwnd, WM_KILLFOCUS, 0, 0))
@@ -778,7 +803,7 @@ class WindowManager:
             hwnd = self._sdl_window_id_to_hwnd.get(motion.windowID, 0)
             log_x, log_y = self._to_logical_xy(hwnd, motion.x, motion.y)
             if hwnd:
-                wparam = _sdl_buttons_to_wparam(motion.state)
+                wparam = _sdl_buttons_to_wparam(motion.state | self._mouse_buttons_down)
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_MOUSEMOVE, wparam, lparam))
             from tew.api.dinput_handlers import notify_mouse_motion
@@ -786,6 +811,7 @@ class WindowManager:
 
         elif etype == SDL_MOUSEBUTTONUP:
             btn = event.button
+            self._mouse_buttons_down &= ~_sdl_button_to_mask(btn.button)
             if btn.button != SDL_BUTTON_LEFT:
                 # FIXED (2026-09-13): silently dropped, no log -- confirmed
                 # live this hid a real click that SDL_PollEvent picked up
@@ -798,7 +824,9 @@ class WindowManager:
             hwnd = self._sdl_window_id_to_hwnd.get(btn.windowID, 0)
             if hwnd:
                 log_x, log_y = self._to_logical_xy(hwnd, btn.x, btn.y)
-                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
+                # The released button is already cleared above, so wParam
+                # correctly omits MK_LBUTTON (real WM_LBUTTONUP semantics).
+                wparam = _sdl_buttons_to_wparam(self._mouse_buttons_down)
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((hwnd, WM_LBUTTONUP, wparam, lparam))
             else:
@@ -882,6 +910,7 @@ class WindowManager:
 
         elif etype == SDL_MOUSEBUTTONDOWN:
             btn = event.button
+            self._mouse_buttons_down |= _sdl_button_to_mask(btn.button)
             if btn.button != SDL_BUTTON_LEFT:
                 # FIXED (2026-09-13): silently dropped, no log -- confirmed
                 # live this hid a real click that SDL_PollEvent picked up
@@ -905,7 +934,7 @@ class WindowManager:
             # VK_LBUTTON) were ever fed real click data for that window.
             if win_hwnd:
                 log_x, log_y = self._to_logical_xy(win_hwnd, btn.x, btn.y)
-                wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))
+                wparam = _sdl_buttons_to_wparam(self._mouse_buttons_down)
                 lparam = (log_x & 0xFFFF) | ((log_y & 0xFFFF) << 16)
                 self._message_queue.append((win_hwnd, WM_LBUTTONDOWN, wparam, lparam))
                 self._handle_mouse_click(win_hwnd, log_x, log_y)
