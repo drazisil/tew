@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import ESP
+from tew.hardware.cpu_zig import ESP, ZigCPU, _lib as _cpu_lib
 from tew.logger import logger, set_current_handler
 from tew.api.nt_syscall import NtSyscallDispatcher
 
@@ -101,7 +101,20 @@ pending_timers: dict[int, PendingTimer] = {}
 
 
 def cleanup_stdcall(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
-    """For stdcall: move return address past args so the RET skips them."""
+    """For stdcall: move return address past args so the RET skips them.
+
+    Runs on nearly every API call, so a real ZigCPU does it in one libcpu
+    call (cpu_stdcall_cleanup) instead of six ctypes crossings. The Python
+    path below is the same operation for test CPU fakes.
+    """
+    if type(cpu) is ZigCPU and memory is cpu.memory:
+        if not _cpu_lib.cpu_stdcall_cleanup(cpu._state, arg_bytes):
+            esp = cpu.regs[ESP]
+            raise RuntimeError(
+                f"cleanup_stdcall: stack slot out of bounds (ESP=0x{esp:08x}, "
+                f"arg_bytes={arg_bytes}, memory size=0x{memory.size:x})"
+            )
+        return
     ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
     cpu.regs[ESP] = (cpu.regs[ESP] + arg_bytes) & 0xFFFFFFFF
     memory.write32(cpu.regs[ESP], ret_addr)
