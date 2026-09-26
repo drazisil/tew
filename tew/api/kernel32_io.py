@@ -2452,7 +2452,15 @@ def register_kernel32_io_handlers(
             # operator happened to pick, same reasoning as the crash-
             # diagnostic lines that got this same treatment (see logger.py's
             # `always` docstring).
-            logger.always(INFO, "handlers", f"[OutputDebugString] {text}")
+            #
+            # FIXED (2026-09-17): the game's own debug strings often already
+            # end in "\n" (or "\r\n"), which used to go straight into this
+            # single-line log message verbatim, printing a stray blank line
+            # right after it in /tmp/emu.log -- confirmed live, Molly caught
+            # it in a smoke-test log's first 13 lines. Only strips it for
+            # this log line; `text` itself (unstripped) still goes to
+            # write_guest_stdout below, unaffected.
+            logger.always(INFO, "handlers", f"[OutputDebugString] {text.rstrip('\r\n')}")
             # Also lands in the real stdout.txt stream (guest_stdout_handle,
             # same sink Channel_SystemPrint uses -- Molly's request
             # 2026-08-07) rather than only tew's own /tmp/emu.log, since
