@@ -6,6 +6,35 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
+## NEW (2026-09-26): perf pass, remaining items (tasks 1-3 done, see changelog)
+
+Latest profile (tasks 1-3, persona-select phase): `simple_alloc` 13.4%,
+`_enter_cs` 5.1% + `_leave_cs` 3.7%, `CompareStringA` 4.5% (goes away with
+PR #28: DAO350 then takes its `_stricmp` path).
+- Task 4, critical sections: the uncontended path pays read32 +
+  `tls_current_thread_id` (via the scheduler proxy) + dict lookup +
+  `cleanup_stdcall`. First cache the current tid cheaply; later an
+  uncontended fast path in Zig, Python only on contention.
+- `simple_alloc` (`tew/api/_state.py`): first-fit linear scan of a free list
+  that is never coalesced or trimmed, so it grows and every alloc walks it.
+- sprintf/`_write_cstring`/write8 write strings byte by byte (bulk
+  write_bytes); `eip`/`eflags`/`get_flag` crossings ~3% each (Desktop's list).
+
+## NEW (2026-09-26): thread stacks have no upper bound
+
+The scheduler (`cpu/src/scheduler.zig`) bumps each new thread's stack upward
+from `THREAD_STACK_BASE` (0x08000000) by 256 KB and never reuses or caps it.
+PR #28 reserves 0x08000000-0x0FFFFFFF for them in the loader; past ~512
+threads they would run into the DLL slots at 0x10000000 with no diagnostic.
+
+## NEW (2026-09-26): FEUI dialog backgrounds don't render
+
+The Exit confirmation dialog shows only its YES/NO button sprites over the
+lobby screen; the dialog's own background panel is not drawn. Part of the
+general FEUI rendering gaps (alongside the known font and 3D model issues).
+
+---
+
 ## NEW (2026-09-18): ~28 more real x86 opcodes still missing from `dispatch_table`, silently falling through to `opFault`
 
 Found via a full enumeration of `cpu/src/engine.zig`'s `dispatch_table`

@@ -4,6 +4,38 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-26 — PERF: Win32 API dispatch crossings, tasks 1-3 of the profile-driven pass (+74% guest steps/s)
+
+From a `perf record` of `python -X perf` (Desktop handoff): libpython 59%,
+libcpu 25%, ctypes/ffi 10%; Win32 API dispatch 68% inclusive -- the cost is
+ctypes crossings per API call times a very high call rate.
+
+1. `_handle_api_int`: each `HandlerEntry` precomputes its log string and
+   trace-suppress flag at registration; the recent-call log is a
+   `deque(maxlen)` of `[entry, count]`, formatted only when read (was a
+   regex-parsed `" xN"` suffix plus `list.pop(0)` on every call). Comparing
+   entries by identity also fixed `startswith()` merging distinct stubs
+   whose addresses share a prefix (0x10 vs 0x100).
+2. `cleanup_stdcall`: one libcpu call, `cpu_stdcall_cleanup` (new export,
+   tew-cpu `60771bc`), instead of six crossings (3x ESP read, ESP write,
+   read32, write32). Raw bounds-checked access -- no watchpoint/history/
+   null-guard side effects, same as the Python path; ESP frozen while
+   fatal-halted, like `cpu_set_reg`. The Python path stays for test fakes.
+3. `__chkesp`: the real function starts `JNE esp_error; RET` (75 01 C3), so
+   only the failure path (0x009f1bc3) is patched now; a balanced frame never
+   leaves the emulator (it used to trap to Python on every debug-build
+   return just to read ZF).
+
+Measured (two runs each, same launch, 40s warm-up then 20s window):
+be1ed2d 9.36M / 9.53M steps/s -> tasks 1-3 16.20M / 16.73M. Inclusive:
+`cleanup_stdcall` 17.0% -> 1.9%, API dispatch 74.2% -> 58.8%, libpython
+61.5% -> 50.2%, libcpu 22.3% -> 37.0%. Virtual time advanced +13%
+(1392 -> 1581 virtual ms per wall s); not yet looked into why it gains less.
+Caution: libcpu must be installed ReleaseFast -- `zig build test` reinstalls
+a Debug build (37 MB) over it.
+
+---
+
 ## 2026-09-19 — FIXED: `simple_alloc`/`simple_free` MSVC debug-heap fills (0xCD/0xDD), with a `fill` parameter so zero-contract callers get zeros
 
 **Fills (2026-09-17).** `state.simple_alloc`/`simple_free` (`tew/api/_state.py`) used to hand out and take back raw memory, so a game read a few bytes past its allocation saw tew's leftover heap contents instead of the debug CRT's inert `0xCD` filler -- confirmed live when a `DBRES_Login` over-read picked up a value equal to a real code address. Allocated blocks are now filled with `0xCD` and freed blocks with `0xDD`, matching `dbgheap.h`. `CRTState.memory` is set by `register_crt_handlers` so the allocator can write. Three test fixtures (`test_cmdline_nomovie.py`, `test_lock_file.py`, `test_read_write_file_handle.py`) had `Memory` buffers too small to cover the `0x04000000` heap base and now use 96MB. (That over-read turned out NOT to be the `DBRES_Login` crash's cause -- a missing CPU opcode was -- but the fill is a real correctness fix on its own.)
