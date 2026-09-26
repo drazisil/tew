@@ -36,6 +36,7 @@ def register_crt_handlers(
     Returns the CRTState so callers can pass it to patch_crt_internals.
     """
     state = CRTState(config=config, registry_dir=registry_dir)
+    state.memory = memory
 
     # ── Fixed data region writes ──────────────────────────────────────────────
     # Generously-sized slots (not exact-length packed -- the previous

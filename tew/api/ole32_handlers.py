@@ -475,11 +475,14 @@ def register_ole32_handlers(
                 hr = REGDB_E_CLASSNOTREG
                 _fail_all(hr)
             else:
-                factory_ppv = state.simple_alloc(4)
+                # Out-parameters must read NULL until the callee writes them
+                # (real CoCreateInstance sets *ppv = NULL up front), so a
+                # callee that leaves one untouched yields NULL, not 0xCD filler.
+                factory_ppv = state.simple_alloc(4, fill=0)
                 hr = _call_dll_get_class_object(cpu, loaded, rclsid, _get_iid_iclassfactory_addr(), factory_ppv)
                 factory_obj = memory.read32(factory_ppv) if not _hr_failed(hr) else 0
                 if factory_obj:
-                    unk_ppv = state.simple_alloc(4)
+                    unk_ppv = state.simple_alloc(4, fill=0)
                     hr = _dispatch_com_method(cpu, factory_obj, 3, [p_unk_outer, _get_iid_iunknown_addr(), unk_ppv])  # IClassFactory::CreateInstance
                     _dispatch_com_method(cpu, factory_obj, 2, [])  # IUnknown::Release (factory)
                     unk_obj = memory.read32(unk_ppv) if not _hr_failed(hr) else 0
