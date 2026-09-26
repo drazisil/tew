@@ -299,6 +299,9 @@ def _win32_error_from_errno(e: OSError):
 
 # ── Thread / stack constants ──────────────────────────────────────────────────
 
+# Heap arena: simple_alloc bumps upward from HEAP_BASE and refuses to cross
+# THREAD_STACK_BASE.
+HEAP_BASE         = 0x04000000
 THREAD_STACK_BASE = 0x08000000
 THREAD_STACK_SIZE = 256 * 1024
 THREAD_SENTINEL   = 0x001FE000
@@ -330,7 +333,7 @@ class CRTState:
         self.memory: "Memory | None" = None
 
         # ── Heap allocator ────────────────────────────────────────────────
-        self.next_heap_alloc: int = 0x04000000
+        self.next_heap_alloc: int = HEAP_BASE
         self.heap_alloc_sizes: dict[int, int] = {}   # addr → user size
         self.heap_alloc_owner: dict[int, int] = {}   # addr → heap handle
         # Freed blocks, first-fit-searched by simple_alloc before it bumps the

@@ -27,11 +27,11 @@ from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ECX, EDX, EBX, ESP, EBP, ES
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt, _annotate_address
 from tew.pe.exe_file import EXEFile
-from tew.api.win32_handlers import Win32Handlers
+from tew.api.win32_handlers import Win32Handlers, HANDLER_BASE, HANDLER_SIZE, MAX_HANDLERS
 from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
 from tew.api.kernel32_handlers import _invoke_dependency_dllmain
 from tew.api.pe_resources import PEResources
-from tew.api._state import EmulatorConfig
+from tew.api._state import EmulatorConfig, HEAP_BASE, THREAD_STACK_BASE
 from tew.api.nt_handlers import register_nt_handlers
 from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
 from tew.logger import logger, set_thread_id_provider, WARN, configure_logger
@@ -166,6 +166,23 @@ kernel_structures = KernelStructures(mem)
 cpu.kernel_structures = kernel_structures
 
 exe.import_resolver.set_memory(mem)
+
+# Address space the process owns before any DLL loads. The loader used to
+# check a DLL's preferred base only against other DLLs, so DAO350.DLL
+# (preferred base 0x04470000, loaded at runtime by COM activation) was
+# mapped straight into the live heap arena, overwriting whatever heap
+# blocks already sat there -- caught by the game's own MEM_validate as an
+# "INVALID BLOCK" whose sentinel bytes were DAO350's .text. Reserving these
+# makes the loader rebase such a DLL instead, as real Windows does.
+# Thread stacks are bumped upward from THREAD_STACK_BASE with no fixed cap
+# (cpu/src/scheduler.zig), so reserve up to the loader's own fallback range.
+_img_base = exe.optional_header.image_base
+exe.import_resolver.reserve_address_range(
+    "exe image", _img_base, _img_base + exe.optional_header.size_of_image - 1)
+exe.import_resolver.reserve_address_range(
+    "API stubs", HANDLER_BASE, HANDLER_BASE + MAX_HANDLERS * HANDLER_SIZE - 1)
+exe.import_resolver.reserve_address_range("heap", HEAP_BASE, THREAD_STACK_BASE - 1)
+exe.import_resolver.reserve_address_range("thread stacks", THREAD_STACK_BASE, 0x0FFFFFFF)
 
 # DLL search paths: application directory first (mirrors Windows loader behavior).
 # 2026-08-26: dropped the dgVoodoo/rayman_d3d8 search path (and deleted its
