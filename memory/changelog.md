@@ -4,6 +4,38 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-26 — FIXED: DLLs mapped over the heap (DAO350.DLL at its preferred base 0x04470000, inside the heap arena); added `msvcrt!_stricmp`
+
+`DLLLoader._is_address_range_available` only checked a DLL's preferred
+base against other DLLs, never against memory the process already owns.
+DAO350.DLL (preferred base 0x04470000, loaded ~13s in by COM activation)
+landed inside the heap arena (0x04000000-0x07FFFFFF), so its image and
+live heap blocks overwrote each other:
+- the game's `MEM_validate` (called during front-end teardown on Exit)
+  reported an INVALID BLOCK (1 MB block at 0x0439c1a0) whose sentinel held
+  DAO350 `.text` bytes (exact match at RVA 0x2c190) and aborted; the abort
+  handler's own leak walker then faulted at 0x5a7bf8 before the message
+  was ever formatted. Same fault address and abort sequence as the
+  intermittent crash investigated 2026-09-14 (see status_archive.md).
+- DAO's DBCS flag (0x044e57c0, `.data`) read 0xCDCDCDCD -- a game heap
+  block's debug fill -- so DAO took its CompareStringA path on every
+  string compare (30k+ calls in ~38s) instead of its cp1252 `_stricmp` path.
+
+Fix: `DLLLoader.reserve_range` / `ImportResolver.reserve_address_range`;
+`run_exe.py` reserves the exe image, the API stub region, the heap arena
+and thread stacks (up to 0x0FFFFFFF -- the scheduler bumps stacks upward
+with no cap) before the first DLL load, so an overlapping DLL is rebased
+(DAO350 now at 0x16000000; its 9,845 HIGHLOW relocations apply cleanly).
+With DAO no longer corrupted it calls `_stricmp` for real, so that is now
+implemented ("C" locale only -- tew has no `setlocale`; NULL halts).
+Tests: 6 loader reserved-range tests, 7 `_stricmp` tests.
+
+Also found: the parked `_nfsabortmessage_probe` in `run_exe.py` points at
+0x687bd8, which is a return address inside `_NFSabortmessage` (+0x78,
+after the leak check), not its entry (0x687b60) -- why it never fired.
+
+---
+
 ## 2026-09-19 — FIXED: `simple_alloc`/`simple_free` MSVC debug-heap fills (0xCD/0xDD), with a `fill` parameter so zero-contract callers get zeros
 
 **Fills (2026-09-17).** `state.simple_alloc`/`simple_free` (`tew/api/_state.py`) used to hand out and take back raw memory, so a game read a few bytes past its allocation saw tew's leftover heap contents instead of the debug CRT's inert `0xCD` filler -- confirmed live when a `DBRES_Login` over-read picked up a value equal to a real code address. Allocated blocks are now filled with `0xCD` and freed blocks with `0xDD`, matching `dbgheap.h`. `CRTState.memory` is set by `register_crt_handlers` so the allocator can write. Three test fixtures (`test_cmdline_nomovie.py`, `test_lock_file.py`, `test_read_write_file_handle.py`) had `Memory` buffers too small to cover the `0x04000000` heap base and now use 96MB. (That over-read turned out NOT to be the `DBRES_Login` crash's cause -- a missing CPU opcode was -- but the fill is a real correctness fix on its own.)
