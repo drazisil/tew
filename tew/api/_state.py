@@ -826,7 +826,7 @@ class CRTState:
     # ── TLS helpers ───────────────────────────────────────────────────────────
 
     def tls_current_thread_id(self) -> int:
-        return self.scheduler.current_thread().thread_id
+        return self.scheduler.current_thread_id()
 
     def tls_thread_store(self, tid: int) -> dict[int, int]:
         if tid not in self.tls_store:

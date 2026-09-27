@@ -136,6 +136,8 @@ def _bind_lib() -> ctypes.CDLL:
     lib.scheduler_handle_at_idx.restype = _i64
     lib.scheduler_current_handle.argtypes = [_vp]
     lib.scheduler_current_handle.restype = _u32
+    lib.scheduler_current_thread_id.argtypes = [_vp]
+    lib.scheduler_current_thread_id.restype = _i64
 
     return lib
 
@@ -237,6 +239,15 @@ class ZigScheduler:
             raise RuntimeError(f"No current thread (current_idx={idx})")
         handle = _lib.scheduler_current_handle(self._sched)
         return _CurrentThreadProxy(self, handle)
+
+    def current_thread_id(self) -> int:
+        """The current thread's id in one libcpu call -- hot (every critical
+        section and TLS handler), so it skips current_thread()'s proxy object
+        and its three separate crossings."""
+        tid = _lib.scheduler_current_thread_id(self._sched)
+        if tid < 0:
+            raise RuntimeError("No current thread")
+        return tid
 
     def _current_tid_or_none(self) -> int | None:
         """Read the live current thread id straight from libcpu.so, or None

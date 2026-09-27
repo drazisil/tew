@@ -95,6 +95,16 @@ class TestCurrentThreadProxy:
         with pytest.raises(RuntimeError):
             sched.current_thread()
 
+    def test_current_thread_id_matches_proxy(self):
+        _, _, sched = _make_env()
+        sched.create_main_thread(1000, 0xBEEF)
+        assert sched.current_thread_id() == 1000 == sched.current_thread().thread_id
+
+    def test_current_thread_id_raises_without_current_thread(self):
+        _, _, sched = _make_env()
+        with pytest.raises(RuntimeError):
+            sched.current_thread_id()
+
 
 # ── status_at_idx (translator for the old scheduler.threads[idx].status) ────
 
@@ -200,6 +210,7 @@ class TestSwitchToAndPreemptSlice:
         assert result is True
         assert sched.current_idx == 1
         assert cpu.eip == BG_START
+        assert sched.current_thread_id() == 1001
 
     def test_preempt_slice_switches_to_next_ready(self):
         cpu, mem, sched = _make_env()
