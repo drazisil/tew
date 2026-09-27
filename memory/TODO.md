@@ -11,14 +11,77 @@ items here are queued but not yet started, or started and paused.
 Latest profile (tasks 1-3, persona-select phase): `simple_alloc` 13.4%,
 `_enter_cs` 5.1% + `_leave_cs` 3.7%, `CompareStringA` 4.5% (goes away with
 PR #28: DAO350 then takes its `_stricmp` path).
-- Task 4, critical sections: the uncontended path pays read32 +
-  `tls_current_thread_id` (via the scheduler proxy) + dict lookup +
-  `cleanup_stdcall`. First cache the current tid cheaply; later an
-  uncontended fast path in Zig, Python only on contention.
+- Task 4, critical sections. Step 1 DONE (tew 80401df / tew-cpu b0e69e1:
+  current tid in one libcpu call). Remaining, agreed 2026-09-27: do it the
+  way XP does -- see the next entry.
 - `simple_alloc` (`tew/api/_state.py`): first-fit linear scan of a free list
   that is never coalesced or trimmed, so it grows and every alloc walks it.
 - sprintf/`_write_cstring`/write8 write strings byte by byte (bulk
   write_bytes); `eip`/`eflags`/`get_flag` crossings ~3% each (Desktop's list).
+
+## NEW (2026-09-27): critical sections the XP way (perf task 4, planned, not started)
+
+**How XP does it** (disassembled from `/data/Downloads/i386-binaries/ntdll.dll`,
+base 0x7c900000; kernel32 `Enter/Leave/TryEnterCriticalSection` are export
+forwarders to `NTDLL.Rtl*`). All state lives in the guest's 24-byte
+`RTL_CRITICAL_SECTION`: +0 DebugInfo (ptr to a separate 32-byte
+`RTL_CRITICAL_SECTION_DEBUG`), +4 LockCount (-1 free; otherwise counts
+pending entries, recursions AND waiters), +8 RecursionCount, +0xC
+OwningThread (= TEB+0x24 ClientId.UniqueThread), +0x10 LockSemaphore
+(auto-reset event, created lazily), +0x14 SpinCount.
+- `RtlEnterCriticalSection` (7c901000), SpinCount==0 path: `lock inc
+  LockCount`; if it hit 0 -> owner=TEB+0x24, recursion=1, `xor eax,eax;
+  ret 4`. Else if owner==self -> `inc RecursionCount` (LockCount stays
+  incremented), return 0. Else `RtlpWaitForCriticalSection` (7c91b19f,
+  kernel wait on LockSemaphore), then fall into the acquired path: the woken
+  thread OWNS it (handoff, no retry). SpinCount!=0 path: cmpxchg -1->0 +
+  `pause` spin, then the same.
+- `RtlLeaveCriticalSection` (7c9010e0): `dec RecursionCount`; if nonzero ->
+  `lock dec LockCount`, ret. If zero -> owner=0; `lock dec LockCount`; if the
+  result < 0 -> free, ret; if >= 0 -> `RtlpUnWaitCriticalSection` (7c91b267:
+  create LockSemaphore if needed, `NtSetEventBoostPriority` -> wakes exactly
+  one waiter).
+- MCity uses the standard struct: only imports kernel32
+  Initialize/Enter/Leave/DeleteCriticalSection; wrappers
+  `cQ::Help_EnterCriticalSection` (CS embedded at cQ+0x24, init flag +0x3c)
+  and `SNDSYS_entercritical` (-> `sndmutex`, `_RTL_CRITICAL_SECTION`) are thin.
+
+**How tew differs today**: state in the Python `state.critical_sections`
+dict, nothing written to the guest struct (not even LockCount=-1);
+recursion/waiters not counted in LockCount; Leave wakes ALL waiters who
+retry; Enter leaves EAX untouched (XP returns 0). And the scheduler's
+`pickNextReady` (`cpu/src/scheduler.zig` ~262) wakes a `blocked_cs` thread
+when guest `[cs+0xC]` reads 0 -- a field tew never writes (zeroed CS ->
+spurious wake/retry churn; 0xCD-filled heap CS -> only unblock_cs wakes it).
+
+**Plan** (separate commits):
+1. Prerequisite, stands alone: all threads share ONE TEB whose
+   ClientId.ThreadId (+0x24) is hardcoded 1 (`kernel_structures.py:73`); the
+   scheduler only swaps TLS slots on a switch. Make the scheduler write the
+   current thread's id to TEB+0x24 on every switch (Zig, beside the TLS
+   swap). Also a latent bug by itself: real DLL code reading fs:[0x24] gets 1
+   while GetCurrentThreadId returns 1000+.
+2. `Initialize*` (kernel32 + ntdll variants) write the real struct:
+   LockCount=-1, RecursionCount=0, OwningThread=0, LockSemaphore=0,
+   SpinCount=0 (XP forces 0 on a uniprocessor), DebugInfo = new 32-byte
+   `RTL_CRITICAL_SECTION_DEBUG` with its CriticalSection back-pointer.
+   `Delete` frees it.
+3. Enter/Leave/TryEnter as GUEST CODE (our own implementation of the logic
+   above) in consecutive stub slots -- needs a small `Win32Handlers`
+   addition: register a guest routine with named `INT 0xFE` hook points.
+   Uncontended paths never leave the emulator (like `__chkesp` now).
+4. Python only for the slow paths, with LockSemaphore as a real tew
+   auto-reset event: contended Enter waits on it (then the guest code takes
+   ownership); Leave with waiters signals it (wake exactly one). First verify
+   tew's auto-reset event wakes exactly one waiter (`scheduler.zig`
+   `unblockHandle`).
+5. Remove `state.critical_sections` and the CS-specific scheduler blocking
+   (`block_current_on_cs`, the pickNextReady owner read) -- no other users.
+6. Tests: guest-code tests on the real ZigCPU (uncontended enter/leave with
+   no dispatch, recursion, TryEnter), a two-thread contention/handoff test,
+   full suite, live run, re-profile (enter+leave were ~8% inclusive).
+
+---
 
 ## NEW (2026-09-26): thread stacks have no upper bound
 
