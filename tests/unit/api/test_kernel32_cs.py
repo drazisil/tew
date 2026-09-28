@@ -30,6 +30,8 @@ class _FakeCPU:
 MEM_SIZE = 4 * 1024 * 1024
 STACK    = 0x200000
 CS_ADDR  = 0x300000   # CRITICAL_SECTION struct in emulator memory
+CS_ADDR2 = 0x300040   # a second one
+HEAP_START = 0x380000 # RTL_CRITICAL_SECTION_DEBUG blocks come from here
 
 # CS memory layout offsets
 OFF_LOCK      = 0x04  # LockCount      (-1 = free)
@@ -44,6 +46,8 @@ OTHER_TID     = 9999  # a TID that is not the current thread
 def env():
     mem   = Memory(MEM_SIZE)
     state = CRTState()
+    state.memory = mem
+    state.next_heap_alloc = HEAP_START  # default (0x04000000) is past MEM_SIZE here
     stubs = _StubHandlers()
     register_kernel32_sync_handlers(stubs, mem, state)
     cpu = _FakeCPU()
@@ -118,6 +122,85 @@ class TestInitializeCriticalSectionAndSpinCount:
         mem.write32(STACK + 8, 4000)
         stubs.get("kernel32.dll", "InitializeCriticalSectionAndSpinCount")(cpu)
         assert cs_field(state, OFF_LOCK) == LOCK_FREE
+
+
+# ── Guest-side struct (XP ntdll layout) ───────────────────────────────────────
+
+OFF_DEBUG     = 0x00  # DebugInfo -> RTL_CRITICAL_SECTION_DEBUG
+OFF_SEMAPHORE = 0x10  # LockSemaphore
+OFF_SPIN      = 0x14  # SpinCount
+DBG_CS        = 0x04  # RTL_CRITICAL_SECTION_DEBUG.CriticalSection
+DBG_FLINK     = 0x08  # .ProcessLocksList.Flink
+DBG_BLINK     = 0x0C  # .ProcessLocksList.Blink
+
+
+class TestGuestStruct:
+    def test_init_writes_the_real_struct(self, env):
+        cpu, mem, state, stubs = env
+        mem.load(CS_ADDR, b"\xcd" * 0x18)  # debug-heap garbage underneath
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection")
+        assert mem.read32(CS_ADDR + OFF_LOCK) == LOCK_FREE
+        assert mem.read32(CS_ADDR + OFF_REC) == 0
+        assert mem.read32(CS_ADDR + OFF_OWNER) == 0
+        assert mem.read32(CS_ADDR + OFF_SEMAPHORE) == 0
+        assert mem.read32(CS_ADDR + OFF_SPIN) == 0
+
+    def test_debug_info_points_back_at_the_cs(self, env):
+        cpu, mem, state, stubs = env
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection")
+        debug = mem.read32(CS_ADDR + OFF_DEBUG)
+        assert debug != 0
+        assert mem.read16(debug) == 0            # Type = RTL_CRITSECT_TYPE
+        assert mem.read32(debug + DBG_CS) == CS_ADDR
+        assert mem.read32(debug + 0x10) == 0     # EntryCount
+        assert mem.read32(debug + 0x14) == 0     # ContentionCount
+
+    def test_spin_count_forced_to_zero_on_one_processor(self, env):
+        cpu, mem, state, stubs = env
+        mem.write32(STACK + 4, CS_ADDR)
+        mem.write32(STACK + 8, 4000)
+        stubs.get("kernel32.dll", "InitializeCriticalSectionAndSpinCount")(cpu)
+        assert mem.read32(CS_ADDR + OFF_SPIN) == 0
+
+    def test_debug_blocks_linked_into_one_process_list(self, env):
+        cpu, mem, state, stubs = env
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection", CS_ADDR)
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection", CS_ADDR2)
+        links1 = mem.read32(CS_ADDR + OFF_DEBUG) + DBG_FLINK
+        links2 = mem.read32(CS_ADDR2 + OFF_DEBUG) + DBG_FLINK
+        head = mem.read32(links1 + 4)             # first entry's Blink is the head
+        assert mem.read32(head) == links1         # head -> 1 -> 2 -> head
+        assert mem.read32(links1) == links2
+        assert mem.read32(links2) == head
+        assert mem.read32(head + 4) == links2     # head's Blink is the tail
+        assert mem.read32(links2 + 4) == links1
+
+    def test_delete_unlinks_frees_and_zeroes(self, env):
+        cpu, mem, state, stubs = env
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection", CS_ADDR)
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection", CS_ADDR2)
+        debug1 = mem.read32(CS_ADDR + OFF_DEBUG)
+        links2 = mem.read32(CS_ADDR2 + OFF_DEBUG) + DBG_FLINK
+        head = mem.read32(debug1 + DBG_BLINK)
+        cs_call(stubs, cpu, mem, "DeleteCriticalSection", CS_ADDR)
+        assert mem.read_bytes(CS_ADDR, 0x18) == bytes(0x18)
+        assert debug1 not in state.heap_alloc_sizes
+        assert CS_ADDR not in state.critical_sections
+        assert mem.read32(head) == links2 and mem.read32(links2 + 4) == head
+
+    def test_second_delete_is_harmless(self, env):
+        cpu, mem, state, stubs = env
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection")
+        cs_call(stubs, cpu, mem, "DeleteCriticalSection")
+        cs_call(stubs, cpu, mem, "DeleteCriticalSection")  # DebugInfo now 0
+        assert mem.read_bytes(CS_ADDR, 0x18) == bytes(0x18)
+
+    def test_delete_refuses_a_semaphore_tew_never_created(self, env):
+        cpu, mem, state, stubs = env
+        cs_call(stubs, cpu, mem, "InitializeCriticalSection")
+        mem.write32(CS_ADDR + OFF_SEMAPHORE, 0x1234)
+        with pytest.raises(RuntimeError, match="LockSemaphore"):
+            cs_call(stubs, cpu, mem, "DeleteCriticalSection")
 
 
 # ── EnterCriticalSection ──────────────────────────────────────────────────────

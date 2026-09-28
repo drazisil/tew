@@ -22,6 +22,7 @@ from tew.hardware.memory import Memory
 MEM_SIZE  = 8 * 1024 * 1024
 STACK     = 0x200000
 CS_ADDR   = 0x300000
+HEAP_START = 0x600000  # RTL_CRITICAL_SECTION_DEBUG blocks come from here
 NAME_BUF  = 0x400000
 
 OFF_LOCK  = 0x04   # LockCount  (-1 == free)
@@ -54,6 +55,8 @@ class _FakeCPU:
 def make_env():
     mem   = Memory(MEM_SIZE)
     state = CRTState()
+    state.memory = mem
+    state.next_heap_alloc = HEAP_START  # default (0x04000000) is past MEM_SIZE here
     stubs = _StubHandlers()
     register_kernel32_sync_handlers(stubs, mem, state)
     register_kernel32_io_handlers(stubs, mem, state)

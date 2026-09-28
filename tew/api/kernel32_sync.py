@@ -46,9 +46,59 @@ def register_kernel32_sync_handlers(
             entry = state.critical_sections[ptr] = CriticalSectionEntry()
         return entry
 
+    # ── Guest-side RTL_CRITICAL_SECTION, the way XP's ntdll lays it out ───────
+    # Disassembled from XP ntdll (RtlInitializeCriticalSectionAndSpinCount
+    # 7c9114fa, RtlDeleteCriticalSection 7c91135a). The 24-byte struct:
+    # +0 DebugInfo, +4 LockCount, +8 RecursionCount, +0xC OwningThread,
+    # +0x10 LockSemaphore, +0x14 SpinCount. DebugInfo points to a separate
+    # 32-byte RTL_CRITICAL_SECTION_DEBUG: +0 WORD Type (0 = critical
+    # section), +2 WORD CreatorBackTraceIndex, +4 CriticalSection
+    # (back-pointer), +8 ProcessLocksList (LIST_ENTRY, linked at the tail of
+    # the process-wide RtlCriticalSectionList), +0x10 EntryCount,
+    # +0x14 ContentionCount, +0x18 Spare[2] (never written by XP).
+    _CS_SIZE = 0x18
+    _CS_DEBUG_SIZE = 0x20
+
+    # RtlCriticalSectionList: the process-wide list head (a LIST_ENTRY that
+    # lives in ntdll's .data on XP). Allocated on first use, empty list =
+    # Flink and Blink both pointing at the head itself.
+    cs_list_head = 0
+
+    def _cs_list_head() -> int:
+        nonlocal cs_list_head
+        if cs_list_head == 0:
+            cs_list_head = state.simple_alloc(8, fill=0)
+            memory.write32(cs_list_head, cs_list_head)
+            memory.write32(cs_list_head + 4, cs_list_head)
+        return cs_list_head
+
+    def _write_initialized_cs(ptr: int) -> None:
+        """RtlInitializeCriticalSectionAndSpinCount's effect on the guest
+        struct. SpinCount is stored as 0: XP only keeps the caller's spin
+        count when the PEB reports more than one processor, and tew reports
+        one (GetSystemInfo)."""
+        debug = state.simple_alloc(_CS_DEBUG_SIZE, fill=0)
+        # Type=0 and CreatorBackTraceIndex=0 (XP's RtlLogStackBackTrace
+        # returns 0 without a stack-trace database), EntryCount and
+        # ContentionCount=0 all come from the zero fill.
+        memory.write32(debug + 0x04, ptr)
+        head = _cs_list_head()
+        tail = memory.read32(head + 4)
+        memory.write32(debug + 0x08, head)       # Flink -> list head
+        memory.write32(debug + 0x0C, tail)       # Blink -> old tail
+        memory.write32(tail, debug + 0x08)       # old tail's Flink
+        memory.write32(head + 4, debug + 0x08)   # head's Blink
+        memory.write32(ptr + 0x00, debug)        # DebugInfo
+        memory.write32(ptr + 0x04, 0xFFFFFFFF)   # LockCount = -1 (free)
+        memory.write32(ptr + 0x08, 0)            # RecursionCount
+        memory.write32(ptr + 0x0C, 0)            # OwningThread
+        memory.write32(ptr + 0x10, 0)            # LockSemaphore (created lazily)
+        memory.write32(ptr + 0x14, 0)            # SpinCount
+        state.critical_sections[ptr] = CriticalSectionEntry()
+
     def _init_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        state.critical_sections[ptr] = CriticalSectionEntry()
+        _write_initialized_cs(ptr)
         # kernel32's InitializeCriticalSection is void; ntdll's own
         # RtlInitializeCriticalSection (same struct layout, same effect --
         # real kernel32 just forwards to it) returns NTSTATUS STATUS_SUCCESS.
@@ -58,10 +108,8 @@ def register_kernel32_sync_handlers(
 
     def _init_cs_spin(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        # spin_count (arg at ESP+8) is read by real Windows but only used by
-        # its own spin-wait loop before blocking -- this emulation blocks
-        # cooperatively instead of spinning, so the value has no effect here.
-        state.critical_sections[ptr] = CriticalSectionEntry()
+        # spin_count (arg at ESP+8) is dropped: see _write_initialized_cs.
+        _write_initialized_cs(ptr)
         cpu.regs[EAX] = 1  # BOOL TRUE
         cleanup_stdcall(cpu, memory, 8)
 
@@ -70,7 +118,7 @@ def register_kernel32_sync_handlers(
     # Windows), but returns NTSTATUS (0 = STATUS_SUCCESS) instead of BOOL.
     def _rtl_init_cs_spin(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
-        state.critical_sections[ptr] = CriticalSectionEntry()
+        _write_initialized_cs(ptr)
         cpu.regs[EAX] = 0  # STATUS_SUCCESS
         cleanup_stdcall(cpu, memory, 8)
 
@@ -110,8 +158,29 @@ def register_kernel32_sync_handlers(
             state.scheduler.unblock_cs(ptr)
         cleanup_stdcall(cpu, memory, 4)
 
+    # XP's RtlDeleteCriticalSection: close LockSemaphore if one was created,
+    # unlink DebugInfo from RtlCriticalSectionList, zero and free it, then
+    # zero the whole 24-byte struct. A DebugInfo of 0 (already deleted, or
+    # never initialized) skips the debug-block part, as on XP.
     def _delete_cs(cpu: "CPU") -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        semaphore = memory.read32((ptr + 0x10) & 0xFFFFFFFF)
+        if semaphore != 0:
+            # tew never creates a LockSemaphore yet, so a non-zero one here
+            # isn't a handle tew can close.
+            raise RuntimeError(
+                f"DeleteCriticalSection(0x{ptr:08x}): LockSemaphore is "
+                f"0x{semaphore:08x}, but tew never creates one -- not a "
+                f"handle it can close")
+        debug = memory.read32(ptr)
+        if debug != 0:
+            flink = memory.read32(debug + 0x08)
+            blink = memory.read32(debug + 0x0C)
+            memory.write32(blink, flink)       # Blink->Flink = Flink
+            memory.write32(flink + 4, blink)   # Flink->Blink = Blink
+            memory.load(debug, bytes(_CS_DEBUG_SIZE))
+            state.simple_free(debug)
+        memory.load(ptr, bytes(_CS_SIZE))
         state.critical_sections.pop(ptr, None)
         cleanup_stdcall(cpu, memory, 4)
 
