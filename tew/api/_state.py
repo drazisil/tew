@@ -17,6 +17,7 @@ from tew.fs import find_file_ci
 from tew.hardware.alloc_zig import bump_alloc_next
 from tew.hardware.scheduler_zig import ZigScheduler
 from tew.kernel.kernel import Kernel
+from tew.kernel.kernel_structures import MAIN_THREAD_ID
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -413,9 +414,8 @@ class CRTState:
         self.error_info_store: dict[int, int] = {}   # tid → IErrorInfo ptr (0 = none)
 
         # ── Kernel scheduler ──────────────────────────────────────────────
-        # Main thread TID 1000 matches the tls_current_thread_id() fallback.
         self.scheduler: ZigScheduler = ZigScheduler()
-        self.scheduler.create_main_thread(thread_id=1000, handle=0xFFFFFFFF)
+        self.scheduler.create_main_thread(thread_id=MAIN_THREAD_ID, handle=0xFFFFFFFF)
         # Kernel owns async I/O completions; wired into the scheduler so
         # tick() fires from _pick_next_ready() when no thread is READY.
         self.kernel: Kernel = Kernel(self)
