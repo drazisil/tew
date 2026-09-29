@@ -95,6 +95,16 @@ class TestCurrentThreadProxy:
         with pytest.raises(RuntimeError):
             sched.current_thread()
 
+    def test_current_thread_id_matches_proxy(self):
+        _, _, sched = _make_env()
+        sched.create_main_thread(1000, 0xBEEF)
+        assert sched.current_thread_id() == 1000 == sched.current_thread().thread_id
+
+    def test_current_thread_id_raises_without_current_thread(self):
+        _, _, sched = _make_env()
+        with pytest.raises(RuntimeError):
+            sched.current_thread_id()
+
 
 # ── status_at_idx (translator for the old scheduler.threads[idx].status) ────
 
@@ -200,6 +210,7 @@ class TestSwitchToAndPreemptSlice:
         assert result is True
         assert sched.current_idx == 1
         assert cpu.eip == BG_START
+        assert sched.current_thread_id() == 1001
 
     def test_preempt_slice_switches_to_next_ready(self):
         cpu, mem, sched = _make_env()
@@ -221,42 +232,6 @@ class TestSwitchToAndPreemptSlice:
 
         assert result is False
         assert sched.current_idx == 0
-
-
-# ── block_current_on_cs (full two-call Python orchestration) ────────────────
-
-class TestBlockCurrentOnCs:
-    def test_blocks_and_switches_to_next_thread(self):
-        cpu, mem, sched = _make_env()
-        sched.create_main_thread(1000, 0xBEEF)
-        sched.create_thread(1001, 0xBEF0, BG_START, 0x0)
-
-        sched.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
-
-        assert sched.current_idx == 1
-        assert sched.status_at_idx(0) == ThreadStatus.BLOCKED_CS
-
-    def test_retries_when_no_other_thread(self):
-        cpu, mem, sched = _make_env()
-        sched.create_main_thread(1000, 0xBEEF)
-
-        sched.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
-
-        assert cpu.eip == 0x401000
-        assert sched.status_at_idx(0) == ThreadStatus.READY
-        assert cpu.halted is False
-
-    def test_refused_while_reentrant_still_redirects_eip(self):
-        cpu, mem, sched = _make_env()
-        sched.create_main_thread(1000, 0xBEEF)
-        sched.create_thread(1001, 0xBEF0, BG_START, 0x0)
-        sched.enter_reentrant_call()
-
-        sched.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
-
-        assert cpu.eip == 0x401000
-        assert sched.current_idx == 0  # no swap happened
-        assert sched.status_at_idx(0) == ThreadStatus.READY  # never marked blocked
 
 
 # ── block_current_on_handles ──────────────────────────────────────────────────
@@ -434,19 +409,9 @@ class TestTerminateThread:
         assert cpu.halted is True
 
 
-# ── unblock_cs / unblock_handle / tick ────────────────────────────────────────
+# ── unblock_handle / tick ────────────────────────────────────────
 
 class TestUnblockAndTick:
-    def test_unblock_cs_marks_waiting_thread_ready(self):
-        cpu, mem, sched = _make_env()
-        sched.create_main_thread(1000, 0xBEEF)
-        sched.create_thread(1001, 0xBEF0, BG_START, 0x0)
-        sched.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)  # main -> BLOCKED_CS
-
-        sched.unblock_cs(0x1234)
-
-        assert sched.status_at_idx(0) == ThreadStatus.READY
-
     def test_unblock_handle_returns_count(self):
         cpu, mem, sched = _make_env()
         sched.create_main_thread(1000, 0xBEEF)
@@ -478,7 +443,6 @@ class TestReentrancyOrchestration:
         sched.enter_reentrant_call()
 
         sched.switch_to(cpu, mem, 1)
-        sched.block_current_on_cs(cpu, mem, cs_ptr=0x1234, retry_eip=0x401000)
         sched.block_current_on_handles(cpu, mem, frozenset([0x700B]), retry_eip=0x401000)
         sched.sleep_current(cpu, mem, return_eip=RET_ADDR, eax_val=0, sleep_ms=50)
         sched.preempt_slice(cpu, mem)

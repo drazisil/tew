@@ -142,7 +142,7 @@ def _invoke_emulated_proc(
     # do with DAO. Run in bounded chunks and check which thread is actually
     # live after each one to guard against this.
     # Bracket the nested cpu.run() with the scheduler's reentrancy guard:
-    # while this is set, block_current_on_cs/on_handles/sleep_current/
+    # while this is set, block_current_on_handles/sleep_current/
     # switch_to all refuse to swap the shared cpu.regs away from
     # started_thread_idx (logging a violation instead of silently handing
     # our registers to an unrelated thread -- see Scheduler._swap_current).

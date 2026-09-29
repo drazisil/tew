@@ -17,6 +17,7 @@ from tew.fs import find_file_ci
 from tew.hardware.alloc_zig import bump_alloc_next
 from tew.hardware.scheduler_zig import ZigScheduler
 from tew.kernel.kernel import Kernel
+from tew.kernel.kernel_structures import MAIN_THREAD_ID
 
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
@@ -107,13 +108,6 @@ def file_entry_size(entry: "FileHandleEntry") -> int:
 
 
 # ── Kernel object types ───────────────────────────────────────────────────────
-
-@dataclass
-class CriticalSectionEntry:
-    lock_count: int = 0xFFFFFFFF   # -1 (0xFFFFFFFF) == free
-    recursion_count: int = 0
-    owner_tid: int = 0             # 0 == unowned
-
 
 @dataclass
 class MutexHandle:
@@ -369,23 +363,6 @@ class CRTState:
         self.kernel_handle_map: dict[int, KernelHandle] = {}
         self.next_kernel_handle: int = 0x7000
 
-        # ── Critical sections ────────────────────────────────────────────
-        # Keyed by the guest CRITICAL_SECTION pointer. Guest code only ever
-        # touches a CS through the documented Win32 API (Enter/Leave/
-        # TryEnter/Initialize/Delete) -- MSVC-compiled code treats the
-        # struct layout as opaque, it's never read directly except by our
-        # own handlers -- so state lives here in Python instead of being
-        # read/written through guest memory on every call. 2026-09-14:
-        # measured live that batching the guest-memory reads/writes into
-        # fewer bulk ctypes crossings (read_bytes/load instead of several
-        # read32/write32) made no measurable difference (~27us/call either
-        # way) -- the crossings themselves, not their count, aren't what's
-        # expensive here, or something else dominates -- so this drops them
-        # entirely instead of trying to make them cheaper. Confirmed live:
-        # EnterCriticalSection dropped from ~22-27us/call to ~14us/call,
-        # LeaveCriticalSection from ~14us to ~9us.
-        self.critical_sections: dict[int, "CriticalSectionEntry"] = {}
-
         # ── Dynamic modules ───────────────────────────────────────────────
         self.dynamic_modules: dict[int, DynamicModule] = {}   # handle → module
 
@@ -413,9 +390,8 @@ class CRTState:
         self.error_info_store: dict[int, int] = {}   # tid → IErrorInfo ptr (0 = none)
 
         # ── Kernel scheduler ──────────────────────────────────────────────
-        # Main thread TID 1000 matches the tls_current_thread_id() fallback.
         self.scheduler: ZigScheduler = ZigScheduler()
-        self.scheduler.create_main_thread(thread_id=1000, handle=0xFFFFFFFF)
+        self.scheduler.create_main_thread(thread_id=MAIN_THREAD_ID, handle=0xFFFFFFFF)
         # Kernel owns async I/O completions; wired into the scheduler so
         # tick() fires from _pick_next_ready() when no thread is READY.
         self.kernel: Kernel = Kernel(self)
@@ -826,7 +802,7 @@ class CRTState:
     # ── TLS helpers ───────────────────────────────────────────────────────────
 
     def tls_current_thread_id(self) -> int:
-        return self.scheduler.current_thread().thread_id
+        return self.scheduler.current_thread_id()
 
     def tls_thread_store(self, tid: int) -> dict[int, int]:
         if tid not in self.tls_store:

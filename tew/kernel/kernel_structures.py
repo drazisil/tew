@@ -4,6 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+# The main thread's id. The scheduler registers the main thread under it and
+# the initial TEB's ClientId.UniqueThread holds it; the scheduler rewrites
+# that TEB field on every thread switch, so fs:[0x24] always agrees with
+# GetCurrentThreadId.
+MAIN_THREAD_ID = 1000
+
 if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
@@ -70,7 +76,7 @@ class KernelStructures:
         self._memory.write32(addr + 0x0018, addr)        # Self (pointer to TEB)
         self._memory.write32(addr + 0x001C, 0)           # EnvironmentPointer
         self._memory.write32(addr + 0x0020, 0x00000004)  # ClientId.ProcessId = 4
-        self._memory.write32(addr + 0x0024, 0x00000001)  # ClientId.ThreadId  = 1
+        self._memory.write32(addr + 0x0024, MAIN_THREAD_ID)  # ClientId.UniqueThread
         self._memory.write32(addr + 0x0030, teb.peb_address)
         self._memory.write32(addr + 0x0034, 0)           # LastErrorValue
 

@@ -3747,7 +3747,7 @@ try:
             eip_now = cpu.eip & 0xFFFFFFFF
             stub_note = ""
             if 0x00200000 <= eip_now < 0x00220000:
-                recent = win32_handlers._call_log[-8:]
+                recent = win32_handlers.get_call_log()[-8:]
                 stub_note = f" calls={recent}"
             logger.debug(
                 "startup",

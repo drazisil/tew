@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP, EBP, ZF_BIT
+from tew.hardware.cpu_zig import EAX, ESP, EBP
 from tew.api.win32_handlers import (
     Win32Handlers,
     DIALOG_TRAMPOLINE,
@@ -100,27 +100,30 @@ def patch_crt_internals(
     stubs.patch_address(0x0040159B, "_winmain_check2_GetVersionString", _winmain_check2)
 
     # __chkesp (0x009f1bc0): called after every function call in MSVC debug builds to
-    # verify ESP was properly restored. If ESP is wrong it calls _CrtDbgReport then INT3.
-    # Caller emits: CMP EBP, ESP; CALL __chkesp at end of each function epilog.
-    # ZF=1 if EBP==ESP (frame balanced) → return transparently.
-    # ZF=0 if mismatch → halt with diagnostic.
-    def _chkesp(cpu: "CPU") -> None:
-        if not cpu.get_flag(ZF_BIT):
-            ret_addr    = memory.read32(cpu.regs[ESP])
-            ebp         = cpu.regs[EBP] & 0xFFFFFFFF
-            esp_at_cmp  = (cpu.regs[ESP] + 4) & 0xFFFFFFFF  # CALL pushed retAddr, so add 4
-            logger.error(
-                "exception",
-                f"__chkesp FAILED at return to 0x{(ret_addr & 0xFFFFFFFF):08x}"
-                f" — EBP=0x{ebp:08x}"
-                f" ESP=0x{esp_at_cmp:08x}"
-                f" delta={esp_at_cmp - ebp}",
-            )
-            cpu.halted = True
-            cpu.fatal_halt = True
-        # On pass: cdecl no args, EAX preserved (caller continues using it), plain RET
+    # verify ESP was properly restored. Caller emits CMP EBP, ESP; CALL __chkesp.
+    # The real function starts `JNE esp_error; RET` (75 01 C3), so the passing
+    # case (ZF=1, the overwhelmingly common one) is left to the game's own two
+    # instructions and never leaves the emulator. Only the failure path at
+    # 0x009f1bc3 (which would push registers and call _CrtDbgReport) is patched,
+    # so a mismatch halts with the frame details. Patching the entry used to
+    # trap to Python on every debug-build function return just to read ZF.
+    def _chkesp_fail(cpu: "CPU") -> None:
+        # Reached only via the JNE: ZF=0, and [ESP] is still the caller's
+        # return address (the failure path hasn't pushed anything yet).
+        ret_addr    = memory.read32(cpu.regs[ESP])
+        ebp         = cpu.regs[EBP] & 0xFFFFFFFF
+        esp_at_cmp  = (cpu.regs[ESP] + 4) & 0xFFFFFFFF  # CALL pushed retAddr, so add 4
+        logger.error(
+            "exception",
+            f"__chkesp FAILED at return to 0x{(ret_addr & 0xFFFFFFFF):08x}"
+            f" — EBP=0x{ebp:08x}"
+            f" ESP=0x{esp_at_cmp:08x}"
+            f" delta={esp_at_cmp - ebp}",
+        )
+        cpu.halted = True
+        cpu.fatal_halt = True
 
-    stubs.patch_address(0x009F1BC0, "__chkesp", _chkesp)
+    stubs.patch_address(0x009F1BC3, "__chkesp_esp_error", _chkesp_fail)
 
     # _CrtDbgReport (0x009f9300): called by MSVC debug CRT assertions (_ASSERTE, _ASSERT etc.)
     # Signature: __cdecl _CrtDbgReport(int reportType, const char *filename, int linenumber,
