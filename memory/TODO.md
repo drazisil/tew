@@ -11,15 +11,17 @@ items here are queued but not yet started, or started and paused.
 Latest profile (tasks 1-3, persona-select phase): `simple_alloc` 13.4%,
 `_enter_cs` 5.1% + `_leave_cs` 3.7%, `CompareStringA` 4.5% (goes away with
 PR #28: DAO350 then takes its `_stricmp` path).
-- Task 4, critical sections. Step 1 DONE (tew 80401df / tew-cpu b0e69e1:
-  current tid in one libcpu call). Remaining, agreed 2026-09-27: do it the
-  way XP does -- see the next entry.
+- Task 4, critical sections: DONE 2026-09-29 (see changelog). Enter/Leave
+  no longer appear in the profile.
+- New in the 2026-09-29 profile (texture-upload phase, reached ~12% sooner
+  now): D3D8 `UnlockRect` -> `_convert_to_bgra8` ~30% inclusive, the biggest
+  single item once that phase starts.
 - `simple_alloc` (`tew/api/_state.py`): first-fit linear scan of a free list
   that is never coalesced or trimmed, so it grows and every alloc walks it.
 - sprintf/`_write_cstring`/write8 write strings byte by byte (bulk
   write_bytes); `eip`/`eflags`/`get_flag` crossings ~3% each (Desktop's list).
 
-## NEW (2026-09-27): critical sections the XP way (perf task 4, planned, not started)
+## RESOLVED (2026-09-29): critical sections the XP way (perf task 4) -- all 6 steps done, see changelog; plan kept below
 
 **How XP does it** (disassembled from `/data/Downloads/i386-binaries/ntdll.dll`,
 base 0x7c900000; kernel32 `Enter/Leave/TryEnterCriticalSection` are export

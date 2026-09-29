@@ -4,6 +4,45 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-29 — PERF: critical sections the XP way (perf task 4): ~12% less wall time to the same step count
+
+Plan and XP ntdll disassembly notes are in TODO.md's (now RESOLVED) entry.
+
+1. TEB `ClientId.UniqueThread` (fs:[0x24]) follows the running thread. The
+   scheduler writes it on every switch (tew-cpu `cb48170`); it was
+   hardcoded 1 while `GetCurrentThreadId` returned 1000+ (tew `f9ffeb9`).
+2. `Initialize*CriticalSection` writes the real guest `RTL_CRITICAL_SECTION`
+   (LockCount -1, SpinCount 0 on one CPU) plus a 32-byte
+   `RTL_CRITICAL_SECTION_DEBUG` linked into a process `RtlCriticalSectionList`.
+   Delete unlinks, frees and zeroes the block, closes LockSemaphore, and
+   zeroes the CS (tew `fbbf0ab`).
+3+4. Enter/Leave/TryEnter are guest x86 in the stub region
+   (`Win32Handlers.register_guest_code`, new), same logic as XP's
+   `RtlEnterCriticalSection`/`RtlLeaveCriticalSection`. Only contention traps
+   to Python: a contended Enter waits on LockSemaphore (lazily created
+   auto-reset event) and is handed ownership; a Leave with waiters signals
+   it. `state.critical_sections` is gone -- the guest struct is the state
+   (tew `f3f32fc`). Merged steps 3 and 4: with XP's LockCount accounting a
+   contended Enter has already counted itself, so the old retry-style block
+   would double-count.
+5. Scheduler CS blocking removed: `blocked_cs`, `waiting_on_cs`,
+   `completeBlockOnCs`, `unblockCs`, `block_current_on_cs`/`unblock_cs`, and
+   `pickNextReady`'s guest owner read (it no longer takes the CPU).
+   ThreadStatus values shift down by one (tew-cpu `f1b8d4f`, tew `fe41cd4`).
+6. Live: two `prof.sh` runs (40s warm-up, 20s `perf record`) vs two at
+   `80401df`. Wall time to step 900M: 59.1 / 58.3s -> 52.2 / 50.5s (every
+   100M mark from 300M on is ~10-13% sooner). `_enter_cs` 4.2% + `_leave_cs`
+   3.9% inclusive -> nothing; the wait/wake hooks never showed up in a
+   sample. The 20s-window steps/s alone looks lower (19.1/16.9M -> 15.4/15.8M)
+   only because the faster runs are already in the D3D texture-upload phase
+   by then (`UnlockRect` -> `_convert_to_bgra8` ~30%), not the heap-heavy
+   phase the baseline window measured. Virtual time at 900M steps also
+   dropped (82.0/80.9s -> 71.0/69.5s); not looked into. No new errors, no
+   `except.txt`. Not yet re-checked: the manual login -> main UI -> CONTINUE
+   path.
+
+---
+
 ## 2026-09-26 — PERF: Win32 API dispatch crossings, tasks 1-3 of the profile-driven pass (+74% guest steps/s)
 
 From a `perf record` of `python -X perf` (Desktop handoff): libpython 59%,
