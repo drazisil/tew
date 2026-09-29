@@ -23,10 +23,16 @@ cd /data/Code/tew
 .venv/bin/python run_exe.py
 ```
 
-Useful environment variables include `TEW_MAX_STEPS`, `LOG_LEVEL` and
-`LOG_CATEGORIES`. For scripted clicks, `TEW_CLICK_AT=x,y` together with
+Useful environment variables include `TEW_MAX_STEPS` (a guest step cap;
+unlimited when unset), `LOG_LEVEL` and `LOG_CATEGORIES`. For scripted clicks, `TEW_CLICK_AT=x,y` together with
 `TEW_CLICK_WHEN_FILE`/`TEW_CLICK_WHEN_TEXT` clicks once the game writes a given
 line to a log file, and a `/tmp/tew_click_trigger` file drives a click on demand.
+
+By default a run plays itself as far as the main UI: it clicks Continue on the
+login dialog, answers No to the full-screen prompt, and clicks START on
+persona-select 30s after `MCity_Log.txt` reports `Done Getting Personas`. Set
+`TEW_NO_AUTO=1` to turn all of that off and drive the game by hand; any
+explicit `TEW_CLICK_*` setup replaces the persona-select click.
 
 ## Tests
 

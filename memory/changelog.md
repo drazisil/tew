@@ -4,6 +4,45 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-29 — FIXED: intermittent crash loading the lobby (DispatchMessageA's nested WndProc call); persona-select START is clicked by default; TEW_MAX_STEPS unlimited unless set
+
+**Crash** (1 run in 6, ~30s after START, loading the lobby): tid 1011 died
+in `_cs_enter_wait` reading 0xCCCCCCCC from its own stack slot, 0.1s after
+`[_invoke_emulated_proc] max_steps=5000000 exhausted ... nested call to
+0x00404d45` (incremental-link thunk -> `_EAC_Lib_WinProc_16`, the game's
+main WndProc). `DispatchMessageA` called the WndProc as a nested
+`_invoke_emulated_proc` run with no scheduler: the lobby legitimately loops
+inside that WndProc for more than 5M steps, so tew gave up and
+`restore_state` rewound the CPU to the moment of dispatch -- after other
+threads had run in between, leaving a thread with rewound stack state.
+Bisected with the same click scenario at 80401df / d9decf7 / 05539b3 /
+ed4b7a1 / HEAD (x2): no commit regression, intermittent everywhere.
+Giving the call the scheduler would not fix it: the reentrancy guard then
+stops the thread from switching away, and the lobby WndProc waits on the
+lobby/DB threads -- a deadlock instead.
+
+Fix: `DispatchMessageA` runs the proc as ordinary guest code on the calling
+thread, like XP's user32. The handler rewrites the stack (`[proc][return
+stub][hwnd][msg][wParam][lParam][caller's ret]`) so the stub's RET enters
+the proc, which returns into a post-dispatch stub (`register_guest_code`,
+`INT 0xFE; RET`) that re-renders dialogs, restores ESP to where it belongs
+whatever convention the proc used (user32's call thunk does the same), and
+returns the proc's EAX. Expected ESP is kept per thread as a stack, since
+message loops nest. `register_guest_code` now returns its base address.
+New `test_dispatch_message_trampoline.py` (5 tests; the long-running and
+wrong-convention ones fail on the old code). Live: two 240s runs reach the
+lobby and keep sending heartbeats, no crash.
+
+**Also on this branch**: `TEW_MAX_STEPS` is unlimited unless set (was a
+500M default). The persona-select START click is baked in: 30s after
+`MCity_Log.txt` reports `Done Getting Personas`, click START at its measured
+guest coordinate (387,491), converted to window pixels when the trigger
+fires (`WindowManager.to_physical_xy`); any explicit `TEW_CLICK_*` setup
+replaces it. `TEW_NO_AUTO=1` turns off every baked-in input (login
+Continue, full-screen answer, START).
+
+---
+
 ## 2026-09-29 — FIXED: static initializers no longer mark the calling thread dead (`THREAD_SENTINEL` collision, TODO since 2026-08-26)
 
 Why the main thread "exited" at ~1.4s on every run: tew runs OLEAUT32's real
