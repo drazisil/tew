@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, file_entry_size, read_cstring, read_wide_string, THREAD_SENTINEL, OPEN_ALWAYS
+from tew.api._state import CRTState, file_entry_size, read_cstring, read_wide_string, OPEN_ALWAYS
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────
@@ -269,21 +269,33 @@ def register_msvcrt_handlers(
     # Maximum steps to allow per initializer function.
     _INITTERM_STEP_LIMIT = 10_000_000
 
+    # Return address for _call_guest_void: one HLT byte of its own, allocated
+    # on first use. It must not be THREAD_SENTINEL -- that address is wired to
+    # the "spawned thread returned" handler, which marks the current thread
+    # dead. Static initializers run nested inside whatever thread is loading
+    # the DLL (the main thread, for a static import's DllMain before WinMain),
+    # so returning there killed that thread in the scheduler.
+    initializer_sentinel = 0
+
+    def _initializer_sentinel() -> int:
+        nonlocal initializer_sentinel
+        if initializer_sentinel == 0:
+            initializer_sentinel = state.simple_alloc(4)
+            memory.write8(initializer_sentinel, 0xF4)  # HLT
+        return initializer_sentinel
+
     def _call_guest_void(cpu: "CPU", fn_addr: int) -> bool:
         """
-        Call a no-arg guest function by pushing the THREAD_SENTINEL as the
-        return address and stepping the CPU until the function returns.
+        Call a no-arg guest function by pushing a dedicated HLT sentinel as
+        the return address and stepping the CPU until the function returns.
 
-        Returns True if the function returned normally (hit the sentinel),
-        False if the CPU halted due to an error or exceeded the step limit.
-
-        Assumption: this helper is only called from main-thread context
-        (state.current_thread_idx == -1), so hitting the sentinel does not
-        corrupt cooperative-thread bookkeeping.
+        Returns True if the function returned normally (halted at the
+        sentinel), False if the CPU halted anywhere else or exceeded the
+        step limit.
         """
-        # Push sentinel return address and jump to fn_addr.
+        sentinel = _initializer_sentinel()
         cpu.regs[ESP] = (cpu.regs[ESP] - 4) & 0xFFFFFFFF
-        memory.write32(cpu.regs[ESP], THREAD_SENTINEL)
+        memory.write32(cpu.regs[ESP], sentinel)
         cpu.eip    = fn_addr
         if not cpu.fatal_halt:
             cpu.halted = False
@@ -302,9 +314,10 @@ def register_msvcrt_handlers(
             cpu.fatal_halt = True
             return False
 
-        # A normal return via sentinel sets EIP = THREAD_SENTINEL + 2
-        # (the INT 0xFE dispatch advances EIP by 2 bytes past the INT instruction).
-        if cpu.eip != (THREAD_SENTINEL + 2) & 0xFFFFFFFF:
+        # The initializer's RET popped the sentinel (ESP is back where it was
+        # before the push) and HLT executed there: EIP is the HLT itself or
+        # just past it.
+        if cpu.eip not in (sentinel, (sentinel + 1) & 0xFFFFFFFF):
             logger.error(
                 "handlers",
                 f"_call_guest_void: 0x{fn_addr:08x} halted at unexpected EIP=0x{cpu.eip:08x}",
