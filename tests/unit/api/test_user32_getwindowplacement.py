@@ -17,6 +17,11 @@ class _StubHandlers:
     def register_handler(self, dll, name, fn):
         self._h[(dll, name)] = fn
 
+    def register_guest_code(self, dll, code, exports, hooks):
+        for _offset, (name, fn) in hooks.items():
+            self._h[(dll, name)] = fn
+        return 0x00300000
+
     def get(self, dll, name):
         return self._h[(dll, name)]
 

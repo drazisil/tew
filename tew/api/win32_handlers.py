@@ -255,7 +255,7 @@ class Win32Handlers:
         code: bytes,
         exports: dict[str, int],
         hooks: dict[int, tuple[str, ApiHandler]],
-    ) -> None:
+    ) -> int:
         """Register exports implemented as guest x86 code instead of a Python handler.
 
         For hot APIs whose common path never needs Python (e.g. an
@@ -266,6 +266,7 @@ class Win32Handlers:
         ``INT 0xFE`` (CD FE) in ``code`` to a (name, handler) pair. When a
         hook's handler returns normally, execution continues after the
         ``INT 0xFE`` -- the handler does NOT get the stub's implicit RET.
+        Returns the address the code was placed at.
         """
         dll = dll_name.lower()
         for offset in hooks:
@@ -306,6 +307,7 @@ class Win32Handlers:
             self._handlers_by_addr[base + offset] = entry
         if len(self._handlers_by_id) > MAX_HANDLERS:
             raise RuntimeError(f"Too many Win32 stubs (max {MAX_HANDLERS})")
+        return base
 
     def patch_address_to_guest_code(self, addr: int, name: str, target: int) -> None:
         """Patch loaded code at ``addr`` with ``JMP target`` (5 bytes), for a

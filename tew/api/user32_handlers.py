@@ -1368,6 +1368,48 @@ def register_user32_gdi32_handlers(
 
     # DispatchMessageA(const MSG* lpMsg) -> LRESULT
     # Routes the message to the registered window proc or dialog proc.
+    #
+    # The proc runs as ordinary guest code on the calling thread, the way
+    # XP's user32 calls it: the handler rewrites the stack so the stub's RET
+    # enters the proc, and the proc returns into a post-dispatch stub that
+    # hands its EAX back to DispatchMessageA's caller. It used to be a nested
+    # _invoke_emulated_proc call, which gave up after 5M steps and rewound the
+    # CPU to the moment of dispatch -- but a game WndProc can legitimately
+    # loop for much longer (the lobby waits inside one while its network/DB
+    # threads work), and rewinding after other threads had run in between
+    # left a thread with another thread's stack state (seen live 2026-09-29:
+    # tid 1011 read 0xCCCCCCCC from its own stack loading the lobby).
+    #
+    # Like user32's own call thunk, the post-dispatch stub restores ESP to
+    # where it belongs whatever convention the proc used. Message loops nest
+    # (a WndProc can run a modal loop that dispatches again), so the expected
+    # ESP is kept per thread as a stack.
+    pending_dispatch: dict[int, list[tuple[int, int]]] = {}  # tid -> [(expected_esp, hwnd)]
+
+    def _dispatch_return(cpu: "CPU") -> None:
+        tid = state.tls_current_thread_id()
+        frames = pending_dispatch.get(tid)
+        if not frames:
+            raise RuntimeError(
+                f"DispatchMessageA return stub reached on tid {tid} with no dispatch in flight")
+        expected_esp, hwnd = frames.pop()
+        esp = cpu.regs[ESP]
+        if esp != expected_esp:
+            logger.debug("handlers",
+                f"[Win32] DispatchMessageA: proc for hwnd=0x{hwnd:x} left ESP=0x{esp:08x}, "
+                f"expected 0x{expected_esp:08x} -- restoring, as user32 does")
+            cpu.regs[ESP] = expected_esp
+        entry = wm.get_window(hwnd)
+        if entry is not None and entry.sdl_renderer is not None:
+            # Re-render after each dispatch so the window reflects any state changes
+            from tew.api.dialog_renderer import render_dialog
+            render_dialog(wm, hwnd)
+        # EAX still holds the proc's result; the stub's RET returns it.
+
+    dispatch_return_stub = stubs.register_guest_code(
+        "user32.dll", bytes([0xCD, 0xFE, 0xC3]), {},
+        {0: ("DispatchMessageA:return", _dispatch_return)})
+
     def _DispatchMessageA(cpu: "CPU") -> None:
         lp_msg = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
 
@@ -1381,34 +1423,26 @@ def register_user32_gdi32_handlers(
             f"wp=0x{wparam:x} lp=0x{lparam:x}"
         )
 
-        # Stack must be cleaned before _invoke_emulated_proc modifies it
-        cleanup_stdcall(cpu, memory, 4)
+        cleanup_stdcall(cpu, memory, 4)  # ESP now at the caller's return address
 
-        result = 0
         entry = wm.get_window(hwnd)
-        if entry is not None:
-            proc = entry.dlg_proc_addr or entry.wnd_proc_addr
-            if proc:
-                sentinel = _get_dialog_sentinel(state, memory)
-                result = _invoke_emulated_proc(
-                    cpu, memory, proc,
-                    [hwnd, msg_id, wparam, lparam],
-                    sentinel,
-                )
-                # Re-render after each dispatch so the window reflects any state changes
-                if entry.sdl_renderer is not None:
-                    from tew.api.dialog_renderer import render_dialog
-                    render_dialog(wm, hwnd)
-            else:
-                logger.debug("handlers",
-                    f"[Win32] DispatchMessageA: hwnd=0x{hwnd:x} msg=0x{msg_id:04x} — no proc, skipping"
-                )
-        else:
+        proc = (entry.dlg_proc_addr or entry.wnd_proc_addr) if entry is not None else 0
+        if not proc:
             logger.debug("handlers",
-                f"[Win32] DispatchMessageA: unknown hwnd=0x{hwnd:x}, ignoring"
-            )
+                f"[Win32] DispatchMessageA: hwnd=0x{hwnd:x} msg=0x{msg_id:04x} -- "
+                f"{'no proc' if entry is not None else 'unknown hwnd'}, skipping")
+            cpu.regs[EAX] = 0
+            return
 
-        cpu.regs[EAX] = result & 0xFFFFFFFF
+        # [proc][return stub][hwnd][msg][wParam][lParam][caller's return address]
+        # The stub's own RET pops `proc`, so the proc starts with the return
+        # stub as its return address and its four args above it.
+        expected_esp = cpu.regs[ESP]
+        esp = (expected_esp - 24) & 0xFFFFFFFF
+        for i, v in enumerate((proc, dispatch_return_stub, hwnd, msg_id, wparam, lparam)):
+            memory.write32((esp + 4 * i) & 0xFFFFFFFF, v & 0xFFFFFFFF)
+        cpu.regs[ESP] = esp
+        pending_dispatch.setdefault(state.tls_current_thread_id(), []).append((expected_esp, hwnd))
 
     stubs.register_handler("user32.dll", "DispatchMessageA", _DispatchMessageA)
 
