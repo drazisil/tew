@@ -764,6 +764,18 @@ class WindowManager:
             round(y * entry.logical_h / entry.phys_h),
         )
 
+    def to_physical_xy(self, hwnd: int, x: int, y: int) -> tuple[int, int]:
+        """Inverse of _to_logical_xy: a guest (logical) client coordinate to
+        the SDL window's current physical pixels, for injecting a click at a
+        known in-game position whatever the host window's size is."""
+        entry = self._windows.get(hwnd)
+        if entry is None or not entry.phys_w or not entry.logical_w:
+            return x, y
+        return (
+            round(x * entry.phys_w / entry.logical_w),
+            round(y * entry.phys_h / entry.logical_h),
+        )
+
     def _handle_sdl_event(self, event: SDL_Event) -> None:
         """Convert a single SDL event to Win32 message(s) and post them."""
         etype = event.type

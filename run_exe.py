@@ -292,8 +292,12 @@ def _auto_decline_fullscreen_prompt(caption, text, u_type):
         return _IDNO
     return None
 
-crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
-crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
+# TEW_NO_AUTO=1 turns off every baked-in input: these two and the
+# persona-select START click below, for driving the game by hand.
+_TEW_NO_AUTO = os.environ.get("TEW_NO_AUTO", "") not in ("", "0")
+if not _TEW_NO_AUTO:
+    crt_state.window_manager.set_dialog_step_hook(_auto_click_login_continue)
+    crt_state.window_manager.set_messagebox_hook(_auto_decline_fullscreen_prompt)
 
 # ── Debug-only mouse click injection (2026-09-13) ───────────────────────────
 # In-game screens like persona-select have no HWND/control-ID structure the
@@ -385,6 +389,22 @@ if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
             "set either TEW_CLICK_AFTER_SEC (time-based) or TEW_CLICK_WHEN_FILE/TEXT (file-based), not both")
     _click_file_trigger = FileTextTrigger(
         os.path.expanduser(_TEW_CLICK_WHEN_FILE), _TEW_CLICK_WHEN_TEXT)
+
+# Baked-in persona-select click (on unless TEW_NO_AUTO or any explicit
+# TEW_CLICK_AT/_AFTER_SEC/_WHEN_* setup): the same file trigger, clicking
+# START 30s after MCity_Log.txt says "Done Getting Personas" -- the recipe
+# that took the game hands-off to the main UI on 2026-09-18. START's
+# position is a guest (logical) coordinate -- (387,491), where both a real
+# and the fixed synthetic click on START were measured that day -- and is
+# converted to the SDL window's physical pixels when the trigger fires,
+# since the host window's size varies.
+_AUTO_PERSONA_START_XY = (387, 491)
+_auto_persona_click = False
+if not _TEW_NO_AUTO and not (_TEW_CLICK_AT or _TEW_CLICK_AFTER_SEC or _click_file_trigger):
+    _TEW_CLICK_WHEN_FILE = crt_state.translate_windows_path("C:\\MCity\\MCity_Log.txt")
+    _TEW_CLICK_WHEN_TEXT = "Done Getting Personas"
+    _click_file_trigger = FileTextTrigger(_TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT)
+    _auto_persona_click = True
 
 # 2026-09-18: out-of-range x87 FIST/FISTP stores are silent on real hardware
 # (integer indefinite) but here they mean upstream float math produced
@@ -3427,6 +3447,10 @@ try:
             _close_injected = True
 
         if _click_file_trigger is not None and not _click_file_trigger.fired and _click_file_trigger.poll():
+            if _auto_persona_click:
+                import tew.api.d3d8._state as _d3d8_state
+                _TEW_CLICK_AT = "%d,%d" % crt_state.window_manager.to_physical_xy(
+                    _d3d8_state._vk_hwnd, *_AUTO_PERSONA_START_XY)
             _TEW_CLICK_AFTER_SEC = str(
                 time.monotonic() - _click_start_wall_time + _TEW_CLICK_WHEN_DELAY_SEC)
             logger.error("startup",
