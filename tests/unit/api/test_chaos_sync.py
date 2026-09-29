@@ -13,16 +13,15 @@ from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, ru
 
 from tew.api._state import CRTState
 from tew.api.kernel32_io import register_kernel32_io_handlers
-from tew.api.kernel32_sync import register_kernel32_sync_handlers
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.hardware.memory import Memory
+from tests.unit.api.cs_guest_env import SMALL_MEM_SIZE, make_cs_env
 
 # ── Shared constants ──────────────────────────────────────────────────────────
 
 MEM_SIZE  = 8 * 1024 * 1024
 STACK     = 0x200000
-CS_ADDR   = 0x300000
-HEAP_START = 0x600000  # RTL_CRITICAL_SECTION_DEBUG blocks come from here
+CS_ADDR   = 0x580000  # clear of the PEB/TEB at 0x300000/0x320000
 NAME_BUF  = 0x400000
 
 OFF_LOCK  = 0x04   # LockCount  (-1 == free)
@@ -53,12 +52,11 @@ class _FakeCPU:
 
 
 def make_env():
+    # Mutex/handle tests only: a fake CPU with handlers called directly.
+    # Critical sections are guest code and need make_cs()'s real CPU.
     mem   = Memory(MEM_SIZE)
     state = CRTState()
-    state.memory = mem
-    state.next_heap_alloc = HEAP_START  # default (0x04000000) is past MEM_SIZE here
     stubs = _StubHandlers()
-    register_kernel32_sync_handlers(stubs, mem, state)
     register_kernel32_io_handlers(stubs, mem, state)
     cpu = _FakeCPU()
     cpu.regs[ESP] = STACK
@@ -76,14 +74,15 @@ def _call(stubs, cpu, mem, dll, name, *args):
     return cpu.regs[EAX]
 
 
-def cs(stubs, cpu, mem, name):
-    return _call(stubs, cpu, mem, "kernel32.dll", name, CS_ADDR)
+def cs(env, name):
+    """Critical-section call on the real CPU (Enter/Leave/TryEnter are guest code)."""
+    return env.call(name, CS_ADDR)
 
-def cs_field(state, offset):
-    # 2026-09-14: CS state (LockCount/RecursionCount/OwningThread) moved out
-    # of guest memory into state.critical_sections -- see kernel32_sync.py.
-    attr = {OFF_LOCK: "lock_count", OFF_REC: "recursion_count", OFF_OWNER: "owner_tid"}[offset]
-    return getattr(state.critical_sections[CS_ADDR], attr)
+def cs_field(env, offset):
+    return env.field(offset, CS_ADDR)
+
+def make_cs():
+    return make_cs_env(SMALL_MEM_SIZE)
 
 def create_mutex(stubs, cpu, mem, initial_owner=0, name_ptr=0):
     return _call(stubs, cpu, mem, "kernel32.dll", "CreateMutexA", 0, initial_owner, name_ptr)
@@ -103,37 +102,37 @@ def close(stubs, cpu, mem, handle):
 @given(st.integers(min_value=1, max_value=16))
 def test_cs_balanced_enter_leave_always_frees(n):
     """N matched Enter/Leave pairs must always leave the CS free."""
-    cpu, mem, state, stubs = make_env()
-    cs(stubs, cpu, mem, "InitializeCriticalSection")
+    env = make_cs()
+    cs(env, "InitializeCriticalSection")
     for _ in range(n):
-        cs(stubs, cpu, mem, "EnterCriticalSection")
+        cs(env, "EnterCriticalSection")
     for _ in range(n):
-        cs(stubs, cpu, mem, "LeaveCriticalSection")
-    assert cs_field(state, OFF_LOCK)  == LOCK_FREE
-    assert cs_field(state, OFF_REC)   == 0
-    assert cs_field(state, OFF_OWNER) == 0
+        cs(env, "LeaveCriticalSection")
+    assert cs_field(env, OFF_LOCK)  == LOCK_FREE
+    assert cs_field(env, OFF_REC)   == 0
+    assert cs_field(env, OFF_OWNER) == 0
 
 
 @given(st.integers(min_value=1, max_value=16))
 def test_cs_recursion_count_tracks_depth(n):
     """After N recursive enters, RecursionCount must equal N."""
-    cpu, mem, state, stubs = make_env()
-    cs(stubs, cpu, mem, "InitializeCriticalSection")
+    env = make_cs()
+    cs(env, "InitializeCriticalSection")
     for _ in range(n):
-        cs(stubs, cpu, mem, "EnterCriticalSection")
-    assert cs_field(state, OFF_REC) == n
-    assert cs_field(state, OFF_OWNER) == MAIN_TID
+        cs(env, "EnterCriticalSection")
+    assert cs_field(env, OFF_REC) == n
+    assert cs_field(env, OFF_OWNER) == MAIN_TID
 
 
 @given(st.integers(min_value=1, max_value=16))
 def test_try_enter_recursive_depth_matches(n):
     """N recursive TryEnter calls from the owning thread always succeed."""
-    cpu, mem, state, stubs = make_env()
-    cs(stubs, cpu, mem, "InitializeCriticalSection")
+    env = make_cs()
+    cs(env, "InitializeCriticalSection")
     for _ in range(n):
-        result = cs(stubs, cpu, mem, "TryEnterCriticalSection")
+        result = cs(env, "TryEnterCriticalSection")
         assert result == 1
-    assert cs_field(state, OFF_REC) == n
+    assert cs_field(env, OFF_REC) == n
 
 
 @given(st.integers(min_value=0, max_value=0xFFFFFFFF))
@@ -150,13 +149,13 @@ def test_cs_garbage_handle_never_halts(handle):
 @given(st.binary(min_size=24, max_size=24))
 def test_init_cs_overwrites_garbage(garbage):
     """InitializeCriticalSection must produce a valid CS regardless of prior contents."""
-    cpu, mem, state, stubs = make_env()
+    env = make_cs()
     for i, b in enumerate(garbage):
-        mem.write8(CS_ADDR + i, b)
-    cs(stubs, cpu, mem, "InitializeCriticalSection")
-    assert cs_field(state, OFF_LOCK)  == LOCK_FREE
-    assert cs_field(state, OFF_REC)   == 0
-    assert cs_field(state, OFF_OWNER) == 0
+        env.mem.write8(CS_ADDR + i, b)
+    cs(env, "InitializeCriticalSection")
+    assert cs_field(env, OFF_LOCK)  == LOCK_FREE
+    assert cs_field(env, OFF_REC)   == 0
+    assert cs_field(env, OFF_OWNER) == 0
 
 
 # ── 3. @given: Mutex invariants ───────────────────────────────────────────────
@@ -212,21 +211,21 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     def __init__(self):
         super().__init__()
-        self.cpu, self.mem, self.state, self.stubs = make_env()
+        self.env = make_cs()
         self.depth = 0
 
     @initialize()
     def init(self):
-        cs(self.stubs, self.cpu, self.mem, "InitializeCriticalSection")
+        cs(self.env, "InitializeCriticalSection")
 
     @rule()
     def enter(self):
-        cs(self.stubs, self.cpu, self.mem, "EnterCriticalSection")
+        cs(self.env, "EnterCriticalSection")
         self.depth += 1
 
     @rule()
     def try_enter(self):
-        result = cs(self.stubs, self.cpu, self.mem, "TryEnterCriticalSection")
+        result = cs(self.env, "TryEnterCriticalSection")
         # No other threads in this machine, so TryEnter always succeeds.
         assert result == 1
         self.depth += 1
@@ -234,12 +233,12 @@ class CriticalSectionMachine(RuleBasedStateMachine):
     @rule()
     def leave(self):
         if self.depth > 0:
-            cs(self.stubs, self.cpu, self.mem, "LeaveCriticalSection")
+            cs(self.env, "LeaveCriticalSection")
             self.depth -= 1
 
     @invariant()
     def lock_count_consistent(self):
-        lock = cs_field(self.state, OFF_LOCK)
+        lock = cs_field(self.env, OFF_LOCK)
         if self.depth == 0:
             assert lock == LOCK_FREE, f"depth=0 but LockCount={lock:#010x}"
         else:
@@ -247,7 +246,7 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     @invariant()
     def owner_consistent(self):
-        owner = cs_field(self.state, OFF_OWNER)
+        owner = cs_field(self.env, OFF_OWNER)
         if self.depth == 0:
             assert owner == 0, f"depth=0 but OwningThread={owner}"
         else:
@@ -255,7 +254,7 @@ class CriticalSectionMachine(RuleBasedStateMachine):
 
     @invariant()
     def recursion_count_matches_depth(self):
-        rec = cs_field(self.state, OFF_REC)
+        rec = cs_field(self.env, OFF_REC)
         assert rec == self.depth, f"RecursionCount={rec} != model depth={self.depth}"
 
 
