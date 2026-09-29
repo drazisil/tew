@@ -79,6 +79,17 @@ class AddressMapping:
 
 
 @dataclass
+class ReservedRange:
+    """Address space the process already owns for something other than a
+    DLL image (the exe image, the heap arena, thread stacks, ...). The loader
+    must never map a DLL over it; a DLL whose preferred base overlaps one is
+    rebased, as the real loader does when its preferred range is taken."""
+    label: str
+    base_address: int
+    end_address: int   # inclusive, like AddressMapping
+
+
+@dataclass
 class _DLLIATEntry:
     iat_addr: int
     dll_name: str
@@ -193,6 +204,7 @@ class DLLLoader:
         self._search_paths: list[str] = list(search_paths or [])
         self._loaded_dlls: dict[str, LoadedDLL] = {}
         self._address_mappings: list[AddressMapping] = []
+        self._reserved_ranges: list[ReservedRange] = []
         self._dll_iat_entries: list[_DLLIATEntry] = []
         # Every real DLL's import table includes kernel32.dll/user32.dll/etc,
         # names this emulator never has on disk (they're Python-simulated,
@@ -219,10 +231,30 @@ class DLLLoader:
             # that were in effect when it was populated.
             self._not_found.clear()
 
+    def reserve_range(self, label: str, base_address: int, end_address: int) -> None:
+        """Mark [base_address, end_address] (inclusive) as owned by the process
+        so no DLL is ever mapped over it. Must be called before the first
+        load_dll -- a DLL already mapped there would not be moved."""
+        if end_address < base_address:
+            raise ValueError(
+                f"reserve_range({label!r}): end 0x{end_address:08x} < base 0x{base_address:08x}"
+            )
+        for mapping in self._address_mappings:
+            if not (end_address < mapping.base_address or base_address > mapping.end_address):
+                raise RuntimeError(
+                    f"reserve_range({label!r}, 0x{base_address:08x}-0x{end_address:08x}): "
+                    f"{mapping.dll_name} is already mapped there "
+                    f"(0x{mapping.base_address:08x}-0x{mapping.end_address:08x})"
+                )
+        self._reserved_ranges.append(ReservedRange(label, base_address, end_address))
+
     def _is_address_range_available(self, base_address: int, size: int) -> bool:
         end_address = base_address + size - 1
         for mapping in self._address_mappings:
             if not (end_address < mapping.base_address or base_address > mapping.end_address):
+                return False
+        for reserved in self._reserved_ranges:
+            if not (end_address < reserved.base_address or base_address > reserved.end_address):
                 return False
         return True
 

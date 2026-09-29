@@ -145,3 +145,47 @@ class TestLoadDllPropagatesFatalHalt:
         result = loader.load_dll("FAKE.DLL", mem)
 
         assert result is None
+
+
+class TestReservedRanges:
+    """A DLL must never be mapped over address space the process already
+    owns (heap arena, thread stacks, exe image). Regression (2026-09-26):
+    DAO350.DLL's preferred base 0x04470000 sits inside tew's heap arena
+    (0x04000000-0x07FFFFFF); the loader only checked other DLLs, mapped it
+    there, and overwrote live heap blocks."""
+
+    def test_preferred_base_inside_reserved_range_is_rebased(self):
+        loader = DLLLoader()
+        loader.reserve_range("heap", 0x04000000, 0x07FFFFFF)
+        base = loader._find_available_base(0x04470000)
+        assert base != 0x04470000
+        assert not (base <= 0x07FFFFFF and base + loader._DLL_SIZE - 1 >= 0x04000000)
+
+    def test_preferred_base_partially_overlapping_is_rebased(self):
+        # The DLL's slot starting below the range but running into it still overlaps.
+        loader = DLLLoader()
+        loader.reserve_range("heap", 0x04000000, 0x07FFFFFF)
+        assert loader._find_available_base(0x03800000) != 0x03800000
+
+    def test_preferred_base_outside_reserved_range_is_kept(self):
+        loader = DLLLoader()
+        loader.reserve_range("heap", 0x04000000, 0x07FFFFFF)
+        assert loader._find_available_base(0x20000000) == 0x20000000
+
+    def test_fallback_skips_reserved_slots(self):
+        loader = DLLLoader()
+        loader.reserve_range("heap", 0x04000000, 0x07FFFFFF)
+        loader.reserve_range("block", 0x10000000, 0x10FFFFFF)
+        assert loader._find_available_base(0x04470000) == 0x11000000
+
+    def test_reserving_over_a_mapped_dll_raises(self):
+        from tew.loader.dll_loader import AddressMapping
+        loader = DLLLoader()
+        loader._address_mappings.append(AddressMapping("x.dll", 0x10000000, 0x10FFFFFF))
+        with pytest.raises(RuntimeError, match="x.dll"):
+            loader.reserve_range("heap", 0x10800000, 0x10800FFF)
+
+    def test_inverted_range_raises(self):
+        loader = DLLLoader()
+        with pytest.raises(ValueError):
+            loader.reserve_range("bad", 0x2000, 0x1000)

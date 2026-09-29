@@ -1228,6 +1228,36 @@ def register_msvcrt_handlers(
 
     stubs.register_handler("msvcrt.dll", "strcmp", _strcmp)
 
+    # _stricmp(const char* s1, const char* s2) -> int [cdecl]
+    # Compares after lowercasing each byte per the current LC_CTYPE locale.
+    # tew implements no setlocale, so the locale is always "C", where only
+    # 'A'-'Z' fold. Returns the difference of the first mismatching folded
+    # bytes (as unsigned chars), like the real CRT. A NULL argument would
+    # invoke the CRT's invalid-parameter handler, which tew does not model,
+    # so it halts loudly instead of guessing.
+    def _stricmp(cpu: "CPU") -> None:
+        s1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
+        s2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        if s1 == 0 or s2 == 0:
+            logger.error("handlers", f"[_stricmp] NULL argument (s1=0x{s1:08x}, s2=0x{s2:08x}) — halting")
+            cpu.halted = True
+            cpu.fatal_halt = True
+            return
+        i = 0
+        while True:
+            a = memory.read8(s1 + i)
+            b = memory.read8(s2 + i)
+            if 0x41 <= a <= 0x5A:
+                a += 0x20
+            if 0x41 <= b <= 0x5A:
+                b += 0x20
+            if a != b or a == 0:
+                cpu.regs[EAX] = (a - b) & 0xFFFFFFFF
+                return
+            i += 1
+
+    stubs.register_handler("msvcrt.dll", "_stricmp", _stricmp)
+
     # strncmp(const char* s1, const char* s2, size_t n) -> int [cdecl]
     def _strncmp(cpu: "CPU") -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)

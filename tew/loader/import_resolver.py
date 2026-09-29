@@ -122,6 +122,10 @@ class ImportResolver:
     def add_dll_search_path(self, path: str) -> None:
         self._dll_loader.add_search_path(path)
 
+    def reserve_address_range(self, label: str, base_address: int, end_address: int) -> None:
+        """See DLLLoader.reserve_range."""
+        self._dll_loader.reserve_range(label, base_address, end_address)
+
     def get_dll_loader(self) -> DLLLoader:
         return self._dll_loader
 
