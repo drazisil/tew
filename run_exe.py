@@ -3118,7 +3118,16 @@ _profiler = _cProfile.Profile() if _TEW_PROFILE else None
 if _profiler is not None:
     _profiler.enable()
 
-MAX_STEPS = int(os.environ.get("TEW_MAX_STEPS", "500000000"))
+# Guest step cap for the whole run: unlimited unless TEW_MAX_STEPS is set.
+_max_steps_env = os.environ.get("TEW_MAX_STEPS", "").strip()
+MAX_STEPS: int | None = int(_max_steps_env) if _max_steps_env else None
+
+
+def _steps_left(n: int, step_count: int) -> int:
+    """n, clipped to what TEW_MAX_STEPS still allows (n itself when unlimited)."""
+    return n if MAX_STEPS is None else min(n, MAX_STEPS - step_count)
+
+
 # Debug-only: watch a specific address for writes (cpu/src/core.zig's single
 # hardware-style watchpoint -- fires on every matching write, unconditionally
 # overwriting watchpoint_eip/watchpoint_val each time, so what's reported at
@@ -3341,7 +3350,7 @@ _THREAD_TIME_SAMPLE_STRIDE = 1  # preempt_slice() is called once per OUTER loop 
                                  # run is only in the tens of thousands; no sampling needed
 
 try:
-    while not cpu.halted and step_count < MAX_STEPS and not detected_runaway:
+    while not cpu.halted and (MAX_STEPS is None or step_count < MAX_STEPS) and not detected_runaway:
         if not _HISTORY_CAPTURE_ENABLED and not _HISTORY_CAPTURE_DONE and step_count >= _HISTORY_CAPTURE_START_STEP:
             cpu.enable_history_capture_clickhouse("http://localhost:8123", "default", "poc")
             _HISTORY_CAPTURE_ENABLED = True
@@ -3383,7 +3392,7 @@ try:
                 _step_n = 0
                 logger.error("startup", f"[step-trigger] unparseable step count: {_step_line!r}")
             if _step_n > 0:
-                _step_n = min(_step_n, MAX_STEPS - step_count)
+                _step_n = _steps_left(_step_n, step_count)
                 cpu.run(_step_n)
                 step_count += _step_n
                 logger.always(WARN, "startup",
@@ -3393,7 +3402,7 @@ try:
         if _tew_paused:
             time.sleep(0.05)  # idle-wait for a resume/step trigger, don't busy-spin a core
         else:
-            batch = min(_TIMER_HEARTBEAT_INTERVAL, MAX_STEPS - step_count)
+            batch = _steps_left(_TIMER_HEARTBEAT_INTERVAL, step_count)
             cpu.run(batch)
             step_count += batch
 
@@ -3823,7 +3832,7 @@ except FatalHaltError as e:
     # through -- no separate diagnostic call needed here.
     logger.error("cpu", f"Fatal halt: {e}")
 
-if step_count >= MAX_STEPS:
+if MAX_STEPS is not None and step_count >= MAX_STEPS:
     logger.warn("cpu", f"Execution limit reached ({MAX_STEPS} steps)")
 
 # ── Post-run reporting ────────────────────────────────────────────────────────
