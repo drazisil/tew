@@ -4,6 +4,29 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-29 — FIXED: static initializers no longer mark the calling thread dead (`THREAD_SENTINEL` collision, TODO since 2026-08-26)
+
+Why the main thread "exited" at ~1.4s on every run: tew runs OLEAUT32's real
+DllMain as a nested call on the main thread before WinMain; its CRT startup
+calls msvcrt `_initterm` (Python handler), whose `_call_guest_void` pushed
+`THREAD_SENTINEL` as each initializer's return address. That address is the
+spawned-thread completion trampoline (`_threadReturn`), so the initializer's
+plain `RET` (0x10002139, 0x77122139 at OLEAUT32's preferred base) logged
+"Thread 1000 returned normally" and ran `mark_current_dead` on the main
+thread. `_invoke_emulated_proc` then logged "thread idx=0 ... has died" --
+but only after DllMain had already finished at its own sentinel, so its
+real return (1) still came back; the message's "returning 0" was false.
+
+Fix: `_call_guest_void` gets its own lazily allocated HLT sentinel (like
+`_invoke_emulated_proc`'s). `_invoke_emulated_proc`'s thread-death logging
+now says what is actually returned. New `test_initterm_sentinel.py` (fails
+on the old code with the main thread DEAD). Live: no "has died" / "returned
+normally" lines, OLEAUT32's DllMain returns 1, 60s run to 965M steps, no
+`except.txt`. The `0x004d980f` SEH fault ~2s in is the game's
+`_CLayer_DetectDebugger` self-test, expected.
+
+---
+
 ## 2026-09-29 — PERF: critical sections the XP way (perf task 4): ~12% less wall time to the same step count
 
 Plan and XP ntdll disassembly notes are in TODO.md's (now RESOLVED) entry.

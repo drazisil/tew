@@ -803,16 +803,14 @@ later, `bAlertable` (and the plain, non-Ex `SleepEx`'s alertable semantics --
 same gap, same cause) need to be wired in at the same time, or an alertable
 wait/sleep will silently never wake early for a queued APC.
 
-## NEXT UP (2026-09-29, opened 2026-08-26): `THREAD_SENTINEL` collision between `_call_guest_void` (static initializers) and real thread completion
+## RESOLVED (2026-09-29, opened 2026-08-26): `THREAD_SENTINEL` collision between `_call_guest_void` (static initializers) and real thread completion
 
-**2026-09-29**: still firing in every run (OLEAUT32's DllMain, nested call to
-its entry 0x77121560, logged as `0x10001560` at its load address). Its
-consequence: `_invoke_emulated_proc` returns 0, so tew sees OLEAUT32's
-`DLL_PROCESS_ATTACH` as FALSE. On XP a FALSE from a static import's DllMain
-fails process init (`STATUS_DLL_INIT_FAILED` 0xC0000142, "failed to
-initialize properly") -- tew ignores it today. Fix both: a dedicated return
-sentinel for `_call_guest_void`, then make the loader honor a FALSE the way
-XP does (static import -> fail startup; LoadLibrary -> NULL + unload).
+**2026-09-29, fixed**: `_call_guest_void` returns to its own HLT sentinel;
+see changelog. Correction to the note written earlier the same day: tew did
+NOT see OLEAUT32's DllMain as FALSE -- the death check only runs between
+200k-step chunks, DllMain had already halted at its sentinel, and its real
+EAX (1) was returned; only the log line's "returning 0" was wrong. What was
+real: the main thread sat DEAD in the scheduler after every startup.
 
 
 `_call_guest_void` (`msvcrt_handlers.py:272`, used by `_initterm` to invoke a
