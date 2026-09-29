@@ -122,6 +122,9 @@ def _bind_lib() -> ctypes.CDLL:
     lib.cpu_enable_null_page_guard.argtypes = [_vp]
     lib.cpu_enable_null_page_guard.restype  = None
 
+    lib.cpu_stdcall_cleanup.argtypes = [_vp, _u32]
+    lib.cpu_stdcall_cleanup.restype  = _b
+
     lib.cpu_get_step_count.argtypes  = [_vp]
     lib.cpu_get_step_count.restype   = _u64
     lib.cpu_get_run_id.argtypes      = [_vp]

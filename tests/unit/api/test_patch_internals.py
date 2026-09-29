@@ -29,6 +29,7 @@ MEM_SIZE = 64 * 1024 * 1024  # must cover SNDMEMI_STRUCT_PTR (~33MB)
 STACK    = 0x200000
 
 CHKESP_ADDR       = 0x009F1BC0
+CHKESP_FAIL_ADDR  = 0x009F1BC3  # JNE target: __chkesp's esp_error path
 CRT_DBG_REPORT    = 0x009F9300
 CHANNEL_DBG_PRINT = 0x004CC5B0
 CHANNEL_SYS_PRINT = 0x004CBDE0
@@ -98,9 +99,15 @@ class TestPatchSideEffect:
 
     def test_bytes_written_at_patched_address(self, env):
         cpu, mem, state, stubs = env
-        assert mem.read8(CHKESP_ADDR) == 0xCD
-        assert mem.read8(CHKESP_ADDR + 1) == 0xFE
-        assert mem.read8(CHKESP_ADDR + 2) == 0xC3
+        assert mem.read8(CHKESP_FAIL_ADDR) == 0xCD
+        assert mem.read8(CHKESP_FAIL_ADDR + 1) == 0xFE
+        assert mem.read8(CHKESP_FAIL_ADDR + 2) == 0xC3
+
+    def test_chkesp_entry_is_left_to_the_game(self, env):
+        # The real `JNE esp_error; RET` at the entry must stay guest code, so
+        # the passing case never traps out to Python.
+        cpu, mem, state, stubs = env
+        assert CHKESP_ADDR not in stubs._handlers_by_addr
 
     def test_bytes_written_at_second_address(self, env):
         cpu, mem, state, stubs = env
@@ -174,38 +181,65 @@ class TestWinmainCheck2:
 
 class TestChkesp:
 
-    def test_zf_set_does_not_halt(self, env):
+    def test_fail_path_halts(self, env):
         cpu, mem, state, stubs = env
-        cpu.set_flag(ZF_BIT, True)
-        patched(stubs, CHKESP_ADDR)(cpu)
-        assert cpu.halted is False
-
-    def test_zf_clear_halts(self, env):
-        cpu, mem, state, stubs = env
-        cpu.set_flag(ZF_BIT, False)
         cpu.regs[ESP] = STACK
         mem.write32(STACK, 0x00401234)  # fake return address
         cpu.regs[EBP] = STACK
-        patched(stubs, CHKESP_ADDR)(cpu)
+        patched(stubs, CHKESP_FAIL_ADDR)(cpu)
         assert cpu.halted is True
-
-    def test_zf_clear_sets_fatal_halt(self, env):
-        cpu, mem, state, stubs = env
-        cpu.set_flag(ZF_BIT, False)
-        cpu.regs[ESP] = STACK
-        mem.write32(STACK, 0x00401234)
-        cpu.regs[EBP] = STACK
-        patched(stubs, CHKESP_ADDR)(cpu)
         assert cpu.fatal_halt is True
 
-    def test_zf_clear_diagnostic_read_does_not_crash(self, env):
+    def test_fail_path_diagnostic_read_does_not_crash(self, env):
         cpu, mem, state, stubs = env
-        cpu.set_flag(ZF_BIT, False)
         cpu.regs[ESP] = STACK
         mem.write32(STACK, 0x00401234)
         cpu.regs[EBP] = STACK + 100
-        patched(stubs, CHKESP_ADDR)(cpu)  # must not raise
+        patched(stubs, CHKESP_FAIL_ADDR)(cpu)  # must not raise
         assert cpu.halted is True
+
+
+class TestChkespOnRealCpu:
+    """Run the game's real __chkesp prologue bytes (75 01 C3) on the Zig CPU
+    with the failure-path patch applied: a balanced frame must return without
+    any Python dispatch; an unbalanced one must reach the halt."""
+
+    CALLER = 0x00300000
+
+    def _setup(self):
+        from tew.hardware.cpu_zig import ZigCPU
+        mem = Memory(MEM_SIZE)
+        mem.load(CHKESP_ADDR, bytes([0x75, 0x01, 0xC3]))  # the real entry: JNE +1; RET
+        stubs = Win32Handlers(mem)
+        patch_crt_internals(stubs, mem, CRTState(config=EmulatorConfig(path_mappings={}, interactive_on_missing_file=False)))
+        cpu = ZigCPU(mem)
+        stubs.install(cpu)
+        # caller: CMP EBP, ESP ; CALL __chkesp ; HLT-free landing pad (NOP)
+        rel = (CHKESP_ADDR - (self.CALLER + 2 + 5)) & 0xFFFFFFFF
+        mem.load(self.CALLER, bytes([0x3B, 0xEC, 0xE8]) + rel.to_bytes(4, "little") + bytes([0x90]))
+        cpu.eip = self.CALLER
+        cpu.regs[ESP] = STACK
+        return cpu, stubs
+
+    def test_balanced_frame_returns_without_dispatch(self):
+        cpu, stubs = self._setup()
+        cpu.regs[EBP] = STACK
+        calls = []
+        entry = stubs._handlers_by_addr[CHKESP_FAIL_ADDR]
+        orig = entry.handler
+        entry.handler = lambda c: (calls.append(1), orig(c))
+        cpu.run(4)  # CMP, CALL, JNE (not taken), RET
+        assert calls == []
+        assert cpu.eip == self.CALLER + 7
+        assert cpu.fatal_halt is False
+
+    def test_unbalanced_frame_halts(self):
+        from tew.hardware.cpu_zig import FatalHaltError
+        cpu, stubs = self._setup()
+        cpu.regs[EBP] = STACK + 0x10
+        with pytest.raises(FatalHaltError):
+            cpu.run(6)  # CMP, CALL, JNE (taken), INT 0xFE
+        assert cpu.fatal_halt is True
 
 
 # ── _CrtDbgReport ────────────────────────────────────────────────────────────

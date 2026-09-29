@@ -12,17 +12,16 @@ Architecture:
 
 from __future__ import annotations
 
-import re
 import time
 import collections
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import ESP
+from tew.hardware.cpu_zig import ESP, ZigCPU, _lib as _cpu_lib
 from tew.logger import logger, set_current_handler
 from tew.api.nt_syscall import NtSyscallDispatcher
 
@@ -68,7 +67,17 @@ class HandlerEntry:
     func_name: str   # e.g. "GetVersion"
     address: int     # address of the stub trampoline in memory
     handler_id: int  # index for INT 0xFE dispatch
-    handler: ApiHandler
+    # None for an export implemented as guest code (register_guest_code):
+    # its address is the start of real x86 code, not an INT 0xFE trampoline.
+    handler: ApiHandler | None
+    # Precomputed once at registration so the per-call dispatch path does no
+    # string formatting or substring scanning (INT 0xFE is the hottest path).
+    log_entry: str = field(init=False)
+    trace_suppressed: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.log_entry = f"{self.name} @ 0x{self.address:x}"
+        self.trace_suppressed = any(s in self.name for s in _TRACE_SUPPRESS)
 
 
 # ── Timer type ───────────────────────────────────────────────────────────────
@@ -94,7 +103,20 @@ pending_timers: dict[int, PendingTimer] = {}
 
 
 def cleanup_stdcall(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
-    """For stdcall: move return address past args so the RET skips them."""
+    """For stdcall: move return address past args so the RET skips them.
+
+    Runs on nearly every API call, so a real ZigCPU does it in one libcpu
+    call (cpu_stdcall_cleanup) instead of six ctypes crossings. The Python
+    path below is the same operation for test CPU fakes.
+    """
+    if type(cpu) is ZigCPU and memory is cpu.memory:
+        if not _cpu_lib.cpu_stdcall_cleanup(cpu._state, arg_bytes):
+            esp = cpu.regs[ESP]
+            raise RuntimeError(
+                f"cleanup_stdcall: stack slot out of bounds (ESP=0x{esp:08x}, "
+                f"arg_bytes={arg_bytes}, memory size=0x{memory.size:x})"
+            )
+        return
     ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
     cpu.regs[ESP] = (cpu.regs[ESP] + arg_bytes) & 0xFFFFFFFF
     memory.write32(cpu.regs[ESP], ret_addr)
@@ -168,8 +190,11 @@ class Win32Handlers:
         self._next_handler_addr: int = HANDLER_BASE
         self._memory: "Memory" = memory
         self._installed: bool = False
-        self._call_log: list[str] = []
+        # Recent stub calls as [entry, repeat_count]; consecutive calls to the
+        # same entry bump the count instead of appending. Formatted to strings
+        # only when read (get_call_log), never on the dispatch path.
         self._call_log_size: int = 2000
+        self._call_log: collections.deque[list] = collections.deque(maxlen=self._call_log_size)
         self._nt_dispatcher: NtSyscallDispatcher = NtSyscallDispatcher(memory)
 
     @property
@@ -223,6 +248,71 @@ class Win32Handlers:
         while offset < address + HANDLER_SIZE:
             self._memory.write8(offset, 0xCC)   # INT3
             offset += 1
+
+    def register_guest_code(
+        self,
+        dll_name: str,
+        code: bytes,
+        exports: dict[str, int],
+        hooks: dict[int, tuple[str, ApiHandler]],
+    ) -> None:
+        """Register exports implemented as guest x86 code instead of a Python handler.
+
+        For hot APIs whose common path never needs Python (e.g. an
+        uncontended EnterCriticalSection): the guest runs ``code`` natively
+        and only traps to Python at its hook points. ``code`` is placed in
+        consecutive stub slots; ``exports`` maps each exported name to its
+        entry offset in ``code``; ``hooks`` maps the offset of each
+        ``INT 0xFE`` (CD FE) in ``code`` to a (name, handler) pair. When a
+        hook's handler returns normally, execution continues after the
+        ``INT 0xFE`` -- the handler does NOT get the stub's implicit RET.
+        """
+        dll = dll_name.lower()
+        for offset in hooks:
+            if code[offset:offset + 2] != bytes([0xCD, STUB_INT]):
+                raise ValueError(
+                    f"register_guest_code({dll}): hook offset 0x{offset:x} is not an INT 0x{STUB_INT:02X}"
+                )
+        for func_name, offset in exports.items():
+            if not 0 <= offset < len(code):
+                raise ValueError(
+                    f"register_guest_code({dll}): export {func_name} offset 0x{offset:x} outside the code"
+                )
+            if f"{dll}!{func_name}" in self._handlers:
+                raise ValueError(f"register_guest_code: {dll}!{func_name} is already registered")
+
+        slots = -(-len(code) // HANDLER_SIZE)
+        base = self._next_handler_addr
+        self._next_handler_addr += slots * HANDLER_SIZE
+        self._memory.load(base, code)
+        tail = slots * HANDLER_SIZE - len(code)
+        if tail:
+            self._memory.load(base + len(code), b"\xCC" * tail)  # INT3 padding
+
+        for func_name, offset in exports.items():
+            key = f"{dll}!{func_name}"
+            entry = HandlerEntry(
+                name=key, dll_name=dll, func_name=func_name,
+                address=base + offset, handler_id=len(self._handlers_by_id), handler=None,
+            )
+            self._handlers[key] = entry
+            self._handlers_by_id.append(entry)
+        for offset, (hook_name, handler) in hooks.items():
+            entry = HandlerEntry(
+                name=f"{dll}!{hook_name}", dll_name=dll, func_name=hook_name,
+                address=base + offset, handler_id=len(self._handlers_by_id), handler=handler,
+            )
+            self._handlers_by_id.append(entry)
+            self._handlers_by_addr[base + offset] = entry
+        if len(self._handlers_by_id) > MAX_HANDLERS:
+            raise RuntimeError(f"Too many Win32 stubs (max {MAX_HANDLERS})")
+
+    def patch_address_to_guest_code(self, addr: int, name: str, target: int) -> None:
+        """Patch loaded code at ``addr`` with ``JMP target`` (5 bytes), for a
+        real DLL export whose implementation is registered guest code."""
+        rel = (target - (addr + 5)) & 0xFFFFFFFF
+        self._memory.load(addr, bytes([0xE9]) + rel.to_bytes(4, "little"))
+        logger.debug("handlers", f"[Win32Handlers] Patched 0x{addr:x} => JMP 0x{target:x} ({name})")
 
     def patch_address(self, addr: int, name: str, handler: ApiHandler) -> None:
         """Patch a specific address in loaded code to redirect to a Python handler.
@@ -314,8 +404,15 @@ class Win32Handlers:
         ]
 
     def get_call_log(self) -> list[str]:
-        """Return a copy of the recent stub call log."""
-        return list(self._call_log)
+        """Return the recent stub call log, oldest first, as display strings.
+
+        Consecutive repeats of the same stub collapse to one line with an
+        `` xN`` suffix.
+        """
+        return [
+            entry.log_entry if count == 1 else f"{entry.log_entry} x{count}"
+            for entry, count in self._call_log
+        ]
 
     @property
     def count(self) -> int:
@@ -444,18 +541,13 @@ class Win32Handlers:
         previous_handler = set_current_handler(entry.func_name)
         try:
             # Log the stub call; deduplicate consecutive identical calls with a counter
-            log_entry = f"{entry.name} @ 0x{handler_addr:x}"
-            if not any(s in entry.name for s in _TRACE_SUPPRESS):
-                logger.trace("calls", log_entry)
-            if self._call_log and self._call_log[-1].startswith(log_entry):
-                last = self._call_log[-1]
-                count_match = re.search(r" x(\d+)$", last)
-                count = (int(count_match.group(1)) + 1) if count_match else 2
-                self._call_log[-1] = f"{log_entry} x{count}"
+            if not entry.trace_suppressed:
+                logger.trace("calls", entry.log_entry)
+            call_log = self._call_log
+            if call_log and call_log[-1][0] is entry:
+                call_log[-1][1] += 1
             else:
-                self._call_log.append(log_entry)
-                if len(self._call_log) > self._call_log_size:
-                    self._call_log.pop(0)
+                call_log.append([entry, 1])
 
             # Execute the Python handler
             # EIP already points at RET, so the CPU will execute RET next.

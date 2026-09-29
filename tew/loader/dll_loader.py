@@ -528,7 +528,11 @@ class DLLLoader:
                     continue
                 if 0x00200000 <= export_addr < 0x00210000:
                     continue
-                win32_handlers.patch_address(export_addr, f"{dll_name}!{func_name}", handler_entry.handler)
+                if handler_entry.handler is None:
+                    win32_handlers.patch_address_to_guest_code(
+                        export_addr, f"{dll_name}!{func_name}", handler_entry.address)
+                else:
+                    win32_handlers.patch_address(export_addr, f"{dll_name}!{func_name}", handler_entry.handler)
                 patched_count += 1
         logger.info("loader", f"Patched {patched_count} DLL export addresses with stub trampolines")
 

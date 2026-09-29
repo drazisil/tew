@@ -30,14 +30,13 @@ THREAD_SENTINEL = 0x001FE000
 
 class ThreadStatus(enum.IntEnum):
     """Values match cpu/src/scheduler.zig's `ThreadStatus = enum(u8) { ready,
-    blocked_cs, blocked_handles, sleeping, dead }` exactly -- see the
+    blocked_handles, sleeping, dead }` exactly -- see the
     "RegKey alignment"-style guard in that file's own tests for the native
     side of this contract."""
     READY = 0
-    BLOCKED_CS = 1
-    BLOCKED_HANDLES = 2
-    SLEEPING = 3
-    DEAD = 4
+    BLOCKED_HANDLES = 1
+    SLEEPING = 2
+    DEAD = 3
 
 
 # Sentinels returned by the native accessors for "handle/index not found" --
@@ -75,7 +74,7 @@ def _bind_lib() -> ctypes.CDLL:
     lib.scheduler_switch_to.restype = _b
     lib.scheduler_preempt_slice.argtypes = [_vp, _vp]
     lib.scheduler_preempt_slice.restype = _b
-    lib.scheduler_pick_next_ready.argtypes = [_vp, _vp]
+    lib.scheduler_pick_next_ready.argtypes = [_vp]
     lib.scheduler_pick_next_ready.restype = _i32
 
     lib.scheduler_enter_reentrant_call.argtypes = [_vp]
@@ -93,8 +92,6 @@ def _bind_lib() -> ctypes.CDLL:
     lib.scheduler_set_virtual_ticks_ms.argtypes = [_vp, _u32]
     lib.scheduler_set_virtual_ticks_ms.restype = None
 
-    lib.scheduler_complete_block_on_cs.argtypes = [_vp, _vp, _u32, _u32, _i32]
-    lib.scheduler_complete_block_on_cs.restype = _b
     lib.scheduler_complete_block_on_handles.argtypes = [
         _vp, _vp, _u32p, _u32, _u32, _b, _u32, _i32]
     lib.scheduler_complete_block_on_handles.restype = _b
@@ -104,8 +101,6 @@ def _bind_lib() -> ctypes.CDLL:
     lib.scheduler_complete_mark_current_dead.restype = _b
     lib.scheduler_terminate_thread.argtypes = [_vp, _vp, _u32, _i32]
     lib.scheduler_terminate_thread.restype = _i8
-    lib.scheduler_unblock_cs.argtypes = [_vp, _u32]
-    lib.scheduler_unblock_cs.restype = None
     lib.scheduler_unblock_handle.argtypes = [_vp, _u32]
     lib.scheduler_unblock_handle.restype = _u32
     lib.scheduler_tick.argtypes = [_vp, _u32]
@@ -136,6 +131,8 @@ def _bind_lib() -> ctypes.CDLL:
     lib.scheduler_handle_at_idx.restype = _i64
     lib.scheduler_current_handle.argtypes = [_vp]
     lib.scheduler_current_handle.restype = _u32
+    lib.scheduler_current_thread_id.argtypes = [_vp]
+    lib.scheduler_current_thread_id.restype = _i64
 
     return lib
 
@@ -237,6 +234,15 @@ class ZigScheduler:
             raise RuntimeError(f"No current thread (current_idx={idx})")
         handle = _lib.scheduler_current_handle(self._sched)
         return _CurrentThreadProxy(self, handle)
+
+    def current_thread_id(self) -> int:
+        """The current thread's id in one libcpu call -- hot (every critical
+        section and TLS handler), so it skips current_thread()'s proxy object
+        and its three separate crossings."""
+        tid = _lib.scheduler_current_thread_id(self._sched)
+        if tid < 0:
+            raise RuntimeError("No current thread")
+        return tid
 
     def _current_tid_or_none(self) -> int | None:
         """Read the live current thread id straight from libcpu.so, or None
@@ -359,10 +365,10 @@ class ZigScheduler:
     # I/O, window messages) before trying once more.
 
     def _resolve_next_idx(self, cpu: "CPU") -> int:
-        next_idx = _lib.scheduler_pick_next_ready(self._sched, cpu.native_handle)
+        next_idx = _lib.scheduler_pick_next_ready(self._sched)
         if next_idx < 0 and self._kernel is not None:
             self._kernel.tick()
-            next_idx = _lib.scheduler_pick_next_ready(self._sched, cpu.native_handle)
+            next_idx = _lib.scheduler_pick_next_ready(self._sched)
         return next_idx
 
     # ── Public: blocking operations ───────────────────────────────────────────
@@ -371,21 +377,6 @@ class ZigScheduler:
     # operations" header comment for why this ordering matters (pick_next_
     # ready has real wake side effects that the original Python never
     # triggers on a refused/fatally-halted call).
-
-    def block_current_on_cs(self, cpu: "CPU", memory: "Memory",
-                             cs_ptr: int, retry_eip: int) -> None:
-        before = self._current_tid_or_none()
-        if cpu.fatal_halt:
-            return
-        cs_ptr &= 0xFFFFFFFF
-        retry_eip &= 0xFFFFFFFF
-        if self.reentrant_depth > 0:
-            _lib.scheduler_complete_block_on_cs(self._sched, cpu.native_handle, cs_ptr, retry_eip, -1)
-            self._log_if_switched(before, "block_current_on_cs")
-            return
-        next_idx = self._resolve_next_idx(cpu)
-        _lib.scheduler_complete_block_on_cs(self._sched, cpu.native_handle, cs_ptr, retry_eip, next_idx)
-        self._log_if_switched(before, "block_current_on_cs")
 
     def block_current_on_handles(self, cpu: "CPU", memory: "Memory",
                                   handles: frozenset, retry_eip: int,
@@ -463,9 +454,6 @@ class ZigScheduler:
         return result == 1
 
     # ── Public: unblocking ────────────────────────────────────────────────────
-
-    def unblock_cs(self, cs_ptr: int) -> None:
-        _lib.scheduler_unblock_cs(self._sched, cs_ptr & 0xFFFFFFFF)
 
     def unblock_handle(self, handle: int) -> int:
         return _lib.scheduler_unblock_handle(self._sched, handle & 0xFFFFFFFF)

@@ -142,7 +142,7 @@ def _invoke_emulated_proc(
     # do with DAO. Run in bounded chunks and check which thread is actually
     # live after each one to guard against this.
     # Bracket the nested cpu.run() with the scheduler's reentrancy guard:
-    # while this is set, block_current_on_cs/on_handles/sleep_current/
+    # while this is set, block_current_on_handles/sleep_current/
     # switch_to all refuse to swap the shared cpu.regs away from
     # started_thread_idx (logging a violation instead of silently handing
     # our registers to an unrelated thread -- see Scheduler._swap_current).
@@ -173,9 +173,8 @@ def _invoke_emulated_proc(
                 # burn through a 50,000,000-step budget doing nothing useful.
                 logger.error("dialog",
                     f"[_invoke_emulated_proc] thread idx={started_thread_idx} that made this "
-                    f"nested call to 0x{proc_addr:08x} has died (skipped past our sentinel "
-                    f"0x{sentinel:08x}) -- returning 0 now instead of exhausting max_steps "
-                    "waiting for a thread that can never run again")
+                    f"nested call to 0x{proc_addr:08x} has died -- stopping instead of "
+                    "exhausting max_steps waiting for a thread that can never run again")
                 started_thread_died = True
                 break
 
@@ -213,7 +212,9 @@ def _invoke_emulated_proc(
 
     if not genuinely_completed:
         if started_thread_died:
-            pass  # already logged inside the loop, right when it was detected
+            logger.error("dialog",
+                f"[_invoke_emulated_proc] nested call to 0x{proc_addr:08x} never reached "
+                f"its sentinel 0x{sentinel:08x} -- returning 0")
         elif not cpu.halted:
             # Exhausted max_steps without our thread ever getting back to
             # its sentinel -- other cooperative threads (or our own call's
@@ -231,6 +232,14 @@ def _invoke_emulated_proc(
                 "-- returning 0, not this unrelated halt's EAX")
         result = 0
     else:
+        if started_thread_died:
+            # Thread status is only checked between chunks, so the call can
+            # finish at its sentinel within the same chunk the thread was
+            # marked dead in. Its EAX is then the call's real return value.
+            logger.error("dialog",
+                f"[_invoke_emulated_proc] nested call to 0x{proc_addr:08x} did reach its "
+                f"sentinel before the death was noticed -- returning its EAX "
+                f"0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
         result = cpu.regs[EAX]
 
     cpu.restore_state(saved)

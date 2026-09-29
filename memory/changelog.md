@@ -4,6 +4,68 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-29 — FIXED: static initializers no longer mark the calling thread dead (`THREAD_SENTINEL` collision, TODO since 2026-08-26)
+
+Why the main thread "exited" at ~1.4s on every run: tew runs OLEAUT32's real
+DllMain as a nested call on the main thread before WinMain; its CRT startup
+calls msvcrt `_initterm` (Python handler), whose `_call_guest_void` pushed
+`THREAD_SENTINEL` as each initializer's return address. That address is the
+spawned-thread completion trampoline (`_threadReturn`), so the initializer's
+plain `RET` (0x10002139, 0x77122139 at OLEAUT32's preferred base) logged
+"Thread 1000 returned normally" and ran `mark_current_dead` on the main
+thread. `_invoke_emulated_proc` then logged "thread idx=0 ... has died" --
+but only after DllMain had already finished at its own sentinel, so its
+real return (1) still came back; the message's "returning 0" was false.
+
+Fix: `_call_guest_void` gets its own lazily allocated HLT sentinel (like
+`_invoke_emulated_proc`'s). `_invoke_emulated_proc`'s thread-death logging
+now says what is actually returned. New `test_initterm_sentinel.py` (fails
+on the old code with the main thread DEAD). Live: no "has died" / "returned
+normally" lines, OLEAUT32's DllMain returns 1, 60s run to 965M steps, no
+`except.txt`. The `0x004d980f` SEH fault ~2s in is the game's
+`_CLayer_DetectDebugger` self-test, expected.
+
+---
+
+## 2026-09-29 — PERF: critical sections the XP way (perf task 4): ~12% less wall time to the same step count
+
+Plan and XP ntdll disassembly notes are in TODO.md's (now RESOLVED) entry.
+
+1. TEB `ClientId.UniqueThread` (fs:[0x24]) follows the running thread. The
+   scheduler writes it on every switch (tew-cpu `cb48170`); it was
+   hardcoded 1 while `GetCurrentThreadId` returned 1000+ (tew `f9ffeb9`).
+2. `Initialize*CriticalSection` writes the real guest `RTL_CRITICAL_SECTION`
+   (LockCount -1, SpinCount 0 on one CPU) plus a 32-byte
+   `RTL_CRITICAL_SECTION_DEBUG` linked into a process `RtlCriticalSectionList`.
+   Delete unlinks, frees and zeroes the block, closes LockSemaphore, and
+   zeroes the CS (tew `fbbf0ab`).
+3+4. Enter/Leave/TryEnter are guest x86 in the stub region
+   (`Win32Handlers.register_guest_code`, new), same logic as XP's
+   `RtlEnterCriticalSection`/`RtlLeaveCriticalSection`. Only contention traps
+   to Python: a contended Enter waits on LockSemaphore (lazily created
+   auto-reset event) and is handed ownership; a Leave with waiters signals
+   it. `state.critical_sections` is gone -- the guest struct is the state
+   (tew `f3f32fc`). Merged steps 3 and 4: with XP's LockCount accounting a
+   contended Enter has already counted itself, so the old retry-style block
+   would double-count.
+5. Scheduler CS blocking removed: `blocked_cs`, `waiting_on_cs`,
+   `completeBlockOnCs`, `unblockCs`, `block_current_on_cs`/`unblock_cs`, and
+   `pickNextReady`'s guest owner read (it no longer takes the CPU).
+   ThreadStatus values shift down by one (tew-cpu `f1b8d4f`, tew `fe41cd4`).
+6. Live: two `prof.sh` runs (40s warm-up, 20s `perf record`) vs two at
+   `80401df`. Wall time to step 900M: 59.1 / 58.3s -> 52.2 / 50.5s (every
+   100M mark from 300M on is ~10-13% sooner). `_enter_cs` 4.2% + `_leave_cs`
+   3.9% inclusive -> nothing; the wait/wake hooks never showed up in a
+   sample. The 20s-window steps/s alone looks lower (19.1/16.9M -> 15.4/15.8M)
+   only because the faster runs are already in the D3D texture-upload phase
+   by then (`UnlockRect` -> `_convert_to_bgra8` ~30%), not the heap-heavy
+   phase the baseline window measured. Virtual time at 900M steps also
+   dropped (82.0/80.9s -> 71.0/69.5s); not looked into. No new errors, no
+   `except.txt`. Not yet re-checked: the manual login -> main UI -> CONTINUE
+   path.
+
+---
+
 ## 2026-09-26 — FIXED: DLLs mapped over the heap (DAO350.DLL at its preferred base 0x04470000, inside the heap arena); added `msvcrt!_stricmp`
 
 `DLLLoader._is_address_range_available` only checked a DLL's preferred
@@ -33,6 +95,38 @@ Tests: 6 loader reserved-range tests, 7 `_stricmp` tests.
 Also found: the parked `_nfsabortmessage_probe` in `run_exe.py` points at
 0x687bd8, which is a return address inside `_NFSabortmessage` (+0x78,
 after the leak check), not its entry (0x687b60) -- why it never fired.
+
+---
+
+## 2026-09-26 — PERF: Win32 API dispatch crossings, tasks 1-3 of the profile-driven pass (+74% guest steps/s)
+
+From a `perf record` of `python -X perf` (Desktop handoff): libpython 59%,
+libcpu 25%, ctypes/ffi 10%; Win32 API dispatch 68% inclusive -- the cost is
+ctypes crossings per API call times a very high call rate.
+
+1. `_handle_api_int`: each `HandlerEntry` precomputes its log string and
+   trace-suppress flag at registration; the recent-call log is a
+   `deque(maxlen)` of `[entry, count]`, formatted only when read (was a
+   regex-parsed `" xN"` suffix plus `list.pop(0)` on every call). Comparing
+   entries by identity also fixed `startswith()` merging distinct stubs
+   whose addresses share a prefix (0x10 vs 0x100).
+2. `cleanup_stdcall`: one libcpu call, `cpu_stdcall_cleanup` (new export,
+   tew-cpu `60771bc`), instead of six crossings (3x ESP read, ESP write,
+   read32, write32). Raw bounds-checked access -- no watchpoint/history/
+   null-guard side effects, same as the Python path; ESP frozen while
+   fatal-halted, like `cpu_set_reg`. The Python path stays for test fakes.
+3. `__chkesp`: the real function starts `JNE esp_error; RET` (75 01 C3), so
+   only the failure path (0x009f1bc3) is patched now; a balanced frame never
+   leaves the emulator (it used to trap to Python on every debug-build
+   return just to read ZF).
+
+Measured (two runs each, same launch, 40s warm-up then 20s window):
+be1ed2d 9.36M / 9.53M steps/s -> tasks 1-3 16.20M / 16.73M. Inclusive:
+`cleanup_stdcall` 17.0% -> 1.9%, API dispatch 74.2% -> 58.8%, libpython
+61.5% -> 50.2%, libcpu 22.3% -> 37.0%. Virtual time advanced +13%
+(1392 -> 1581 virtual ms per wall s); not yet looked into why it gains less.
+Caution: libcpu must be installed ReleaseFast -- `zig build test` reinstalls
+a Debug build (37 MB) over it.
 
 ---
 
