@@ -85,6 +85,36 @@ spurious wake/retry churn; 0xCD-filled heap CS -> only unblock_cs wakes it).
 
 ---
 
+## NEW (2026-09-29): lobby home screen placeholders -- two explained (not tew bugs), `PlayerName` still open
+
+Seen on the lobby home screen after the baked-in START + CONTINUE clicks:
+- **Racing rows show `kTxtChannelProRacing` / `...StreetRacing` / `...DragRacing`
+  -- expected with this exe + data.** The view files (`Data/GUI/view.home.simrace`,
+  `view.home.arcrace`) set `GUI.mText` to those keys; `GUIStr::FromResourceName`
+  (0x00ae60b0) looks them up in the exe's compiled name table, which only has
+  `kTxtChannel00`-`19` and `kTxtChannelClub`, and on a miss displays the raw
+  key. No game code overwrites those labels (only the "N Racers" counts, via
+  `Home_Pop_RACES_SIM_*`); `Lobby_GetRaceTypeName` (0x004034d1) has no callers.
+  Only 4 of the 273 kTxt keys the GUI uses are missing from this exe (these 3 +
+  `kTxtWagerRules`), and no exe under `~/.emu32` has them -- the view files
+  likely come from a later build. Real XP would show the same text.
+- **"No Active Car" / empty MY CAR / "0 Cars Owned" -- correct for the server's
+  data.** All of it keys off the owned-car list (`MCityDBIOwnedCars`,
+  `MCityDBICar::Get`, active car id at `DAT_01408bd8`; `Home_CarPerformance`
+  0x008121c0, `Home_CarName` 0x00812040). mco-rust grants a starter car only
+  through the new-persona "Buy a Starter Car" screen
+  (`garage::service::grant_starter_car`); persona 21 "Dr Brown" never went
+  through it, so it owns nothing. To see a car model: create a persona and buy
+  a starter car (server-side data -- Molly's call).
+- **Left-panel header shows the literal `PlayerName` -- open.** `Home_Name`
+  (0x008104b0) copies the shared scratch buffer `DAT_01408b54` into the label;
+  what should put the persona name there first wasn't found statically (the
+  banner's "DR BROWN" comes from `MProfPersona::OnPersonaDef` 0x008b23e0 instead).
+  Next: a runtime logpoint on `Home_Name` / writes to `DAT_01408b54` to see
+  whether it's called and with what.
+- Also odd, not investigated: "Avg. Player Level: 83,886,080" (0x05000000) and
+  the blank rank name under "Rank".
+
 ## NEW (2026-09-26): thread stacks have no upper bound
 
 The scheduler (`cpu/src/scheduler.zig`) bumps each new thread's stack upward
