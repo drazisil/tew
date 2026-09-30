@@ -219,3 +219,6 @@ stdout.txt
 
 # Claude Code local permission/settings overrides -- personal, not shared
 .claude/settings.local.json
+
+# Linux perf profiler output
+perf.data*
