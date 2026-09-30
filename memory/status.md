@@ -14,25 +14,33 @@ Path: ~/Documents/i386.pdf (421 pages)
 ---
 
 
-## Current status (2026-09-29) — a plain `run_exe.py` plays itself from launch into the lobby and stays there; perf pass tasks 1-4 done (1.44x to 600M guest steps)
+## Current status (2026-09-30) — a plain `run_exe.py` plays itself from launch into a clean lobby and stays there; lobby text is correct after replacing the GUI data set
 
 **Where the game is**: unattended, a run clicks Continue on the login
 dialog, answers No to full screen, clicks START on persona-select 30s after
-`MCity_Log.txt` reports `Done Getting Personas` (lands ~92s), then CONTINUE
+`MCity_Log.txt` reports `Done Getting Personas` (lands ~95s), then CONTINUE
 on the Mayor's welcome letter 30s after `stdout.txt` reports `New mail IDs
-detected!` (lands ~136s), leaving the lobby home screen up; it keeps sending
-lobby heartbeats and 240s runs end cleanly there (~4.2B steps).
-`TEW_NO_AUTO=1` turns all of that off; `TEW_MAX_STEPS` is unlimited unless
-set. (CONTINUE click: branch `feat/lobby-population`, not merged yet.)
+detected!` (~142s), then the Screen Tips popup's X (~172s) and the OK on the
+notice after it (~203s), leaving the lobby home screen up; it keeps sending
+lobby heartbeats and 250s runs end cleanly there. `TEW_NO_AUTO=1` turns all
+of that off; `TEW_MAX_STEPS` is unlimited unless set.
 
-**Lobby home placeholders** (TODO.md has the detail; on that branch):
-racing rows showing `kTxtChannel*Racing` keys are an exe/data mismatch --
-real XP shows the same; "No Active Car"/empty MY CAR is correct for the
+**Data: `~/.emu32/Data/GUI` must be the stock GUI set** (2026-09-30). The
+previous loose files were a later-edited set (raw `kTxtChannel*Racing` keys,
+`PlayerName`, placeholder numbers like 100000 / $123,456,789, BEGIN hooks
+moved to IDLE); the game reads loose `Data/GUI/<name>` files, so they
+overrode everything. Replaced from Molly's `~/Desktop/GUI`; the old set is at
+`~/.emu32/Data/GUI.bak-2026-09-30`. `Data/GUI/System/GUI.viv` (BIGF,
+2001-10-21) holds the original copies if the set is ever in doubt. The
+baked-in click positions assume this set.
+
+**Lobby home, still open**: "Avg. Player Level: 83,886,080" (0x05000000,
+computed, not a view default); the headline ticker shows a raw
+`<html><head><title>301 Moved Permanently` body -- real WinINet follows
+redirects unless told not to, so check tew's `InternetOpenUrlA`/read path
+before blaming the server. "No Active Car"/empty MY CAR is correct for the
 server data (persona 21 owns no car; mco-rust grants one only via the
-new-persona starter screen); the left-frame `PlayerName` header is open --
-its `LFrame_ProfileName` hook never fires because UPDATEUI only reaches the
-view being Begun, not the side frame; unknown yet whether tew changes the
-frame-vs-persona ordering.
+new-persona starter screen).
 
 **Fixed 2026-09-29** (changelog has the detail):
 - Intermittent crash loading the lobby (1 run in 6): `DispatchMessageA`'s
@@ -53,8 +61,7 @@ frame-vs-persona ordering.
 **Expected, not a bug**: the SEH fault at `EIP=0x004d980f` ~2s in is the
 game's `_CLayer_DetectDebugger` self-test (null-page guard + its own SEH).
 
-**Next candidates**: `PlayerName` (log MLFrame creation/Begin vs persona
-select); perf (D3D8
+**Next candidates**: the 301 news ticker and Avg. Player Level (above); perf (D3D8
 `_convert_to_bgra8` ~30% once textures load, `simple_alloc`); the remaining
 nested `_invoke_emulated_proc` callers.
 

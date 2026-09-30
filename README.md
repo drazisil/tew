@@ -32,7 +32,10 @@ By default a run plays itself as far as the main UI: it clicks Continue on the
 login dialog, answers No to the full-screen prompt, and clicks START on
 persona-select 30s after `MCity_Log.txt` reports `Done Getting Personas`, then
 CONTINUE on the Mayor's welcome letter 30s after `stdout.txt` reports `New mail
-IDs detected!`, leaving the lobby home screen visible. Set
+IDs detected!`, then closes the home screen's Screen Tips popup and OKs the
+notice that follows (30s apart; the server always reports a first visit, so
+both show every run), leaving the lobby home screen visible. The click
+positions assume the stock GUI set in `Data/GUI` (see `memory/status.md`). Set
 `TEW_NO_AUTO=1` to turn all of that off and drive the game by hand; any
 explicit `TEW_CLICK_*` setup replaces the persona-select click.
 

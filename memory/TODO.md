@@ -35,46 +35,22 @@ WM_INITDIALOG and CreateWindowEx's creation messages, `patch_internals.py`,
 them that can run long or block (a timer callback waiting on another
 thread) should move to the same trampoline pattern.
 
-## NEW (2026-09-29): lobby home screen placeholders -- two explained (not tew bugs), `PlayerName` still open
+## NEW (2026-09-30): lobby home screen leftovers -- 301 news ticker, Avg. Player Level
 
-Seen on the lobby home screen after the baked-in START + CONTINUE clicks:
-- **Racing rows show `kTxtChannelProRacing` / `...StreetRacing` / `...DragRacing`
-  -- expected with this exe + data.** The view files (`Data/GUI/view.home.simrace`,
-  `view.home.arcrace`) set `GUI.mText` to those keys; `GUIStr::FromResourceName`
-  (0x00ae60b0) looks them up in the exe's compiled name table, which only has
-  `kTxtChannel00`-`19` and `kTxtChannelClub`, and on a miss displays the raw
-  key. No game code overwrites those labels (only the "N Racers" counts, via
-  `Home_Pop_RACES_SIM_*`); `Lobby_GetRaceTypeName` (0x004034d1) has no callers.
-  Only 4 of the 273 kTxt keys the GUI uses are missing from this exe (these 3 +
-  `kTxtWagerRules`), and no exe under `~/.emu32` has them -- the view files
-  likely come from a later build. Real XP would show the same text.
-- **"No Active Car" / empty MY CAR / "0 Cars Owned" -- correct for the server's
-  data.** All of it keys off the owned-car list (`MCityDBIOwnedCars`,
-  `MCityDBICar::Get`, active car id at `DAT_01408bd8`; `Home_CarPerformance`
-  0x008121c0, `Home_CarName` 0x00812040). mco-rust grants a starter car only
-  through the new-persona "Buy a Starter Car" screen
-  (`garage::service::grant_starter_car`); persona 21 "Dr Brown" never went
-  through it, so it owns nothing. To see a car model: create a persona and buy
-  a starter car (server-side data -- Molly's call).
-- **Left-panel header shows the literal `PlayerName` -- open.** `Home_Name`
-  (0x008104b0) copies the shared scratch buffer `DAT_01408b54` into the label;
-  the banner's "DR BROWN" comes from `MProfPersona::OnPersonaDef` 0x008b23e0.
-  **Measured live (temporary logpoints, removed):** `Home_Name` runs once,
-  ~10s after persona select, event 0x12, with `DAT_01408b54 = "Dr Brown"`. The
-  left frame's own header hook is `LFrame_ProfileName` (`scn.lframe`
-  `[PersonaName.GText]`, `*GEVENT_UPDATEUI=LFrame_ProfileName`; handler
-  FUN_00824640, registered in FUN_00822b30) and it **never runs**. Static
-  trace: `GUI::Begin` (0x00af0470) broadcasts UPDATEUI (0x12) only to the view
-  it's called on and its children (`GUI::BroadcastEvent` 0x00aedc20); the
-  side frame (`MLFrame::MLFrame` 0x0081fe90) is a separate, persistent tree,
-  so the home view's Begin never reaches it, and no call found re-sends
-  UPDATEUI to the frame once persona data arrives. Hook binding is not the
-  cause (same CRC32 table mechanism as Home_Name). Open: whether real XP
-  shows the name (e.g. the frame is created or re-Begun after persona select
-  there) -- i.e. whether tew changes the order of frame creation vs. persona
-  data. Next: log when MLFrame is constructed/Begun relative to persona select.
-- Also odd, not investigated: "Avg. Player Level: 83,886,080" (0x05000000) and
-  the blank rank name under "Rank".
+The 2026-09-29 placeholder findings (raw `kTxtChannel*Racing` rows,
+`PlayerName` header, 100000 / $123,456,789 values) were all the wrong loose
+GUI set in `Data/GUI` -- resolved by replacing it, see changelog 2026-09-30.
+The earlier "exe/data version mismatch", "`Lobby_GetRaceTypeName` has no
+callers" (its thunk 0x004034d1 has 14) and "UPDATEUI never reaches the side
+frame" conclusions were wrong; don't reuse them. Still open:
+- **Headline ticker shows `<html><head><title>301 Moved Permanently...`.**
+  The news fetch gets a 301 and the body is displayed. Real WinINet follows
+  redirects unless `INTERNET_FLAG_NO_AUTO_REDIRECT` is set -- check tew's
+  `InternetOpenUrlA` / `InternetReadFile` first.
+- **"Avg. Player Level: 83,886,080"** (0x05000000). Not a view default;
+  find what computes it.
+- "No Active Car" / empty MY CAR is correct for the server data (persona 21
+  owns no car; mco-rust grants one only via the new-persona starter screen).
 
 ## NEW (2026-09-26): thread stacks have no upper bound
 
