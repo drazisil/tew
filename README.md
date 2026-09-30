@@ -30,7 +30,9 @@ line to a log file, and a `/tmp/tew_click_trigger` file drives a click on demand
 
 By default a run plays itself as far as the main UI: it clicks Continue on the
 login dialog, answers No to the full-screen prompt, and clicks START on
-persona-select 30s after `MCity_Log.txt` reports `Done Getting Personas`. Set
+persona-select 30s after `MCity_Log.txt` reports `Done Getting Personas`, then
+CONTINUE on the Mayor's welcome letter 30s after `stdout.txt` reports `New mail
+IDs detected!`, leaving the lobby home screen visible. Set
 `TEW_NO_AUTO=1` to turn all of that off and drive the game by hand; any
 explicit `TEW_CLICK_*` setup replaces the persona-select click.
 
