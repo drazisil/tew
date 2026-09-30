@@ -34,6 +34,12 @@ overrode everything. Replaced from Molly's `~/Desktop/GUI`; the old set is at
 2001-10-21) holds the original copies if the set is ever in doubt. The
 baked-in click positions assume this set.
 
+**HOME avatar draws** (2026-09-30, tew-cpu 0.3.1): tew's x87 had FPTAN/
+FPATAN/FXTRACT/FYL2XP1 as silent no-ops and FXAM classifying everything as
+"unsupported"; the avatar's projection collapsed ~500px off-screen. Fixed in
+tew-cpu. Molly reports the animated logo cursor still doesn't appear to
+animate (hard to tell at emulator speed) -- unverified, next to check.
+
 **Lobby home, still open**: "Avg. Player Level: 83,886,080" (0x05000000,
 computed, not a view default); the headline ticker shows a raw
 `<html><head><title>301 Moved Permanently` body -- real WinINet follows
@@ -61,7 +67,7 @@ new-persona starter screen).
 **Expected, not a bug**: the SEH fault at `EIP=0x004d980f` ~2s in is the
 game's `_CLayer_DetectDebugger` self-test (null-page guard + its own SEH).
 
-**Next candidates**: the 301 news ticker and Avg. Player Level (above); perf (D3D8
+**Next candidates**: the logo cursor animation, the 301 news ticker and Avg. Player Level (above); perf (D3D8
 `_convert_to_bgra8` ~30% once textures load, `simple_alloc`); the remaining
 nested `_invoke_emulated_proc` callers.
 

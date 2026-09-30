@@ -4,6 +4,43 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-30 — FIXED: HOME avatar never drew -- tew's x87 FPTAN/FPATAN/FXTRACT/FYL2XP1 were no-ops and FXAM misclassified everything (tew-cpu 0.3.1)
+
+Re-measured the 2026-09-19 avatar investigation (draft PR #27) on current
+main with the stock GUI set: unchanged -- the game's clipper
+(`EASCLIP_drawtri` 0x0052e5c0) rejected every avatar triangle, vertices at
+x ~ -510..-545 and all within 0.2px of y = 226.8 (the projection collapsed
+to a line, not just offset). New lead in the same run: each avatar draw
+triggered 2-3 CRT math-error reports (`[fist-invalid]` at EIP 0x00a03e69 =
+`__set_statfp` deliberately raising IE, called from `__handle_exc` <-
+`__87except` <- the math dispatcher at 0x00a01bba), ~1000 per run. That
+dispatcher (0x00a01dc7) classifies its arguments with FXAM.
+
+Molly's suggestion to check the FPU instructions found, in tew-cpu
+`src/fpu.zig`'s D9 register group: FPTAN, FPATAN, FXTRACT and FYL2XP1 fell
+into `else => {}` (silent no-ops; FPTAN also never pushed its 1.0, so the
+FPU stack was off by one for everything after), FXAM cleared C3/C2/C0 so
+every value classified as "unsupported format", FPREM/FPREM1 never set C2
+or the quotient bits (and FPREM1 truncated), FSIN/FCOS left stale C2, and
+FRNDINT used half-away-from-zero. All of these opcodes occur in the exe.
+The avatar's camera (`scn.Lframe` `personacam`, `mFOV=40`) needs
+tan(fov/2).
+
+Fixed in tew-cpu 0.3.1 (see its CHANGELOG); reserved D9 register encodings
+now fault as unknown opcodes. Verified live: the avatar draws (vertices at
+x ~ 75, y ~ 150), zero math-error reports, same step rate as before
+(2.6B steps at ~169s). The probe block from #27 was only needed to find
+this and is not carried forward.
+
+Also: baked-in clicks 3-4 (Screen Tips X and OK) now fire a fixed 30s after
+the previous click instead of re-watching `stdout.txt` for the mail line.
+A `FileTextTrigger` only reads past the file size it saw at startup; once
+the game's rewritten `stdout.txt` grows back past that size before the step
+is armed, text already written below it is never seen, so step 3 silently
+never fired in one run.
+
+---
+
 ## 2026-09-30 — RESOLVED: lobby raw text keys / `PlayerName` / placeholder numbers were a wrong GUI data set, not tew; baked-in clicks updated
 
 The lobby's RACING rows showed raw `kTxtChannelProRacing` /
