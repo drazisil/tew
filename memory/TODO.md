@@ -108,10 +108,21 @@ Seen on the lobby home screen after the baked-in START + CONTINUE clicks:
   a starter car (server-side data -- Molly's call).
 - **Left-panel header shows the literal `PlayerName` -- open.** `Home_Name`
   (0x008104b0) copies the shared scratch buffer `DAT_01408b54` into the label;
-  what should put the persona name there first wasn't found statically (the
-  banner's "DR BROWN" comes from `MProfPersona::OnPersonaDef` 0x008b23e0 instead).
-  Next: a runtime logpoint on `Home_Name` / writes to `DAT_01408b54` to see
-  whether it's called and with what.
+  the banner's "DR BROWN" comes from `MProfPersona::OnPersonaDef` 0x008b23e0.
+  **Measured live (temporary logpoints, removed):** `Home_Name` runs once,
+  ~10s after persona select, event 0x12, with `DAT_01408b54 = "Dr Brown"`. The
+  left frame's own header hook is `LFrame_ProfileName` (`scn.lframe`
+  `[PersonaName.GText]`, `*GEVENT_UPDATEUI=LFrame_ProfileName`; handler
+  FUN_00824640, registered in FUN_00822b30) and it **never runs**. Static
+  trace: `GUI::Begin` (0x00af0470) broadcasts UPDATEUI (0x12) only to the view
+  it's called on and its children (`GUI::BroadcastEvent` 0x00aedc20); the
+  side frame (`MLFrame::MLFrame` 0x0081fe90) is a separate, persistent tree,
+  so the home view's Begin never reaches it, and no call found re-sends
+  UPDATEUI to the frame once persona data arrives. Hook binding is not the
+  cause (same CRC32 table mechanism as Home_Name). Open: whether real XP
+  shows the name (e.g. the frame is created or re-Begun after persona select
+  there) -- i.e. whether tew changes the order of frame creation vs. persona
+  data. Next: log when MLFrame is constructed/Begun relative to persona select.
 - Also odd, not investigated: "Avg. Player Level: 83,886,080" (0x05000000) and
   the blank rank name under "Rank".
 
