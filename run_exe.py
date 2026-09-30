@@ -398,17 +398,27 @@ if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
 # window's physical pixels when the step fires, since the host window's size
 # varies. Triggers are created now, so text written before a step is armed
 # still counts once it is (the files are rewritten each run).
-#   1. persona-select START (387,491): 30s after MCity_Log.txt's "Done
-#      Getting Personas" -- where both a real and the fixed synthetic click
-#      on START were measured 2026-09-18.
+#   1. persona-select START (389,444): 30s after MCity_Log.txt's "Done
+#      Getting Personas" -- measured from a 2026-09-30 screenshot after
+#      Data/GUI was replaced with the correct GUI set (the old loose files
+#      had START at (387,491)).
 #   2. the Mayor's welcome letter CONTINUE (399,540): 30s after stdout.txt's
 #      "New mail IDs detected!" (the letter is mail) -- measured from a
 #      2026-09-29 screenshot (window 1600 px wide = 2x the 800-wide space).
+#   3. the home screen's "Screen Tips" popup close X (563,215): 30s after
+#      CONTINUE -- same trigger line, already in the file by the time this
+#      step is armed. The server always reports a first visit, so both the
+#      letter and the tips popup show every run. Measured 2026-09-30.
+#   4. OK (398,335) on the "Screen Tips are available for many game
+#      screens..." notice that closing the popup brings up: 30s after step 3,
+#      same trigger line. Measured 2026-09-30.
 _auto_click_steps: list[tuple[FileTextTrigger, str, str, tuple[int, int]]] = []
 if not _TEW_NO_AUTO and not (_TEW_CLICK_AT or _TEW_CLICK_AFTER_SEC or _click_file_trigger):
     for _win_path, _text, _xy in (
-        ("C:\\MCity\\MCity_Log.txt", "Done Getting Personas", (387, 491)),
+        ("C:\\MCity\\MCity_Log.txt", "Done Getting Personas", (389, 444)),
         ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (399, 540)),
+        ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (563, 215)),
+        ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (398, 335)),
     ):
         _path = crt_state.translate_windows_path(_win_path)
         _auto_click_steps.append((FileTextTrigger(_path, _text), _path, _text, _xy))

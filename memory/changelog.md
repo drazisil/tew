@@ -4,6 +4,36 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-30 — RESOLVED: lobby raw text keys / `PlayerName` / placeholder numbers were a wrong GUI data set, not tew; baked-in clicks updated
+
+The lobby's RACING rows showed raw `kTxtChannelProRacing` /
+`StreetRacing` / `DragRacing`, the left frame showed `PlayerName`, and
+values like Pts to Next Level 100000 and Cash $123,456,789 never updated.
+Live check: clicking the first RACING row hit `jumpPro` (MHyperText, vtable
+0x011d6390) from `view.home.simrace`, with its GUIStr holding the literal
+key -- the raw-key fallback of `GUIStr::FromResourceName` (0x00ae60b0),
+taken when `MCStringHandler::GetResource` (0x007f3040) finds no match in
+`gTextStringDefs` (0x0127433c, 0xe31 keys). A `fileio` run showed the game
+opens loose `C:\Data\GUI\<name>` files. Those loose files were a
+later-edited set: the copies inside `Data/GUI/System/GUI.viv` (BIGF,
+2001-10-21) use `kTxtProRacing` etc., "My Profile", `kTxtInsRiskFormat`,
+and `GEVENT_BEGIN` hooks where the loose set had `GEVENT_IDLE`. Molly
+replaced `~/.emu32/Data/GUI` with her stock set (old one kept as
+`Data/GUI.bak-2026-09-30`); the lobby now matches her XP screenshot --
+"Dr Brown", Newbie, $50,000, Street/Circuit/Drag Racing.
+
+`text.eng` (`Data/Text/`) layout, for future reference: u32 offsets[0xe31]
+from file start, entry i = NUL-terminated string at file[offsets[i]];
+`TextSys_LoadWords` (0x0078a460) checks offsets[0xe30] against the file
+size. Keys exist only in the exe; the language index (`_GameOptions`, set
+by `MCStringHandler::SetLanguage`) only picks which `text.<ext>` loads.
+
+Baked-in clicks (`run_exe.py`): START moved to (389,444) for the stock
+persona dialog; added the Screen Tips popup's X (563,215) and the OK on the
+notice after it (398,335), 30s apart after CONTINUE. The server always
+reports a first visit, so both show every run. Verified in one clean run:
+clicks at 95s / 142s / 172s / 203s, lobby left clear.
+
 ## 2026-09-29 — FIXED: intermittent crash loading the lobby (DispatchMessageA's nested WndProc call); persona-select START is clicked by default; TEW_MAX_STEPS unlimited unless set
 
 **Crash** (1 run in 6, ~30s after START, loading the lobby): tid 1011 died
