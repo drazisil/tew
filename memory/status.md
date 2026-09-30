@@ -17,13 +17,22 @@ Path: ~/Documents/i386.pdf (421 pages)
 ## Current status (2026-09-29) — a plain `run_exe.py` plays itself from launch into the lobby and stays there; perf pass tasks 1-4 done (1.44x to 600M guest steps)
 
 **Where the game is**: unattended, a run clicks Continue on the login
-dialog, answers No to full screen, and clicks START on persona-select 30s
-after `MCity_Log.txt` reports `Done Getting Personas` (~60s in; the click
-lands ~90s). It then loads the lobby (`NPS_MINI_USER_LIST`, `NPS_USER_LIST`)
-and keeps sending lobby heartbeats; 240s runs end cleanly there (~4.2B
-steps). `TEW_NO_AUTO=1` turns all of that off for driving by hand;
-`TEW_MAX_STEPS` is unlimited unless set. Not re-checked since 2026-09-18:
-the main UI (welcome letter) and CONTINUE.
+dialog, answers No to full screen, clicks START on persona-select 30s after
+`MCity_Log.txt` reports `Done Getting Personas` (lands ~92s), then CONTINUE
+on the Mayor's welcome letter 30s after `stdout.txt` reports `New mail IDs
+detected!` (lands ~136s), leaving the lobby home screen up; it keeps sending
+lobby heartbeats and 240s runs end cleanly there (~4.2B steps).
+`TEW_NO_AUTO=1` turns all of that off; `TEW_MAX_STEPS` is unlimited unless
+set. (CONTINUE click: branch `feat/lobby-population`, not merged yet.)
+
+**Lobby home placeholders** (TODO.md has the detail; on that branch):
+racing rows showing `kTxtChannel*Racing` keys are an exe/data mismatch --
+real XP shows the same; "No Active Car"/empty MY CAR is correct for the
+server data (persona 21 owns no car; mco-rust grants one only via the
+new-persona starter screen); the left-frame `PlayerName` header is open --
+its `LFrame_ProfileName` hook never fires because UPDATEUI only reaches the
+view being Begun, not the side frame; unknown yet whether tew changes the
+frame-vs-persona ordering.
 
 **Fixed 2026-09-29** (changelog has the detail):
 - Intermittent crash loading the lobby (1 run in 6): `DispatchMessageA`'s
@@ -44,7 +53,8 @@ the main UI (welcome letter) and CONTINUE.
 **Expected, not a bug**: the SEH fault at `EIP=0x004d980f` ~2s in is the
 game's `_CLayer_DetectDebugger` self-test (null-page guard + its own SEH).
 
-**Next candidates**: re-check main UI -> CONTINUE; perf (D3D8
+**Next candidates**: `PlayerName` (log MLFrame creation/Begin vs persona
+select); perf (D3D8
 `_convert_to_bgra8` ~30% once textures load, `simple_alloc`); the remaining
 nested `_invoke_emulated_proc` callers.
 
