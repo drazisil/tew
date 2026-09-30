@@ -390,21 +390,40 @@ if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
     _click_file_trigger = FileTextTrigger(
         os.path.expanduser(_TEW_CLICK_WHEN_FILE), _TEW_CLICK_WHEN_TEXT)
 
-# Baked-in persona-select click (on unless TEW_NO_AUTO or any explicit
-# TEW_CLICK_AT/_AFTER_SEC/_WHEN_* setup): the same file trigger, clicking
-# START 30s after MCity_Log.txt says "Done Getting Personas" -- the recipe
-# that took the game hands-off to the main UI on 2026-09-18. START's
-# position is a guest (logical) coordinate -- (387,491), where both a real
-# and the fixed synthetic click on START were measured that day -- and is
-# converted to the SDL window's physical pixels when the trigger fires,
-# since the host window's size varies.
-_AUTO_PERSONA_START_XY = (387, 491)
-_auto_persona_click = False
+# Baked-in clicks (on unless TEW_NO_AUTO or any explicit TEW_CLICK_AT/
+# _AFTER_SEC/_WHEN_* setup): the same file trigger, run as a chain -- each
+# step waits for a line the game itself writes, then clicks 30s later
+# through the usual premove/down/hold/up sequence. Positions are guest
+# (logical) coordinates in the game's 800x600 space, converted to the SDL
+# window's physical pixels when the step fires, since the host window's size
+# varies. Triggers are created now, so text written before a step is armed
+# still counts once it is (the files are rewritten each run).
+#   1. persona-select START (387,491): 30s after MCity_Log.txt's "Done
+#      Getting Personas" -- where both a real and the fixed synthetic click
+#      on START were measured 2026-09-18.
+#   2. the Mayor's welcome letter CONTINUE (399,540): 30s after stdout.txt's
+#      "New mail IDs detected!" (the letter is mail) -- measured from a
+#      2026-09-29 screenshot (window 1600 px wide = 2x the 800-wide space).
+_auto_click_steps: list[tuple[FileTextTrigger, str, str, tuple[int, int]]] = []
 if not _TEW_NO_AUTO and not (_TEW_CLICK_AT or _TEW_CLICK_AFTER_SEC or _click_file_trigger):
-    _TEW_CLICK_WHEN_FILE = crt_state.translate_windows_path("C:\\MCity\\MCity_Log.txt")
-    _TEW_CLICK_WHEN_TEXT = "Done Getting Personas"
-    _click_file_trigger = FileTextTrigger(_TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT)
-    _auto_persona_click = True
+    for _win_path, _text, _xy in (
+        ("C:\\MCity\\MCity_Log.txt", "Done Getting Personas", (387, 491)),
+        ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (399, 540)),
+    ):
+        _path = crt_state.translate_windows_path(_win_path)
+        _auto_click_steps.append((FileTextTrigger(_path, _text), _path, _text, _xy))
+_auto_click_xy: tuple[int, int] | None = None
+
+
+def _arm_next_auto_click() -> None:
+    """Make the next baked-in step the active file trigger."""
+    global _click_file_trigger, _TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT, _auto_click_xy
+    _click_file_trigger, _TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT, _auto_click_xy = \
+        _auto_click_steps.pop(0)
+
+
+if _auto_click_steps:
+    _arm_next_auto_click()
 
 # 2026-09-18: out-of-range x87 FIST/FISTP stores are silent on real hardware
 # (integer indefinite) but here they mean upstream float math produced
@@ -3447,10 +3466,10 @@ try:
             _close_injected = True
 
         if _click_file_trigger is not None and not _click_file_trigger.fired and _click_file_trigger.poll():
-            if _auto_persona_click:
+            if _auto_click_xy is not None:
                 import tew.api.d3d8._state as _d3d8_state
                 _TEW_CLICK_AT = "%d,%d" % crt_state.window_manager.to_physical_xy(
-                    _d3d8_state._vk_hwnd, *_AUTO_PERSONA_START_XY)
+                    _d3d8_state._vk_hwnd, *_auto_click_xy)
             _TEW_CLICK_AFTER_SEC = str(
                 time.monotonic() - _click_start_wall_time + _TEW_CLICK_WHEN_DELAY_SEC)
             logger.error("startup",
@@ -3489,6 +3508,12 @@ try:
             _rel_x, _rel_y = (int(v) for v in _TEW_CLICK_AT.split(","))
             _inject_click_up(_rel_x, _rel_y)
             _click_up_injected = True
+            if _auto_click_steps:
+                # Chain to the next baked-in click.
+                _arm_next_auto_click()
+                _TEW_CLICK_AT = None
+                _TEW_CLICK_AFTER_SEC = None
+                _click_premove_injected = _click_down_injected = _click_up_injected = False
 
         if os.path.exists(_TEW_LOG_TRIGGER):
             try:
