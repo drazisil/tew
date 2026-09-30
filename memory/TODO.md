@@ -6,13 +6,11 @@ items here are queued but not yet started, or started and paused.
 
 ---
 
-## NEW (2026-09-26): perf pass, remaining items (tasks 1-3 done, see changelog)
+## NEW (2026-09-26): perf pass, remaining items (tasks 1-4 done, see changelog)
 
-Latest profile (tasks 1-3, persona-select phase): `simple_alloc` 13.4%,
-`_enter_cs` 5.1% + `_leave_cs` 3.7%, `CompareStringA` 4.5% (goes away with
-PR #28: DAO350 then takes its `_stricmp` path).
-- Task 4, critical sections: DONE 2026-09-29 (see changelog). Enter/Leave
-  no longer appear in the profile.
+Tasks 1-4 done (changelog 2026-09-26 and 2026-09-29): 1.44x to 600M guest
+steps. `CompareStringA` (was 4.5%) is gone since PR #28 (DAO350 no longer
+over the heap, so it takes its `_stricmp` path). Remaining, biggest first:
 - New in the 2026-09-29 profile (texture-upload phase, reached ~12% sooner
   now): D3D8 `UnlockRect` -> `_convert_to_bgra8` ~30% inclusive, the biggest
   single item once that phase starts.
@@ -21,69 +19,21 @@ PR #28: DAO350 then takes its `_stricmp` path).
 - sprintf/`_write_cstring`/write8 write strings byte by byte (bulk
   write_bytes); `eip`/`eflags`/`get_flag` crossings ~3% each (Desktop's list).
 
-## RESOLVED (2026-09-29): critical sections the XP way (perf task 4) -- all 6 steps done, see changelog; plan kept below
+- RESOLVED (2026-09-29): critical sections the XP way (perf task 4) → status_archive.md "Resolved TODOs"
 
-**How XP does it** (disassembled from `/data/Downloads/i386-binaries/ntdll.dll`,
-base 0x7c900000; kernel32 `Enter/Leave/TryEnterCriticalSection` are export
-forwarders to `NTDLL.Rtl*`). All state lives in the guest's 24-byte
-`RTL_CRITICAL_SECTION`: +0 DebugInfo (ptr to a separate 32-byte
-`RTL_CRITICAL_SECTION_DEBUG`), +4 LockCount (-1 free; otherwise counts
-pending entries, recursions AND waiters), +8 RecursionCount, +0xC
-OwningThread (= TEB+0x24 ClientId.UniqueThread), +0x10 LockSemaphore
-(auto-reset event, created lazily), +0x14 SpinCount.
-- `RtlEnterCriticalSection` (7c901000), SpinCount==0 path: `lock inc
-  LockCount`; if it hit 0 -> owner=TEB+0x24, recursion=1, `xor eax,eax;
-  ret 4`. Else if owner==self -> `inc RecursionCount` (LockCount stays
-  incremented), return 0. Else `RtlpWaitForCriticalSection` (7c91b19f,
-  kernel wait on LockSemaphore), then fall into the acquired path: the woken
-  thread OWNS it (handoff, no retry). SpinCount!=0 path: cmpxchg -1->0 +
-  `pause` spin, then the same.
-- `RtlLeaveCriticalSection` (7c9010e0): `dec RecursionCount`; if nonzero ->
-  `lock dec LockCount`, ret. If zero -> owner=0; `lock dec LockCount`; if the
-  result < 0 -> free, ret; if >= 0 -> `RtlpUnWaitCriticalSection` (7c91b267:
-  create LockSemaphore if needed, `NtSetEventBoostPriority` -> wakes exactly
-  one waiter).
-- MCity uses the standard struct: only imports kernel32
-  Initialize/Enter/Leave/DeleteCriticalSection; wrappers
-  `cQ::Help_EnterCriticalSection` (CS embedded at cQ+0x24, init flag +0x3c)
-  and `SNDSYS_entercritical` (-> `sndmutex`, `_RTL_CRITICAL_SECTION`) are thin.
+## NEW (2026-09-29): remaining nested `_invoke_emulated_proc` calls still give up and rewind
 
-**How tew differs today**: state in the Python `state.critical_sections`
-dict, nothing written to the guest struct (not even LockCount=-1);
-recursion/waiters not counted in LockCount; Leave wakes ALL waiters who
-retry; Enter leaves EAX untouched (XP returns 0). And the scheduler's
-`pickNextReady` (`cpu/src/scheduler.zig` ~262) wakes a `blocked_cs` thread
-when guest `[cs+0xC]` reads 0 -- a field tew never writes (zeroed CS ->
-spurious wake/retry churn; 0xCD-filled heap CS -> only unblock_cs wakes it).
-
-**Plan** (separate commits):
-1. Prerequisite, stands alone: all threads share ONE TEB whose
-   ClientId.ThreadId (+0x24) is hardcoded 1 (`kernel_structures.py:73`); the
-   scheduler only swaps TLS slots on a switch. Make the scheduler write the
-   current thread's id to TEB+0x24 on every switch (Zig, beside the TLS
-   swap). Also a latent bug by itself: real DLL code reading fs:[0x24] gets 1
-   while GetCurrentThreadId returns 1000+.
-2. `Initialize*` (kernel32 + ntdll variants) write the real struct:
-   LockCount=-1, RecursionCount=0, OwningThread=0, LockSemaphore=0,
-   SpinCount=0 (XP forces 0 on a uniprocessor), DebugInfo = new 32-byte
-   `RTL_CRITICAL_SECTION_DEBUG` with its CriticalSection back-pointer.
-   `Delete` frees it.
-3. Enter/Leave/TryEnter as GUEST CODE (our own implementation of the logic
-   above) in consecutive stub slots -- needs a small `Win32Handlers`
-   addition: register a guest routine with named `INT 0xFE` hook points.
-   Uncontended paths never leave the emulator (like `__chkesp` now).
-4. Python only for the slow paths, with LockSemaphore as a real tew
-   auto-reset event: contended Enter waits on it (then the guest code takes
-   ownership); Leave with waiters signals it (wake exactly one). First verify
-   tew's auto-reset event wakes exactly one waiter (`scheduler.zig`
-   `unblockHandle`).
-5. Remove `state.critical_sections` and the CS-specific scheduler blocking
-   (`block_current_on_cs`, the pickNextReady owner read) -- no other users.
-6. Tests: guest-code tests on the real ZigCPU (uncontended enter/leave with
-   no dispatch, recursion, TryEnter), a two-thread contention/handoff test,
-   full suite, live run, re-profile (enter+leave were ~8% inclusive).
-
----
+`DispatchMessageA` no longer uses it (PR #31: the WndProc runs as guest
+code via a stack trampoline -- the fix for the intermittent lobby-load
+crash). The other callers still run guest code as a nested `cpu.run` with a
+step budget, and on exhaustion `restore_state` rewinds the CPU to the moment
+of the call, even if other threads ran in between: timer callbacks
+(`kernel32_system.py`, timeSetEvent), message hooks (`user32_handlers.py`
+CallNextHookEx / PeekMessage hook paths), CreateDialogParamA's
+WM_INITDIALOG and CreateWindowEx's creation messages, `patch_internals.py`,
+`exception_diagnostics.py`, and DllMain calls. All are short today. Any of
+them that can run long or block (a timer callback waiting on another
+thread) should move to the same trampoline pattern.
 
 ## NEW (2026-09-26): thread stacks have no upper bound
 
@@ -124,19 +74,7 @@ actually shows up in a real run's log.
 
 ---
 
-## RESOLVED (2026-09-18): `screen.c(475) width>=0&&height>=0` -- root cause was a HOST x87 stack leak in tew's own FPU handlers (discarded `f80` return value); also the two-week 2026-09-03/04 "FMUL returns NaN on one call in many" mystery
-
-**RESOLVED 2026-09-18.** Root cause: `fpuPop()` in `cpu/src/fpu.zig` returned an `f80` and every popping handler (`FSTP`, `FISTP`, `FCOMP`, `FADDP`, ...) called it as `_ = fpuPop(s);`. On x86/x86-64 an `f80` return value lives in ST(0) of the HOST x87 stack and Zig does not pop a DISCARDED x87 return, so each such handler leaked one host x87 entry. tew's f80 arithmetic runs on the host's real x87 unit, so after 8 leaks the next host `fld` overflowed the 8-entry stack and produced a QNaN -- the intermittent "`ViewToScreen`'s `FMUL` returns NaN on exactly one of many otherwise-identical calls" that the 2026-09-03/04 investigation (see `status_archive.md`) characterised precisely but could not explain, because every value it could observe (emulated ST0, the memory operand, `fpu_top`, MMX) really was identical -- the corruption lived in host x87 tag/stack state tew never looks at. The NaN then flowed `ViewToScreen` -> `FUN_00af1780` (`round(float)`) -> `FISTP` -> `0x80000000` -> `Screen_SetClip(.., h=-2147483648)` -> the assert (the negative height in the probe output WAS the FISTP integer indefinite). Fix: `fpuDrop()` (returns void) replaces every discarded pop; `fpuPop` deleted. Regression test: `popping x87 handlers do not leak entries on the HOST x87 stack` (failed with `expected 0, found 20` before the fix). **Live-verified**: a 140s run with NO reset showed 0 dirty host-x87 observations and 0 out-of-range FISTP events (before: 699,784 dirty observations and a NaN at 13.7s). How it was found: a `fxsave`-based dirty check at every x87 handler entry showed the host tag word non-empty after 100% of the popping handlers and 0% of the others; per-handler culprit counts pinned it to the pop forms. The debug scaffolding (`captureHostFpuState`, the `fxsave`/`fninit` experiment, the culprit tables, and the `Screen_SetClip`/`ViewToScreen`/`GUI_InitView` probes) was deleted; only a test-only `hostFpuCheck` guard remains. **Lesson**: never write `_ = <f80-returning fn>()` in Zig code that runs on the host x87.
-
-Original write-up (the chain up to `FeDC::DoClip`, still accurate as description of the symptom):
-
-
-
-Reached only now that clicks, `DBRES_Login`, `strpbrk` and the FPU panic are fixed. ~110s after the port-43300 connect (lobby up: `LFrame.cpp Refreshing Buddy List`, `INet_Mail Calling Mail Poll`) the game prints `ASSERT: screen.c(475) width>=0&&height>=0` (in `~/.emu32/MCity/stdout.txt`; no `except.txt`, inline `_Nfs_DebugBreak`) and tew halts on the unhandled `INT3` at `0x00688c68` -- correct per the standing no-auto-continue rule. Chain (crash JSON): `Screen_SetClip(x,y,w,h)` `0x0073d4b5` <- `FeDC::DoClip` `0x0053e089` (intersects the widget rect with `GUI_ViewRect` via `GRect::operator&`, `ViewToScreen`, and if it differs from the cached rect at `this+0x7cc` calls `Screen_SetClip`) <- `0x543a77` <- `0xb43285` <- `0xaed019` (`GUI::OnEvent`). Meaning: a widget's rect does not overlap the view rect, so the intersection is inverted.
-
-**Next steps (not started)**: log `GUI_ViewRect` and the widget rect at `FeDC::DoClip` (entry `0x0053e0..`; args are `this` in ECX) to see the real numbers, and work out which input comes from tew (window/client size, `GetTextMetrics`/font metrics, D3D8 viewport, `GetSystemMetrics`). Real game code is assumed correct, so the divergence is expected to be tew's. Also still unverified live: whether the `XLAT`/`FISTP`/`FSCALE` fixes carry the animation (`fmod`) path, which the run would have reached ~25s after this halt.
-
----
+- RESOLVED (2026-09-18): `screen.c(475) width>=0&&height>=0` → status_archive.md "Resolved TODOs"
 
 ## NEW (2026-09-18): the game's own `dprintf` debug output is almost entirely swallowed by three gates -- only an entry logpoint exists so far
 
@@ -182,178 +120,11 @@ char-set bitmap loop, i.e. plain CRT string code, not game logic.
 
 ---
 
-## RESOLVED (2026-09-18): synthetic clicks never registered -- `wParam` lacked `MK_LBUTTON` because `SDL_GetMouseState()` ignores `SDL_PushEvent`-injected events (original write-up kept below)
+- RESOLVED (2026-09-18): synthetic clicks never registered → status_archive.md "Resolved TODOs"
 
-**RESOLVED 2026-09-18.** The hypothesis below was correct and is now measured: a guest logpoint on `FUN_00780d80` showed real `WM_LBUTTONDOWN` `wParam=0x1` vs synthetic `wParam=0x0`, every other field identical (hwnd `0x1034`, lParam (387,491), message `0x201`, the `DAT_016f3628` gate). Fixed in `tew/api/window_manager.py` by tracking pressed buttons from the events themselves (`_mouse_buttons_down`), never from `SDL_GetMouseState()`; 8 tests in `tests/unit/api/test_window_manager_mouse_wparam.py`. Live-confirmed: a synthetic START click now logs in (port 43300, lobby user list). Also fixes a latent race for REAL clicks (`SDL_GetMouseState()` is poll-time state; under emulator lag a quick click could already be released). Corrections to details below: `MouseSetButton`'s first arg is a real button index (0..3 over `rgbButtons[4]`), not a `GInput` type (those are 2/3/4); the guest's mask bits are `1/2/4` (left/right/middle) remapped from `MK_LBUTTON 1/MK_RBUTTON 2/MK_MBUTTON 0x10`. The click-investigation probes were deleted after this.
+- RESOLVED (2026-09-18, this entry's 2026-09-17 conclusion was WRONG -- corrected below): real crash right after a live `MC_LOGIN_COMPLETE` → status_archive.md "Resolved TODOs"
 
-Original write-up:
-
-
-**The actual root cause of "clicks don't work," found via live logpoints +
-a side-by-side real-vs-synthetic click on the same running process.** Full
-chain traced in Ghidra: `MMouseInput::AppPollMouse` (0075fae0) calls
-`_MOUSE_getstate(6)` (00a72d20), confirmed live via logpoint to run in mode
-`DAT_0128af04==4` (the `getmousepos()`/00a73a60 absolute-position path, not
-DirectInput's buffered `_INPUT_getdevicedata`). `getmousepos()` just reads
-3 globals (`DAT_020e398c`=buttons, `DAT_020e3990`/`3994`=x/y) written by
-exactly one function, `seteacmouse` (00a73b90) -- confirmed via Ghidra
-XREFs, no other writer exists. `seteacmouse` gates its entire body behind
-`_mouseflag != 0 && _winmsgmutex != NULL`; if either is unset it silently
-no-ops on every call.
-
-**Live-confirmed** (logpoint on `GMouseInput::MouseSetButton`, 0x00b1b2c0,
-the only writer downstream of `AppPollMouse`): a real manual click (Molly,
-same running process) produced `state=112` sustained across 10+
-consecutive polls for the whole real hold duration. Every synthetic click
-attempted the same session (392 logged polls total, multiple attempts,
-various hold durations/wiggle patterns) produced `state=0`, always. This
-rules out `_mouseflag`/`_winmsgmutex` init as the problem (real clicks
-clearly work on the same live process) -- the divergence is specifically
-synthetic vs. real input, upstream of `seteacmouse` itself.
-
-**Most likely mechanism (not yet fixed or further verified)**:
-`window_manager.py`'s `_handle_sdl_event` computes
-`wparam = _sdl_buttons_to_wparam(SDL_GetMouseState(None, None))` for
-`WM_LBUTTONDOWN`/`WM_LBUTTONUP`. `SDL_GetMouseState()` reads SDL's own
-internally-tracked mouse-button state, updated via `SDL_SendMouseButton` --
-the same internal call real hardware-driven events go through. Our
-synthetic clicks build a raw `SDL_Event` and call `SDL_PushEvent()`
-directly, which enqueues the event but does **not** call
-`SDL_SendMouseButton` -- so SDL's own tracked button state never updates
-for a synthetic press, and `SDL_GetMouseState()` keeps reporting "nothing
-down" even during a synthetic button-down. That would make the computed
-`wparam` always miss `MK_LBUTTON` for synthetic events specifically -- a
-clean explanation for the real-vs-synthetic split just observed, though not
-yet directly confirmed by reading the live wParam value itself (cheap next
-step: one more logpoint/log line at the wparam computation site, real vs.
-synthetic).
-
-**Fix direction (not yet implemented)**: stop deriving wParam's button bits
-from `SDL_GetMouseState()`; track pressed-button state directly inside
-`window_manager.py` from the events `_handle_sdl_event` itself already
-processes (real and synthetic both flow through this one function), and
-compute `wparam` from that self-tracked state instead. This would very
-likely also explain every prior click-delivery investigation this project
-has done (the 2026-09-14 "OnMouseUp never entered" dead end, the whole
-multi-session click-coordinate saga) -- none of those synthetic clicks
-would have carried correct wParam either, regardless of how correct their
-coordinates were.
-
-See `status.md`'s 2026-09-17/18 entry and `status_archive.md` for the full
-session narrative (manual click-trigger API, `GetCursorPos` fix, the
-research-agent history dig, and this live logpoint chain).
-
-**Ruled out 2026-09-18**: confirmed unrelated to the `0xD0`/`0x34` CPU
-opcode gaps fixed the same session -- a synthetic DOWN still shows
-`state=0` throughout the hold with the fixes in, and the new
-`unknown_opcode` diagnostic never fires during a click attempt. The
-`SDL_GetMouseState()`/`SDL_PushEvent` mechanism above remains the real,
-still-unfixed lead.
-
----
-
-## RESOLVED (2026-09-18, this entry's 2026-09-17 conclusion was WRONG -- corrected below): real crash right after a live `MC_LOGIN_COMPLETE` -- a genuine tew CPU-core bug (missing 0xD0 opcode), not a server payload issue
-
-**Correction (2026-09-18): everything below the original write-up is wrong.**
-This entry originally concluded "not a tew bug, fix belongs in mco-server's
-`LoginCompletePayload`" and recommended adding shard/server-list fields
-server-side. **Do not act on that.** The crash was re-verified live with
-the heap-fill fix in place (see status.md's 2026-09-17 entry) and
-reproduced again at the exact same fault site, with no server change --
-ruling out the payload-size theory entirely. Real root cause, found the
-same session Molly decoded the actual bytes at the fault EIP in Ghidra:
-`0x0099ed78` is `D0 E8` (`SHR AL,1`), and `cpu/src/engine.zig`'s
-`dispatch_table` never had `0xD0` wired in (`0xD1`/`0xD2`/`0xD3` were, `0xD0`
-was skipped) -- a genuine missing-opcode gap in tew's own CPU core, not a
-wild pointer and not a server bug. Fixed by adding `opD0`. **Live-confirmed
-2026-09-18**: a fresh run sailed straight through `MC_LOGIN_COMPLETE` ->
-`DBRES_Login` into persona-physical + `MC_GET_OWNED_PARTS` with zero faults.
-See status.md's current entry for the full writeup, including why `opFault`
-never reporting which opcode triggered it is what let this go unnoticed,
-and the resulting ~29-opcode coverage audit.
-
-Original (now-superseded) write-up kept below for the false-lead detail --
-the `0x4d980f`-vs-real-fault-EIP confusion it describes is still real and
-worth knowing, just not the actual root cause.
-
-On the click-repro run that live-confirmed the `_recv`/`_select` fixes,
-right after `dblog.txt` shows a genuine `DBServiceResultQ msg #213
-MC_LOGIN_COMPLETE Seq:3`, `tid=1011` faulted inside `DBRES_Login`
-(`DBResultQ.C`, reached via `DBServiceResultQ`'s indirect message-dispatch
-table -- invisible to static Ghidra XREF, which is why naively chasing the
-logged fault address's "only caller" led to the wrong function entirely).
-Crash JSON's real `eip`/`ebp_chain` (7 clean frames to `THREAD_SENTINEL`)
-put EIP genuinely inside `DBRES_Login`; `memory_access.attempted_address`
-was `0x4d980f` -- the unrelated `_CLayer_DetectDebugger`'s entry point -- a
-wild/corrupted pointer read, not a deliberate jump.
-
-**Root cause, confirmed against mco-server's own log**
-(`/data/Code/server/data/application-2026-09-17-12.log`, port 43300,
-connectionId `43fcb52f`): the server's `LoginCompletePayload` response body
-is only 72 bytes, but `DBRES_Login` unconditionally reads fixed struct
-fields out to offset `0xa9+4 = 173` bytes into that buffer -- no length or
-bounds check, matching the real original client's expected (longer)
-message format. The server's own decoded log shows `serverList: ` empty --
-it never fills in the shard/server-list entries `DBRES_Login` expects
-(it later loops over what should be 4 server-list entries using fields read
-from those far-past-buffer-end offsets). **Not a tew emulation bug** --
-nothing to fix here; the fix belongs in mco-server's `LoginCompletePayload`
-generation (add the missing shard/server-list fields to match the real
-client's expected fixed-size struct). See `status_archive.md`'s
-"2026-09-17, later still" entry for the byte-for-byte comparison.
-
-**False-lead trap hit once while root-causing this**: the log's own
-`[exception] CPU fault at EIP=0x004d980f` line is NOT the fault EIP --
-that's the `memory_access.attempted_address` field from the crash JSON; the
-real fault EIP (`0x0099ed78`) is a separate field. Don't re-chase
-`0x4d980f`/`_CLayer_DetectDebugger` (WinMain's one-time debugger self-test,
-normally SEH-caught, unrelated) as a crash site again -- check `eip` in
-`/tmp/emu_crash.json` directly, not the log line.
-
----
-
-## RESOLVED (2026-09-16, fixed later same day): guest `recv()` blocking with no data ready freezes the ENTIRE emulator, not just the calling guest thread
-
-`tew/api/wsock32_handlers.py`'s `_recv` (~line 459) calls the real host
-socket's blocking `entry.py_sock.recv(length)` directly. Guest "threads"
-have no real host OS thread each -- `CreateThread` doesn't spawn one;
-they're cooperatively scheduled via `crt_state.scheduler.preempt_slice(cpu,
-mem)` on tew's single shared CPU-stepping host thread (same thread
-`run_exe.py`'s one `[alive]` log site lives in). So when any guest thread's
-`recv()` has no data ready, it blocks that single shared thread -- freezing
-every other guest thread and the heartbeat log too, not just the caller.
-Confirmed live 2026-09-16: after a successful DB-attach handshake on a new
-MCOTS connection (port 43300), the whole run went completely silent (no log
-growth anywhere) for 1000+s until killed by our own timeout -- root-caused
-via `/proc/<pid>/task/*/syscall` showing the main host thread parked in a
-real blocking `recvfrom`, confirmed via `ss -tin` that this was NOT stuck
-unread data (`Recv-Q:0`) but a genuine wait for a message that never came.
-See `status.md`'s 2026-09-16 entry for the full trace. Fix direction: make
-the host socket non-blocking (or poll with a short timeout cooperating with
-`preempt_slice`) so one guest thread's network wait yields instead of
-wedging the whole machine.
-
-Also noticed while in `_recv`, lower priority: it still writes received
-bytes into guest memory one byte at a time (`for i, b in enumerate(data):
-memory.write8(...)`, ~lines 476-477) -- the same per-byte anti-pattern
-already fixed elsewhere (`_heap_alloc`, `sendto`'s read, 2026-09-14) but
-missed here. Bulk-write while fixing the blocking issue above.
-
-**Both fixed and LIVE-CONFIRMED (2026-09-17)**: `_recv` now does a
-zero-timeout `select()` check and, for a guest-blocking socket with nothing
-ready, yields via `state.scheduler.sleep_current(cpu, memory, retry_eip, 0,
-5)` (same retry-via-rewound-EIP pattern as `WaitForSingleObject`) instead
-of calling the real blocking `recv()`; the per-byte write loop is now
-`memory.load(...)`. A sibling bug in `_select` (same file) had the
-identical disease -- fixed the same way, tracked per-thread since one
-`select()` call spans multiple sockets. Reproduced the exact original
-scenario live (real MCOTS connect to port 43300, `recv()`/`select()` both
-finding nothing ready) and the process stayed fully alive with every other
-thread continuing normally -- no more `poll_schedule_timeout`/`recvfrom`
-host freeze. See `status.md`'s current entry and `status_archive.md`'s
-2026-09-16/17 entries for the full trace.
-
----
+- RESOLVED (2026-09-16, fixed later same day): guest `recv()` blocking with no data ready freezes the ENTIRE emulator, not just the calling guest thread → status_archive.md "Resolved TODOs"
 
 ## NEW (2026-09-13): persona-select list's selection-highlight bar overdraws the PERSONA/SERVER-vs-POP. column divider
 
@@ -393,188 +164,9 @@ known gap, not a confirmed active blocker.
 
 ---
 
-## RESOLVED (2026-09-13): `IDirect3DDevice8::Reset` was a complete lying no-op, clipping the persona-select screen
+- RESOLVED (2026-09-13): `IDirect3DDevice8::Reset` was a complete lying no-op, clipping the persona-select screen → status_archive.md "Resolved TODOs"
 
-Found while attempting the mouse/keyboard interaction item below: the
-persona dialog rendered larger than the actual window, clipping "PLEASE
-SELECT FROM THE LIST BELOW" and the persona list past the right/bottom
-edge. Root cause was `Dev::Reset` never reading its
-`D3DPRESENT_PARAMETERS*`, never resizing the window, and never
-recreating the swapchain -- the game's `setvideomode` takes the `Reset`
-path (not `CreateDevice`) for every mode change after the first, so the
-window/swapchain stayed frozen at the login screen's size. Fixed for
-real: swapchain/image-views/framebuffers now destroyed and recreated at
-the new size on every `Reset`, window resized to match (same
-`WINDOW_SCALE` as `CreateDevice`). Confirmed live via screenshot -- full
-writeup in changelog.md's 2026-09-13 entry. Does not fix the separate,
-still-open `SetWindowPos`/`MoveWindow` lying-no-op gap above -- Reset was
-the actual mechanism the game uses for mode changes; that item stays
-open as an unconfirmed, unrelated gap.
-
----
-
-## NEW (2026-09-13, corrected): real mouse/keyboard interaction with the persona-select screen -- three real bugs fixed, but click delivery is still NOT confirmed working
-
-**Correction, same session**: this was briefly marked RESOLVED after
-clicking "Dr Brown" appeared to advance the game to "Connecting to
-localhost:8226 try 1" -- that screen turned out to be the LOGIN server
-reconnecting (`LoginServerPort=8226`), not the lobby (`LobbyServerPort=
-7003`), and further testing showed it's a periodic automatic refresh
-unrelated to any click (same payload repeats ~44s later regardless of
-what's clicked). Do not treat that screen transition as evidence the
-click worked.
-
-Three real, independently-confirmed bugs were fixed getting here -- see
-changelog.md's 2026-09-13 entries for the full chain: (1)
-`IDirect3DDevice8::Reset` was a lying no-op clipping the window
-(separate RESOLVED entry above), (2) `SDL_MOUSEBUTTONDOWN` never posted
-a real `WM_LBUTTONDOWN` to any non-dialog top-level window (only
-MOUSEBUTTONUP/MOTION did), and (3) DirectInput's `SetEventNotification`
-accepted event-handle registration and then never signaled it. All three
-are real and necessary fixes, confirmed via extensive live testing
-(SDL reliably delivers real clicks; `pump_sdl_events` runs continuously)
--- but NOT sufficient: most real clicks during the persona-select screen
-still produce zero downstream reaction, while clicks during the earlier
-login-dialog stage reliably work.
-
-**Real, confirmed next step**: one dropped click was caught directly in
-the log (`SDL event type=0x401` with no follow-up) and traced to
-`_handle_sdl_event`'s `SDL_MOUSEBUTTONDOWN`/`UP` handlers
-(`window_manager.py`) having **silent** early-return paths (non-left
-button, or `windowID` not found in `_sdl_window_id_to_hwnd`) -- now
-instrumented with logging (both branches, both handlers, plus the actual
-`sdl_win_id` added to window-creation log lines) but not yet re-tested
-against a real dropped click. Next session: reproduce one and read which
-branch actually fired.
-
-Real mouse/keyboard input being "wired into DirectInput" (an even
-earlier session's note) meant the vtable slots existed and returned
-plausible values, not that any of them were actually being called or fed
-by real events -- worth remembering next time a similar "should just
-work" input claim comes up.
-
----
-
-## RESOLVED (2026-09-05, cont'd again): "mistiled/blocky background image" root-caused as `GetRenderTarget`/`GetDepthStencilSurface` fabricating a fresh surface object every call — a real premature-free bug, not a missing D3DFORMAT case
-
-What first looked like a texture-format bug (a 1536x1248 surface,
-`this=0x09750000`, flipping from `fmt=0x16` to `fmt=0x4f`/`D3DFMT_D24X4S4`
-between `UnlockRect` calls) turned out to be a genuine object-lifetime
-bug, confirmed via temporary alloc/free diagnostics correlated
-chronologically against `Surface::UnlockRect` calls: `Dev::GetRenderTarget`
-and `Dev::GetDepthStencilSurface` allocated a brand-new, independently
-ref-counted surface object on *every* call instead of returning a stable,
-AddRef'd, cached one. Real D3D8 AddRef's and returns the same underlying
-surface every time -- the caller's matching `Release()` only drops their
-own reference, since the device keeps its own. Fabricating a fresh object
-per call meant the game's single, correct `Release()` immediately freed
-tew's only copy of it; the freed heap address was then handed to an
-unrelated later allocation, whose write into the object header's format
-field corrupted what the still-in-use original surface reported. Proven
-directly: a `Surface::UnlockRect` call on that address succeeded 23.8
-seconds after tew's own bookkeeping had already freed it, reading stale
-leftover memory.
-
-**Fixed**: both accessors now cache one canonical surface object per
-device (`_state._vk_backbuffer_surface_obj`/`_vk_depth_stencil_surface_obj`)
-and AddRef on repeat calls. Regression test:
-`tests/unit/api/test_d3d8_render_target_cache.py`.
-
-The visible "mosaic" itself was a separate misdiagnosis, corrected by
-Molly watching the actual game window live: it was real, correctly
-loading 32x32 icon content (1201 icon uploads in one run) caught
-mid-population, not corrupted output -- it resolved into real content
-once loading finished.
-
-Also fixed along the way (real, correct, but confirmed NOT the cause of
-this particular bug): `IDirect3DSurface8::LockRect` ignored the `pRect`
-sub-rectangle parameter, always returning a pointer to the surface's
-absolute origin regardless of which sub-rectangle was requested -- would
-cause exactly this kind of tile-patchwork corruption for any surface
-genuinely streamed/decoded via repeated `Lock(pRect)`/`Unlock` cycles on
-different sub-rects. Regression test:
-`tests/unit/api/test_d3d8_lock_rect_prect.py`.
-
----
-
-## RESOLVED (2026-09-05, full session): D3D8 texture-sampling pipeline built end-to-end, real content confirmed ON SCREEN
-
-Full methodology in changelog.md (2026-09-05 entry) and the rotated
-status_archive.md entry. Six real, independently-verified bugs found and
-fixed across a single long session, ending with a real textured quad
-confirmed visible in a live screenshot (not just via GPU pixel readback):
-
-1. `CreateTexture`/`SetTexture`/`GetTextureStageState`/`SetTextureStageState`
-   converted from lying no-ops to real state-tracking implementations.
-2. Real GPU texture upload wired into `IDirect3DSurface8::LockRect`/
-   `UnlockRect` (confirmed via call tracing to be the actual path the real
-   game uses -- the texture's OWN `LockRect`/`UnlockRect` are never called).
-3. D3DFORMAT-aware pitch + BGRA8 conversion (`_format_bytes_per_pixel`/
-   `_convert_to_bgra8` in `_helpers.py`) -- `LockRect`'s `Pitch` was
-   hardcoded to `width*4` regardless of real format, corrupting every
-   non-32bpp texture (confirmed live with real `D3DFMT_R5G6B5` textures).
-   Handles R5G6B5/X1R5G5B5/A1R5G5B5/A4R4G4B4/A8; DXT/S3TC still unhandled
-   (see item below).
-4. Window-transparency bug: alpha=0 draws (blend disabled) were writing
-   real transparency into the swapchain's alpha channel, letting the
-   Wayland compositor show the desktop through the game window. Fixed by
-   excluding alpha from the pipeline's `colorWriteMask`.
-5. Descriptor-set race: a single shared descriptor set mutated per
-   `SetTexture()` call doesn't work, because Vulkan reads descriptor
-   contents at command-buffer *execution* time (Present's `vkQueueSubmit`),
-   not at record time -- every draw in an unpresented frame sampled
-   whichever texture was bound *last* in that frame. Fixed with one
-   persistent descriptor set per texture (`_pipeline.py`'s
-   `_MAX_TEXTURE_DESCRIPTOR_SETS` pool), resolved and bound per-draw at
-   record time in `_draw_primitive`.
-6. Same class of bug, for vertex data: `_draw_primitive` always wrote to
-   vertex-buffer offset 0, so every draw accumulated in a frame overwrote
-   the previous one's vertex data before the GPU ever read any of it. Fixed
-   with a per-frame cursor (`_state._vk_vertex_cursor`) giving each draw
-   its own buffer region, reset once per new frame acquire.
-7. **The actual remaining bug, found only after Molly refused to accept "a
-   provably-correct GPU readback" as proof of a working screen**: Vulkan's
-   NDC Y-axis points DOWN by default (opposite of OpenGL), but
-   `_draw_primitive`'s screen-to-NDC Y math used the OpenGL-style flip
-   formula (`1 - y/h*2`) inherited from a GL mental model, rendering
-   everything upside-down/off-screen relative to where anyone would look
-   for it. Fixed: `yn = (y/vp_h)*2 - 1` (no flip; D3D8 screen-space Y-down
-   already matches Vulkan NDC Y-down).
-8. A separate, real Vulkan correctness bug found while chasing the above:
-   `BeginScene`'s per-frame swapchain-image re-acquire barrier used
-   `oldLayout=UNDEFINED` unconditionally -- a real "discard prior content"
-   hint some drivers honor literally, wrong for every re-acquire after the
-   first (D3D8's `Clear()`, not every frame boundary, is supposed to be
-   what erases backbuffer content). Fixed by tracking which swapchain image
-   indices have completed at least one frame
-   (`_state._vk_swapchain_images_used`) and using `oldLayout=PRESENT_SRC_KHR`
-   for every re-acquire after the first.
-
-**Verification chain, strongest to weakest**: (a) a real textured quad
-directly confirmed in a live screenshot -- the actual bar Molly held this
-session to, not accepted until met; (b) full-screen solid-red `Clear()`
-confirmed reaching the actual composited window (proved the presentation
-pipeline itself, independent of any draw-content bug); (c) direct GPU pixel
-readback (`vkCmdCopyImageToBuffer` to a host-visible staging buffer) showing
-real non-clear-color texture data at the expected screen location; (d) full
-test suite green (1249 passed) after every change.
-
-**Still open, carried forward**:
-- DXT/S3TC/BC1-3 texture decompression -- `IDirect3D8::CheckDeviceFormat`
-  still unconditionally returns `S_OK` for DXT1/DXT3 FourCCs
-  (`tew/api/d3d8/idirect3d8.py:495`) with no decompression path; the real
-  textures traced this session were uncompressed (`D3DFMT_R5G6B5`), so this
-  wasn't blocking, but a DXT-compressed texture would currently render
-  garbage via the "unrecognized format, pass through raw" fallback in
-  `_convert_to_bgra8`.
-- Only stage-0 textures are wired to the GPU-visible descriptor set --
-  multitexturing (stage > 0) is tracked in `_state._bound_textures` but not
-  rendered. Not yet observed to matter in practice.
-- `C:\Data\GUI\dlg.options` still occasionally reported missing -- low
-  priority, doesn't block rendering.
-- DirectSound looks like a real, working implementation -- "no music"
-  probably isn't the same class of bug as the texture pipeline; not
-  investigated this session.
+- RESOLVED (2026-09-18, opened 2026-09-13): real mouse/keyboard interaction with the persona-select screen → status_archive.md "Resolved TODOs"
 
 ## NEW (2026-09-05): real guest-code crash around t≈41s, IDENTIFIED but not yet root-caused -- genuinely rare, only reproduced once
 
@@ -606,34 +198,7 @@ what actually calls into the exit sequence at t≈41s, then check tew's
 `CreateMutex`/`CloseHandle` handlers (`tew/api/kernel32_*.py`) for a real
 bug vs. confirming this is genuine original-game behavior.
 
-## RESOLVED (2026-09-05): D3D8 game window now receives real mouse/keyboard input
-
-Was: no real mouse/keyboard input reached the game at all (see prior
-description in `changelog.md`'s 2026-09-05 entry for the full original
-finding). Fixed both real gaps:
-- `tew/api/dinput_handlers.py`'s `Dev::GetDeviceState` now really polls SDL:
-  `cbData==256` is treated as the keyboard (real `SDL_GetKeyboardState` +
-  a fixed SDL-scancode -> real `DIK_*` table covering letters, digits,
-  punctuation, function keys, arrows, and modifiers); any other `cbData`
-  (16/20) is treated as the mouse (`SDL_GetMouseState`, reported as
-  DirectInput's default *relative* lX/lY deltas since the last poll, plus
-  left/right/middle button bytes). The single generic device object
-  (`CreateDevice` doesn't distinguish keyboard vs. mouse by REFGUID) is
-  disambiguated this way since `cbData` is the one thing every caller
-  always states.
-- `tew/api/window_manager.py`'s `_handle_sdl_event` now handles
-  `SDL_MOUSEMOTION` (posts `WM_MOUSEMOVE`), `SDL_MOUSEBUTTONUP` (posts
-  `WM_LBUTTONUP`), and `SDL_WINDOWEVENT_FOCUS_GAINED`/`_LOST` (posts
-  `WM_ACTIVATE`+`WM_SETFOCUS` / `WM_ACTIVATE`+`WM_KILLFOCUS`) to the real
-  top-level window, not just tew's own dialog-widget system.
-
-Not yet done: right/middle mouse buttons in `window_manager.py`'s own
-message-based dialog path (DirectInput's mouse polling above does report
-them); mouse wheel (`lZ`) is not tracked at all. Full suite green (1249
-passed) throughout; sanity-checked with a live run (no exceptions from the
-new SDL event handling).
-
-## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
+- RESOLVED (2026-09-05): D3D8 game window now receives real mouse/keyboard input → status_archive.md "Resolved TODOs"
 
 ## NEW (2026-09-04, evening): possible native fast-path for the highest-volume trivial Win32 calls
 
@@ -733,43 +298,9 @@ blocker yet, just flagged before the queue/packet work begins.
 
 ---
 
-## RESOLVED (2026-08-29, cont'd x40): DAO/Jet query-parameter gap -- `StockAssembly_SelectAPT` "could not get param count" -- FULLY FIXED end to end
+- RESOLVED (2026-08-29, cont'd x40): DAO/Jet query-parameter gap → status_archive.md "Resolved TODOs"
 
-Full root cause and fix in status.md "cont'd x40" and changelog.md's
-matching entry. x39 fixed `GetLocaleInfoW` and a cascade of exposed
-locale/calendar table gaps (`_wtoi`, `_itoa`, a mislabeled
-`LOCALE_SMONTHNAME1..13` entry, `GetCalendarInfoW`, `NlsGetCacheUpdateCount`,
-a silent-stub logging gap in `MultiByteToWideChar`/`WideCharToMultiByte`).
-With those closed, `VarDateFromStr` still failed -- traced to
-`classify_wide_string` (`char_type.py`) leaving its output buffer
-unwritten when asked to classify a null-terminated "string" whose first
-character IS the terminator (a zero-length classification), which let a
-caller read back stale leftover data (a `DIGIT` flag from the character
-tested just before) and made a date-string tokenizer wrongly treat two
-null bytes as still-a-digit, overshooting the true end of a number by 2
-WCHARs. Fixed by always writing a real classification for the terminator
-in that case. Confirmed live end-to-end: `StockAssembly_SelectAPT`'s error
-no longer appears anywhere in `stdout.txt`; the game runs straight past
-the whole query.
-
-**New, completely unrelated blocker opened immediately downstream**: an
-unhandled SEH fault at `EIP=0x1901d9eb` (0x19xxxxxx range -- a different
-DLL entirely). Not yet investigated at all -- pick this up first next
-session.
-
-## RESOLVED (2026-08-29, cont'd x40): `FUN_77121505` "thread splat" suspicion -- ruled out, real cause was the already-documented `THREAD_SENTINEL` collision
-
-Reran with `thread` added to `LOG_CATEGORIES` per the plan from x39;
-`FUN_77121505` never fires at all in the relevant window. What DOES fire
-early in every run is the already-documented (see the `THREAD_SENTINEL`
-entry below, "NEW (2026-08-26)") spurious "thread died" event from
-`OLEAUT32.dll`'s real `DllMain` static initializer sharing `THREAD_SENTINEL`
-with real thread completion -- non-fatal, `_invoke_emulated_proc` catches
-it and continues normally. This is almost certainly what Molly's original
-"thread went splat" recollection actually was. `FUN_77121505` itself is
-confirmed, separately and conclusively, to be a correct, real stack-cookie
-check (`__chkesp`-style) with clean success/`TerminateProcess`-on-mismatch
-semantics -- not a bug, not involved.
+- RESOLVED (2026-08-29, cont'd x40): `FUN_77121505` "thread splat" suspicion → status_archive.md "Resolved TODOs"
 
 ## NEW (2026-08-28, cont'd x38): `cpu_add_logpoint` silently drops registrations past its 8-slot cap -- violates this project's own fail-loudly standard
 
@@ -803,72 +334,13 @@ later, `bAlertable` (and the plain, non-Ex `SleepEx`'s alertable semantics --
 same gap, same cause) need to be wired in at the same time, or an alertable
 wait/sleep will silently never wake early for a queued APC.
 
-## RESOLVED (2026-09-29, opened 2026-08-26): `THREAD_SENTINEL` collision between `_call_guest_void` (static initializers) and real thread completion
+- RESOLVED (2026-09-29, opened 2026-08-26): `THREAD_SENTINEL` collision between `_call_guest_void` (static initializers) and real thread completion → status_archive.md "Resolved TODOs"
 
-**2026-09-29, fixed**: `_call_guest_void` returns to its own HLT sentinel;
-see changelog. Correction to the note written earlier the same day: tew did
-NOT see OLEAUT32's DllMain as FALSE -- the death check only runs between
-200k-step chunks, DllMain had already halted at its sentinel, and its real
-EAX (1) was returned; only the log line's "returning 0" was wrong. What was
-real: the main thread sat DEAD in the scheduler after every startup.
+- RESOLVED (2026-08-26): 101 `test_oleaut32_*.py` unit tests and dead `oleaut32_handlers.py` cleaned up → status_archive.md "Resolved TODOs"
 
+- RESOLVED (2026-08-26): statically-imported DLLs' `DllMain` now runs; original DAO license-key BSTR bug confirmed fixed → status_archive.md "Resolved TODOs"
 
-`_call_guest_void` (`msvcrt_handlers.py:272`, used by `_initterm` to invoke a
-DLL's C++ static initializers) pushes `THREAD_SENTINEL` (`0x001FE000`) as its
-own inner-call return address and steps until it returns there. But
-`THREAD_SENTINEL` has a real `INT 0xFE` trampoline permanently wired to
-`_make_thread_return_handler` (`crt_handlers.py`) -- the same handler used
-for a real spawned thread's natural completion, which calls
-`scheduler.mark_current_dead()` unconditionally, with no way to tell "an
-initializer just returned" apart from "this thread just died".
-
-`_call_guest_void`'s own docstring documents the precondition this
-violates: "this helper is only called from main-thread context ... so
-hitting the sentinel does not corrupt cooperative-thread bookkeeping." That
-was true until 2026-08-26's DllMain-for-static-imports fix (see changelog
-x34/x35): `oleaut32.dll`'s real `DllMain` has a genuine `_initterm` static
-initializer, and calling it now happens *nested inside* an in-flight
-`_invoke_emulated_proc` call (tracking `OLEAUT32.dll`'s own `DllMain` as
-`started_thread_idx`). The initializer returning to `THREAD_SENTINEL`
-spuriously marks that thread dead mid-call
-(`/tmp/emu.log`: "Thread 1000 returned normally" immediately followed by
-"[_invoke_emulated_proc] thread idx=0 ... has died"). This run happened to
-still produce the correct result (`_invoke_emulated_proc`'s
-`genuinely_completed` check apparently still passed despite the spurious
-death flag) -- not verified whether that holds in general, or just got
-lucky this once.
-
-Not yet fixed -- flagging so it doesn't get rediscovered from scratch next
-time a DLL's `DllMain` (real or via `_ensure_dll_ready`) has static
-initializers AND is invoked through `_invoke_emulated_proc`'s nested-call
-path. Fix would need `_call_guest_void` to use its own dedicated
-sentinel/return address (like `_invoke_emulated_proc`'s own
-`_get_dialog_sentinel`-allocated one) instead of sharing `THREAD_SENTINEL`
-with real thread completion.
-
-## RESOLVED (2026-08-26): 101 `test_oleaut32_*.py` unit tests and dead `oleaut32_handlers.py` cleaned up
-
-Deleted the 7 obsolete `tests/unit/api/test_oleaut32_*.py` unit test files that tested Python stubs now handled by real `oleaut32.dll`. Removed all dead Python `oleaut32.dll` stubs and trap objects (~1,100 lines), removed the temporary `_NoOleaut32Stubs` shim, migrated active `ole32.dll` COM handlers to `tew/api/ole32_handlers.py` (`register_ole32_handlers`), and updated callers in `crt_handlers.py` and `test_ole32_com.py`.
-
-## RESOLVED (2026-08-26): statically-imported DLLs' `DllMain` now runs; original DAO license-key BSTR bug confirmed fixed
-
-Fixed `build_iat_map`/`run_exe.py` so `d3d8.dll`/`oleaut32.dll`/`rpcrt4.dll`/
-`secur32.dll` (MCity_d.exe's own direct imports) actually run their real
-`DllMain(DLL_PROCESS_ATTACH)` now, matching real Windows loader ordering.
-Working through the resulting wave of newly-exercised missing handlers
-(GetSystemTimeAsFileTime, LoadLibraryExW, InitializeSListHead, CreateEventW,
-several ntdll.dll Rtl* primitives, wsprintfA, RegisterClipboardFormatA,
-GetSystemDirectoryA, CoSetState) confirmed the original bug fixed
-end-to-end: `SysAllocString` now returns a real BSTR, and the game runs
-real single-race gameplay DB traffic instead of halting on
-`Database initialization failed!`. Full writeup: status.md "cont'd x35",
-status_archive.md "cont'd x34" for the root-cause trace.
-
-## RESOLVED (2026-08-26): `kernel32.dll!SearchPathA` and `SearchPathW` implemented
-
-Implemented standard Win32 file search sequence and custom path search for `SearchPathA` and `SearchPathW` (`kernel32_io.py`). Live run confirmed `SearchPathW("expsrv.dll")` resolves cleanly to `C:\WINDOWS\SYSTEM32\expsrv.dll`.
-
-New blocker opened immediately downstream: `msvcrt.dll!wcsncpy`, called by `OLEAUT32.dll` at ~61.3s to copy the found typelib/DLL path.
+- RESOLVED (2026-08-26): `kernel32.dll!SearchPathA` and `SearchPathW` implemented → status_archive.md "Resolved TODOs"
 
 ## OBSOLETE (2026-08-26): real `.tlb` type-library parsing for `LoadTypeLibEx`
 
@@ -884,10 +356,4 @@ real, embedded `TYPELIB` PE resource itself and answers `Bind`/`GetDllEntry`/
 
 **Follow-up cleanup (RESOLVED 2026-08-26)**: dead `oleaut32_handlers.py` code removed and active `ole32.dll` handlers moved to `ole32_handlers.py`.
 
-## RESOLVED (2026-08-27/28, cont'd x36/x37): "Database initialization failed!" cleared -- DB init now runs for real
-
-Was caused by the chain of missing handlers fixed across x36/x37 (`_llseek`/`_lread`,
-`LoadLibraryA` stub-DLL fallback, `RegNotifyChangeKeyValue`, `WaitForMultipleObjects`,
-`GetStringTypeExW`, `wcsncmp`, etc.) -- DB init itself now completes and the game reaches
-real query execution. New, deeper blocker opened immediately downstream: see the
-`StockAssembly_SelectAPT` DAO/Jet query-parameter entry above.
+- RESOLVED (2026-08-27/28, cont'd x36/x37): "Database initialization failed!" cleared → status_archive.md "Resolved TODOs"
