@@ -406,30 +406,39 @@ if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
 #      "New mail IDs detected!" (the letter is mail) -- measured from a
 #      2026-09-29 screenshot (window 1600 px wide = 2x the 800-wide space).
 #   3. the home screen's "Screen Tips" popup close X (563,215): 30s after
-#      CONTINUE -- same trigger line, already in the file by the time this
-#      step is armed. The server always reports a first visit, so both the
-#      letter and the tips popup show every run. Measured 2026-09-30.
+#      the CONTINUE click. The server always reports a first visit, so both
+#      the letter and the tips popup show every run. Measured 2026-09-30.
 #   4. OK (398,335) on the "Screen Tips are available for many game
-#      screens..." notice that closing the popup brings up: 30s after step 3,
-#      same trigger line. Measured 2026-09-30.
-_auto_click_steps: list[tuple[FileTextTrigger, str, str, tuple[int, int]]] = []
+#      screens..." notice that closing the popup brings up: 30s after step 3.
+# Steps 3-4 have no file trigger (path None): they fire a fixed delay after
+# the previous click. Re-watching stdout.txt for the same line did not work
+# reliably -- a trigger only reads bytes past the file size it saw at
+# startup, and once the game's rewritten stdout.txt grows back past that size
+# before the step is armed, text already written below it is never seen.
+_auto_click_steps: list[tuple[FileTextTrigger | None, str | None, str | None, tuple[int, int]]] = []
 if not _TEW_NO_AUTO and not (_TEW_CLICK_AT or _TEW_CLICK_AFTER_SEC or _click_file_trigger):
     for _win_path, _text, _xy in (
         ("C:\\MCity\\MCity_Log.txt", "Done Getting Personas", (389, 444)),
         ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (399, 540)),
-        ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (563, 215)),
-        ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (398, 335)),
+        (None, None, (563, 215)),
+        (None, None, (398, 335)),
     ):
+        if _win_path is None:
+            _auto_click_steps.append((None, None, None, _xy))
+            continue
         _path = crt_state.translate_windows_path(_win_path)
         _auto_click_steps.append((FileTextTrigger(_path, _text), _path, _text, _xy))
 _auto_click_xy: tuple[int, int] | None = None
 
 
-def _arm_next_auto_click() -> None:
-    """Make the next baked-in step the active file trigger."""
+def _arm_next_auto_click() -> bool:
+    """Make the next baked-in step the active file trigger. A step without a
+    trigger is instead due _TEW_CLICK_WHEN_DELAY_SEC from now; returns True
+    for those so the caller schedules the click itself."""
     global _click_file_trigger, _TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT, _auto_click_xy
     _click_file_trigger, _TEW_CLICK_WHEN_FILE, _TEW_CLICK_WHEN_TEXT, _auto_click_xy = \
         _auto_click_steps.pop(0)
+    return _click_file_trigger is None
 
 
 if _auto_click_steps:
@@ -3520,10 +3529,18 @@ try:
             _click_up_injected = True
             if _auto_click_steps:
                 # Chain to the next baked-in click.
-                _arm_next_auto_click()
                 _TEW_CLICK_AT = None
                 _TEW_CLICK_AFTER_SEC = None
                 _click_premove_injected = _click_down_injected = _click_up_injected = False
+                if _arm_next_auto_click():
+                    import tew.api.d3d8._state as _d3d8_state
+                    _TEW_CLICK_AT = "%d,%d" % crt_state.window_manager.to_physical_xy(
+                        _d3d8_state._vk_hwnd, *_auto_click_xy)
+                    _TEW_CLICK_AFTER_SEC = str(
+                        time.monotonic() - _click_start_wall_time + _TEW_CLICK_WHEN_DELAY_SEC)
+                    logger.error("startup",
+                        f"[click-trigger] next baked-in click at {_TEW_CLICK_AT} in "
+                        f"{_TEW_CLICK_WHEN_DELAY_SEC}s (fixed delay after the previous click)")
 
         if os.path.exists(_TEW_LOG_TRIGGER):
             try:
