@@ -27,3 +27,4 @@ class Win32Error(IntEnum):
     ERROR_INSUFFICIENT_BUFFER  = 122   # The data area passed to a system call is too small
     ERROR_NOT_LOCKED           = 158   # The segment is already unlocked
     ERROR_ALREADY_EXISTS       = 183   # Cannot create a file that already exists
+    ERROR_INVALID_ADDRESS      = 487   # Attempt to access invalid address

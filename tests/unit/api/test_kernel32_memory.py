@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-from tew.api._state import CRTState
+from tew.api._state import CRTState, TEB_BASE
 from tew.api.kernel32_memory import register_kernel32_memory_handlers
+from tew.api.win32_errors import Win32Error
 from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
 
@@ -46,12 +47,16 @@ PAGE_NOACCESS   = 0x01
 PAGE_READWRITE  = 0x04
 PAGE_SIZE       = 4096
 MBI_SIZE        = 28
+VA_FLOOR        = 0x06000000
 
 
 @pytest.fixture
 def env():
     mem   = Memory(MEM_SIZE)
     state = CRTState()
+    # VirtualAlloc never hands out addresses past guest memory, so move its
+    # range inside this test's 128 MB (above the heap at 0x04000000).
+    state.virtual_alloc_floor = state.next_virtual_alloc = VA_FLOOR
     stubs = _StubHandlers()
     register_kernel32_memory_handlers(stubs, mem, state)
     cpu = _FakeCPU()
@@ -393,7 +398,7 @@ class TestVirtualAlloc:
 
     def test_reserve_explicit_addr_beyond_cursor_pulls_cursor_forward(self, env):
         cpu, mem, state, stubs = env
-        explicit_addr = state.next_virtual_alloc + 0x10000000
+        explicit_addr = state.next_virtual_alloc + 0x01000000
         call(stubs, cpu, mem, "VirtualAlloc", [explicit_addr, 1, MEM_RESERVE, PAGE_READWRITE])
         assert cpu.regs[EAX] == explicit_addr
         assert state.virtual_reserved[explicit_addr] == PAGE_SIZE
@@ -434,6 +439,71 @@ class TestVirtualAlloc:
         addr = cpu.regs[EAX]
         assert addr not in state.virtual_reserved
         assert addr not in state.virtual_committed
+
+    # Live crash: MSJET35 reserves and releases 1 MB pools repeatedly; a cursor
+    # that only moved up walked off the end of user space into unbacked memory.
+
+    def test_released_range_is_reused_after_wraparound(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 0x100000, MEM_RESERVE, PAGE_NOACCESS])
+        first = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualFree", [first, 0, MEM_RELEASE])
+        # Push the cursor to the end so the next search has to wrap.
+        state.next_virtual_alloc = MEM_SIZE - PAGE_SIZE
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 0x100000, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == first
+
+    def test_reserve_skips_over_live_reservations(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 0x2000, MEM_RESERVE, PAGE_NOACCESS])
+        a = cpu.regs[EAX]
+        state.next_virtual_alloc = a  # cursor points into a live range
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 0x1000, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == a + 0x2000
+
+    def test_exhausted_space_returns_null_and_sets_last_error(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc",
+             [0, MEM_SIZE - VA_FLOOR, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == VA_FLOOR
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 1, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == 0
+        assert mem.read32(TEB_BASE + 0x34) == Win32Error.ERROR_NOT_ENOUGH_MEMORY
+        assert cpu.halted is False
+        assert cpu.regs[ESP] == STACK + 16
+
+    def test_null_commit_also_fails_when_exhausted(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc",
+             [0, MEM_SIZE - VA_FLOOR, MEM_RESERVE, PAGE_NOACCESS])
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 1, MEM_COMMIT, PAGE_READWRITE])
+        assert cpu.regs[EAX] == 0
+        assert mem.read32(TEB_BASE + 0x34) == Win32Error.ERROR_NOT_ENOUGH_MEMORY
+
+    def test_never_returns_address_past_guest_memory(self, env):
+        cpu, mem, state, stubs = env
+        for _ in range(200):
+            call(stubs, cpu, mem, "VirtualAlloc", [0, 0x100000, MEM_RESERVE, PAGE_NOACCESS])
+            addr = cpu.regs[EAX]
+            if addr == 0:
+                break
+            assert addr + 0x100000 <= MEM_SIZE
+        assert addr == 0
+
+    def test_explicit_reserve_overlapping_existing_fails(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0, 0x2000, MEM_RESERVE, PAGE_NOACCESS])
+        base = cpu.regs[EAX]
+        call(stubs, cpu, mem, "VirtualAlloc", [base + 0x1000, 0x1000, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == 0
+        assert mem.read32(TEB_BASE + 0x34) == Win32Error.ERROR_INVALID_ADDRESS
+
+    def test_explicit_reserve_past_guest_memory_fails(self, env):
+        cpu, mem, state, stubs = env
+        call(stubs, cpu, mem, "VirtualAlloc", [0x814D0000, 0x100000, MEM_RESERVE, PAGE_NOACCESS])
+        assert cpu.regs[EAX] == 0
+        assert mem.read32(TEB_BASE + 0x34) == Win32Error.ERROR_INVALID_ADDRESS
+        assert 0x814D0000 not in state.virtual_reserved
 
 
 # ── VirtualFree ────────────────────────────────────────────────────────────────
