@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE
+from tew.api.win32_handlers import cleanup_stdcall
+from tew.logger import DEBUG, is_active as _log_active
 
 # ── D3D8 private bump-heap ──────────────────────────────────────────────────
 # Own bounded region, non-overlapping with the CRT heap (0x04000000 -
@@ -191,10 +193,13 @@ def _convert_to_bgra8(fmt: int, width: int, height: int, raw: bytes) -> bytes:
 
 
 def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
-    """stdcall stack cleanup for COM methods (this in ECX, args on stack)."""
-    ret_addr = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-    cpu.regs[ESP] = (cpu.regs[ESP] + 4 + arg_bytes) & 0xFFFFFFFF
-    memory.write32(cpu.regs[ESP], ret_addr)
+    """stdcall stack cleanup for COM methods: `this` (4 bytes) plus args.
+
+    Same operation as cleanup_stdcall with the extra 4 bytes, so a real
+    ZigCPU does it in one libcpu call instead of five ctypes crossings
+    (14% of lobby wall time when done here in Python).
+    """
+    cleanup_stdcall(cpu, memory, arg_bytes + 4)
 
 
 def _com_stub(
@@ -208,6 +213,9 @@ def _com_stub(
 ) -> int:
     """Register a COM vtable handler and return its trampoline address."""
     from tew.logger import logger as _logger
+
+    # See the logging comment inside _h for why D3D8 gets its own category.
+    _com_category = "d3d8" if dll_name.startswith("d3d8") else "handlers"
 
     def _h(cpu: "CPU") -> None:
         if expected_this is not None:
@@ -240,10 +248,14 @@ def _com_stub(
         # calls on DirectInput) drag the whole per-frame D3D8 firehose
         # back in too, which is most of what caused a run to get OOM-killed
         # earlier this session.
-        _com_category = "d3d8" if dll_name.startswith("d3d8") else "handlers"
-        _logger.debug(_com_category, f"[COM] {dll_name}!{name} called")
-        handler(cpu, memory)
-        _logger.debug(_com_category, f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
+        # The level check comes first so the f-strings (and the EAX read
+        # for the second one) aren't built on every call when DEBUG is off.
+        if _log_active(DEBUG, _com_category):
+            _logger.debug(_com_category, f"[COM] {dll_name}!{name} called")
+            handler(cpu, memory)
+            _logger.debug(_com_category, f"[COM] {dll_name}!{name} -> 0x{cpu.regs[EAX] & 0xFFFFFFFF:08x}")
+        else:
+            handler(cpu, memory)
         _cleanup_com(cpu, memory, arg_bytes)
 
     stubs.register_handler(dll_name, name, _h)
