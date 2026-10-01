@@ -31,6 +31,10 @@ never reuses them; past ~512 threads they hit the DLL slots at 0x10000000.
   the quad's DrawPrimitive before touching blend state; never enable the
   swapchain alpha write mask (the window goes transparent).
 - Logo cursor may not animate (low priority; may resolve as a side effect).
+- HOME avatar seen side-on: a few facets shade wrong (gray patch on the white
+  shirt below the shoulder, mismatched upper-arm facet); the rest of the model
+  is fine, so suspect per-triangle normals/UVs, not global state. Needs an XP
+  side-on screenshot of the same persona to confirm it's tew.
 
 ## `SetWindowPos` / `MoveWindow` don't touch the SDL window
 They update `WindowEntry` bookkeeping and return TRUE; only CreateDevice
@@ -54,6 +58,11 @@ unexamined). Poke them from tew to see the game's own debug text.
 ## Latent: `bAlertable` ignored in WaitForMultipleObjectsEx / SleepEx
 Harmless while no APC source exists (QueueUserAPC, ReadFileEx, WriteFileEx
 are unimplemented). Wire it in if any of those are added.
+
+## Auto-clicks after the Mayor's letter use fixed 30s delays
+CONTINUE, Screen Tips X and its OK each fire 30s after the previous click
+(~90s of padding to the lobby). Trigger each on a log/stdout line instead,
+like the first two clicks.
 
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
