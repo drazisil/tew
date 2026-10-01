@@ -13,16 +13,19 @@ These tests verify the DISPATCHER is correct on inputs we fully control.
 """
 
 import pytest
-from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, ESP, EAX, EBP
-from tew.kernel.kernel_structures import KernelStructures
+
 from tew.api.win32_handlers import Win32Handlers
-from tew.logger import set_emit_hook
+from tew.hardware.cpu_zig import EAX, EBP, ESP, ZigCPU
+from tew.hardware.memory import Memory
+from tew.kernel.kernel_structures import KernelStructures
+from tew.kernel.seh import (
+    dispatch_exception,
+    register_seh_handlers,
+)
 from tew.kernel.seh import (
     install as seh_install,
-    register_seh_handlers,
-    dispatch_exception,
 )
+from tew.logger import set_emit_hook
 
 MEM_SIZE = 0x00400000
 STACK_TOP = 0x00040000

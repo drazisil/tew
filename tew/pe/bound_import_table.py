@@ -1,8 +1,9 @@
 """PE Bound Import Table parser."""
 
 from __future__ import annotations
+
 import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from tew.helpers import hex_val, read_null_terminated
 
@@ -40,7 +41,7 @@ class BoundImportDescriptor:
     def forwarder_refs(self) -> list[BoundForwarderRef]: return self._forwarder_refs
 
     def __str__(self) -> str:
-        dt = datetime.fromtimestamp(self._time_date_stamp, tz=timezone.utc).strftime(
+        dt = datetime.fromtimestamp(self._time_date_stamp, tz=UTC).strftime(
             "%a, %d %b %Y %H:%M:%S GMT"
         )
         s = f"{self._module_name} ({hex_val(self._time_date_stamp)} - {dt})"

@@ -7,16 +7,16 @@ CoCreateInstanceEx, CoGetClassObject, CLSIDFromProgID).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader, LoadedDLL
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState, read_wide_string
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 S_OK = 0
@@ -46,10 +46,10 @@ _KNOWN_COM_SERVERS = {"dao350.dll"}
 
 
 def register_ole32_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
-    dll_loader: Optional["DLLLoader"] = None,
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
+    dll_loader: DLLLoader | None = None,
 ) -> None:
     """Register all ole32.dll handlers."""
 
@@ -77,21 +77,21 @@ def register_ole32_handlers(
     # ── ole32.dll — COM initialisation ────────────────────────────────────────
 
     # CoInitialize(pvReserved) -> HRESULT
-    def _CoInitialize(cpu: "CPU") -> None:
+    def _CoInitialize(cpu: CPU) -> None:
         cpu.regs[EAX] = 0  # S_OK
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("ole32.dll", "CoInitialize", _CoInitialize)
 
     # CoInitializeEx(pvReserved, dwCoInit) -> HRESULT
-    def _CoInitializeEx(cpu: "CPU") -> None:
+    def _CoInitializeEx(cpu: CPU) -> None:
         cpu.regs[EAX] = 0  # S_OK
         cleanup_stdcall(cpu, memory, 8)
 
     stubs.register_handler("ole32.dll", "CoInitializeEx", _CoInitializeEx)
 
     # CoUninitialize() -> void
-    def _CoUninitialize(cpu: "CPU") -> None:
+    def _CoUninitialize(cpu: CPU) -> None:
         cleanup_stdcall(cpu, memory, 0)
 
     stubs.register_handler("ole32.dll", "CoUninitialize", _CoUninitialize)
@@ -102,7 +102,7 @@ def register_ole32_handlers(
     # cross-apartment state tracking is modeled here -- callers only need a
     # non-negative HRESULT to treat their own state setup as having
     # succeeded, matching real S_OK.
-    def _CoSetState(cpu: "CPU") -> None:
+    def _CoSetState(cpu: CPU) -> None:
         cpu.regs[EAX] = 0  # S_OK
         cleanup_stdcall(cpu, memory, 4)
 
@@ -130,13 +130,13 @@ def register_ole32_handlers(
         """Register an IMalloc vtable method ('this' pushed on stack as an
         implicit first arg, standard COM __stdcall ABI) and return its
         trampoline address."""
-        def _h(cpu: "CPU") -> None:
+        def _h(cpu: CPU) -> None:
             handler(cpu)
             cleanup_stdcall(cpu, memory, 4 + stack_arg_bytes)
         stubs.register_handler("ole32", name, _h)
         return stubs.get_handler_address("ole32", name) or 0
 
-    def _imalloc_query_interface(cpu: "CPU") -> None:
+    def _imalloc_query_interface(cpu: CPU) -> None:
         riid = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         ppv  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         riid_str = _read_guid_str(riid)
@@ -152,20 +152,20 @@ def register_ole32_handlers(
             logger.info("com", f"IMalloc::QueryInterface({{{riid_str}}}) -> E_NOINTERFACE")
             cpu.regs[EAX] = E_NOINTERFACE
 
-    def _imalloc_add_ref(cpu: "CPU") -> None:
+    def _imalloc_add_ref(cpu: CPU) -> None:
         _imalloc_box["refcount"] += 1
         cpu.regs[EAX] = _imalloc_box["refcount"] & 0xFFFFFFFF
 
-    def _imalloc_release(cpu: "CPU") -> None:
+    def _imalloc_release(cpu: CPU) -> None:
         _imalloc_box["refcount"] = max(0, _imalloc_box["refcount"] - 1)
         cpu.regs[EAX] = _imalloc_box["refcount"] & 0xFFFFFFFF
 
-    def _imalloc_alloc(cpu: "CPU") -> None:
+    def _imalloc_alloc(cpu: CPU) -> None:
         cb = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         addr = state.simple_alloc(cb or 1)
         cpu.regs[EAX] = addr & 0xFFFFFFFF
 
-    def _imalloc_realloc(cpu: "CPU") -> None:
+    def _imalloc_realloc(cpu: CPU) -> None:
         pv = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         cb = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if pv == 0:
@@ -187,7 +187,7 @@ def register_ole32_handlers(
         state.heap_alloc_sizes.pop(pv, None)
         cpu.regs[EAX] = new_addr & 0xFFFFFFFF
 
-    def _imalloc_free(cpu: "CPU") -> None:
+    def _imalloc_free(cpu: CPU) -> None:
         pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if pv == 0:
             return
@@ -198,16 +198,16 @@ def register_ole32_handlers(
             return
         del state.heap_alloc_sizes[pv]
 
-    def _imalloc_get_size(cpu: "CPU") -> None:
+    def _imalloc_get_size(cpu: CPU) -> None:
         pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         sz = state.heap_alloc_sizes.get(pv)
         cpu.regs[EAX] = sz if sz is not None else 0xFFFFFFFF
 
-    def _imalloc_did_alloc(cpu: "CPU") -> None:
+    def _imalloc_did_alloc(cpu: CPU) -> None:
         pv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         cpu.regs[EAX] = 1 if pv in state.heap_alloc_sizes else 0
 
-    def _imalloc_heap_minimize(cpu: "CPU") -> None:
+    def _imalloc_heap_minimize(cpu: CPU) -> None:
         pass  # no-op, void return — bump allocator has nothing to minimize
 
     def _get_imalloc_obj() -> int:
@@ -233,7 +233,7 @@ def register_ole32_handlers(
         return _imalloc_box["obj_addr"]
 
     # CoGetMalloc(dwMemContext, ppMalloc) -> HRESULT
-    def _CoGetMalloc(cpu: "CPU") -> None:
+    def _CoGetMalloc(cpu: CPU) -> None:
         ppmalloc = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         obj_addr = _get_imalloc_obj()
         _imalloc_box["refcount"] += 1
@@ -261,7 +261,7 @@ def register_ole32_handlers(
     # not import ole32_handlers.py, but this keeps the same
     # import-inside-function convention crt_handlers.py/kernel32_system.py
     # already use for this exact same import).
-    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+    from tew.api.user32_handlers import _get_dialog_sentinel, _invoke_emulated_proc
 
     # Scratch IID_IClassFactory, needed for the internal
     # DllGetClassObject(..., IID_IClassFactory, ...) call every real
@@ -292,12 +292,12 @@ def register_ole32_handlers(
             _iid_iunknown_addr_box[0] = addr
         return _iid_iunknown_addr_box[0]
 
-    def _resolve_com_server(clsid_addr: int) -> "str | None":
+    def _resolve_com_server(clsid_addr: int) -> str | None:
         key = f"hkcr\\clsid\\{{{_read_guid_str(clsid_addr)}}}\\inprocserver32"
         entry = state.registry_values.get(key, {}).get("")
         return str(entry.value) if entry is not None else None
 
-    def _resolve_progid_clsid(progid: str) -> "str | None":
+    def _resolve_progid_clsid(progid: str) -> str | None:
         """ProgID -> CLSID string (no braces), per HKCR\\<ProgID>\\CLSID's
         default value. Registry-driven, same honest-failure philosophy as
         _resolve_com_server: an unregistered ProgID returns None rather
@@ -319,7 +319,7 @@ def register_ole32_handlers(
             for key in state.registry_values
         )
 
-    def _ensure_dll_ready(dll_filename: str, cpu: "CPU") -> "LoadedDLL | None":
+    def _ensure_dll_ready(dll_filename: str, cpu: CPU) -> LoadedDLL | None:
         if dll_loader is None:
             return None
         was_loaded = dll_loader.get_dll(dll_filename) is not None
@@ -362,7 +362,7 @@ def register_ole32_handlers(
         return loaded
 
     def _call_dll_get_class_object(
-        cpu: "CPU", loaded: "LoadedDLL", rclsid: int, riid: int, ppv: int,
+        cpu: CPU, loaded: LoadedDLL, rclsid: int, riid: int, ppv: int,
     ) -> int:
         addr = dll_loader.get_export_address(loaded.name, "DllGetClassObject") if dll_loader else None
         if not addr:
@@ -380,7 +380,7 @@ def register_ole32_handlers(
         *positive* Python int, not negative."""
         return bool(hr & 0x80000000)
 
-    def _dispatch_com_method(cpu: "CPU", obj_addr: int, slot: int, args: list[int]) -> int:
+    def _dispatch_com_method(cpu: CPU, obj_addr: int, slot: int, args: list[int]) -> int:
         vtable = memory.read32(obj_addr)
         method_addr = memory.read32((vtable + slot * 4) & 0xFFFFFFFF)
         sentinel = _get_dialog_sentinel(state, memory)
@@ -389,7 +389,7 @@ def register_ole32_handlers(
             scheduler=state.scheduler) & 0xFFFFFFFF
 
     # CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv) -> HRESULT
-    def _CoCreateInstance(cpu: "CPU") -> None:
+    def _CoCreateInstance(cpu: CPU) -> None:
         rclsid      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p_unk_outer = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         riid        = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -437,7 +437,7 @@ def register_ole32_handlers(
     # requested interfaces -- writes each result directly into its own
     # MULTI_QI.pItf/hr fields (real COM proxies do the same in-place
     # marshaling, so no scratch buffer is needed for the [out] pointers).
-    def _CoCreateInstanceEx(cpu: "CPU") -> None:
+    def _CoCreateInstanceEx(cpu: CPU) -> None:
         rclsid       = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         p_unk_outer  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dw_count     = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -518,7 +518,7 @@ def register_ole32_handlers(
     stubs.register_handler("ole32.dll", "CoCreateInstanceEx", _CoCreateInstanceEx)
 
     # CoGetClassObject(rclsid, dwClsContext, pServerInfo, riid, ppv) -> HRESULT
-    def _CoGetClassObject(cpu: "CPU") -> None:
+    def _CoGetClassObject(cpu: CPU) -> None:
         rclsid = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         riid   = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         ppv    = memory.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -552,7 +552,7 @@ def register_ole32_handlers(
     stubs.register_handler("ole32.dll", "CoGetClassObject", _CoGetClassObject)
 
     # CLSIDFromProgID(lpszProgID, lpclsid) -> HRESULT
-    def _CLSIDFromProgID(cpu: "CPU") -> None:
+    def _CLSIDFromProgID(cpu: CPU) -> None:
         lp_progid = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_clsid  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         progid = read_wide_string(lp_progid, memory)
@@ -578,7 +578,7 @@ def register_ole32_handlers(
     # verifies the resolved CLSID actually has a server registration
     # (InprocServer32/LocalServer32) -- the extra integrity check real
     # Windows makes that plain CLSIDFromProgID doesn't.
-    def _CLSIDFromProgIDEx(cpu: "CPU") -> None:
+    def _CLSIDFromProgIDEx(cpu: CPU) -> None:
         lp_progid = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_clsid  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         progid = read_wide_string(lp_progid, memory)
@@ -607,14 +607,14 @@ def register_ole32_handlers(
     stubs.register_handler("ole32.dll", "CLSIDFromProgIDEx", _CLSIDFromProgIDEx)
 
     # OleInitialize(pvReserved) -> HRESULT
-    def _OleInitialize(cpu: "CPU") -> None:
+    def _OleInitialize(cpu: CPU) -> None:
         cpu.regs[EAX] = 0  # S_OK — 1 stdcall arg (pvReserved, must be NULL)
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("ole32.dll", "OleInitialize", _OleInitialize)
 
     # OleUninitialize() -> void
-    def _OleUninitialize(cpu: "CPU") -> None:
+    def _OleUninitialize(cpu: CPU) -> None:
         cleanup_stdcall(cpu, memory, 0)  # void return, no args
 
     stubs.register_handler("ole32.dll", "OleUninitialize", _OleUninitialize)

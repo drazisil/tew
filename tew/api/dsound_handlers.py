@@ -41,10 +41,10 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers
-from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
 from tew.api._state import CRTState
+from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
+from tew.api.win32_handlers import Win32Handlers
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # ── Fixed COM addresses ────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ _callback_refs: dict[int, object]    = {}
 # ── SDL audio helpers ─────────────────────────────────────────────────────────
 
 def _mix_into(buf: _DSBuffer, mem_buf: bytearray,
-              out: "_array.ArrayType[int]", length: int) -> None:
+              out: _array.ArrayType[int], length: int) -> None:
     """Mix one DSBuffer's PCM data into the S16 output array, advancing play_cursor."""
     remaining = buf.buf_size - buf.play_cursor
     if remaining <= 0:
@@ -128,14 +128,14 @@ def _mix_into(buf: _DSBuffer, mem_buf: bytearray,
         n = min(len(src), len(out))
         for i in range(n):
             mixed = out[i] + src[i]
-            out[i] = 32767 if mixed > 32767 else (-32768 if mixed < -32768 else mixed)
+            out[i] = 32767 if mixed > 32767 else (max(mixed, -32768))
     else:
         # 8-bit unsigned → convert to S16
         n = min(len(chunk), len(out))
         for i in range(n):
             s = (chunk[i] - 128) * 256
             mixed = out[i] + s
-            out[i] = 32767 if mixed > 32767 else (-32768 if mixed < -32768 else mixed)
+            out[i] = 32767 if mixed > 32767 else (max(mixed, -32768))
 
     buf.play_cursor += copy_bytes
     if buf.looping and buf.play_cursor >= buf.buf_size:
@@ -147,15 +147,18 @@ def _open_sdl_audio(mem_buf: bytearray,
     """Open SDL2 audio device.  Returns device ID (> 0) on success."""
     try:
         from sdl2 import (
-            SDL_AudioSpec, SDL_AudioCallback,
-            SDL_OpenAudioDevice, SDL_PauseAudioDevice,
-            AUDIO_S16SYS, AUDIO_U8,
+            AUDIO_S16SYS,
+            AUDIO_U8,
+            SDL_AudioCallback,
+            SDL_AudioSpec,
+            SDL_OpenAudioDevice,
+            SDL_PauseAudioDevice,
         )
 
         fmt = AUDIO_S16SYS if bits == 16 else AUDIO_U8
 
         def _callback(userdata: int,
-                       stream: "ctypes.POINTER[ctypes.c_uint8]",
+                       stream: ctypes.POINTER[ctypes.c_uint8],
                        length: int) -> None:
             stream_addr = ctypes.cast(stream, ctypes.c_void_p).value
             ctypes.memset(stream_addr, 0, length)
@@ -213,9 +216,9 @@ def _close_sdl_audio(dev_id: int) -> None:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 def register_dsound_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register all DirectSound COM stubs and write vtable pointers into memory."""
 
@@ -234,13 +237,13 @@ def register_dsound_handlers(
 
     # ── IDirectSound vtable ────────────────────────────────────────────────
 
-    def _ds_query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _ds_query_interface(cpu: CPU, mem: Memory) -> None:
         ppv = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if ppv:
             mem.write32(ppv, DS_OBJ)
         cpu.regs[EAX] = DS_OK
 
-    def _ds_create_sound_buffer(cpu: "CPU", mem: "Memory") -> None:
+    def _ds_create_sound_buffer(cpu: CPU, mem: Memory) -> None:
         lp_desc    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp_lp_dsb  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if not lp_desc or not lp_lp_dsb:
@@ -289,7 +292,7 @@ def register_dsound_handlers(
             f"{sr}Hz/{ch}ch/{bps}bit buf={buf_bytes}B) -> obj=0x{obj:08x}")
         cpu.regs[EAX] = DS_OK
 
-    def _ds_get_caps(cpu: "CPU", mem: "Memory") -> None:
+    def _ds_get_caps(cpu: CPU, mem: Memory) -> None:
         lp = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if lp:
             dw_size = mem.read32(lp & 0xFFFFFFFF)
@@ -300,10 +303,10 @@ def register_dsound_handlers(
             mem.write32(lp + 4, 0x00000001)       # dwFlags: DSCAPS_PRIMARYMONO
         cpu.regs[EAX] = DS_OK
 
-    def _ds_set_cooperative_level(cpu: "CPU", mem: "Memory") -> None:
+    def _ds_set_cooperative_level(cpu: CPU, mem: Memory) -> None:
         cpu.regs[EAX] = DS_OK
 
-    def _ds_duplicate_sound_buffer(cpu: "CPU", mem: "Memory") -> None:
+    def _ds_duplicate_sound_buffer(cpu: CPU, mem: Memory) -> None:
         lp_orig     = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp_lp_dup   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if not lp_orig or not lp_lp_dup:
@@ -376,7 +379,7 @@ def register_dsound_handlers(
 
     # ── IDirectSoundBuffer vtable ──────────────────────────────────────────
 
-    def _buf_this(cpu: "CPU", mem: "Memory") -> "_DSBuffer | None":
+    def _buf_this(cpu: CPU, mem: Memory) -> _DSBuffer | None:
         """Read `this` from ESP+4, look up buffer state.  Returns None if invalid."""
         obj = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if not obj:
@@ -385,14 +388,14 @@ def register_dsound_handlers(
         with _ds_buf_lock:
             return _ds_buffers.get(idx)
 
-    def _buf_query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_query_interface(cpu: CPU, mem: Memory) -> None:
         this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ppv  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if ppv:
             mem.write32(ppv, this)
         cpu.regs[EAX] = DS_OK
 
-    def _buf_get_caps(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_get_caps(cpu: CPU, mem: Memory) -> None:
         lp = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
         if lp and buf:
@@ -404,7 +407,7 @@ def register_dsound_handlers(
             mem.write32(lp + 8,   buf.buf_size)   # dwBufferBytes
         cpu.regs[EAX] = DS_OK
 
-    def _buf_get_current_position(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_get_current_position(cpu: CPU, mem: Memory) -> None:
         lp_play  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_write = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
@@ -421,7 +424,7 @@ def register_dsound_handlers(
                 mem.write32(lp_write, write_cur & 0xFFFFFFFF)
         cpu.regs[EAX] = DS_OK
 
-    def _buf_get_format(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_get_format(cpu: CPU, mem: Memory) -> None:
         lp_wfx       = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dw_allocated = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         lp_written   = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -441,7 +444,7 @@ def register_dsound_handlers(
                 mem.write32(lp_written, 18)
         cpu.regs[EAX] = DS_OK
 
-    def _buf_get_status(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_get_status(cpu: CPU, mem: Memory) -> None:
         lp = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
         if lp and buf:
@@ -453,7 +456,7 @@ def register_dsound_handlers(
             mem.write32(lp, status)
         cpu.regs[EAX] = DS_OK
 
-    def _buf_lock(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_lock(cpu: CPU, mem: Memory) -> None:
         obj           = mem.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_cursor     = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dw_bytes      = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -498,7 +501,7 @@ def register_dsound_handlers(
         if lp_bytes2: mem.write32(lp_bytes2, bytes2)
         cpu.regs[EAX] = DS_OK
 
-    def _buf_play(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_play(cpu: CPU, mem: Memory) -> None:
         dw_flags = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
         if buf is None or buf.is_primary:
@@ -515,7 +518,7 @@ def register_dsound_handlers(
             buf.playing = True
         cpu.regs[EAX] = DS_OK
 
-    def _buf_set_current_position(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_set_current_position(cpu: CPU, mem: Memory) -> None:
         dw_pos = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
         if buf:
@@ -523,7 +526,7 @@ def register_dsound_handlers(
                 buf.play_cursor = dw_pos % buf.buf_size if buf.buf_size else 0
         cpu.regs[EAX] = DS_OK
 
-    def _buf_set_format(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_set_format(cpu: CPU, mem: Memory) -> None:
         lp_wfx = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf = _buf_this(cpu, mem)
         if buf and lp_wfx:
@@ -534,7 +537,7 @@ def register_dsound_handlers(
                 buf.bits_per_sample = bps
         cpu.regs[EAX] = DS_OK
 
-    def _buf_stop(cpu: "CPU", mem: "Memory") -> None:
+    def _buf_stop(cpu: CPU, mem: Memory) -> None:
         buf = _buf_this(cpu, mem)
         if buf:
             with _ds_buf_lock:
@@ -612,7 +615,7 @@ def register_dsound_handlers(
 
     # ── DirectSoundCreate DLL export (ordinal 1 + by name) ────────────────
 
-    def _direct_sound_create(cpu: "CPU") -> None:
+    def _direct_sound_create(cpu: CPU) -> None:
         # DirectSoundCreate(lpGUID, ppDS, pUnkOuter) — 12 bytes, stdcall
         from tew.api.win32_handlers import cleanup_stdcall
         pp_ds = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)

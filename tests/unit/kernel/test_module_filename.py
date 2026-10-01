@@ -3,9 +3,7 @@ Tests for GetModuleFileNameA support: CRTState.reverse_translate_path and
 the path-resolution logic used by the handler.
 """
 
-import pytest
 from tew.api._state import CRTState, DynamicModule, EmulatorConfig
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers

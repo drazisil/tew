@@ -5,15 +5,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api._state import CRTState
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
-    from tew.api._state import CRTState
 
-from tew.hardware.cpu_zig import EAX, ESP
 from tew.api._state import TEB_BASE
 from tew.api.win32_errors import Win32Error
 from tew.api.win32_handlers import cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # ── Heap flag constants ───────────────────────────────────────────────────────
@@ -43,15 +43,15 @@ _USER_VA_START          = 0x00010000
 
 
 def register_kernel32_memory_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register heap and virtual memory handlers."""
 
     # ── Heap management ───────────────────────────────────────────────────────
 
-    def _heap_create(cpu: "CPU") -> None:
+    def _heap_create(cpu: CPU) -> None:
         fl = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         unsupported = fl & ~_HEAP_KNOWN_CREATE_FLAGS
         if unsupported:
@@ -66,10 +66,10 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 12)
 
-    def _get_process_heap(cpu: "CPU") -> None:
+    def _get_process_heap(cpu: CPU) -> None:
         cpu.regs[EAX] = state.process_heap
 
-    def _heap_alloc(cpu: "CPU") -> None:
+    def _heap_alloc(cpu: CPU) -> None:
         caller   = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         h_heap   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
@@ -101,7 +101,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = addr
         cleanup_stdcall(cpu, memory, 12)
 
-    def _heap_free(cpu: "CPU") -> None:
+    def _heap_free(cpu: CPU) -> None:
         h_heap   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp_mem   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -130,7 +130,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 12)
 
-    def _heap_realloc(cpu: "CPU") -> None:
+    def _heap_realloc(cpu: CPU) -> None:
         h_heap   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp_mem   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -169,7 +169,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = new_addr
         cleanup_stdcall(cpu, memory, 16)
 
-    def _heap_size(cpu: "CPU") -> None:
+    def _heap_size(cpu: CPU) -> None:
         h_heap   = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         lp_mem   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -189,7 +189,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = sz if sz is not None else 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 12)
 
-    def _heap_validate(cpu: "CPU") -> None:
+    def _heap_validate(cpu: CPU) -> None:
         h_heap  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         # dw_flags (ESP+8) and lp_mem (ESP+12) are intentionally unused:
         # our bump allocator has no fragmentation or corruption to check.
@@ -237,13 +237,13 @@ def register_kernel32_memory_handlers(
                 return cand
         return None
 
-    def _fail(cpu: "CPU", err: Win32Error, msg: str) -> None:
+    def _fail(cpu: CPU, err: Win32Error, msg: str) -> None:
         logger.error("handlers", f"[VirtualAlloc] {msg} -> NULL ({err.name})")
         memory.write32(TEB_BASE + 0x34, int(err))
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 16)
 
-    def _take_free_range(cpu: "CPU", size: int) -> int | None:
+    def _take_free_range(cpu: CPU, size: int) -> int | None:
         addr = _find_free_range(size)
         if addr is None:
             used = sum(state.virtual_reserved.values())
@@ -254,7 +254,7 @@ def register_kernel32_memory_handlers(
         state.next_virtual_alloc = (addr + size) & 0xFFFFFFFF
         return addr
 
-    def _virtual_alloc(cpu: "CPU") -> None:
+    def _virtual_alloc(cpu: CPU) -> None:
         lp_addr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_size  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         fl_type  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -329,7 +329,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = addr
         cleanup_stdcall(cpu, memory, 16)
 
-    def _virtual_query(cpu: "CPU") -> None:
+    def _virtual_query(cpu: CPU) -> None:
         # VirtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer,
         # SIZE_T dwLength) -> SIZE_T (bytes written, 0 on failure). Live-
         # confirmed call: MSJET35.DLL's own memory manager probing a page it
@@ -379,7 +379,7 @@ def register_kernel32_memory_handlers(
         cpu.regs[EAX] = _MBI_SIZE
         cleanup_stdcall(cpu, memory, 12)
 
-    def _virtual_free(cpu: "CPU") -> None:
+    def _virtual_free(cpu: CPU) -> None:
         lp_addr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_size  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dw_type  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)

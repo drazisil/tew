@@ -25,19 +25,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu_zig import EAX, ESP
+from tew.api.d3d8._helpers import _alloc_registry, _com_stub, _heap_free, _set_eax
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax, _heap_free, _alloc_registry
+from tew.hardware.cpu_zig import EAX, ESP
 
 # Per-object reference counts: obj_addr -> count (initial = 1 on first access)
 _ref_counts: dict[int, int] = {}
 
 
-def _add_ref(cpu: "CPU", mem: "Memory") -> None:
+def _add_ref(cpu: CPU, mem: Memory) -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) + 1
     _ref_counts[this] = count
@@ -77,7 +77,7 @@ def _free_object(addr: int) -> None:
             _dec_ref_and_maybe_free(surf)
 
 
-def _release(cpu: "CPU", mem: "Memory") -> None:
+def _release(cpu: CPU, mem: Memory) -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) - 1
     if count > 0:
@@ -88,18 +88,18 @@ def _release(cpu: "CPU", mem: "Memory") -> None:
     cpu.regs[EAX] = max(count, 0)
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def make_vtable(stubs: Win32Handlers, memory: Memory) -> list[int]:
     """Return the 14 trampoline addresses for the buffer resource vtable."""
 
     # [3] GetDevice(IDirect3DDevice8**) — writes D3DDEV_OBJ into the out-pointer
-    def _get_device(cpu: "CPU", mem: "Memory") -> None:
+    def _get_device(cpu: CPU, mem: Memory) -> None:
         pp_device = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
         cpu.regs[EAX] = S_OK
 
     # [11] GetDesc(void* pDesc) — fills D3DVERTEXBUFFER_DESC / D3DINDEXBUFFER_DESC
-    def _buffer_get_desc(cpu: "CPU", mem: "Memory") -> None:
+    def _buffer_get_desc(cpu: CPU, mem: Memory) -> None:
         this_ptr = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         p_desc   = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_desc:
@@ -125,7 +125,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # Confirmed live: every DrawPrimitive with StartVertex > 0 read an
     # all-zero vertex (position, color and UV all 0) from an otherwise
     # correctly-populated buffer, while StartVertex == 0 read real data.
-    def _buffer_lock(cpu: "CPU", mem: "Memory") -> None:
+    def _buffer_lock(cpu: CPU, mem: Memory) -> None:
         this_ptr = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         offset   = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         ppb_data = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -137,7 +137,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     from tew.logger import logger as _log
     _qi_seen: set = set()
 
-    def _query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _query_interface(cpu: CPU, mem: Memory) -> None:
         riid_ptr = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ppv      = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         try:

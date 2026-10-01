@@ -27,7 +27,8 @@ import pytest
 from tew.api._state import CRTState
 from tew.api.user32_handlers import _invoke_emulated_proc
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU as CPU, FatalHaltError
+from tew.hardware.cpu_zig import FatalHaltError
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE  = 8 * 1024 * 1024
@@ -45,7 +46,7 @@ def test_invoke_emulated_proc_raises_when_nested_call_fatally_halts():
 
     stubs = Win32Handlers(mem)
 
-    def _fake_unimplemented(c: "CPU") -> None:
+    def _fake_unimplemented(c: CPU) -> None:
         c.halted = True
         c.fatal_halt = True
 

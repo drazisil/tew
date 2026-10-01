@@ -13,17 +13,17 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP, EBP
-from tew.api.win32_handlers import (
-    Win32Handlers,
-    DIALOG_TRAMPOLINE,
-    DLLMAIN_TRAMPOLINE,
-    DLLMAIN_HANDLE_STORE,
-)
 from tew.api._state import CRTState, read_cstring
 from tew.api.msvcrt_handlers import _sprintf_format, _write_cstring
-from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
-from tew.logger import logger, DEBUG
+from tew.api.user32_handlers import _get_dialog_sentinel, _invoke_emulated_proc
+from tew.api.win32_handlers import (
+    DIALOG_TRAMPOLINE,
+    DLLMAIN_HANDLE_STORE,
+    DLLMAIN_TRAMPOLINE,
+    Win32Handlers,
+)
+from tew.hardware.cpu_zig import EAX, EBP, ESP
+from tew.logger import DEBUG, logger
 
 # __pfnReportHook (0x020ee23c): global written by the game's own real,
 # unpatched _CrtSetReportHook (0x009f92e0 -- `MOV [0x020ee23c], ECX`,
@@ -36,9 +36,9 @@ _CRT_REPORT_HOOK_PTR = 0x020ee23c
 
 
 def patch_crt_internals(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Patch CRT internal functions at hardcoded game addresses."""
 
@@ -47,7 +47,7 @@ def patch_crt_internals(
     # We set EAX=1 (IDOK) and RET — which pops the original DialogBoxParamA
     # return address (placed there by our stack manipulation) — returning to
     # the game's call site with the login result.
-    def _dialog_finish_idok(cpu: "CPU") -> None:
+    def _dialog_finish_idok(cpu: CPU) -> None:
         cpu.regs[EAX] = 1  # IDOK — dialog proc ran, credentials were read
         # Dialog proc uses RET (cdecl, no arg cleanup), so the 4 args (hwnd, msg,
         # wParam, lParam) remain on the stack. Skip them so [ESP] = retAddr.
@@ -61,7 +61,7 @@ def patch_crt_internals(
     # DllMain(hModule, DLL_PROCESS_ATTACH, 0) via the stack trick.
     # After DllMain does RET 12, EIP lands here. We restore EAX = hModule
     # (the correct LoadLibraryA return value) then RET back to the original caller.
-    def _dll_main_finish(cpu: "CPU") -> None:
+    def _dll_main_finish(cpu: CPU) -> None:
         # This trampoline always overwrites EAX with the handle regardless
         # of DllMain's real return value -- a DllMain returning FALSE (init
         # failure) is silently treated as success. Confirmed not currently
@@ -80,7 +80,7 @@ def patch_crt_internals(
 
     # WinMain check 1 (0x68a402 CALL 0x40d1d4; 0x68a407 TEST EAX,EAX; JNZ pass)
     # No-arg cdecl function; must return non-zero (any non-zero = pass).
-    def _winmain_check1(cpu: "CPU") -> None:
+    def _winmain_check1(cpu: CPU) -> None:
         cpu.regs[EAX] = 0x12345678  # non-zero — cdecl no args, caller has no ADD ESP
 
     stubs.patch_address(0x0040D1D4, "_winmain_check1", _winmain_check1)
@@ -89,7 +89,7 @@ def patch_crt_internals(
     # cdecl 2 args: [ESP+4]=buf_ptr, [ESP+8]=max_len (31).
     # Must return non-zero AND write a parseable version string to the buffer so that
     # the following _sscanf(buf, "%u, %u, %u", ...) returns 3.
-    def _winmain_check2(cpu: "CPU") -> None:
+    def _winmain_check2(cpu: CPU) -> None:
         buf_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         s = "1, 2, 3"
         for i, ch in enumerate(s):
@@ -107,7 +107,7 @@ def patch_crt_internals(
     # 0x009f1bc3 (which would push registers and call _CrtDbgReport) is patched,
     # so a mismatch halts with the frame details. Patching the entry used to
     # trap to Python on every debug-build function return just to read ZF.
-    def _chkesp_fail(cpu: "CPU") -> None:
+    def _chkesp_fail(cpu: CPU) -> None:
         # Reached only via the JNE: ZF=0, and [ESP] is still the caller's
         # return address (the failure path hasn't pushed anything yet).
         ret_addr    = memory.read32(cpu.regs[ESP])
@@ -130,7 +130,7 @@ def patch_crt_internals(
     #            const char *moduleName, const char *format, ...)
     # reportType: 0=_CRT_WARN, 1=_CRT_ERROR, 2=_CRT_ASSERT
     # We halt loudly so assertions are never silently swallowed.
-    def _crt_dbg_report(cpu: "CPU") -> None:
+    def _crt_dbg_report(cpu: CPU) -> None:
         sp          = cpu.regs[ESP]
         report_type = memory.read32((sp + 4)  & 0xFFFFFFFF)
         filename_ptr = memory.read32((sp + 8)  & 0xFFFFFFFF)
@@ -231,7 +231,7 @@ def patch_crt_internals(
     # real per-track/per-asset chatter, e.g. dozens of Track.c(444) lines
     # per run, not warning-worthy, and drowned out the [alive] progress
     # signal under default LOG_LEVEL=info).
-    def _channel_debug_print(cpu: "CPU") -> None:
+    def _channel_debug_print(cpu: CPU) -> None:
         sp        = cpu.regs[ESP]
         user      = memory.read32((sp + 4)  & 0xFFFFFFFF)
         channel   = memory.read32((sp + 8)  & 0xFFFFFFFF)
@@ -296,7 +296,7 @@ def patch_crt_internals(
     # "NUL","wt") runs) at Molly's request 2026-08-07, so SYSTEM-channel
     # output lands in stdout.txt alongside real puts()/printf() output
     # instead of only tew's own /tmp/emu.log.
-    def _channel_system_print(cpu: "CPU") -> None:
+    def _channel_system_print(cpu: CPU) -> None:
         # Skip the vararg-formatting walk entirely when neither sink needs
         # it -- same rationale as _channel_debug_print above, but this one
         # also feeds the real stdout redirect (guest_stdout_handle), so
@@ -373,7 +373,7 @@ def patch_crt_internals(
     SNDMEMI_STRUCT_PTR = 0x020def78  # DAT_020def78
     SNDMEMI_INIT_ADDR  = 0x00a5422a
 
-    def _sndmemi_init(cpu: "CPU") -> None:
+    def _sndmemi_init(cpu: CPU) -> None:
         param_1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         param_2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         # Zero-fill the entire pool struct so all fields (including [5]) start clean
@@ -408,7 +408,7 @@ def patch_crt_internals(
     # Original: __cdecl, no args, no return value.
     from tew.hardware.cpu_zig import EBP as _EBP
 
-    def _sndmemi_validate(cpu: "CPU") -> None:
+    def _sndmemi_validate(cpu: CPU) -> None:
         pool_ptr = memory.read32(SNDMEMI_STRUCT_PTR & 0xFFFFFFFF)
         if not pool_ptr:
             return

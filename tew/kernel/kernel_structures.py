@@ -1,6 +1,7 @@
 """TEB/PEB kernel structure simulation for the x86-32 emulator."""
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -33,7 +34,7 @@ class KernelStructures:
     Sets up the FS segment base so FS:[offset] addressing works.
     """
 
-    def __init__(self, memory: "Memory") -> None:
+    def __init__(self, memory: Memory) -> None:
         self._memory = memory
         self._teb: TEBStructure | None = None
         self._peb: PEBStructure | None = None

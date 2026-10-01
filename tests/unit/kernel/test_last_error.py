@@ -6,11 +6,11 @@ GetLastError reads from there.  These tests verify the layout directly.
 """
 
 import pytest
-from tew.hardware.memory import Memory
-from tew.kernel.kernel_structures import KernelStructures
+
 from tew.api._state import TEB_BASE
 from tew.api.win32_errors import Win32Error
-
+from tew.hardware.memory import Memory
+from tew.kernel.kernel_structures import KernelStructures
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Win32Error constants match winerror.h

@@ -9,15 +9,15 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.dsound_handlers import (
-    register_dsound_handlers,
     DS_OBJ,
     DS_OK,
-    DSERR_INVALIDPARAM,
     DSBCAPS_PRIMARYBUFFER,
     DSBLOCK_ENTIREBUFFER,
+    DSERR_INVALIDPARAM,
+    register_dsound_handlers,
 )
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

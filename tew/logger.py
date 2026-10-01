@@ -41,9 +41,9 @@ categories).
 """
 
 import os
-import sys
 import time
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Literal
 
 _start_time: float = time.monotonic()
 

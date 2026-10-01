@@ -10,7 +10,8 @@ If a number seems wrong for your binary, verify against ntoskrnl KiServiceTable.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
@@ -320,14 +321,14 @@ class NtSyscallDispatcher:
     Unregistered syscalls raise RuntimeError with the name from the XP table.
     """
 
-    def __init__(self, memory: "Memory") -> None:
+    def __init__(self, memory: Memory) -> None:
         self._memory = memory
         self._handlers: dict[int, NtSyscallHandler] = {}
 
     def register(self, syscall_num: int, handler: NtSyscallHandler) -> None:
         self._handlers[syscall_num] = handler
 
-    def dispatch(self, cpu: "CPU") -> None:
+    def dispatch(self, cpu: CPU) -> None:
         num = cpu.regs[EAX] & 0xFFFFFFFF
         name = _NT_SYSCALL_NAMES.get(num, f"Unknown_0x{num:x}")
         logger.debug("nt", f"NT syscall 0x{num:03x} ({name}) EIP=0x{cpu.eip & 0xFFFFFFFF:08x}")

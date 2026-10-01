@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from tew.hardware._kernel_lib import _lib
 from tew.logger import logger
@@ -150,7 +150,7 @@ class _CurrentThreadProxy:
     call-site inventory)."""
     __slots__ = ("_sched", "handle")
 
-    def __init__(self, sched: "ZigScheduler", handle: int) -> None:
+    def __init__(self, sched: ZigScheduler, handle: int) -> None:
         self._sched = sched
         self.handle = handle
 
@@ -182,7 +182,7 @@ class ZigScheduler:
         # non-cpu/non-memory Python collaborator (Kernel.tick() does real
         # socket select()/window-manager posting), see the plan's Design
         # Decision 2 for why that can't move into Zig as-is.
-        self._kernel: Optional[object] = None
+        self._kernel: object | None = None
 
     def __del__(self) -> None:
         if getattr(self, "_sched", 0):
@@ -273,7 +273,7 @@ class ZigScheduler:
             logger.debug("scheduler",
                 f"[switch] tid={before_tid} -> tid={after_tid} ({context})")
 
-    def status_at_idx(self, idx: int) -> Optional[ThreadStatus]:
+    def status_at_idx(self, idx: int) -> ThreadStatus | None:
         """Translator for user32_handlers.py's index-based DEAD check
         (`scheduler.threads[idx].status` in the old Scheduler) -- looks up
         the handle at `idx` first (scheduler_handle_at_idx), then the
@@ -312,7 +312,7 @@ class ZigScheduler:
     def set_suspended(self, handle: int, val: bool) -> None:
         _lib.scheduler_set_suspended(self._sched, handle & 0xFFFFFFFF, val)
 
-    def get_thread_id(self, handle: int) -> Optional[int]:
+    def get_thread_id(self, handle: int) -> int | None:
         """None if handle doesn't match any known thread (matches the other
         accessors' benign-sentinel convention -- see scheduler.zig)."""
         tid = _lib.scheduler_get_thread_id(self._sched, handle & 0xFFFFFFFF)
@@ -337,13 +337,13 @@ class ZigScheduler:
 
     # ── Public: context switch ────────────────────────────────────────────────
 
-    def switch_to(self, cpu: "CPU", memory: "Memory", idx: int) -> bool:
+    def switch_to(self, cpu: CPU, memory: Memory, idx: int) -> bool:
         before = self._current_tid_or_none()
         result = bool(_lib.scheduler_switch_to(self._sched, cpu.native_handle, idx & 0xFFFFFFFF))
         self._log_if_switched(before, "switch_to")
         return result
 
-    def preempt_slice(self, cpu: "CPU", memory: "Memory") -> bool:
+    def preempt_slice(self, cpu: CPU, memory: Memory) -> bool:
         before = self._current_tid_or_none()
         result = bool(_lib.scheduler_preempt_slice(self._sched, cpu.native_handle))
         self._log_if_switched(before, "preempt_slice, batch boundary")
@@ -364,7 +364,7 @@ class ZigScheduler:
     # ready, give Kernel.tick() a chance to signal something (real socket
     # I/O, window messages) before trying once more.
 
-    def _resolve_next_idx(self, cpu: "CPU") -> int:
+    def _resolve_next_idx(self, cpu: CPU) -> int:
         next_idx = _lib.scheduler_pick_next_ready(self._sched)
         if next_idx < 0 and self._kernel is not None:
             self._kernel.tick()
@@ -378,9 +378,9 @@ class ZigScheduler:
     # ready has real wake side effects that the original Python never
     # triggers on a refused/fatally-halted call).
 
-    def block_current_on_handles(self, cpu: "CPU", memory: "Memory",
+    def block_current_on_handles(self, cpu: CPU, memory: Memory,
                                   handles: frozenset, retry_eip: int,
-                                  deadline_ms: Optional[int] = None) -> None:
+                                  deadline_ms: int | None = None) -> None:
         before = self._current_tid_or_none()
         if cpu.fatal_halt:
             return
@@ -401,7 +401,7 @@ class ZigScheduler:
             retry_eip, has_deadline, deadline_val, next_idx)
         self._log_if_switched(before, "block_current_on_handles")
 
-    def sleep_current(self, cpu: "CPU", memory: "Memory",
+    def sleep_current(self, cpu: CPU, memory: Memory,
                        return_eip: int, eax_val: int, sleep_ms: int) -> None:
         before = self._current_tid_or_none()
         if cpu.fatal_halt:
@@ -419,7 +419,7 @@ class ZigScheduler:
             self._sched, cpu.native_handle, return_eip, eax_val, sleep_ms, next_idx)
         self._log_if_switched(before, "sleep_current")
 
-    def mark_current_dead(self, cpu: "CPU", memory: "Memory") -> None:
+    def mark_current_dead(self, cpu: CPU, memory: Memory) -> None:
         """Deliberately does NOT check reentrant_depth -- a thread dying
         mid-nested-call must still hand off the CPU; see scheduler.zig's
         completeMarkCurrentDead docstring."""
@@ -430,7 +430,7 @@ class ZigScheduler:
         _lib.scheduler_complete_mark_current_dead(self._sched, cpu.native_handle, next_idx)
         self._log_if_switched(before, "mark_current_dead")
 
-    def terminate_thread(self, cpu: "CPU", memory: "Memory", handle: int) -> Optional[bool]:
+    def terminate_thread(self, cpu: CPU, memory: Memory, handle: int) -> bool | None:
         """Returns None if handle doesn't match any known thread, True if a
         *different* thread was terminated, False if the *current* thread
         terminated itself (matches the old tri-state Optional[bool]
@@ -460,5 +460,5 @@ class ZigScheduler:
 
     # ── Public: clock ──────────────────────────────────────────────────────────
 
-    def tick(self, ms: int, memory: "Memory") -> None:
+    def tick(self, ms: int, memory: Memory) -> None:
         _lib.scheduler_tick(self._sched, ms & 0xFFFFFFFF)

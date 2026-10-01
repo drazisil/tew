@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from tew import logger as logger_module
-from tew.logger import ERROR, WARN, INFO, DEBUG, configure_logger, logger, set_emit_hook
+from tew.logger import DEBUG, INFO, WARN, configure_logger, logger, set_emit_hook
 
 
 @pytest.fixture

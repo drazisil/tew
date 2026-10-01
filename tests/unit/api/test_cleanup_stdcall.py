@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from tew.api.win32_handlers import cleanup_stdcall
-from tew.hardware.cpu_zig import ZigCPU, ESP
+from tew.hardware.cpu_zig import ESP, ZigCPU
 from tew.hardware.memory_zig import ZigMemory
 
 MEM_SIZE = 0x10000

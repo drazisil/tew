@@ -8,9 +8,9 @@ from __future__ import annotations
 import pytest
 
 from tew.api._state import CRTState, RegistryEntry
-from tew.api.advapi32_handlers import register_advapi32_handlers, _reg_key_names
-from tew.hardware.memory import Memory
+from tew.api.advapi32_handlers import _reg_key_names, register_advapi32_handlers
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

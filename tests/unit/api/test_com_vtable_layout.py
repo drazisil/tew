@@ -16,11 +16,16 @@ do with DirectSound at all. This test would have caught it.
 from __future__ import annotations
 
 from tew.api.d3d8._layout import (
-    D3D8_VTABLE, D3D8_OBJ, D3DDEV_VTABLE, D3DDEV_OBJ,
-    D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE,
+    D3D8_OBJ,
+    D3D8_VTABLE,
+    D3DDEV_OBJ,
+    D3DDEV_VTABLE,
+    D3DRES_VTABLE,
+    D3DSURF_VTABLE,
+    D3DTEX_VTABLE,
 )
-from tew.api.dinput_handlers import DI_VTABLE, DI_OBJ, DI_DEV_VTABLE
-from tew.api.dsound_handlers import DS_VTABLE, DS_OBJ, DS_BUF_VTABLE
+from tew.api.dinput_handlers import DI_DEV_VTABLE, DI_OBJ, DI_VTABLE
+from tew.api.dsound_handlers import DS_BUF_VTABLE, DS_OBJ, DS_VTABLE
 
 # (name, start, byte_size) for every fixed COM region in this address space.
 _REGIONS: list[tuple[str, int, int]] = [

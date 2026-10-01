@@ -13,9 +13,9 @@ import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.nt_syscall import NtSyscallDispatcher
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.nt_syscall import NtSyscallDispatcher
 
 from tew.hardware.cpu_zig import EAX, EDX
 from tew.logger import logger
@@ -23,14 +23,14 @@ from tew.logger import logger
 STATUS_SUCCESS = 0x00000000
 
 
-def _arg(cpu: "CPU", memory: "Memory", n: int) -> int:
+def _arg(cpu: CPU, memory: Memory, n: int) -> int:
     """Read the nth argument (1-based) from the syscall arg list at EDX."""
     return memory.read32((cpu.regs[EDX] + (n - 1) * 4) & 0xFFFFFFFF)
 
 
 # ── NtWriteFile (0x116) ───────────────────────────────────────────────────────
 
-def _nt_write_file(cpu: "CPU", memory: "Memory") -> None:
+def _nt_write_file(cpu: CPU, memory: Memory) -> None:
     """NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
                    IoStatusBlock, Buffer, Length, ByteOffset, Key)
 
@@ -61,7 +61,7 @@ def _nt_write_file(cpu: "CPU", memory: "Memory") -> None:
 
 # ── NtTerminateProcess (0x103) ────────────────────────────────────────────────
 
-def _nt_terminate_process(cpu: "CPU", memory: "Memory") -> None:
+def _nt_terminate_process(cpu: CPU, memory: Memory) -> None:
     """NtTerminateProcess(ProcessHandle, ExitStatus)
 
     ProcessHandle -1 means the current process. Halts the CPU cleanly.
@@ -77,6 +77,6 @@ def _nt_terminate_process(cpu: "CPU", memory: "Memory") -> None:
 
 # ── Registration ──────────────────────────────────────────────────────────────
 
-def register_nt_handlers(dispatcher: "NtSyscallDispatcher") -> None:
+def register_nt_handlers(dispatcher: NtSyscallDispatcher) -> None:
     dispatcher.register(0x116, _nt_write_file)
     dispatcher.register(0x103, _nt_terminate_process)

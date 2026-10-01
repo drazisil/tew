@@ -11,21 +11,20 @@ from __future__ import annotations
 import pytest
 
 from tew.api.dinput_handlers import (
-    register_dinput_handlers,
-    DI_OBJ,
-    DI_VTABLE,
     DI_DEV_VTABLE,
-    DI_OK,
     DI_NOTATTACHED,
+    DI_OBJ,
+    DI_OK,
     DI_POLLEDDEVICE,
-    E_NOTIMPL,
-    E_NOINTERFACE,
+    DI_VTABLE,
     DIERR_DEVICENOTREG,
     DIERR_UNSUPPORTED,
-    DIERR_OBJECTNOTFOUND,
+    E_NOINTERFACE,
+    E_NOTIMPL,
+    register_dinput_handlers,
 )
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

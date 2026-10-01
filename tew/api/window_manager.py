@@ -12,39 +12,61 @@ from __future__ import annotations
 
 import ctypes
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.api.pe_resources import PEResources
 
 from sdl2 import (
-    SDL_Init, SDL_Quit, SDL_INIT_VIDEO, SDL_INIT_EVENTS, SDL_INIT_AUDIO,
-    SDL_SetHint,
-    SDL_CreateWindow, SDL_DestroyWindow,
-    SDL_CreateRenderer, SDL_DestroyRenderer,
-    SDL_WINDOW_SHOWN, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
-    SDL_RENDERER_ACCELERATED, SDL_RENDERER_PRESENTVSYNC,
-    SDL_PollEvent, SDL_Event,
+    SDL_BUTTON_LEFT,
+    SDL_BUTTON_LMASK,
+    SDL_BUTTON_MIDDLE,
+    SDL_BUTTON_MMASK,
+    SDL_BUTTON_RIGHT,
+    SDL_BUTTON_RMASK,
+    SDL_INIT_AUDIO,
+    SDL_INIT_EVENTS,
+    SDL_INIT_VIDEO,
+    SDL_KEYDOWN,
+    SDL_KEYUP,
+    SDL_MOUSEBUTTONDOWN,
+    SDL_MOUSEBUTTONUP,
+    SDL_MOUSEMOTION,
     SDL_QUIT,
-    SDL_KEYDOWN, SDL_KEYUP,
+    SDL_RENDERER_ACCELERATED,
+    SDL_RENDERER_PRESENTVSYNC,
     SDL_TEXTINPUT,
-    SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP, SDL_MOUSEMOTION,
+    SDL_WINDOW_RESIZABLE,
+    SDL_WINDOW_SHOWN,
+    SDL_WINDOW_VULKAN,
     SDL_WINDOWEVENT,
     SDL_WINDOWEVENT_CLOSE,
-    SDL_WINDOWEVENT_FOCUS_GAINED, SDL_WINDOWEVENT_FOCUS_LOST,
+    SDL_WINDOWEVENT_FOCUS_GAINED,
+    SDL_WINDOWEVENT_FOCUS_LOST,
+    SDLK_BACKSPACE,
+    SDLK_DELETE,
+    SDLK_ESCAPE,
+    SDLK_KP_ENTER,
+    SDLK_RETURN,
+    SDLK_TAB,
+    SDL_CreateRenderer,
+    SDL_CreateWindow,
+    SDL_DestroyRenderer,
+    SDL_DestroyWindow,
+    SDL_Event,
     SDL_GetWindowID,
+    SDL_Init,
+    SDL_PollEvent,
+    SDL_Quit,
     SDL_RaiseWindow,
-    SDLK_BACKSPACE, SDLK_RETURN, SDLK_KP_ENTER, SDLK_TAB,
-    SDLK_ESCAPE, SDLK_DELETE,
-    SDL_BUTTON_LEFT, SDL_BUTTON_MIDDLE, SDL_BUTTON_RIGHT,
-    SDL_BUTTON_LMASK, SDL_BUTTON_RMASK, SDL_BUTTON_MMASK,
+    SDL_SetHint,
 )
-
 from sdl2.hints import SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE
 
-from tew.logger import logger
 from tew.api.pe_resources import DialogTemplate
+from tew.logger import logger
 
 
 def _sdl_buttons_to_wparam(sdl_button_state: int) -> int:
@@ -209,9 +231,9 @@ class WindowEntry:
     dlg_result: int = 0
     dlg_done: bool = False
     check_state: int = 0                       # for BUTTON checkboxes (BST_UNCHECKED / BST_CHECKED)
-    sdl_window: Optional[object] = None        # SDL_Window* for top-level windows
-    sdl_renderer: Optional[object] = None      # SDL_Renderer* for top-level windows
-    bitmap_texture: Optional[object] = None    # SDL_Texture* for SS_BITMAP STATIC controls
+    sdl_window: object | None = None        # SDL_Window* for top-level windows
+    sdl_renderer: object | None = None      # SDL_Renderer* for top-level windows
+    bitmap_texture: object | None = None    # SDL_Texture* for SS_BITMAP STATIC controls
     logical_w: int = 0                         # window size (px) as CreateWindow/CreateWindowExA
     logical_h: int = 0                         # requested it -- what the guest believes its window is
     phys_w: int = 0                            # real SDL window size (px) right now; 0 = same as
@@ -248,17 +270,17 @@ class WindowManager:
         # One-shot programmatic dialog interaction hook -- see
         # set_dialog_step_hook/click_control. Cleared before invocation, so
         # it fires at most once per registration.
-        self._dialog_step_hook: Optional[Callable[["WindowManager", int], None]] = None
+        self._dialog_step_hook: Callable[[WindowManager, int], None] | None = None
         # Persistent MessageBoxA/W auto-answer hook -- see set_messagebox_hook.
         # Unlike _dialog_step_hook, NOT one-shot: each MessageBoxA call is
         # already a single synchronous event (no polling loop to consume a
         # hook from), so the hook is consulted on every call and decides
         # per-call whether to answer or let the real message box show.
-        self._messagebox_hook: Optional[Callable[[str, str, int], Optional[int]]] = None
+        self._messagebox_hook: Callable[[str, str, int], int | None] | None = None
         # SDL window ID → top-level hwnd
         self._sdl_window_id_to_hwnd: dict[int, int] = {}
         # PE resources for loading bitmap textures (set by run_exe.py after load)
-        self._pe_resources: Optional["PEResources"] = None
+        self._pe_resources: PEResources | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -310,7 +332,7 @@ class WindowManager:
         self._initialized = False
         logger.info("window", "[WindowManager] SDL2 shut down")
 
-    def set_pe_resources(self, pe_resources: "PEResources") -> None:
+    def set_pe_resources(self, pe_resources: PEResources) -> None:
         """Provide PE resources so bitmap STATIC controls can load their textures."""
         self._pe_resources = pe_resources
 
@@ -1002,7 +1024,7 @@ class WindowManager:
 
         logger.debug("dialog", f"[WindowManager]   no hit for click ({px},{py})")
 
-    def _activate_button(self, dlg_hwnd: int, ctrl_id: int, child_hwnd: int, child: "WindowEntry") -> None:
+    def _activate_button(self, dlg_hwnd: int, ctrl_id: int, child_hwnd: int, child: WindowEntry) -> None:
         """Shared BUTTON-activation logic for both a real pixel-hit-tested
         click (_handle_mouse_click) and a synthetic ID-based one
         (click_control): toggle checkbox styles in place, otherwise post
@@ -1033,7 +1055,7 @@ class WindowManager:
         self._activate_button(dlg_hwnd, ctrl_id, child_hwnd, child)
         return True
 
-    def set_dialog_step_hook(self, hook: Callable[["WindowManager", int], None]) -> None:
+    def set_dialog_step_hook(self, hook: Callable[[WindowManager, int], None]) -> None:
         """Registers a one-shot callback hook(wm, dlg_hwnd), invoked on the
         next DialogBoxParamA modal-loop iteration for whichever dialog is
         active. Cleared immediately before invocation, so it fires once by
@@ -1042,7 +1064,7 @@ class WindowManager:
         or to chain a further step."""
         self._dialog_step_hook = hook
 
-    def set_messagebox_hook(self, hook: Optional[Callable[[str, str, int], Optional[int]]]) -> None:
+    def set_messagebox_hook(self, hook: Callable[[str, str, int], int | None] | None) -> None:
         """Registers a persistent hook(caption, text, uType) consulted before
         every MessageBoxA/W call (see user32_handlers.py's _show_messagebox).
         Returning a Win32 button ID (e.g. 7 = IDNO) auto-answers with it,

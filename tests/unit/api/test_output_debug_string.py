@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import os
 
+from tew import logger as logger_module
 from tew.api._state import CRTState, FileHandleEntry
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.api.win32_handlers import Win32Handlers
 from tew.hardware.cpu_zig import ESP
 from tew.hardware.memory import Memory
-from tew import logger as logger_module
 
 MEM_SIZE = 4 * 1024 * 1024
 STACK    = 0x00200000
