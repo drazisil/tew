@@ -17,7 +17,7 @@ Addresses and layouts come from Ghidra (project debug_clean):
     Exit codes seen: 2 OK/accept, 3 cancel, 4 next screen, 6 quit, 7 error,
     8 timeout, 0xd "parent is exiting" (sent to every child).
   - GUI::ReadProperties (0x00af0800): GUI.mBounds is a GRect at +0x60
-    (vftable, x, y, w, h), GUI.mText a GUIStr at +0x8c, GUI.mToolTip one at
+    (vftable, then y, x, w, h: note y before x), GUI.mText a GUIStr at +0x8c, GUI.mToolTip one at
     +0xf0. The instance name from the `.gui` header (`[<name>.<class>]`) is
     the GUIStr at +0x48.
   - ClassName() is vtable slot 1 (+4). On GUI itself that slot is the
@@ -44,7 +44,7 @@ GUI_VTABLE = 0x01204BD8            # ??_7GUI@@6B@
 _NAME_OFFSET = 0x48                # GUIStr: instance name
 _TEXT_OFFSET = 0x8C                # GUIStr: GUI.mText
 _TIP_OFFSET = 0xF0                 # GUIStr: GUI.mToolTip
-_BOUNDS_OFFSET = 0x60              # GRect: vftable, then x, y, w, h
+_BOUNDS_OFFSET = 0x60              # GRect: vftable, then y, x, w, h
 
 # Classes the log subscriber skips because they dominate every teardown burst.
 # A deny-list, not a whitelist: a class not named here is always logged, so a
@@ -167,7 +167,11 @@ class GuestGuiReader:
             f"+{slot}=0x{ptr:08x}->{self._peek(ptr)!r}" for slot, ptr in slots) + ")"
 
     def bounds(self, obj: int) -> Bounds:
-        x, y, w, h = (int.from_bytes(self._rd(obj + _BOUNDS_OFFSET + 4 + 4 * i, 4), "little", signed=True)
+        """The .gui file says `[x, y] w, h`, but the GRect holds y before x.
+        Checked against the files: Generic.GMsgBox `[238, 260] 351, 85` reads
+        back as (260, 238, 351, 85), jumpCarsales `[9, 2] 56, 12` as (2, 9, 56, 12),
+        and message boxes re-centre to x=224 / y=(600-h)/2 after layout."""
+        y, x, w, h = (int.from_bytes(self._rd(obj + _BOUNDS_OFFSET + 4 + 4 * i, 4), "little", signed=True)
                       for i in range(4))
         return Bounds(x, y, w, h)
 

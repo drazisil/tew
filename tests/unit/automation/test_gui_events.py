@@ -115,15 +115,25 @@ class TestDescribe:
     def test_name_text_tip_and_bounds(self, img):
         put_guistr(img, FOO_OBJ, 0x48, "Login")
         put_guistr(img, FOO_OBJ, 0xF0, "kTxtHome", slot=8, buf=0x6100)     # pointer in the other slot
-        for i, v in enumerate((343, 153, 231, 120)):
+        for i, v in enumerate((153, 343, 231, 120)):        # memory order: y, x, w, h
             u32(img, FOO_OBJ + 0x60 + 4 + 4 * i, v)
         d = reader_for(img).describe(FOO_OBJ)
         assert d == {"name": "Login", "text": "", "tip": "kTxtHome", "bounds": Bounds(343, 153, 231, 120)}
         assert str(d["bounds"]) == "[343, 153] 231, 120"
 
     def test_negative_bounds(self, img):
-        u32(img, FOO_OBJ + 0x60 + 4, -5)
+        u32(img, FOO_OBJ + 0x60 + 8, -5)        # x is the second int
         assert reader_for(img).bounds(FOO_OBJ).x == -5
+
+    @pytest.mark.parametrize("in_memory, as_in_the_gui_file", [
+        ((260, 238, 351, 85), Bounds(238, 260, 351, 85)),    # Generic.GMsgBox  [238, 260] 351, 85
+        ((2, 9, 56, 12), Bounds(9, 2, 56, 12)),              # jumpCarsales     [9, 2] 56, 12
+        ((46, 288, 224, 13), Bounds(288, 46, 224, 13)),      # <EDIT> in Dlg.Msg [288, 46] 224, 13
+    ])
+    def test_bounds_come_out_in_the_gui_files_x_y_order(self, img, in_memory, as_in_the_gui_file):
+        for i, v in enumerate(in_memory):
+            u32(img, FOO_OBJ + 0x60 + 4 + 4 * i, v)
+        assert reader_for(img).bounds(FOO_OBJ) == as_in_the_gui_file
 
     def test_unrecognised_guistr_layout_shows_raw_values(self, img):
         u32(img, FOO_OBJ + 0x48 + 4, 0x6200)
