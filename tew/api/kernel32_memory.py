@@ -11,6 +11,8 @@ if TYPE_CHECKING:
     from tew.api._state import CRTState
 
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.api._state import TEB_BASE
+from tew.api.win32_errors import Win32Error
 from tew.api.win32_handlers import cleanup_stdcall
 from tew.logger import logger
 
@@ -34,6 +36,10 @@ _PAGE_READWRITE         = 0x04
 _PAGE_EXECUTE_READWRITE = 0x40
 _KNOWN_PROTECT_FLAGS    = _PAGE_NOACCESS | _PAGE_READWRITE | _PAGE_EXECUTE_READWRITE
 _KNOWN_ALLOC_TYPES      = _MEM_COMMIT | _MEM_RESERVE
+# Top of XP's user address space (0x7FFF0000 and up is the reserved 64 KB
+# guard and kernel space). Also capped at the guest memory size.
+_USER_VA_END            = 0x7FFF0000
+_USER_VA_START          = 0x00010000
 
 
 def register_kernel32_memory_handlers(
@@ -205,6 +211,49 @@ def register_kernel32_memory_handlers(
 
     # ── VirtualAlloc / VirtualFree ────────────────────────────────────────────
 
+    def _va_end() -> int:
+        return min(_USER_VA_END, memory.size)
+
+    def _overlaps_reserved(addr: int, size: int) -> bool:
+        return any(
+            addr < base + sz and base < addr + size
+            for base, sz in state.virtual_reserved.items()
+        )
+
+    def _find_free_range(size: int) -> int | None:
+        """Next-fit: first gap of `size` bytes at or after the cursor, then
+        from the floor, so ranges released by VirtualFree are reused."""
+        end = _va_end()
+        ranges = sorted(state.virtual_reserved.items())
+        for start in (state.next_virtual_alloc, state.virtual_alloc_floor):
+            cand = max(start, state.virtual_alloc_floor)
+            for base, sz in ranges:
+                if base + sz <= cand:
+                    continue
+                if cand + size <= base:
+                    break
+                cand = (base + sz + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
+            if cand + size <= end:
+                return cand
+        return None
+
+    def _fail(cpu: "CPU", err: Win32Error, msg: str) -> None:
+        logger.error("handlers", f"[VirtualAlloc] {msg} -> NULL ({err.name})")
+        memory.write32(TEB_BASE + 0x34, int(err))
+        cpu.regs[EAX] = 0
+        cleanup_stdcall(cpu, memory, 16)
+
+    def _take_free_range(cpu: "CPU", size: int) -> int | None:
+        addr = _find_free_range(size)
+        if addr is None:
+            used = sum(state.virtual_reserved.values())
+            _fail(cpu, Win32Error.ERROR_NOT_ENOUGH_MEMORY,
+                  f"no free 0x{size:x}-byte range below 0x{_va_end():08x} "
+                  f"(0x{used:x} bytes reserved in {len(state.virtual_reserved)} regions)")
+            return None
+        state.next_virtual_alloc = (addr + size) & 0xFFFFFFFF
+        return addr
+
     def _virtual_alloc(cpu: "CPU") -> None:
         lp_addr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_size  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
@@ -228,10 +277,9 @@ def register_kernel32_memory_handlers(
         if (fl_type & _MEM_COMMIT) and not (fl_type & _MEM_RESERVE):
             if lp_addr == 0:
                 # NULL + MEM_COMMIT: spec says system implicitly reserves+commits
-                addr = state.next_virtual_alloc
-                state.next_virtual_alloc = (
-                    (state.next_virtual_alloc + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
-                ) & 0xFFFFFFFF
+                addr = _take_free_range(cpu, page_size)
+                if addr is None:
+                    return
                 state.virtual_reserved[addr] = page_size
                 state.virtual_committed[addr] = page_size
                 state.virtual_protect[addr] = fl_prot
@@ -256,14 +304,22 @@ def register_kernel32_memory_handlers(
             return
         if lp_addr != 0:
             addr = lp_addr
+            if addr < _USER_VA_START or addr + page_size > _va_end():
+                _fail(cpu, Win32Error.ERROR_INVALID_ADDRESS,
+                      f"requested 0x{addr:08x}+0x{page_size:x} is outside user space "
+                      f"[0x{_USER_VA_START:08x}, 0x{_va_end():08x})")
+                return
+            if (fl_type & _MEM_RESERVE) and _overlaps_reserved(addr, page_size):
+                _fail(cpu, Win32Error.ERROR_INVALID_ADDRESS,
+                      f"MEM_RESERVE at 0x{addr:08x}+0x{page_size:x} overlaps an existing reservation")
+                return
             end = (lp_addr + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
             if end > state.next_virtual_alloc:
                 state.next_virtual_alloc = end & 0xFFFFFFFF
         else:
-            addr = state.next_virtual_alloc
-            state.next_virtual_alloc = (
-                (state.next_virtual_alloc + page_size + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1)
-            ) & 0xFFFFFFFF
+            addr = _take_free_range(cpu, page_size)
+            if addr is None:
+                return
         if fl_type & _MEM_RESERVE:
             state.virtual_reserved[addr] = page_size
         if fl_type & _MEM_COMMIT:

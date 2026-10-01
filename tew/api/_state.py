@@ -343,6 +343,10 @@ class CRTState:
         self.heap_handles.add(self.process_heap)
 
         # ── VirtualAlloc ──────────────────────────────────────────────────
+        # Allocations without an address are placed next-fit in
+        # [virtual_alloc_floor, user VA end / guest memory end), wrapping back
+        # to the floor so released ranges get reused.
+        self.virtual_alloc_floor: int = 0x40000000
         self.next_virtual_alloc: int = 0x40000000
         self.virtual_reserved: dict[int, int] = {}   # addr → size
         self.virtual_committed: dict[int, int] = {}  # addr → size
