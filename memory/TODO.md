@@ -31,6 +31,10 @@ never reuses them; past ~512 threads they hit the DLL slots at 0x10000000.
   the quad's DrawPrimitive before touching blend state; never enable the
   swapchain alpha write mask (the window goes transparent).
 - Logo cursor may not animate (low priority; may resolve as a side effect).
+- HOME avatar seen side-on: a few facets shade wrong (gray patch on the white
+  shirt below the shoulder, mismatched upper-arm facet); the rest of the model
+  is fine, so suspect per-triangle normals/UVs, not global state. Needs an XP
+  side-on screenshot of the same persona to confirm it's tew.
 
 ## `SetWindowPos` / `MoveWindow` don't touch the SDL window
 They update `WindowEntry` bookkeeping and return TRUE; only CreateDevice
