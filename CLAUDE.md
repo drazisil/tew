@@ -56,9 +56,9 @@ Debug build installed).
   `d3d8/`); `_state.py` holds shared CRT state.
 - `tew/loader/`: PE loading, relocations, IAT. `tew/kernel/`: TEB/PEB.
 - `tew/automation/`: game-state events for scripted input. `events.py` is the
-  emitter + log subscriber; `gui_events.py` emits `gui_exit` (GUI::OnExit:
-  class, name, bounds, exit code) from a logpoint. Skip noisy classes in
-  `LOG_SKIP_CLASSES`.
+  emitter + log subscriber; `gui_events.py` emits `gui_begin` / `gui_exit`
+  (GUI::OnBegin / OnExit: class, name, bounds, exit code) from logpoints. Skip
+  noisy classes in `LOG_SKIP_CLASSES`.
 - `cpu/`: Zig x86 core, x87 FPU, scheduler (`libcpu.so`, via
   `tew/hardware/cpu_zig.py`).
 - Config: `emulator.json` (exe path, `C:\` -> `~/.emu32/`), `registry.json`.

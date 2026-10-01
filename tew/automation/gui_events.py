@@ -1,11 +1,17 @@
 """Automation events from the game's GUI objects (MCity_d.exe).
 
-`gui_exit` is emitted every time GUI::OnExit is entered: a dialog, message box
-or screen is closing, or a child is being told its parent is. Everything is
-read out of guest memory from inside a logpoint (which runs in cpu_run), so no
-guest code is called; ClassName() is recovered statically instead.
+  gui_begin  GUI::OnBegin is entered: an object is starting (a dialog, message
+             box, screen or widget is being shown).
+  gui_exit   GUI::OnExit is entered: a dialog, message box or screen is
+             closing, or a child is being told its parent is.
+
+Everything is read out of guest memory from inside a logpoint (which runs in
+cpu_run), so no guest code is called; ClassName() is recovered statically.
 
 Addresses and layouts come from Ghidra (project debug_clean):
+  - GUI::OnBegin(this), __thiscall, vtable slot 21 (0x00aec5e0, a direct
+    entry: GUI's own, not a thunk). It sets the "begun" flag at +0x108 and
+    posts GEVENT 0x13. Overrides chain to it, so the logpoint sees them too.
   - GUI::OnExit(this, teGEXITCODE code, GUI *sender), __thiscall, vtable slot
     29. 0x00405a5b is an incremental-link thunk that JMPs to 0x00571270.
     Exit codes seen: 2 OK/accept, 3 cancel, 4 next screen, 6 quit, 7 error,
@@ -30,6 +36,7 @@ from tew.logger import logger
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
 
+GUI_ONBEGIN = 0x00AEC5E0
 GUI_ONEXIT_THUNK = 0x00405A5B
 GUI_VTABLE = 0x01204BD8            # ??_7GUI@@6B@
 
@@ -180,17 +187,21 @@ class GuestGuiReader:
 
 
 def skip_noisy_classes(event: AutomationEvent) -> bool:
-    """EventLogger skip predicate: hide gui_exit events for LOG_SKIP_CLASSES."""
-    return event.name == "gui_exit" and event.data.get("cls") in LOG_SKIP_CLASSES
+    """EventLogger skip predicate: hide gui_begin/gui_exit events for LOG_SKIP_CLASSES."""
+    return event.name in ("gui_begin", "gui_exit") and event.data.get("cls") in LOG_SKIP_CLASSES
 
 
-def install_gui_exit_events(cpu: "CPU", emitter: AutomationEventEmitter) -> None:
-    """Emit `gui_exit` (this, cls, name, text, tip, bounds, code, sender,
-    sender_cls, ret) whenever GUI::OnExit is entered. Emits every call; noise
-    filtering belongs to subscribers."""
+def install_gui_events(cpu: "CPU", emitter: AutomationEventEmitter) -> None:
+    """Emit `gui_begin` (this, cls, name, text, tip, bounds, ret) and
+    `gui_exit` (the same plus code, sender, sender_cls) from logpoints on
+    GUI::OnBegin and GUI::OnExit. Every call is emitted; noise filtering
+    belongs to subscribers."""
     class_cache: dict[int, str] = {}
 
-    def on_exit(eip, regs, mem_ptr, mem_size):
+    def reader_for(mem_ptr, mem_size, what: str, esp: int) -> GuestGuiReader | None:
+        if esp + 12 > mem_size:
+            logger.error("automation", f"{what}: ESP=0x{esp:08x} outside guest memory")
+            return None
         base = ctypes.addressof(mem_ptr.contents)
 
         def rd(addr: int, n: int) -> bytes:
@@ -198,16 +209,26 @@ def install_gui_exit_events(cpu: "CPU", emitter: AutomationEventEmitter) -> None
                 raise ValueError(f"0x{addr:08x} outside guest memory")
             return ctypes.string_at(base + addr, min(n, mem_size - addr))
 
-        esp = regs[ESP]
-        if esp + 12 > mem_size:
-            logger.error("automation", f"GUI::OnExit: ESP=0x{esp:08x} outside guest memory")
+        return GuestGuiReader(rd, class_cache)
+
+    def on_begin(eip, regs, mem_ptr, mem_size):
+        reader = reader_for(mem_ptr, mem_size, "GUI::OnBegin", regs[ESP])
+        if reader is None:
             return
-        reader = GuestGuiReader(rd, class_cache)
         this = regs[ECX]
+        emitter.emit("gui_begin", this=this, cls=reader.class_name(this), **reader.describe(this),
+                     ret=reader.u32(regs[ESP]))
+
+    def on_exit(eip, regs, mem_ptr, mem_size):
+        reader = reader_for(mem_ptr, mem_size, "GUI::OnExit", regs[ESP])
+        if reader is None:
+            return
+        esp, this = regs[ESP], regs[ECX]
         ret, code, sender = (reader.u32(esp + off) for off in (0, 4, 8))
         emitter.emit(
             "gui_exit",
             this=this, cls=reader.class_name(this), **reader.describe(this),
             code=code, sender=sender, sender_cls=reader.class_name(sender), ret=ret)
 
+    cpu.add_logpoint(GUI_ONBEGIN, on_begin)
     cpu.add_logpoint(GUI_ONEXIT_THUNK, on_exit)

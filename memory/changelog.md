@@ -3,6 +3,7 @@
 One line per fix, newest first. Full write-ups (investigation steps, probe
 addresses) are in git history: `git log -p -- memory/changelog.md`.
 
+- 2026-10-01 — automation: `gui_begin` event from GUI::OnBegin (0x00aec5e0), same fields as `gui_exit` minus code/sender, same log skip list
 - 2026-10-01 — `tew/automation/`: in-process automation event emitter; first source is `gui_exit` (GUI::OnExit class/name/text/tip/mBounds/exit code, read from guest memory in a logpoint)
 - 2026-10-01 — D3D8 BeginScene/EndScene per-frame logs demoted INFO -> DEBUG (~65 frames/s of log noise)
 - 2026-10-01 — PERF: COM wrapper uses native stdcall cleanup and skips DEBUG f-strings when off; COM share of lobby time 45.5% -> 34.3%, guest CPU share 25% -> 31.5%
