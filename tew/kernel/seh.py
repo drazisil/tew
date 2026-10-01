@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
-from tew.hardware.cpu_zig import EAX, EBP, ESP
+from tew.hardware.cpu_zig import EAX, EBP, EBX, EDI, ESI, ESP
 from tew.logger import logger
 
 # ── EXCEPTION_DISPOSITION values (winnt.h) ────────────────────────────────────
@@ -324,6 +324,28 @@ def dispatch_exception(
     cpu: CPU, memory: Memory, exception_code: int, exception_address: int,
     parameters: tuple[int, ...] = (), noncontinuable: bool = False,
 ) -> bool:
+    """Dispatches an exception (see _dispatch_exception for the details) and
+    tracks that a dispatch is in progress. _rtl_unwind's EBP-restoration
+    logic is only meaningful inside one: an RtlUnwind the game itself
+    initiates (longjmp-style unwinds, __global_unwind2 outside a fault) must
+    not be compared against an old dispatch's frame. The previous values are
+    restored on the way out, so a nested dispatch (an exception raised from
+    inside a handler) puts its outer one back."""
+    outer = (getattr(cpu, "_seh_dispatching", False),
+             getattr(cpu, "_seh_original_frame", None),
+             getattr(cpu, "_seh_original_ebp", None))
+    cpu._seh_dispatching = True
+    try:
+        return _dispatch_exception(cpu, memory, exception_code, exception_address,
+                                   parameters, noncontinuable)
+    finally:
+        cpu._seh_dispatching, cpu._seh_original_frame, cpu._seh_original_ebp = outer
+
+
+def _dispatch_exception(
+    cpu: "CPU", memory: "Memory", exception_code: int, exception_address: int,
+    parameters: tuple[int, ...] = (), noncontinuable: bool = False,
+) -> bool:
     """Dispatches a hardware or software exception through the real SEH
     chain (FS:[0]). Returns True if some handler resolved it (either by
     ExceptionContinueExecution, or by escaping via RtlUnwind -- both mean
@@ -415,6 +437,27 @@ def dispatch_exception(
     return False
 
 
+_UNWIND_LOG_FIRST = 3        # log the first few RtlUnwind calls per caller...
+_UNWIND_LOG_EVERY = 1000     # ...then one in this many
+
+
+def _log_unwind_caller(cpu: "CPU", caller: int, target_frame: int, target_ip: int,
+                       record_code: int | None, dispatching: bool) -> None:
+    """INFO line for who is unwinding and why, rate-limited per caller so a
+    hot unwind path can't flood the log."""
+    counts = getattr(cpu, "_seh_unwind_counts", None)
+    if counts is None:
+        counts = cpu._seh_unwind_counts = {}
+    n = counts[caller] = counts.get(caller, 0) + 1
+    if n <= _UNWIND_LOG_FIRST or n % _UNWIND_LOG_EVERY == 0:
+        code = "none" if record_code is None else f"0x{record_code:08x}"
+        why = "while dispatching an exception" if dispatching else "game-initiated (no exception being dispatched)"
+        logger.info(
+            "seh",
+            f"RtlUnwind from 0x{caller:08x} (call #{n}): target_frame=0x{target_frame:08x} "
+            f"target_ip=0x{target_ip:08x} exception_code={code}, {why}")
+
+
 def register_seh_handlers(stubs: Win32Handlers, memory: Memory) -> None:
     """Registers real RtlUnwind and RaiseException implementations,
     replacing the previous `_halt` placeholders in kernel32_io.py."""
@@ -457,7 +500,14 @@ def register_seh_handlers(stubs: Win32Handlers, memory: Memory) -> None:
         exc_record   = memory.read32((esp + 12) & 0xFFFFFFFF)
         return_value = memory.read32((esp + 16) & 0xFFFFFFFF)
 
-        logger.debug("seh", f"RtlUnwind(target_frame=0x{target_frame:08x}, target_ip=0x{target_ip:08x})")
+        caller = memory.read32(esp)
+        dispatching = getattr(cpu, "_seh_dispatching", False)
+        # Real RtlUnwind resumes at TargetIp with the caller's callee-saved
+        # registers as they were at the call; the walk below runs other
+        # handlers, so remember them.
+        saved_regs = {r: cpu.regs[r] & 0xFFFFFFFF for r in (EBX, ESI, EDI, EBP)}
+        record_code = memory.read32(exc_record) if exc_record else None
+        _log_unwind_caller(cpu, caller, target_frame, target_ip, record_code, dispatching)
 
         fs_base = cpu.kernel_structures.get_fs_base()
         frame = memory.read32(fs_base + 0x00)
@@ -530,13 +580,20 @@ def register_seh_handlers(stubs: Win32Handlers, memory: Memory) -> None:
             # doesn't implement -- log clearly and leave EBP untouched
             # rather than fabricate a value.
             original_frame = getattr(cpu, "_seh_original_frame", None)
-            if target_frame == original_frame:
+            if not dispatching:
+                # Not unwinding on behalf of a dispatched exception: the game
+                # called RtlUnwind itself (e.g. a longjmp through SEH frames).
+                # There is no "original frame" to compare with; the caller's
+                # registers come back as they were at the call.
+                for r, value in saved_regs.items():
+                    cpu.regs[r] = value
+            elif target_frame == original_frame:
                 cpu.regs[EBP] = cpu._seh_original_ebp
             else:
                 logger.warn(
                     "seh",
-                    f"RtlUnwind: target_frame=0x{target_frame:08x} doesn't match the original "
-                    f"exception frame (0x{(original_frame or 0):08x}) -- EBP not restored "
+                    f"RtlUnwind from 0x{caller:08x}: target_frame=0x{target_frame:08x} doesn't match the "
+                    f"original exception frame (0x{(original_frame or 0):08x}) -- EBP not restored "
                     "(multi-level unwind recovery not implemented), __except-block code using "
                     "EBP-relative addressing may misbehave",
                 )
