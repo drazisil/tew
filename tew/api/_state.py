@@ -786,7 +786,11 @@ class CRTState:
                     self.file_handle_map[handle] = FileHandleEntry(
                         path=real_path, data=data, position=0, writable=False, fd=None
                     )
-                    logger.debug("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [read, {len(data)} bytes]')
+                    # Archive and model opens are the interesting ones when a screen
+                    # won't build (the game probes for a loose file first, so the
+                    # not-found lines alone don't say whether the real open worked).
+                    log_open = logger.info if win_name.lower().endswith((".viv", ".fce")) else logger.debug
+                    log_open("fileio", f'CreateFile("{win_name}") -> 0x{handle:x} [read, {len(data)} bytes]')
                     return handle
                 except OSError as e:
                     logger.warn("fileio", f'CreateFile("{win_name}") -> INVALID (read error)')

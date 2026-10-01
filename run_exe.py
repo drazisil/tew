@@ -702,7 +702,8 @@ if _TEW_WATCH_ADDR is not None:
 # skips the noisy widget classes (tew.automation.gui_events.LOG_SKIP_CLASSES);
 # other subscribers see everything.
 automation = AutomationEventEmitter()
-automation.subscribe(EventLogger(skip=skip_noisy_classes))
+# TEW_LOG_ALL_GUI=1 logs every GUI event, including the LOG_SKIP_CLASSES widgets.
+automation.subscribe(EventLogger(skip=None if os.environ.get("TEW_LOG_ALL_GUI") else skip_noisy_classes))
 install_gui_events(cpu, automation)
 # Steps per batch (also the virtual-clock tick interval).
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
