@@ -59,6 +59,11 @@ unexamined). Poke them from tew to see the game's own debug text.
 Harmless while no APC source exists (QueueUserAPC, ReadFileEx, WriteFileEx
 are unimplemented). Wire it in if any of those are added.
 
+## Auto-clicks after the Mayor's letter use fixed 30s delays
+CONTINUE, Screen Tips X and its OK each fire 30s after the previous click
+(~90s of padding to the lobby). Trigger each on a log/stdout line instead,
+like the first two clicks.
+
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
 
