@@ -3,7 +3,7 @@
 One line per fix, newest first. Full write-ups (investigation steps, probe
 addresses) are in git history: `git log -p -- memory/changelog.md`.
 
-- 2026-09-30 — MSJET35 crash buying a car: VirtualAlloc's cursor only moved up, never reused released ranges, and handed out 0x814D0000 (unbacked); now next-fit with reuse, NULL + ERROR_NOT_ENOUGH_MEMORY / ERROR_INVALID_ADDRESS past user space
+- 2026-09-30 — MSJET35 crash buying a car: Jet asks VirtualAlloc for explicit addresses above 2 GB (0x814cf000.. at startup) and tew accepted them unbacked; now NULL + ERROR_INVALID_ADDRESS outside user space (also: released ranges reused, NULL + ERROR_NOT_ENOUGH_MEMORY when full)
 - 2026-09-30 — HOME avatar never drew -- tew's x87 FPTAN/FPATAN/FXTRACT/FYL2XP1 were no-ops and FXAM misclassified everything (tew-cpu 0.3.1)
 - 2026-09-30 — lobby raw text keys / `PlayerName` / placeholder numbers were a wrong GUI data set, not tew; baked-in clicks updated
 - 2026-09-29 — intermittent crash loading the lobby (DispatchMessageA's nested WndProc call); persona-select START is clicked by default; TEW_MAX_STEPS unlimited unless set
