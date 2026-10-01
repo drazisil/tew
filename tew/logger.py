@@ -7,7 +7,7 @@ Control via environment variables:
 
 Categories: cpu, dll, loader, handlers, thread, wininet, d3d8,
             graphics, fileio, registry, exception, startup, scheduler, winsock, calls,
-            window, dialog, channel, memory
+            window, dialog, channel, memory, socket
 
 Group tokens (LOG_CATEGORIES filtering only, not real categories -- see
 `_CATEGORY_GROUPS`): threads = thread + scheduler.
@@ -32,12 +32,14 @@ each line still logs and filters under its own real, singular category, so
 emitted it. Add more groups to `_CATEGORY_GROUPS` the same way if another
 pair of categories turns out to usually be wanted together.
 
-`memory` and `registry` are excluded even under the bare `*`/unset default
-(unlike every other category) -- `memory` is per-allocation HeapAlloc/
+`memory`, `registry` and `socket` are excluded even under the bare `*`/unset
+default (unlike every other category) -- `memory` is per-allocation HeapAlloc/
 HeapFree noise, `registry` is per-call RegOpenKeyExA/RegQueryValueExA
-noise, both useful only when actually chasing a bug in that specific area.
-Opt in explicitly with `+memory`/`+registry` (alone or alongside other
-categories).
+noise, `socket` is per-call send/recv/select noise (including the repeating
+"still waiting" WARNs while a guest thread blocks on an idle connection), all
+useful only when actually chasing a bug in that specific area. Opt in
+explicitly with `+memory`/`+registry`/`+socket` (alone or alongside other
+categories). ERROR-level lines are never filtered.
 """
 
 import os
@@ -51,7 +53,7 @@ LogCategory = Literal[
     "cpu", "dll", "loader", "handlers", "thread", "wininet",
     "d3d8", "graphics", "fileio", "registry", "exception",
     "startup", "scheduler", "winsock", "calls",
-    "window", "dialog", "channel", "memory",
+    "window", "dialog", "channel", "memory", "socket",
 ]
 
 # Categories that stay silent even under the bare "*"/unset LOG_CATEGORIES
@@ -60,8 +62,11 @@ LogCategory = Literal[
 # RegOpenKeyExA/RegQueryValueExA calls are frequent enough during normal
 # startup/gameplay to bury the categories someone's actually chasing at the
 # default LOG_LEVEL=info -- opt in with "+registry" when registry access is
-# the thing under investigation.
-_DEFAULT_OFF_CATEGORIES = {"memory", "registry"}
+# the thing under investigation. "socket" joined 2026-10-01: send/recv/select
+# lines (and their repeating "still waiting" WARNs for idle guest threads) ran
+# to thousands of lines per run, burying everything else -- opt in with
+# "+socket" when the network path is the thing under investigation.
+_DEFAULT_OFF_CATEGORIES = {"memory", "registry", "socket"}
 
 ERROR = 0
 WARN = 1
@@ -222,7 +227,7 @@ def _category_permitted(level: int, category: str) -> bool:
     # diagnostic that follows would have no reason attached.
     if level == ERROR:
         return True
-    # A default-off category (currently just "memory") needs an explicit
+    # A default-off category (currently memory, registry and socket) needs an explicit
     # "+category" rule even under the bare "*"/unset default -- everything
     # else falls through to the normal "no filter means everything passes"
     # behavior.
