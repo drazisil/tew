@@ -619,12 +619,12 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             return
 
         _ret_eip = mem.read32(cpu.regs[ESP] & 0xFFFFFFFF)
-        logger.info("d3d8", f"BeginScene: ENTER called_from=0x{_ret_eip:08x}")
+        logger.debug("d3d8", f"BeginScene: ENTER called_from=0x{_ret_eip:08x}")
 
         if _state._vk_image_acquired:
             # Continuing the same unpresented frame -- command buffer and
             # render pass are already open and recording. Do nothing.
-            logger.info("d3d8",
+            logger.debug("d3d8",
                 f"BeginScene: OK (continuing frame) image_idx={_state._vk_current_image_idx}")
             cpu.regs[EAX] = S_OK
             return
@@ -763,7 +763,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             cpu.fatal_halt = True
             return
 
-        logger.info("d3d8",
+        logger.debug("d3d8",
             f"BeginScene: OK image_idx={_state._vk_current_image_idx}")
         cpu.regs[EAX] = S_OK
 
@@ -788,7 +788,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             cpu.fatal_halt = True
             return
 
-        logger.info("d3d8", "EndScene: OK")
+        logger.debug("d3d8", "EndScene: OK")
         cpu.regs[EAX] = S_OK
 
     def _finalize_frame_for_present(cpu: "CPU", mem: "Memory") -> None:
