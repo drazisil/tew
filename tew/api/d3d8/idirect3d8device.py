@@ -132,6 +132,48 @@ from tew.api.win32_handlers import log_register_dump
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
+# D3DRS_* values the pipeline depends on, and their D3D8 defaults.
+_RS_ZENABLE, _RS_SRCBLEND, _RS_DESTBLEND, _RS_ALPHABLENDENABLE = 7, 19, 20, 27
+_RS_DEFAULTS = {_RS_ZENABLE: 1, _RS_SRCBLEND: 2, _RS_DESTBLEND: 1, _RS_ALPHABLENDENABLE: 0}
+
+
+def _current_pipeline():
+    """The graphics pipeline for the blend state the game last set, created on
+    first use and cached. Falls back to D3D8's defaults (blend off, ONE/ZERO)
+    for states the game hasn't set yet."""
+    rs = _state._render_states
+    key = (bool(rs.get(_RS_ALPHABLENDENABLE, _RS_DEFAULTS[_RS_ALPHABLENDENABLE])),
+           rs.get(_RS_SRCBLEND, _RS_DEFAULTS[_RS_SRCBLEND]),
+           rs.get(_RS_DESTBLEND, _RS_DEFAULTS[_RS_DESTBLEND]))
+    pipe = _state._vk_pipeline_cache.get(key)
+    if pipe is None:
+        from tew.api.d3d8._pipeline import create_pipeline
+        pipe, _ = create_pipeline(_state._vk_device, _state._vk_render_pass,
+                                  _state._vk_descriptor_set_layout,
+                                  blend_enable=key[0], src_blend=key[1], dst_blend=key[2],
+                                  layout=_state._vk_pipeline_layout)
+        _state._vk_pipeline_cache[key] = pipe
+        logger.info("d3d8", f"Created pipeline for blend enable={key[0]} src={key[1]} dst={key[2]}")
+    return pipe
+
+
+def _viewport_rect_px() -> tuple[int, int, int, int]:
+    """The current D3D viewport as (x, y, w, h) in swapchain pixels. D3D clips
+    both Clear and drawing to it; with no SetViewport yet it is the whole
+    backbuffer. Game coordinates are logical, so scale to the physical
+    swapchain (WINDOW_SCALE)."""
+    sw, sh = _state._vk_swapchain_width, _state._vk_swapchain_height
+    vp = _state._viewport
+    if vp is None:
+        return 0, 0, sw, sh
+    sx = sw / float(_state._vk_logical_width or sw)
+    sy = sh / float(_state._vk_logical_height or sh)
+    x0 = max(0, int(vp[0] * sx))
+    y0 = max(0, int(vp[1] * sy))
+    x1 = min(sw, int(round((vp[0] + vp[2]) * sx)))
+    y1 = min(sh, int(round((vp[1] + vp[3]) * sy)))
+    return x0, y0, max(0, x1 - x0), max(0, y1 - y0)
+
 
 def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
     """Decode a D3DCOLOR DWORD (0xAARRGGBB) into (r, g, b, a) floats in
@@ -313,6 +355,8 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
     # (idirect3d8.py) at the new size.
     def _reset(cpu: CPU, mem: Memory) -> None:
         import vulkan as vk
+
+        _state._viewport = None   # Reset restores the full-backbuffer viewport
 
         from tew.api.d3d8._pipeline import create_framebuffers, create_image_views
 
@@ -863,6 +907,28 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
             return
 
         argb  = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
+        n_rects = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        p_rects = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        # D3D clears only the intersection of the viewport and the supplied
+        # rects (all of the viewport if none). A camera pass drawing into a
+        # sub-viewport (MCAM_CLEARZ) must not wipe the rest of the frame.
+        vx, vy, vw, vh = _viewport_rect_px()
+        sx = _state._vk_swapchain_width / float(_state._vk_logical_width or _state._vk_swapchain_width)
+        sy = _state._vk_swapchain_height / float(_state._vk_logical_height or _state._vk_swapchain_height)
+        regions: list[tuple[int, int, int, int]] = []
+        if n_rects and p_rects:
+            for i in range(n_rects):
+                x1, y1, x2, y2 = (mem.read32((p_rects + i * 16 + o) & 0xFFFFFFFF) for o in (0, 4, 8, 12))
+                rx0, ry0 = max(vx, int(x1 * sx)), max(vy, int(y1 * sy))
+                rx1, ry1 = min(vx + vw, int(round(x2 * sx))), min(vy + vh, int(round(y2 * sy)))
+                if rx1 > rx0 and ry1 > ry0:
+                    regions.append((rx0, ry0, rx1 - rx0, ry1 - ry0))
+        else:
+            regions.append((vx, vy, vw, vh))
+        full = (0, 0, _state._vk_swapchain_width, _state._vk_swapchain_height)
+        if not regions:
+            cpu.regs[EAX] = S_OK
+            return
         a = ((argb >> 24) & 0xFF) / 255.0
         r = ((argb >> 16) & 0xFF) / 255.0
         g = ((argb >>  8) & 0xFF) / 255.0
@@ -877,16 +943,19 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
                     colorAttachment=0,
                     clearValue=vk.VkClearValue(color=clear_color),
                 )
-                clear_rect = vk.VkClearRect(
-                    rect=vk.VkRect2D(
-                        vk.VkOffset2D(0, 0),
-                        vk.VkExtent2D(_state._vk_swapchain_width,
-                                      _state._vk_swapchain_height)),
-                    baseArrayLayer=0,
-                    layerCount=1,
-                )
+                clear_rects = [
+                    vk.VkClearRect(
+                        rect=vk.VkRect2D(vk.VkOffset2D(x, y), vk.VkExtent2D(w, h)),
+                        baseArrayLayer=0, layerCount=1)
+                    for (x, y, w, h) in regions]
                 vk.vkCmdClearAttachments(_state._vk_cmd_buf,
-                                         1, [clear_attach], 1, [clear_rect])
+                                         1, [clear_attach], len(clear_rects), clear_rects)
+            elif regions != [full]:
+                # vkCmdClearColorImage can't take a sub-rect, and no render
+                # pass is open to use vkCmdClearAttachments in.
+                logger.error("d3d8",
+                    f"Clear: partial clear {regions} outside BeginScene is not supported "
+                    "-- skipped")
             else:
                 image = _state._vk_swapchain_images[_state._vk_current_image_idx]
                 subresource = vk.VkImageSubresourceRange(
@@ -975,9 +1044,10 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
 
     # [51] GetRenderState(State, DWORD* pValue)
     def _get_render_state(cpu: CPU, mem: Memory) -> None:
+        state = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         p_val = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_val:
-            mem.write32(p_val, 0)
+            mem.write32(p_val, _state._render_states.get(state, _RS_DEFAULTS.get(state, 0)))
         cpu.regs[EAX] = S_OK
 
     # [53] EndStateBlock(DWORD* pToken)
@@ -1148,7 +1218,17 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
     dev[37] = _ok  ("Dev::SetTransform",      8)
     dev[38] = _ok  ("Dev::GetTransform",      8)
     dev[39] = _ok  ("Dev::MultiplyTransform",  8)
-    dev[40] = _ok  ("Dev::SetViewport",        4)
+    # [40] SetViewport(D3DVIEWPORT8*): X, Y, Width, Height, MinZ, MaxZ
+    def _set_viewport(cpu: CPU, mem: Memory) -> None:
+        p = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        if not p:
+            logger.error("d3d8", "SetViewport: NULL pointer")
+            cpu.regs[EAX] = 0x8876086C  # D3DERR_INVALIDCALL
+            return
+        _state._viewport = tuple(mem.read32((p + 4 * i) & 0xFFFFFFFF) for i in range(4))
+        cpu.regs[EAX] = S_OK
+    dev[40] = _com_stub(stubs, "d3d8dev", "Dev::SetViewport",
+                _set_viewport, 4, memory, D3DDEV_OBJ)
     dev[41] = _ok  ("Dev::GetViewport",        4)
     dev[42] = _ok  ("Dev::SetMaterial",        4)
     dev[43] = _ok  ("Dev::GetMaterial",        4)
@@ -1158,7 +1238,16 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
     dev[47] = _ok  ("Dev::GetLightEnable",     8)
     dev[48] = _ok  ("Dev::SetClipPlane",       8)
     dev[49] = _ok  ("Dev::GetClipPlane",       8)
-    dev[50] = _ok  ("Dev::SetRenderState",     8)
+    # [50] SetRenderState(State, Value). Only the blend states (ALPHABLENDENABLE,
+    # SRCBLEND, DESTBLEND) affect rendering so far -- see _current_pipeline;
+    # every value is stored so GetRenderState returns what the game set.
+    def _set_render_state(cpu: CPU, mem: Memory) -> None:
+        state = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
+        value = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
+        _state._render_states[state] = value
+        _set_eax(cpu, S_OK)
+    dev[50] = _com_stub(stubs, "d3d8dev", "Dev::SetRenderState",
+                _set_render_state, 8, memory, D3DDEV_OBJ)
     dev[51] = _com_stub(stubs, "d3d8dev", "Dev::GetRenderState",
                 _get_render_state, 8, memory, D3DDEV_OBJ)
     dev[52] = _ok  ("Dev::BeginStateBlock", 0)
@@ -1301,14 +1390,13 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
 
         cmd = _state._vk_cmd_buf
         vk.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
-                             _state._vk_pipeline)
+                             _current_pipeline())
         vp = vk.VkViewport(x=0, y=0,
                            width=_state._vk_swapchain_width,
                            height=_state._vk_swapchain_height,
                            minDepth=0.0, maxDepth=1.0)
-        sc = vk.VkRect2D(vk.VkOffset2D(0, 0),
-                         vk.VkExtent2D(_state._vk_swapchain_width,
-                                       _state._vk_swapchain_height))
+        _sx, _sy, _sw, _sh = _viewport_rect_px()
+        sc = vk.VkRect2D(vk.VkOffset2D(_sx, _sy), vk.VkExtent2D(_sw, _sh))
         vk.vkCmdSetViewport(cmd, 0, 1, [vp])
         vk.vkCmdSetScissor(cmd, 0, 1, [sc])
         vk.vkCmdBindVertexBuffers(cmd, 0, 1, [_state._vk_vertex_buffer], [offset])

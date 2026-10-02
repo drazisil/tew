@@ -562,12 +562,55 @@ def update_descriptor_set(device, desc_set, sampler, image_view):
     vk.vkUpdateDescriptorSets(device, 1, [write], 0, None)
 
 
-def create_pipeline(device, render_pass, descriptor_set_layout):
-    """Create the graphics pipeline for XYZRHW + DIFFUSE + TEX1 geometry.
+# D3DBLEND_* -> (src factor, dst factor) names in the vulkan module. The two
+# BOTH* values set both factors at once (D3D8 legacy); alpha factors are not
+# mapped because the swapchain's alpha channel is never written.
+_D3DBLEND_FACTORS = {
+    1: "VK_BLEND_FACTOR_ZERO",
+    2: "VK_BLEND_FACTOR_ONE",
+    3: "VK_BLEND_FACTOR_SRC_COLOR",
+    4: "VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR",
+    5: "VK_BLEND_FACTOR_SRC_ALPHA",
+    6: "VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA",
+    7: "VK_BLEND_FACTOR_DST_ALPHA",
+    8: "VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA",
+    9: "VK_BLEND_FACTOR_DST_COLOR",
+    10: "VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR",
+    11: "VK_BLEND_FACTOR_SRC_ALPHA_SATURATE",
+}
+_D3DBLEND_BOTHSRCALPHA = 12
+_D3DBLEND_BOTHINVSRCALPHA = 13
 
-    Returns (VkPipeline, VkPipelineLayout).
+
+def _vk_blend_factors(d3d_src: int, d3d_dst: int) -> tuple[int, int]:
+    """Translate D3DRS_SRCBLEND / D3DRS_DESTBLEND values to Vulkan factors.
+    Raises on a value D3D8 doesn't define rather than guessing."""
+    import vulkan as vk
+
+    if d3d_src == _D3DBLEND_BOTHSRCALPHA:
+        d3d_src, d3d_dst = 5, 6
+    elif d3d_src == _D3DBLEND_BOTHINVSRCALPHA:
+        d3d_src, d3d_dst = 6, 5
+    try:
+        return (getattr(vk, _D3DBLEND_FACTORS[d3d_src]),
+                getattr(vk, _D3DBLEND_FACTORS[d3d_dst]))
+    except KeyError as exc:
+        raise ValueError(f"unsupported D3DBLEND value {exc.args[0]} "
+                         f"(src={d3d_src}, dst={d3d_dst})") from None
+
+
+def create_pipeline(device, render_pass, descriptor_set_layout,
+                    blend_enable: bool = True, src_blend: int = 5, dst_blend: int = 6,
+                    layout=None):
+    """Create the graphics pipeline for XYZRHW + DIFFUSE + TEX1 geometry with
+    the given D3D blend state (D3DRS_ALPHABLENDENABLE / SRCBLEND / DESTBLEND).
+
+    Pass an existing `layout` to reuse it (all pipelines share one); otherwise
+    a new one is created. Returns (VkPipeline, VkPipelineLayout).
     """
     import vulkan as vk
+
+    src_factor, dst_factor = _vk_blend_factors(src_blend, dst_blend)
 
     # Shader modules from embedded SPIR-V
     def _make_module(spv: bytes):
@@ -668,10 +711,10 @@ def create_pipeline(device, render_pass, descriptor_set_layout):
         # of blending by coverage, producing solid black rectangles instead
         # of legible text -- confirmed live: the persona-select screen's
         # headline, list rows, and every button label rendered as solid
-        # black bars. Real alpha blending is now enabled for RGB.
-        blendEnable=vk.VK_TRUE,
-        srcColorBlendFactor=vk.VK_BLEND_FACTOR_SRC_ALPHA,
-        dstColorBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        # black bars. Blend state now follows the game's SetRenderState calls.
+        blendEnable=vk.VK_TRUE if blend_enable else vk.VK_FALSE,
+        srcColorBlendFactor=src_factor,
+        dstColorBlendFactor=dst_factor,
         colorBlendOp=vk.VK_BLEND_OP_ADD,
         srcAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE,
         dstAlphaBlendFactor=vk.VK_BLEND_FACTOR_ZERO,
@@ -707,7 +750,7 @@ def create_pipeline(device, render_pass, descriptor_set_layout):
         pSetLayouts=[descriptor_set_layout],
         pushConstantRangeCount=0,
     )
-    pipeline_layout = vk.vkCreatePipelineLayout(device, layout_ci, None)
+    pipeline_layout = layout if layout is not None else vk.vkCreatePipelineLayout(device, layout_ci, None)
 
     pipeline_ci = vk.VkGraphicsPipelineCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,

@@ -118,6 +118,16 @@ _vk_default_tex_image:     object = None
 _vk_default_tex_memory:    object = None
 _vk_default_tex_view:      object = None
 
+# D3D viewport (x, y, w, h) in logical pixels from SetViewport; None = whole backbuffer.
+_viewport: tuple[int, int, int, int] | None = None
+
+# Last value the game set per D3DRS_* render state (SetRenderState/GetRenderState).
+_render_states: dict[int, int] = {}
+
+# Graphics pipelines keyed by (blend_enable, src_blend, dst_blend); all share
+# _vk_pipeline_layout. The entry for the creation-time default is _vk_pipeline.
+_vk_pipeline_cache: dict[tuple[bool, int, int], object] = {}
+
 # Bound IDirect3DBaseTexture8* per sampler stage, set by SetTexture (0 = none).
 _bound_textures: dict[int, int] = {}
 
