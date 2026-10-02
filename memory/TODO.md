@@ -25,8 +25,20 @@ with no signal. Return a failure and have `cpu_zig.py` raise.
 `cpu/src/scheduler.zig` bumps each new stack by 256 KB from 0x08000000 and
 never reuses them; past ~512 threads they hit the DLL slots at 0x10000000.
 
+## D3D8 render state: only blending is applied
+PR #48 tracks SetRenderState/GetRenderState and builds a pipeline per
+(ALPHABLENDENABLE, SRCBLEND, DESTBLEND). Still not applied: depth buffer +
+ZENABLE/ZWRITE/ZFUNC (319 of 600 trade-in draws are the 3D car with Z on;
+likely cause of parts drawn in the wrong order, e.g. steering wheel outside the
+car), cull mode, alpha test. `DrawPrimitive` still skips PrimType 6 (fan,
+~870/run) and 2 (line list, ~5300/run) but returns S_OK (missing car parts);
+`DrawIndexedPrimitive`/`UP` just halt. A partial `Clear` outside BeginScene is
+logged and skipped (no render pass to clear a sub-rect in).
+
 ## Rendering gaps
-- FEUI dialog backgrounds don't draw (Exit dialog shows only its buttons).
+- SDL window steals input focus while drawing (can't click elsewhere). Only
+  creation calls `SDL_RaiseWindow`; suspect repeated `ShowWindow` ->
+  `SDL_ShowWindow` (user32_handlers.py). Log its calls first.
 - Persona-select highlight bar overdraws the list's column divider. Trace
   the quad's DrawPrimitive before touching blend state; never enable the
   swapchain alpha write mask (the window goes transparent).
@@ -48,7 +60,9 @@ check tew's CreateMutex/CloseHandle.
 ## Missing opcodes (fix when one shows up)
 DAA/DAS/AAA/AAS, MOV Sreg (0x8E), AAM/AAD/SALC, far CALL/JMP/RET, BOUND,
 ARPL, INTO, IRET, port I/O, CLI/STI. Any that runs reports
-`Unknown opcode: 0xXX at EIP=...`.
+`Unknown opcode: 0xXX at EIP=...`. x87: FLDENV, FNSTENV, FRSTOR, FNSAVE, FBLD,
+FBSTP now fault loudly (tew-cpu 0.3.2, PR #4) instead of silently doing
+nothing; implement the one that trips.
 
 ## Game debug output (`dprintf` 0x00a34c40) is gated off
 Gates: `_winmsgdebugflag` (0x016f3658) >= level; channel byte at
@@ -87,6 +101,22 @@ like the first two clicks.
   FEInterface to begin; then replace the fixed click delays with events.
 - `gui_begin` hooks GUI::OnBegin (0x00aec5e0); an override that never chains to
   it would be missed. Watch for an exit with no begin.
+
+## DAO duplicate-key INSERT into Vehicle (file for later)
+`dblog.txt`: `DAOERROR (3022) ... would create duplicate values in the index, primary
+key` on `INSERT INTO Vehicle ( VehicleID, SkinID, Flags, Class, InfoSetting )
+VALUES ( 1, 158, 0, 0, 0 )` (`Dbcode_TmpActionQuery` fails), then
+`DBPart_ModelData_PUTCACHE: veh: 1 EMPTY`. Unknown whether the game expects the
+row to exist already (stale ~/.emu32 db, or the DB persisting between runs) or
+tew's Jet/DAO emulation reports 3022 wrongly. Not yet investigated.
+
+## D3D8 private heap exhausts at the pre-race test drive (~326s)
+112 MB bump heap (0x09000000-0x10000000) runs out allocating a 1,920,000-byte
+surface. Too small or leaking is unknown; PR #49 makes the error list live
+objects by kind/size. Suspects: `_alloc_surface_obj` always allocates `w*h*4`
+whatever the format (16-bit textures cost double); surfaces never Released.
+Reproduce: run to the test drive after the dealer (needs IMPLODE.DLL in
+~/.emu32/MCity).
 
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
