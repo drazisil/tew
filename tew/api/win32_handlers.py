@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 from tew.api.nt_syscall import NtSyscallDispatcher
-from tew.hardware.cpu_zig import ESP, ZigCPU
+from tew.hardware.cpu_zig import EBP, ESP, ZigCPU
 from tew.hardware.cpu_zig import _lib as _cpu_lib
 from tew.logger import logger, set_current_handler
 
@@ -197,6 +197,7 @@ class Win32Handlers:
         self._call_log_size: int = 2000
         self._call_log: collections.deque[list] = collections.deque(maxlen=self._call_log_size)
         self._nt_dispatcher: NtSyscallDispatcher = NtSyscallDispatcher(memory)
+        self._int3_counts: dict[int, int] = {}   # INT3 site -> hits, for rate-limited INFO logging
 
     @property
     def nt_dispatcher(self) -> NtSyscallDispatcher:
@@ -468,6 +469,25 @@ class Win32Handlers:
                 # point AT the INT3 itself, matching real Windows.
                 fault_eip = (c.eip - 1) & 0xFFFFFFFF
                 c.eip = fault_eip
+                # The game's ~1,780 assertion sites all land here. Log the first
+                # few hits per site at INFO (then one in 1000), with the caller
+                # chain, so which assert fired is visible at the default level.
+                n = stubs._int3_counts[fault_eip] = stubs._int3_counts.get(fault_eip, 0) + 1
+                if n <= 3 or n % 1000 == 0:
+                    # Follow the EBP chain (the game is built with frame
+                    # pointers); stop at anything unreadable.
+                    chain: list[str] = []
+                    ebp = c.regs[EBP] & 0xFFFFFFFF
+                    for _ in range(4):
+                        if ebp < 0x10000 or ebp > 0x7FFFFFF0:
+                            break
+                        chain.append(f"{stubs._memory.read32((ebp + 4) & 0xFFFFFFFF):08x}")
+                        ebp = stubs._memory.read32(ebp)
+                    logger.info(
+                        "seh",
+                        f"INT3 (game assert) at EIP=0x{fault_eip:08x} (hit #{n}), callers: "
+                        + (" <- ".join(chain) or "unknown"),
+                    )
                 handled = dispatch_exception(c, stubs._memory, STATUS_BREAKPOINT, fault_eip)
                 if handled:
                     logger.debug(

@@ -15,7 +15,7 @@ gives the CPU's real SEH chain a chance before falling back to a halt.
 import pytest
 
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ESP, FatalHaltError, ZigCPU
+from tew.hardware.cpu_zig import EBP, ESP, FatalHaltError, ZigCPU
 from tew.hardware.memory import Memory
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.seh import install as seh_install
@@ -109,3 +109,27 @@ def test_int3_exception_address_points_at_the_int3_not_past_it(cpu_env):
         cpu.step()
 
     assert mem.read32(0x00056000) == int3_addr
+
+
+def test_int3_assert_logs_site_and_caller_chain_at_info(cpu_env, capsys):
+    """An INT3 game assert is visible at the default level: the site's EIP,
+    hit count and the EBP-chain callers (here two fake frames)."""
+    cpu, mem, ks, stubs = cpu_env
+    handler = CODE_BASE
+    write_bytes(mem, handler, bytes([0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]))  # ContinueExecution
+    push_seh_frame(mem, ks.get_fs_base(), FRAME_A, handler, 0xFFFFFFFF)
+
+    # EBP chain: frame1 -> frame2 -> 0, saved return addresses 0x11111111, 0x22222222
+    frame1, frame2 = 0x00042000, 0x00042100
+    mem.write32(frame1, frame2)
+    mem.write32(frame1 + 4, 0x11111111)
+    mem.write32(frame2, 0)
+    mem.write32(frame2 + 4, 0x22222222)
+    cpu.regs[EBP] = frame1
+
+    write_bytes(mem, CODE_BASE + 0x100, bytes([0xCC]))  # INT3
+    cpu.eip = CODE_BASE + 0x100
+    cpu.step()
+
+    out = capsys.readouterr().out
+    assert f"INT3 (game assert) at EIP=0x{CODE_BASE + 0x100:08x} (hit #1), callers: 11111111 <- 22222222" in out
