@@ -107,9 +107,10 @@ def _heap_breakdown(top: int = 8) -> str:
     """What is filling the heap: live registry entries grouped by (kind, data
     size) and the bytes parked on free lists. Used in the exhaustion error so
     "too small" can be told apart from "leaking" without a debugger."""
-    live: dict[tuple[str, int], list[int]] = {}
+    live: dict[tuple[str, int, str], list[int]] = {}
     for entry in _alloc_registry.values():
-        key = (entry["kind"], entry.get("data_size", entry.get("obj_size", 0)))
+        key = (entry["kind"], entry.get("data_size", entry.get("obj_size", 0)),
+               entry.get("origin", ""))
         slot = live.setdefault(key, [0, 0])
         slot[0] += 1
         slot[1] += key[1]
@@ -120,8 +121,9 @@ def _heap_breakdown(top: int = 8) -> str:
         f"live registry data {live_total} bytes in {sum(v[0] for v in live.values())} objects; "
         f"{free_total} bytes sitting on free lists"
     ]
-    for (kind, size), (count, total) in sorted(live.items(), key=lambda kv: -kv[1][1])[:top]:
-        lines.append(f"  live {kind} x{count} @ {size} bytes each = {total} bytes")
+    for (kind, size, origin), (count, total) in sorted(live.items(), key=lambda kv: -kv[1][1])[:top]:
+        suffix = f" from {origin}" if origin else ""
+        lines.append(f"  live {kind} x{count} @ {size} bytes each = {total} bytes{suffix}")
     return "\n".join(lines)
 
 
@@ -303,8 +305,11 @@ def _alloc_resource_obj(data_size: int, memory: Memory) -> int:
     return obj
 
 
-def _alloc_surface_obj(w: int, h: int, fmt: int, memory: Memory) -> int:
+def _alloc_surface_obj(w: int, h: int, fmt: int, memory: Memory, origin: str = "") -> int:
     """Allocate an IDirect3DSurface8 COM object with stored dimensions and format.
+
+    `origin` names the creating D3D8 method and guest caller; it is only
+    reported in the heap-exhaustion breakdown.
 
     Layout (24 bytes): [0] vtable ptr, [4] data ptr, [8] size,
                        [12] width, [16] height, [20] D3DFORMAT.
@@ -321,8 +326,15 @@ def _alloc_surface_obj(w: int, h: int, fmt: int, memory: Memory) -> int:
     _alloc_registry[obj] = {
         "kind": "surface", "obj_size": 24,
         "data_ptr": data_ptr, "data_size": size,
+        "origin": origin,
     }
     return obj
+
+
+def surface_origin(method: str, cpu: CPU, memory: Memory) -> str:
+    """Origin label for a surface created inside a D3D8 handler: method name
+    plus the guest return address read from the top of the stack."""
+    return f"{method} ret=0x{memory.read32(cpu.regs[ESP] & 0xFFFFFFFF):08x}"
 
 
 def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: Memory) -> int:

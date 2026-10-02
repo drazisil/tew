@@ -3,6 +3,7 @@
 One line per fix, newest first. Full write-ups (investigation steps, probe
 addresses) are in git history: `git log -p -- memory/changelog.md`.
 
+- 2026-10-02 — D3D8 heap exhausted ~2 min into the test drive: `GetBackBuffer` allocated a fresh 800x600x4 surface per call (dx8z.dll calls it repeatedly; 51 x 1,920,000 bytes). Now returns the one canonical back buffer, AddRef'd, shared with GetRenderTarget; heap breakdown also labels surfaces by creating method + guest caller
 - 2026-10-02 — RunEngSim zero torque was tew x87 bugs (m80 store/load, DC E0..FF operand order, FCMOVNcc, FCOMI PF, faults for FLDENV/FNSTENV/FRSTOR/FNSAVE/FBLD/FBSTP); bumped cpu to tew-cpu 0.3.2
 - 2026-10-02 — D3D8: SetViewport stored; Clear clipped to viewport∩rects, draws scissored to it (camera sub-viewport clear was wiping the rest of the frame: Exit/DealerTradeIn dialogs); SetRenderState/GetRenderState tracked, pipeline per (blend enable, src, dst)
 - 2026-10-02 — D3D8 heap-exhaustion error now lists what fills the heap (live objects by kind/size, bytes on free lists) so "too small" vs "leak" is visible
