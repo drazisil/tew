@@ -13,9 +13,8 @@ These tests verify the DISPATCHER is correct on inputs we fully control.
 """
 
 import pytest
-
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import EAX, EBP, ESP, ZigCPU
+from tew.hardware.cpu_zig import EAX, EBP, EBX, EDI, ESI, ESP, ZigCPU
 from tew.hardware.memory import Memory
 from tew.kernel.kernel_structures import KernelStructures
 from tew.kernel.seh import (
@@ -414,3 +413,90 @@ def test_dispatch_exception_returns_immediately_when_handler_resumes_far_from_it
     # or return, exactly like a real __except block that never comes back.
     assert (cpu.eip & 0xFFFFFFFF) == resume_target  # the `jmp $` instruction itself
     assert not cpu.halted
+
+
+def _game_unwind_code(rtlunwind_addr: int, target_frame: int, target_ip: int) -> bytes:
+    code = b""
+    code += bytes([0x68]) + (0x99).to_bytes(4, "little")          # push 0x99 (ReturnValue)
+    code += bytes([0x6A, 0x00])                                    # push 0 (ExceptionRecord=NULL)
+    code += bytes([0x68]) + target_ip.to_bytes(4, "little")        # push TargetIp
+    code += bytes([0x68]) + target_frame.to_bytes(4, "little")     # push TargetFrame
+    code += bytes([0xB9]) + rtlunwind_addr.to_bytes(4, "little")   # mov ecx, rtlunwind_addr
+    code += bytes([0xFF, 0xD1])                                    # call ecx
+    return code
+
+
+def test_dispatch_exception_clears_the_original_frame_stash_and_dispatching_flag_on_exit(cpu_env):
+    """The (frame, EBP) stash is only meaningful during a dispatch; it must
+    not outlive it for a later, game-initiated RtlUnwind to trip over."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+
+    handler = CODE_BASE
+    write_bytes(mem, handler, bytes([0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]))  # mov eax,0 (ContinueExecution); ret
+    push_seh_frame(mem, fs_base, FRAME_A, handler, 0xFFFFFFFF)
+    cpu.regs[EBP] = 0x11223344
+
+    dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert cpu._seh_dispatching is False
+    assert cpu._seh_original_frame is None
+    assert cpu._seh_original_ebp is None
+
+
+def test_nested_dispatch_restores_the_outer_dispatchs_stash(cpu_env):
+    """An exception raised from inside a handler must put the outer
+    dispatch's flag/frame/EBP back when it finishes."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+
+    cpu._seh_dispatching = True
+    cpu._seh_original_frame = 0xAAAA0000
+    cpu._seh_original_ebp = 0xBBBB0000
+
+    handler = CODE_BASE
+    write_bytes(mem, handler, bytes([0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]))
+    push_seh_frame(mem, fs_base, FRAME_A, handler, 0xFFFFFFFF)
+
+    dispatch_exception(cpu, mem, 0xC0000005, 0x12345678)
+
+    assert cpu._seh_dispatching is True
+    assert cpu._seh_original_frame == 0xAAAA0000
+    assert cpu._seh_original_ebp == 0xBBBB0000
+
+
+def test_game_initiated_rtlunwind_keeps_callers_registers_and_ignores_a_stale_stash(cpu_env, capsys):
+    """A longjmp-style RtlUnwind made outside any dispatch resumes with the
+    caller's EBX/ESI/EDI/EBP as they were at the call -- even when a stale
+    stash from an earlier dispatch names the same target frame (the old
+    behavior overwrote EBP with the stashed value)."""
+    cpu, mem, ks, stubs = cpu_env
+    fs_base = ks.get_fs_base()
+
+    cpu._seh_dispatching = False
+    cpu._seh_original_frame = FRAME_A     # stale leftover from an earlier dispatch
+    cpu._seh_original_ebp = 0xBAD0BAD0
+
+    rtlunwind_addr = stubs.get_handler_address("kernel32.dll", "RtlUnwind")
+    code_addr = CODE_BASE
+    recovered_label = code_addr + 0x200
+    write_bytes(mem, recovered_label, bytes([0xB8, 0x77, 0x00, 0x00, 0x00, 0xF4]))  # mov eax,0x77; hlt
+    write_bytes(mem, code_addr, _game_unwind_code(rtlunwind_addr, FRAME_A, recovered_label))
+    mem.write32(FRAME_A, 0xFFFFFFFF)
+    mem.write32(fs_base + 0x00, FRAME_A)
+
+    cpu.regs[EBX], cpu.regs[ESI], cpu.regs[EDI], cpu.regs[EBP] = 0x1111, 0x2222, 0x3333, 0x4444
+    cpu.eip = code_addr
+
+    lines: list[tuple[int, str]] = []
+    set_emit_hook(lambda level, line: lines.append((level, line)))
+    try:
+        cpu.run(1000)
+    finally:
+        set_emit_hook(None)
+
+    assert cpu.regs[EAX] == 0x77
+    assert [cpu.regs[r] & 0xFFFFFFFF for r in (EBX, ESI, EDI, EBP)] == [0x1111, 0x2222, 0x3333, 0x4444]
+    assert not any("EBP not restored" in line for _, line in lines)
+    out = capsys.readouterr().out
+    assert f"RtlUnwind from 0x{code_addr + 24:08x}" in out and "game-initiated" in out
