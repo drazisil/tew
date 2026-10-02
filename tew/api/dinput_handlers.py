@@ -25,15 +25,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api._state import CRTState
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api._state import CRTState
 
 import ctypes
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api.d3d8._helpers import _com_stub, _heap_alloc, _set_eax
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # SDL scancode -> DIK_* code, for the keys a game actually polls in practice
@@ -250,9 +250,9 @@ DIERR_OBJECTNOTFOUND   = 0x80040181
 
 
 def register_dinput_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register all DirectInput COM stubs and write vtable pointers into memory."""
     global _state_ref
@@ -260,13 +260,13 @@ def register_dinput_handlers(
 
     # ── IDirectInput2A vtable ─────────────────────────────────────────────────
 
-    def _di_query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _di_query_interface(cpu: CPU, mem: Memory) -> None:
         ppv = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if ppv:
             mem.write32(ppv, 0)
         cpu.regs[EAX] = E_NOINTERFACE
 
-    def _di_create_device(cpu: "CPU", mem: "Memory") -> None:
+    def _di_create_device(cpu: CPU, mem: Memory) -> None:
         # CreateDevice(REFGUID, lplpDID, pUnkOuter) — arg_bytes=12
         pp_dev = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if pp_dev:
@@ -312,7 +312,7 @@ def register_dinput_handlers(
 
     # ── IDirectInputDevice2A vtable ───────────────────────────────────────────
 
-    def _dev_query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_query_interface(cpu: CPU, mem: Memory) -> None:
         # Game QIs for IDirectInputDevice2A from the device it just created —
         # return the same object (AddRef implicit, device is our singleton stub).
         this_ptr = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -321,7 +321,7 @@ def register_dinput_handlers(
             mem.write32(ppv, this_ptr)
         cpu.regs[EAX] = DI_OK
 
-    def _dev_get_caps(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_get_caps(cpu: CPU, mem: Memory) -> None:
         # GetCapabilities(LPDIDEVCAPS lpDIDevCaps) — zero-fill struct
         p_caps = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_caps:
@@ -335,7 +335,7 @@ def register_dinput_handlers(
                 mem.write32((p_caps + off) & 0xFFFFFFFF, 0)
         cpu.regs[EAX] = DI_OK
 
-    def _dev_get_device_state(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_get_device_state(cpu: CPU, mem: Memory) -> None:
         # GetDeviceState(DWORD cbData, LPVOID lpvData) -- real SDL polling.
         # This device object is generic (CreateDevice doesn't distinguish
         # keyboard vs. mouse by REFGUID -- see its own comment), so which
@@ -396,7 +396,7 @@ def register_dinput_handlers(
     # keyboard events yet.
     _DIGDD_PEEK = 0x00000001
 
-    def _dev_get_device_data(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_get_device_data(cpu: CPU, mem: Memory) -> None:
         # GetDeviceData(cbObjectData, rgdod, pdwInOut, dwFlags)
         cb_object_data = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         p_rgdod        = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -438,7 +438,7 @@ def register_dinput_handlers(
     # game stuck this way doesn't look hung). Now stored per-device and
     # actually signaled by _signal_registered_events() whenever
     # notify_mouse_motion/notify_mouse_button observes a real transition.
-    def _dev_set_event_notification(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_set_event_notification(cpu: CPU, mem: Memory) -> None:
         # SetEventNotification(hEvent) — hEvent=NULL means polled
         this    = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         h_event = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -450,7 +450,7 @@ def register_dinput_handlers(
             _registered_events.pop(this, None)
         cpu.regs[EAX] = DI_POLLEDDEVICE if h_event == 0 else DI_OK
 
-    def _dev_get_device_info(cpu: "CPU", mem: "Memory") -> None:
+    def _dev_get_device_info(cpu: CPU, mem: Memory) -> None:
         # GetDeviceInfo(LPDIDEVICEINSTANCEA) — zero-fill struct
         p_info = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_info:
@@ -558,7 +558,7 @@ def register_dinput_handlers(
 
     # ── DirectInputCreateA DLL export ─────────────────────────────────────────
 
-    def _direct_input_create_a(cpu: "CPU") -> None:
+    def _direct_input_create_a(cpu: CPU) -> None:
         # DirectInputCreateA(hInst, dwVersion, lplpDirectInput, pUnkOuter)
         # lplpDirectInput at ESP+12
         pp_di = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -571,7 +571,7 @@ def register_dinput_handlers(
     stubs.register_handler("dinput.dll",  "DirectInputCreateA", _direct_input_create_a)
     stubs.register_handler("dinput8.dll", "DirectInputCreateA", _direct_input_create_a)
 
-    def _direct_input8_create(cpu: "CPU") -> None:
+    def _direct_input8_create(cpu: CPU) -> None:
         # DirectInput8Create(hInst, dwVersion, riidltf, ppvOut, punkOuter) — 5 args, 20 bytes
         # ppvOut at ESP+16 (arg 4)
         pp_di = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)

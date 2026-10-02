@@ -15,8 +15,6 @@ from __future__ import annotations
 import gc
 import tracemalloc
 
-import pytest
-
 from tew.hardware.memory_zig import ZigMemory
 
 MB = 1024 * 1024

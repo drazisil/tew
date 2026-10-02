@@ -5,15 +5,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api._state import CRTState
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
-    from tew.api._state import CRTState
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import cleanup_stdcall, unimplemented_halt as _halt
 from tew.api.char_type import GetStringTypeArgs, classify_wide_string
 from tew.api.lc_map import LCMapStringArgs, lc_map_wide_string
+from tew.api.win32_handlers import cleanup_stdcall
+from tew.api.win32_handlers import unimplemented_halt as _halt
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # ── Codepage identity ─────────────────────────────────────────────────────────
@@ -39,18 +40,18 @@ def _is_dbcs_lead_byte_value(codepage: int, byte_val: int) -> bool:
 
 
 def register_kernel32_locale_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register code page, locale, and string conversion handlers."""
 
     # ── Code pages ────────────────────────────────────────────────────────────
 
-    def _get_acp(cpu: "CPU") -> None:
+    def _get_acp(cpu: CPU) -> None:
         cpu.regs[EAX] = ANSI_CODEPAGE
 
-    def _get_cp_info(cpu: "CPU") -> None:
+    def _get_cp_info(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         memory.write32(lp, 1)
         memory.write8(lp + 4, 0x3F)  # '?'
@@ -65,11 +66,11 @@ def register_kernel32_locale_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
-    def _is_valid_code_page(cpu: "CPU") -> None:
+    def _is_valid_code_page(cpu: CPU) -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
-    def _is_dbcs_lead_byte(cpu: "CPU") -> None:
+    def _is_dbcs_lead_byte(cpu: CPU) -> None:
         test_char = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if _is_dbcs_lead_byte_value(ANSI_CODEPAGE, test_char) else 0
         cleanup_stdcall(cpu, memory, 4)
@@ -81,7 +82,7 @@ def register_kernel32_locale_handlers(
 
     # ── String conversion ─────────────────────────────────────────────────────
 
-    def _multi_byte_to_wide(cpu: "CPU") -> None:
+    def _multi_byte_to_wide(cpu: CPU) -> None:
         # 2026-08-29: this handler had zero logging on any path -- the same
         # silent-stub blind spot already found and fixed for GetLocaleInfoW
         # (see its comment above). A call here left no trace in the log
@@ -102,7 +103,7 @@ def register_kernel32_locale_handlers(
         logger.debug("handlers", f"MultiByteToWideChar(cb_mb={cb_mb}, cch_wc={cch_wc}) -> {cpu.regs[EAX]}")
         cleanup_stdcall(cpu, memory, 24)
 
-    def _wide_to_multi_byte(cpu: "CPU") -> None:
+    def _wide_to_multi_byte(cpu: CPU) -> None:
         # 2026-08-29: same silent-stub gap as _multi_byte_to_wide above.
         lp_wc  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         cch_wc = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -119,7 +120,7 @@ def register_kernel32_locale_handlers(
         logger.debug("handlers", f"WideCharToMultiByte(cch_wc={cch_wc}, cb_mb={cb_mb}) -> {cpu.regs[EAX]}")
         cleanup_stdcall(cpu, memory, 32)
 
-    def _get_string_type_w(cpu: "CPU") -> None:
+    def _get_string_type_w(cpu: CPU) -> None:
         args = GetStringTypeArgs(
             info_type = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF),
             src_ptr   = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF),
@@ -135,7 +136,7 @@ def register_kernel32_locale_handlers(
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 16)
 
-    def _get_string_type_ex_w(cpu: "CPU") -> None:
+    def _get_string_type_ex_w(cpu: CPU) -> None:
         # GetStringTypeExW(Locale, dwInfoType, lpSrcStr, cchSrc, lpCharType) --
         # same 4 trailing args as GetStringTypeW plus a leading Locale that
         # real Windows ignores for character-type classification (Unicode
@@ -156,7 +157,7 @@ def register_kernel32_locale_handlers(
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 20)
 
-    def _lc_map_string_w(cpu: "CPU") -> None:
+    def _lc_map_string_w(cpu: CPU) -> None:
         args = LCMapStringArgs(
             locale    = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF),
             map_flags = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF),
@@ -293,7 +294,7 @@ def register_kernel32_locale_handlers(
             return str(value)
         return None
 
-    def _get_locale_info_a(cpu: "CPU") -> None:
+    def _get_locale_info_a(cpu: CPU) -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lctype_raw = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         lp_data = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -350,7 +351,7 @@ def register_kernel32_locale_handlers(
         logger.debug("handlers", f"GetLocaleInfoA(lctype=0x{lctype:x}) -> {text!r}")
         cleanup_stdcall(cpu, memory, 16)
 
-    def _get_locale_info_w(cpu: "CPU") -> None:
+    def _get_locale_info_w(cpu: CPU) -> None:
         # 2026-08-28: was a bare "always fail" stub (EAX=0, no logging at
         # all) -- real oleaut32.dll code (FUN_7713cee1, reached from
         # VarDateFromStr's whole locale-struct-population chain) calls
@@ -488,7 +489,7 @@ def register_kernel32_locale_handlers(
         0x30: 2029,       # CAL_ITWODIGITYEARMAX
     }
 
-    def _get_calendar_info_w(cpu: "CPU") -> None:
+    def _get_calendar_info_w(cpu: CPU) -> None:
         locale = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         calendar = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         caltype_raw = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -550,7 +551,7 @@ def register_kernel32_locale_handlers(
     # static for the whole process lifetime -- it never gets invalidated --
     # so 0 ("never invalidated since process start") is the honest, correct
     # answer, not an approximation.
-    def _nls_get_cache_update_count(cpu: "CPU") -> None:
+    def _nls_get_cache_update_count(cpu: CPU) -> None:
         cpu.regs[EAX] = 0
 
     stubs.register_handler("kernel32.dll", "NlsGetCacheUpdateCount", _nls_get_cache_update_count)

@@ -1,14 +1,13 @@
 """Tests for kernel32.dll!SearchPathA and SearchPathW."""
 from __future__ import annotations
 
-import os
 import pytest
 
-from tew.api._state import CRTState, TEB_BASE, read_cstring, read_wide_string
+from tew.api._state import TEB_BASE, CRTState, read_cstring, read_wide_string
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.api.win32_errors import Win32Error
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

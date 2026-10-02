@@ -12,18 +12,19 @@ Architecture:
 
 from __future__ import annotations
 
-import time
 import collections
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import ESP, ZigCPU, _lib as _cpu_lib
-from tew.logger import logger, set_current_handler
 from tew.api.nt_syscall import NtSyscallDispatcher
+from tew.hardware.cpu_zig import ESP, ZigCPU
+from tew.hardware.cpu_zig import _lib as _cpu_lib
+from tew.logger import logger, set_current_handler
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -102,7 +103,7 @@ pending_timers: dict[int, PendingTimer] = {}
 # ── Helper ───────────────────────────────────────────────────────────────────
 
 
-def cleanup_stdcall(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
+def cleanup_stdcall(cpu: CPU, memory: Memory, arg_bytes: int) -> None:
     """For stdcall: move return address past args so the RET skips them.
 
     Runs on nearly every API call, so a real ZigCPU does it in one libcpu
@@ -122,13 +123,13 @@ def cleanup_stdcall(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
     memory.write32(cpu.regs[ESP], ret_addr)
 
 
-def unimplemented_halt(name: str) -> Callable[["CPU"], None]:
+def unimplemented_halt(name: str) -> Callable[[CPU], None]:
     """Return a handler that halts loudly with an UNIMPLEMENTED log.
 
     Use for a real Win32 API this project has deliberately not implemented
     yet, so calling it fails loudly instead of silently returning garbage.
     """
-    def _h(cpu: "CPU") -> None:
+    def _h(cpu: CPU) -> None:
         logger.error("handlers", f"[UNIMPLEMENTED] {name} — halting")
         log_register_dump(cpu)
         cpu.halted = True
@@ -136,7 +137,7 @@ def unimplemented_halt(name: str) -> Callable[["CPU"], None]:
     return _h
 
 
-def log_register_dump(cpu: "CPU", category: str = "cpu") -> None:
+def log_register_dump(cpu: CPU, category: str = "cpu") -> None:
     """Log all 8 GP registers plus the stdcall/cdecl return address and a run
     of stack slots below ESP.
 
@@ -183,12 +184,12 @@ def log_register_dump(cpu: "CPU", category: str = "cpu") -> None:
 class Win32Handlers:
     """Manages Win32 API stub trampolines and INT 0xFE dispatch."""
 
-    def __init__(self, memory: "Memory") -> None:
+    def __init__(self, memory: Memory) -> None:
         self._handlers: dict[str, HandlerEntry] = {}          # "dllname!funcName" → entry
         self._handlers_by_id: list[HandlerEntry] = []
         self._handlers_by_addr: dict[int, HandlerEntry] = {}  # trampoline/patched code address → entry
         self._next_handler_addr: int = HANDLER_BASE
-        self._memory: "Memory" = memory
+        self._memory: Memory = memory
         self._installed: bool = False
         # Recent stub calls as [entry, repeat_count]; consecutive calls to the
         # same entry bump the count instead of appending. Formatted to strings
@@ -423,7 +424,7 @@ class Win32Handlers:
 
     # ── Installation ──────────────────────────────────────────────────────────
 
-    def install(self, cpu: "CPU") -> None:
+    def install(self, cpu: CPU) -> None:
         """Install the INT 0xFE handler on the CPU.
 
         Must be called after all stubs are registered.
@@ -440,7 +441,7 @@ class Win32Handlers:
 
         nt_dispatcher = self._nt_dispatcher
 
-        def _dispatch(int_num: int, c: "CPU") -> None:
+        def _dispatch(int_num: int, c: CPU) -> None:
             if int_num == STUB_INT:
                 stubs._handle_api_int(c)
                 return
@@ -461,7 +462,7 @@ class Win32Handlers:
                 # with no debugger attached. Route through the same SEH-chain
                 # dispatch already used for access violations instead of
                 # treating every one of those sites as instant-fatal.
-                from tew.kernel.seh import dispatch_exception, STATUS_BREAKPOINT
+                from tew.kernel.seh import STATUS_BREAKPOINT, dispatch_exception
                 # EIP has already advanced past the 1-byte opcode by the time
                 # this handler runs, but ExceptionAddress/CONTEXT.Eip must
                 # point AT the INT3 itself, matching real Windows.
@@ -521,7 +522,7 @@ class Win32Handlers:
 
     # ── INT 0xFE dispatch ─────────────────────────────────────────────────────
 
-    def _handle_api_int(self, cpu: "CPU") -> None:
+    def _handle_api_int(self, cpu: CPU) -> None:
         """Handle INT 0xFE — find which stub was called and execute its handler.
 
         EIP is now pointing past the INT 0xFE instruction (at the RET).

@@ -10,15 +10,22 @@ from __future__ import annotations
 import math
 import os
 import struct
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
+from tew.api._state import (
+    OPEN_ALWAYS,
+    CRTState,
+    file_entry_size,
+    read_cstring,
+    read_wide_string,
+)
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, file_entry_size, read_cstring, read_wide_string, OPEN_ALWAYS
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # ── Fixed data region addresses ───────────────────────────────────────────────
@@ -60,7 +67,7 @@ _COMMODE_ADDR = 0x00210020
 
 # ── printf helper: write a Python str into emulator memory as C string ────────
 
-def _write_cstring(ptr: int, s: str, memory: "Memory") -> int:
+def _write_cstring(ptr: int, s: str, memory: Memory) -> int:
     """Write *s* into emulator memory at *ptr* as a null-terminated Latin-1 string.
 
     Returns the number of bytes written (not counting the null terminator).
@@ -74,7 +81,7 @@ def _write_cstring(ptr: int, s: str, memory: "Memory") -> int:
 
 # ── printf helper: format engine ─────────────────────────────────────────────
 
-def _sprintf_format(fmt: str, get_arg: Callable[[], int], memory: "Memory") -> str:
+def _sprintf_format(fmt: str, get_arg: Callable[[], int], memory: Memory) -> str:
     """Format *fmt* using x86 stack arguments supplied by *get_arg*.
 
     *get_arg* is called once per format argument (advancing its own offset).
@@ -258,9 +265,9 @@ def _sprintf_format(fmt: str, get_arg: Callable[[], int], memory: "Memory") -> s
 # ── Main registration function ────────────────────────────────────────────────
 
 def register_msvcrt_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register all msvcrt.dll handlers."""
 
@@ -284,7 +291,7 @@ def register_msvcrt_handlers(
             memory.write8(initializer_sentinel, 0xF4)  # HLT
         return initializer_sentinel
 
-    def _call_guest_void(cpu: "CPU", fn_addr: int) -> bool:
+    def _call_guest_void(cpu: CPU, fn_addr: int) -> bool:
         """
         Call a no-arg guest function by pushing a dedicated HLT sentinel as
         the return address and stepping the CPU until the function returns.
@@ -331,7 +338,7 @@ def register_msvcrt_handlers(
     # _initterm(PVOID* pfbegin, PVOID* pfend) -> void [cdecl]
     # Calls each non-null function pointer in [pfbegin, pfend) — C++ static
     # initializers.  Each function takes no arguments and returns void.
-    def _initterm(cpu: "CPU") -> None:
+    def _initterm(cpu: CPU) -> None:
         esp          = cpu.regs[ESP]
         trampoline   = cpu.eip          # = stub_addr + 2 (the RET byte); restore after callbacks
         pf_begin     = memory.read32((esp + 4) & 0xFFFFFFFF)
@@ -363,7 +370,7 @@ def register_msvcrt_handlers(
     # _initterm_e(PVOID* pfbegin, PVOID* pfend) -> int [cdecl]
     # Same as _initterm but each function returns int.  A non-zero return value
     # aborts CRT startup and is returned from _initterm_e.
-    def _initterm_e(cpu: "CPU") -> None:
+    def _initterm_e(cpu: CPU) -> None:
         esp        = cpu.regs[ESP]
         trampoline = cpu.eip
         pf_begin   = memory.read32((esp + 4) & 0xFFFFFFFF)
@@ -399,7 +406,7 @@ def register_msvcrt_handlers(
     # ── __set_app_type — no-op (cdecl, caller cleans) ────────────────────────
 
     # __set_app_type(int apptype) -> void [cdecl]
-    def _set_app_type(cpu: "CPU") -> None:
+    def _set_app_type(cpu: CPU) -> None:
         app_type = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.debug("handlers", f"__set_app_type({app_type}) — no-op (bump allocator has no app-type state)")
 
@@ -412,7 +419,7 @@ def register_msvcrt_handlers(
     # to _O_TEXT (0) or _O_BINARY (0x8000). We return a pointer to a zeroed DWORD.
     memory.write32(_FMODE_ADDR, 0)  # _O_TEXT
 
-    def _p_fmode(cpu: "CPU") -> None:
+    def _p_fmode(cpu: CPU) -> None:
         cpu.regs[EAX] = _FMODE_ADDR
 
     stubs.register_handler("msvcrt.dll", "__p__fmode", _p_fmode)
@@ -422,7 +429,7 @@ def register_msvcrt_handlers(
     # __p__commode() -> int* [cdecl]
     memory.write32(_COMMODE_ADDR, 0)
 
-    def _p_commode(cpu: "CPU") -> None:
+    def _p_commode(cpu: CPU) -> None:
         cpu.regs[EAX] = _COMMODE_ADDR
 
     stubs.register_handler("msvcrt.dll", "__p__commode", _p_commode)
@@ -430,7 +437,7 @@ def register_msvcrt_handlers(
     # ── _controlfp — return default FP control word ───────────────────────────
 
     # _controlfp(unsigned int new, unsigned int mask) -> unsigned int [cdecl]
-    def _controlfp(cpu: "CPU") -> None:
+    def _controlfp(cpu: CPU) -> None:
         cpu.regs[EAX] = 0x0001001F  # default FP control word
         # cdecl: caller cleans up
 
@@ -439,7 +446,7 @@ def register_msvcrt_handlers(
     # ── _except_handler3 — SEH handler ───────────────────────────────────────
 
     # _except_handler3 — SEH handler [cdecl]
-    def _except_handler3(cpu: "CPU") -> None:
+    def _except_handler3(cpu: CPU) -> None:
         cpu.regs[EAX] = 1  # ExceptionContinueSearch
         # cdecl: caller cleans up args
 
@@ -476,7 +483,7 @@ def register_msvcrt_handlers(
     # __getmainargs(int* argc, char*** argv, char*** envp, int doWildCard, _startupinfo*) -> int [cdecl]
     # CRT writes returned pointers to its own globals; game reads argc/argv to decide
     # multiplayer vs single-player mode. We supply argc=4, argv=["MCity_d.exe", "-nomovie", "-dbEnableLog", "-CaptureStdout"].
-    def _getmainargs(cpu: "CPU") -> None:
+    def _getmainargs(cpu: CPU) -> None:
         p_argc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         p_argv = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         p_envp = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -500,7 +507,7 @@ def register_msvcrt_handlers(
     # identify who made one of these calls after the fact (2026-08-29: this
     # is exactly why the one 42MB leaked block in a real leak dump came back
     # with no file/line attribution at all).
-    def _malloc(cpu: "CPU") -> None:
+    def _malloc(cpu: CPU) -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         addr   = state.simple_alloc(size) if size > 0 else 0
@@ -510,7 +517,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "malloc", _malloc)
 
     # _malloc_crt(size_t size) -> void* [cdecl] — alias for malloc
-    def _malloc_crt(cpu: "CPU") -> None:
+    def _malloc_crt(cpu: CPU) -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         addr   = state.simple_alloc(size) if size > 0 else 0
@@ -522,7 +529,7 @@ def register_msvcrt_handlers(
     # calloc(size_t num, size_t size) -> void* [cdecl]
     # calloc's contract is zeroed memory; simple_alloc's default fill is 0xCD,
     # so ask for zeros explicitly.
-    def _calloc(cpu: "CPU") -> None:
+    def _calloc(cpu: CPU) -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         num  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -534,7 +541,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "calloc", _calloc)
 
     # realloc(void* ptr, size_t size) -> void* [cdecl]
-    def _realloc(cpu: "CPU") -> None:
+    def _realloc(cpu: CPU) -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         ptr  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         size = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -557,7 +564,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "realloc", _realloc)
 
     # free(void* ptr) -> void [cdecl]
-    def _free(cpu: "CPU") -> None:
+    def _free(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.trace("handlers", f"free(0x{ptr:08x})")
         state.simple_free(ptr)
@@ -573,7 +580,7 @@ def register_msvcrt_handlers(
     # down into this same primitive for the real memory -- so this is the
     # single chokepoint for every `new` expression, tracked or not. See
     # _malloc above for why this caller/size logging matters.
-    def _operator_new(cpu: "CPU") -> None:
+    def _operator_new(cpu: CPU) -> None:
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         size   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         addr   = state.simple_alloc(size) if size > 0 else 0
@@ -583,7 +590,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "??2@YAPAXI@Z", _operator_new)
 
     # operator delete(void* ptr) -> void [cdecl]  (MSVC mangled name)
-    def _operator_delete(cpu: "CPU") -> None:
+    def _operator_delete(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.trace("handlers", f"operator delete(0x{ptr:08x})")
         state.simple_free(ptr)
@@ -604,7 +611,7 @@ def register_msvcrt_handlers(
     # truncate) plus an explicit seek to end-of-file: unlike a real O_APPEND
     # fd, entry.fd here has no kernel-level "always write at EOF" behavior,
     # and _fputs writes via a plain os.write() at the fd's current position.
-    def _fopen_impl(cpu: "CPU") -> None:
+    def _fopen_impl(cpu: CPU) -> None:
         filename_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         mode_ptr     = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         filename = read_cstring(filename_ptr, memory)
@@ -624,7 +631,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_fopen", _fopen_impl)
 
     # fclose(FILE* stream) -> int [cdecl]
-    def _fclose(cpu: "CPU") -> None:
+    def _fclose(cpu: CPU) -> None:
         stream = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         state.file_handle_map.pop(stream, None)
         cpu.regs[EAX] = 0  # 0 = success
@@ -633,7 +640,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_fclose", _fclose)
 
     # fread(void* ptr, size_t size, size_t count, FILE* stream) -> size_t [cdecl]
-    def _fread(cpu: "CPU") -> None:
+    def _fread(cpu: CPU) -> None:
         ptr    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         size   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -663,7 +670,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "fread", _fread)
 
     # fwrite(const void* ptr, size_t size, size_t count, FILE* stream) -> size_t [cdecl]
-    def _fwrite(cpu: "CPU") -> None:
+    def _fwrite(cpu: CPU) -> None:
         lp_ptr  = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         size    = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         count   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -693,7 +700,7 @@ def register_msvcrt_handlers(
     # fputs(const char* str, FILE* stream) -> int [cdecl]
     # Real fputs returns a non-negative value on success, EOF (-1) on error;
     # we always succeed once we've routed the text somewhere.
-    def _fputs(cpu: "CPU") -> None:
+    def _fputs(cpu: CPU) -> None:
         str_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         stream  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         text = read_cstring(str_ptr, memory)
@@ -717,7 +724,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_fputs", _fputs)
 
     # fseek(FILE* stream, long offset, int whence) -> int [cdecl]
-    def _fseek(cpu: "CPU") -> None:
+    def _fseek(cpu: CPU) -> None:
         stream = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         raw    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         offset = raw if raw < 0x80000000 else (raw - 0x100000000)  # signed 32-bit
@@ -738,7 +745,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "fseek", _fseek)
 
     # ftell(FILE* stream) -> long [cdecl]
-    def _ftell(cpu: "CPU") -> None:
+    def _ftell(cpu: CPU) -> None:
         stream = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(stream)
         cpu.regs[EAX] = (entry.position & 0xFFFFFFFF) if entry is not None else 0xFFFFFFFF
@@ -746,7 +753,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "ftell", _ftell)
 
     # feof(FILE* stream) -> int [cdecl]
-    def _feof(cpu: "CPU") -> None:
+    def _feof(cpu: CPU) -> None:
         stream = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(stream)
         cpu.regs[EAX] = 1 if (entry is not None and entry.position >= len(entry.data)) else 0
@@ -754,7 +761,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "feof", _feof)
 
     # fgets(char* str, int n, FILE* stream) -> char* [cdecl]
-    def _fgets(cpu: "CPU") -> None:
+    def _fgets(cpu: CPU) -> None:
         str_ptr = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         n_raw   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         stream  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -777,7 +784,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "fgets", _fgets)
 
     # rewind(FILE* stream) -> void [cdecl]
-    def _rewind(cpu: "CPU") -> None:
+    def _rewind(cpu: CPU) -> None:
         stream = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(stream)
         if entry is not None:
@@ -786,7 +793,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "rewind", _rewind)
 
     # fprintf(FILE* stream, const char* format, ...) -> int [cdecl]
-    def _fprintf(cpu: "CPU") -> None:
+    def _fprintf(cpu: CPU) -> None:
         stream  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         fmt_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         fmt     = read_cstring(fmt_ptr, memory, 4096)
@@ -813,20 +820,20 @@ def register_msvcrt_handlers(
     # ── atexit / onexit — no-op (return arg) ─────────────────────────────────
 
     # __dllonexit(fn, pbegin, pend) -> fn [cdecl]
-    def _dllonexit(cpu: "CPU") -> None:
+    def _dllonexit(cpu: CPU) -> None:
         cpu.regs[EAX] = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
 
     stubs.register_handler("msvcrt.dll", "__dllonexit", _dllonexit)
 
     # _onexit(fn) -> fn [cdecl]
-    def _onexit(cpu: "CPU") -> None:
+    def _onexit(cpu: CPU) -> None:
         cpu.regs[EAX] = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
 
     stubs.register_handler("msvcrt.dll", "_onexit", _onexit)
 
     # _atexit(fn) -> int [cdecl]
     # Returns 0 (success) without registering; we do not run atexit callbacks.
-    def _atexit(cpu: "CPU") -> None:
+    def _atexit(cpu: CPU) -> None:
         cpu.regs[EAX] = 0
 
     stubs.register_handler("msvcrt.dll", "_atexit", _atexit)
@@ -834,7 +841,7 @@ def register_msvcrt_handlers(
     # ── Character classification ───────────────────────────────────────────────
 
     # _isctype(int c, int type) -> int [cdecl]
-    def _isctype(cpu: "CPU") -> None:
+    def _isctype(cpu: CPU) -> None:
         logger.error("handlers", "[UNIMPLEMENTED] _isctype — halting")
         cpu.halted = True
         cpu.fatal_halt = True
@@ -844,7 +851,7 @@ def register_msvcrt_handlers(
     # ── C++ exception handler ─────────────────────────────────────────────────
 
     # __CxxFrameHandler: C++ exception frame dispatch — halt, we have no SEH
-    def _cxx_frame_handler(cpu: "CPU") -> None:
+    def _cxx_frame_handler(cpu: CPU) -> None:
         logger.error("handlers", "[UNIMPLEMENTED] __CxxFrameHandler — halting")
         cpu.halted = True
         cpu.fatal_halt = True
@@ -854,7 +861,7 @@ def register_msvcrt_handlers(
     # ── printf-family ─────────────────────────────────────────────────────────
 
     # sprintf(char* dst, const char* fmt, ...) -> int [cdecl]
-    def _sprintf(cpu: "CPU") -> None:
+    def _sprintf(cpu: CPU) -> None:
         dst     = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         fmt_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         fmt     = read_cstring(fmt_ptr, memory, 4096)
@@ -871,7 +878,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "sprintf", _sprintf)
 
     # _snprintf(char* dst, size_t count, const char* fmt, ...) -> int [cdecl]
-    def _snprintf(cpu: "CPU") -> None:
+    def _snprintf(cpu: CPU) -> None:
         dst     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         count   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         fmt_ptr = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -896,7 +903,7 @@ def register_msvcrt_handlers(
 
     # vsprintf(char* dst, const char* fmt, va_list ap) -> int [cdecl]
     # va_list is a pointer to the first variadic argument in memory.
-    def _vsprintf(cpu: "CPU") -> None:
+    def _vsprintf(cpu: CPU) -> None:
         dst     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         fmt_ptr = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         ap      = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -914,7 +921,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "vsprintf", _vsprintf)
 
     # printf(const char* fmt, ...) -> int [cdecl]
-    def _printf(cpu: "CPU") -> None:
+    def _printf(cpu: CPU) -> None:
         fmt_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         fmt     = read_cstring(fmt_ptr, memory, 4096)
         arg_off = [8]
@@ -932,7 +939,7 @@ def register_msvcrt_handlers(
 
     # sscanf(const char* str, const char* fmt, ...) -> int [cdecl]
     # Very limited implementation: handles %d, %u, %x, %s, %f, %c only.
-    def _sscanf(cpu: "CPU") -> None:
+    def _sscanf(cpu: CPU) -> None:
         str_ptr  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         fmt_ptr  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         src      = read_cstring(str_ptr, memory, 4096)
@@ -1085,7 +1092,7 @@ def register_msvcrt_handlers(
     # ── String functions ───────────────────────────────────────────────────────
 
     # strlen(const char* s) -> size_t [cdecl]
-    def _strlen(cpu: "CPU") -> None:
+    def _strlen(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         length = 0
         while memory.read8(ptr + length) != 0:
@@ -1095,7 +1102,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strlen", _strlen)
 
     # wcslen(const wchar_t* s) -> size_t [cdecl]
-    def _wcslen(cpu: "CPU") -> None:
+    def _wcslen(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         length = 0
         while memory.read16((ptr + length * 2) & 0xFFFFFFFF) != 0:
@@ -1105,7 +1112,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "wcslen", _wcslen)
 
     # strcpy(char* dst, const char* src) -> char* [cdecl]
-    def _strcpy(cpu: "CPU") -> None:
+    def _strcpy(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         i = 0
@@ -1120,7 +1127,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strcpy", _strcpy)
 
     # strncpy(char* dst, const char* src, size_t n) -> char* [cdecl]
-    def _strncpy(cpu: "CPU") -> None:
+    def _strncpy(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1140,7 +1147,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strncpy", _strncpy)
 
     # wcsncpy(wchar_t* dst, const wchar_t* src, size_t n) -> wchar_t* [cdecl]
-    def _wcsncpy(cpu: "CPU") -> None:
+    def _wcsncpy(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1160,7 +1167,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "wcsncpy", _wcsncpy)
 
     # wcsncmp(const wchar_t* s1, const wchar_t* s2, size_t n) -> int [cdecl]
-    def _wcsncmp(cpu: "CPU") -> None:
+    def _wcsncmp(cpu: CPU) -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         s2 = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1181,7 +1188,7 @@ def register_msvcrt_handlers(
 
     # _wcsicmp(const wchar_t* s1, const wchar_t* s2) -> int [cdecl]
     # Case-insensitive, whole-string (no length arg, unlike wcsncmp above).
-    def _wcsicmp(cpu: "CPU") -> None:
+    def _wcsicmp(cpu: CPU) -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         s2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         a = read_wide_string(s1, memory).upper()
@@ -1191,7 +1198,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_wcsicmp", _wcsicmp)
 
     # strcat(char* dst, const char* src) -> char* [cdecl]
-    def _strcat(cpu: "CPU") -> None:
+    def _strcat(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         # Find end of dst
@@ -1211,7 +1218,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strcat", _strcat)
 
     # strcmp(const char* s1, const char* s2) -> int [cdecl]
-    def _strcmp(cpu: "CPU") -> None:
+    def _strcmp(cpu: CPU) -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         s2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         i = 0
@@ -1235,7 +1242,7 @@ def register_msvcrt_handlers(
     # bytes (as unsigned chars), like the real CRT. A NULL argument would
     # invoke the CRT's invalid-parameter handler, which tew does not model,
     # so it halts loudly instead of guessing.
-    def _stricmp(cpu: "CPU") -> None:
+    def _stricmp(cpu: CPU) -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         s2 = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if s1 == 0 or s2 == 0:
@@ -1259,7 +1266,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_stricmp", _stricmp)
 
     # strncmp(const char* s1, const char* s2, size_t n) -> int [cdecl]
-    def _strncmp(cpu: "CPU") -> None:
+    def _strncmp(cpu: CPU) -> None:
         s1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         s2 = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1279,7 +1286,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strncmp", _strncmp)
 
     # strchr(const char* s, int c) -> char* [cdecl]
-    def _strchr(cpu: "CPU") -> None:
+    def _strchr(cpu: CPU) -> None:
         s   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         c   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF) & 0xFF
         i = 0
@@ -1296,7 +1303,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strchr", _strchr)
 
     # strrchr(const char* s, int c) -> char* [cdecl]
-    def _strrchr(cpu: "CPU") -> None:
+    def _strrchr(cpu: CPU) -> None:
         s   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         c   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF) & 0xFF
         last = 0  # NULL (not found)
@@ -1313,7 +1320,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strrchr", _strrchr)
 
     # strstr(const char* haystack, const char* needle) -> char* [cdecl]
-    def _strstr(cpu: "CPU") -> None:
+    def _strstr(cpu: CPU) -> None:
         haystack_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         needle_ptr   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         haystack = read_cstring(haystack_ptr, memory, 4096)
@@ -1328,7 +1335,7 @@ def register_msvcrt_handlers(
 
     # ── Memory functions ───────────────────────────────────────────────────────
 
-    def _mem_range_halt(cpu: "CPU", func_name: str, **addrs: int) -> None:
+    def _mem_range_halt(cpu: CPU, func_name: str, **addrs: int) -> None:
         args = ", ".join(f"{k}=0x{v:08x}" for k, v in addrs.items())
         logger.error(
             "handlers",
@@ -1340,7 +1347,7 @@ def register_msvcrt_handlers(
         cpu.fatal_halt = True
 
     # memcpy(void* dst, const void* src, size_t n) -> void* [cdecl]
-    def _memcpy(cpu: "CPU") -> None:
+    def _memcpy(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1355,7 +1362,7 @@ def register_msvcrt_handlers(
 
     # memmove(void* dst, const void* src, size_t n) -> void* [cdecl]
     # Handles overlapping regions correctly by choosing copy direction.
-    def _memmove(cpu: "CPU") -> None:
+    def _memmove(cpu: CPU) -> None:
         dst = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         src = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1375,7 +1382,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "memmove", _memmove)
 
     # memset(void* ptr, int value, size_t n) -> void* [cdecl]
-    def _memset(cpu: "CPU") -> None:
+    def _memset(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         val = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF) & 0xFF
         n   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1389,7 +1396,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "memset", _memset)
 
     # memcmp(const void* p1, const void* p2, size_t n) -> int [cdecl]
-    def _memcmp(cpu: "CPU") -> None:
+    def _memcmp(cpu: CPU) -> None:
         p1 = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p2 = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         n  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1409,42 +1416,42 @@ def register_msvcrt_handlers(
     # ── Character classification / conversion ─────────────────────────────────
 
     # toupper(int c) -> int [cdecl]
-    def _toupper(cpu: "CPU") -> None:
+    def _toupper(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = ord(chr(c).upper()) if 0 < c < 128 else c
 
     stubs.register_handler("msvcrt.dll", "toupper", _toupper)
 
     # tolower(int c) -> int [cdecl]
-    def _tolower(cpu: "CPU") -> None:
+    def _tolower(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = ord(chr(c).lower()) if 0 < c < 128 else c
 
     stubs.register_handler("msvcrt.dll", "tolower", _tolower)
 
     # isdigit(int c) -> int [cdecl]
-    def _isdigit(cpu: "CPU") -> None:
+    def _isdigit(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).isdigit() else 0
 
     stubs.register_handler("msvcrt.dll", "isdigit", _isdigit)
 
     # isalpha(int c) -> int [cdecl]
-    def _isalpha(cpu: "CPU") -> None:
+    def _isalpha(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).isalpha() else 0
 
     stubs.register_handler("msvcrt.dll", "isalpha", _isalpha)
 
     # isalnum(int c) -> int [cdecl]
-    def _isalnum(cpu: "CPU") -> None:
+    def _isalnum(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).isalnum() else 0
 
     stubs.register_handler("msvcrt.dll", "isalnum", _isalnum)
 
     # isspace(int c) -> int [cdecl]
-    def _isspace(cpu: "CPU") -> None:
+    def _isspace(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c) in " \t\n\r\x0b\x0c" else 0
 
@@ -1453,28 +1460,28 @@ def register_msvcrt_handlers(
     # iswspace(wint_t wc) -> int [cdecl]
     # Wide-char sibling of isspace above -- same whitespace set, full
     # 16-bit code unit instead of masking to a byte.
-    def _iswspace(cpu: "CPU") -> None:
+    def _iswspace(cpu: CPU) -> None:
         wc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
         cpu.regs[EAX] = 1 if chr(wc) in " \t\n\r\x0b\x0c" else 0
 
     stubs.register_handler("msvcrt.dll", "iswspace", _iswspace)
 
     # isupper(int c) -> int [cdecl]
-    def _isupper(cpu: "CPU") -> None:
+    def _isupper(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).isupper() else 0
 
     stubs.register_handler("msvcrt.dll", "isupper", _isupper)
 
     # islower(int c) -> int [cdecl]
-    def _islower(cpu: "CPU") -> None:
+    def _islower(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).islower() else 0
 
     stubs.register_handler("msvcrt.dll", "islower", _islower)
 
     # isprint(int c) -> int [cdecl]
-    def _isprint(cpu: "CPU") -> None:
+    def _isprint(cpu: CPU) -> None:
         c = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFF
         cpu.regs[EAX] = 1 if chr(c).isprintable() else 0
 
@@ -1483,7 +1490,7 @@ def register_msvcrt_handlers(
     # ── String-to-number conversions ──────────────────────────────────────────
 
     # atoi(const char* str) -> int [cdecl]
-    def _atoi(cpu: "CPU") -> None:
+    def _atoi(cpu: CPU) -> None:
         s = read_cstring(memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF), memory)
         try:
             val = int(s.strip(), 10)
@@ -1496,7 +1503,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "atoi", _atoi)
 
     # _wtoi(const wchar_t* str) -> int [cdecl]
-    def _wtoi(cpu: "CPU") -> None:
+    def _wtoi(cpu: CPU) -> None:
         s = read_wide_string(memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF), memory)
         i = 0
         n = len(s)
@@ -1527,7 +1534,7 @@ def register_msvcrt_handlers(
         return "".join(reversed(digits))
 
     # _itoa(int value, char* str, int radix) -> char* (== str) [cdecl]
-    def _itoa(cpu: "CPU") -> None:
+    def _itoa(cpu: CPU) -> None:
         raw = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         str_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         radix = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1545,7 +1552,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_itoa", _itoa)
 
     # atol(const char* str) -> long [cdecl]
-    def _atol(cpu: "CPU") -> None:
+    def _atol(cpu: CPU) -> None:
         s = read_cstring(memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF), memory)
         try:
             val = int(s.strip(), 10)
@@ -1557,7 +1564,7 @@ def register_msvcrt_handlers(
 
     # atof(const char* str) -> double [cdecl]
     # Returns result on FPU ST(0) (pushed), like most double-returning CRT functions.
-    def _atof(cpu: "CPU") -> None:
+    def _atof(cpu: CPU) -> None:
         s = read_cstring(memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF), memory)
         try:
             val = float(s.strip())
@@ -1569,7 +1576,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "atof", _atof)
 
     # strtol(const char* str, char** endptr, int base) -> long [cdecl]
-    def _strtol(cpu: "CPU") -> None:
+    def _strtol(cpu: CPU) -> None:
         str_ptr  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         end_ptr  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         base     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1587,7 +1594,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "strtol", _strtol)
 
     # strtoul(const char* str, char** endptr, int base) -> unsigned long [cdecl]
-    def _strtoul(cpu: "CPU") -> None:
+    def _strtoul(cpu: CPU) -> None:
         str_ptr  = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         end_ptr  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         base     = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1605,7 +1612,7 @@ def register_msvcrt_handlers(
 
     # strtod(const char* str, char** endptr) -> double [cdecl]
     # Returns result on FPU ST(0).
-    def _strtod(cpu: "CPU") -> None:
+    def _strtod(cpu: CPU) -> None:
         str_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         end_ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         s = read_cstring(str_ptr, memory)
@@ -1624,7 +1631,7 @@ def register_msvcrt_handlers(
     # ── Math ───────────────────────────────────────────────────────────────────
 
     # abs(int x) -> int [cdecl]
-    def _abs(cpu: "CPU") -> None:
+    def _abs(cpu: CPU) -> None:
         raw = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         n   = raw if raw < 0x80000000 else (raw - 0x100000000)  # signed
         cpu.regs[EAX] = abs(n) & 0xFFFFFFFF
@@ -1635,13 +1642,13 @@ def register_msvcrt_handlers(
     # Returns a pseudo-random number in [0, 32767]. We use Python's random module.
     import random as _random
 
-    def _rand(cpu: "CPU") -> None:
+    def _rand(cpu: CPU) -> None:
         cpu.regs[EAX] = _random.randint(0, 32767)
 
     stubs.register_handler("msvcrt.dll", "rand", _rand)
 
     # srand(unsigned int seed) -> void [cdecl]
-    def _srand(cpu: "CPU") -> None:
+    def _srand(cpu: CPU) -> None:
         seed = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         _random.seed(seed)
 
@@ -1651,63 +1658,63 @@ def register_msvcrt_handlers(
     # Convention for double-returning functions: push result to FPU ST(0).
     # These use cdecl; the 64-bit double argument sits at ESP+4 (lo) and ESP+8 (hi).
 
-    def _read_double_arg(cpu: "CPU", off: int = 4) -> float:
+    def _read_double_arg(cpu: CPU, off: int = 4) -> float:
         lo = memory.read32((cpu.regs[ESP] + off)     & 0xFFFFFFFF)
         hi = memory.read32((cpu.regs[ESP] + off + 4) & 0xFFFFFFFF)
         return struct.unpack("<d", struct.pack("<II", lo, hi))[0]
 
-    def _push_fpu(cpu: "CPU", val: float) -> None:
+    def _push_fpu(cpu: CPU, val: float) -> None:
         cpu.fpu_top = (cpu.fpu_top - 1) & 7
         cpu.fpu_stack[cpu.fpu_top] = val
 
     # floor(double x) -> double [cdecl]
-    def _floor(cpu: "CPU") -> None:
+    def _floor(cpu: CPU) -> None:
         f = _read_double_arg(cpu)
         _push_fpu(cpu, math.floor(f))
 
     stubs.register_handler("msvcrt.dll", "floor", _floor)
 
     # ceil(double x) -> double [cdecl]
-    def _ceil(cpu: "CPU") -> None:
+    def _ceil(cpu: CPU) -> None:
         f = _read_double_arg(cpu)
         _push_fpu(cpu, math.ceil(f))
 
     stubs.register_handler("msvcrt.dll", "ceil", _ceil)
 
     # sqrt(double x) -> double [cdecl]
-    def _sqrt(cpu: "CPU") -> None:
+    def _sqrt(cpu: CPU) -> None:
         f = _read_double_arg(cpu)
         _push_fpu(cpu, math.sqrt(f) if f >= 0.0 else float("nan"))
 
     stubs.register_handler("msvcrt.dll", "sqrt", _sqrt)
 
     # sin(double x) -> double [cdecl]
-    def _sin(cpu: "CPU") -> None:
+    def _sin(cpu: CPU) -> None:
         _push_fpu(cpu, math.sin(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "sin", _sin)
 
     # cos(double x) -> double [cdecl]
-    def _cos(cpu: "CPU") -> None:
+    def _cos(cpu: CPU) -> None:
         _push_fpu(cpu, math.cos(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "cos", _cos)
 
     # tan(double x) -> double [cdecl]
-    def _tan(cpu: "CPU") -> None:
+    def _tan(cpu: CPU) -> None:
         _push_fpu(cpu, math.tan(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "tan", _tan)
 
     # atan(double x) -> double [cdecl]
-    def _atan(cpu: "CPU") -> None:
+    def _atan(cpu: CPU) -> None:
         _push_fpu(cpu, math.atan(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "atan", _atan)
 
     # atan2(double y, double x) -> double [cdecl]
     # Stack: y at ESP+4, x at ESP+12 (each occupies 8 bytes).
-    def _atan2(cpu: "CPU") -> None:
+    def _atan2(cpu: CPU) -> None:
         y = _read_double_arg(cpu, 4)
         x = _read_double_arg(cpu, 12)
         _push_fpu(cpu, math.atan2(y, x))
@@ -1715,21 +1722,21 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "atan2", _atan2)
 
     # log(double x) -> double [cdecl]
-    def _log(cpu: "CPU") -> None:
+    def _log(cpu: CPU) -> None:
         f = _read_double_arg(cpu)
         _push_fpu(cpu, math.log(f) if f > 0.0 else float("-inf") if f == 0.0 else float("nan"))
 
     stubs.register_handler("msvcrt.dll", "log", _log)
 
     # exp(double x) -> double [cdecl]
-    def _exp(cpu: "CPU") -> None:
+    def _exp(cpu: CPU) -> None:
         _push_fpu(cpu, math.exp(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "exp", _exp)
 
     # fmod(double x, double y) -> double [cdecl]
     # Stack: x at ESP+4, y at ESP+12.
-    def _fmod(cpu: "CPU") -> None:
+    def _fmod(cpu: CPU) -> None:
         x = _read_double_arg(cpu, 4)
         y = _read_double_arg(cpu, 12)
         _push_fpu(cpu, math.fmod(x, y) if y != 0.0 else float("nan"))
@@ -1738,7 +1745,7 @@ def register_msvcrt_handlers(
 
     # pow(double x, double y) -> double [cdecl]
     # Stack: x at ESP+4, y at ESP+12.
-    def _pow(cpu: "CPU") -> None:
+    def _pow(cpu: CPU) -> None:
         x = _read_double_arg(cpu, 4)
         y = _read_double_arg(cpu, 12)
         try:
@@ -1749,7 +1756,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "pow", _pow)
 
     # fabs(double x) -> double [cdecl]
-    def _fabs(cpu: "CPU") -> None:
+    def _fabs(cpu: CPU) -> None:
         _push_fpu(cpu, abs(_read_double_arg(cpu)))
 
     stubs.register_handler("msvcrt.dll", "fabs", _fabs)
@@ -1758,7 +1765,7 @@ def register_msvcrt_handlers(
 
     # _ftol(): convert FPU ST(0) to 32-bit integer in EAX, pop ST(0) [cdecl, no stack args]
     # Truncates toward zero (same as C's (int) cast).
-    def _ftol(cpu: "CPU") -> None:
+    def _ftol(cpu: CPU) -> None:
         val = cpu.fpu_stack[cpu.fpu_top & 7]
         cpu.fpu_top = (cpu.fpu_top + 1) & 7  # pop ST(0)
         cpu.regs[EAX] = (math.trunc(val) & 0xFFFFFFFF)
@@ -1767,7 +1774,7 @@ def register_msvcrt_handlers(
 
     # _CIpow(): ST(0)=y (exponent), ST(1)=x (base) → ST(0) = pow(x, y) [cdecl, no stack args]
     # Pops both operands, pushes result.
-    def _CIpow(cpu: "CPU") -> None:
+    def _CIpow(cpu: CPU) -> None:
         y = cpu.fpu_stack[cpu.fpu_top & 7]
         x = cpu.fpu_stack[(cpu.fpu_top + 1) & 7]
         cpu.fpu_top = (cpu.fpu_top + 1) & 7  # consume y (ST0); x (ST1) becomes ST0
@@ -1779,39 +1786,39 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_CIpow", _CIpow)
 
     # _CIsqrt(): ST(0) = sqrt(ST(0)) [cdecl, no stack args]
-    def _CIsqrt(cpu: "CPU") -> None:
+    def _CIsqrt(cpu: CPU) -> None:
         val = cpu.fpu_stack[cpu.fpu_top & 7]
         cpu.fpu_stack[cpu.fpu_top & 7] = math.sqrt(val) if val >= 0.0 else float("nan")
 
     stubs.register_handler("msvcrt.dll", "_CIsqrt", _CIsqrt)
 
     # _CIsin(): ST(0) = sin(ST(0)) [cdecl, no stack args]
-    def _CIsin(cpu: "CPU") -> None:
+    def _CIsin(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.sin(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CIsin", _CIsin)
 
     # _CIcos(): ST(0) = cos(ST(0)) [cdecl, no stack args]
-    def _CIcos(cpu: "CPU") -> None:
+    def _CIcos(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.cos(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CIcos", _CIcos)
 
     # _CItan(): ST(0) = tan(ST(0)) [cdecl, no stack args]
-    def _CItan(cpu: "CPU") -> None:
+    def _CItan(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.tan(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CItan", _CItan)
 
     # _CIatan(): ST(0) = atan(ST(0)) [cdecl, no stack args]
-    def _CIatan(cpu: "CPU") -> None:
+    def _CIatan(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.atan(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CIatan", _CIatan)
 
     # _CIatan2(): ST(0)=x, ST(1)=y → ST(0) = atan2(y, x) [cdecl, no stack args]
     # Pops x, replaces ST(0) (formerly ST(1)) with atan2(y, x).
-    def _CIatan2(cpu: "CPU") -> None:
+    def _CIatan2(cpu: CPU) -> None:
         x = cpu.fpu_stack[cpu.fpu_top & 7]
         y = cpu.fpu_stack[(cpu.fpu_top + 1) & 7]
         cpu.fpu_top = (cpu.fpu_top + 1) & 7  # pop x; y becomes ST(0)
@@ -1820,7 +1827,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_CIatan2", _CIatan2)
 
     # _CIlog(): ST(0) = log(ST(0)) [cdecl, no stack args]
-    def _CIlog(cpu: "CPU") -> None:
+    def _CIlog(cpu: CPU) -> None:
         val = cpu.fpu_stack[cpu.fpu_top & 7]
         cpu.fpu_stack[cpu.fpu_top & 7] = (
             math.log(val) if val > 0.0 else float("-inf") if val == 0.0 else float("nan")
@@ -1829,20 +1836,20 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_CIlog", _CIlog)
 
     # _CIexp(): ST(0) = exp(ST(0)) [cdecl, no stack args]
-    def _CIexp(cpu: "CPU") -> None:
+    def _CIexp(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.exp(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CIexp", _CIexp)
 
     # _CIfloor(): ST(0) = floor(ST(0)) [cdecl, no stack args]
-    def _CIfloor(cpu: "CPU") -> None:
+    def _CIfloor(cpu: CPU) -> None:
         cpu.fpu_stack[cpu.fpu_top & 7] = math.floor(cpu.fpu_stack[cpu.fpu_top & 7])
 
     stubs.register_handler("msvcrt.dll", "_CIfloor", _CIfloor)
 
     # _CIfmod(): ST(0)=y, ST(1)=x → ST(0) = fmod(x, y) [cdecl, no stack args]
     # Pops y, replaces ST(0) (formerly ST(1)) with fmod(x, y).
-    def _CIfmod(cpu: "CPU") -> None:
+    def _CIfmod(cpu: CPU) -> None:
         y = cpu.fpu_stack[cpu.fpu_top & 7]
         x = cpu.fpu_stack[(cpu.fpu_top + 1) & 7]
         cpu.fpu_top = (cpu.fpu_top + 1) & 7  # pop y; x becomes ST(0)
@@ -1855,7 +1862,7 @@ def register_msvcrt_handlers(
 
     # time(time_t* timer) -> time_t [cdecl]
     # Returns current Unix time; writes it to *timer if non-NULL.
-    def _time(cpu: "CPU") -> None:
+    def _time(cpu: CPU) -> None:
         t = int(_time_module.time()) & 0xFFFFFFFF
         timer_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if timer_ptr != 0:
@@ -1868,7 +1875,7 @@ def register_msvcrt_handlers(
     # Returns a pointer to a static tm struct in emulator memory.
     _LOCALTIME_BUF = 0x00210064  # 36 bytes for struct tm (9 ints × 4 bytes)
 
-    def _localtime(cpu: "CPU") -> None:
+    def _localtime(cpu: CPU) -> None:
         timer_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         t = memory.read32(timer_ptr) if timer_ptr != 0 else int(_time_module.time())
         tm = _time_module.localtime(t)
@@ -1888,7 +1895,7 @@ def register_msvcrt_handlers(
     # gmtime(const time_t* timer) -> struct tm* [cdecl]
     _GMTIME_BUF = 0x00210090  # 36 bytes after localtime buffer
 
-    def _gmtime(cpu: "CPU") -> None:
+    def _gmtime(cpu: CPU) -> None:
         timer_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         t = memory.read32(timer_ptr) if timer_ptr != 0 else int(_time_module.time())
         tm = _time_module.gmtime(t)
@@ -1906,7 +1913,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "gmtime", _gmtime)
 
     # mktime(struct tm* timeptr) -> time_t [cdecl]
-    def _mktime(cpu: "CPU") -> None:
+    def _mktime(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         tm_sec  = memory.read32(ptr +  0)
         tm_min  = memory.read32(ptr +  4)
@@ -1928,7 +1935,7 @@ def register_msvcrt_handlers(
 
     # difftime(time_t end, time_t start) -> double [cdecl]
     # Returns end - start on FPU ST(0).
-    def _difftime(cpu: "CPU") -> None:
+    def _difftime(cpu: CPU) -> None:
         end_t   = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         start_t = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         diff = float(end_t - start_t)
@@ -1940,7 +1947,7 @@ def register_msvcrt_handlers(
     # Returns process CPU time in CLOCKS_PER_SEC units.  We use wall time * 1000.
     _CLOCK_START = _time_module.monotonic()
 
-    def _clock(cpu: "CPU") -> None:
+    def _clock(cpu: CPU) -> None:
         elapsed_ms = int((_time_module.monotonic() - _CLOCK_START) * 1000)
         cpu.regs[EAX] = elapsed_ms & 0xFFFFFFFF
 
@@ -1950,7 +1957,7 @@ def register_msvcrt_handlers(
 
     # _open(const char* path, int oflag, ...) -> int [cdecl]
     # Returns a file descriptor (handle value).
-    def _open(cpu: "CPU") -> None:
+    def _open(cpu: CPU) -> None:
         path_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         oflag    = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         path     = read_cstring(path_ptr, memory)
@@ -1963,7 +1970,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_open", _open)
 
     # _close(int fd) -> int [cdecl]
-    def _close(cpu: "CPU") -> None:
+    def _close(cpu: CPU) -> None:
         fd = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         state.file_handle_map.pop(fd, None)
         cpu.regs[EAX] = 0  # 0 = success
@@ -1971,7 +1978,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_close", _close)
 
     # _read(int fd, void* buf, unsigned int count) -> int [cdecl]
-    def _read(cpu: "CPU") -> None:
+    def _read(cpu: CPU) -> None:
         fd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         buf   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -1996,7 +2003,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_read", _read)
 
     # _write(int fd, const void* buf, unsigned int count) -> int [cdecl]
-    def _write(cpu: "CPU") -> None:
+    def _write(cpu: CPU) -> None:
         fd    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         buf   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         count = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -2021,7 +2028,7 @@ def register_msvcrt_handlers(
     stubs.register_handler("msvcrt.dll", "_write", _write)
 
     # _lseek(int fd, long offset, int whence) -> long [cdecl]
-    def _lseek(cpu: "CPU") -> None:
+    def _lseek(cpu: CPU) -> None:
         fd     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         raw    = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         offset = raw if raw < 0x80000000 else (raw - 0x100000000)  # signed
@@ -2047,7 +2054,7 @@ def register_msvcrt_handlers(
     # getenv(const char* name) -> char* [cdecl]
     _getenv_caller_logged: set[int] = set()
 
-    def _getenv(cpu: "CPU") -> None:
+    def _getenv(cpu: CPU) -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory) if name_ptr else "(null)"
         caller = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)

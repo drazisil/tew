@@ -1,6 +1,7 @@
 """PE Data Directory parser."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
@@ -43,7 +44,7 @@ class DataDirectory:
         )
         self._data: bytes = b""
 
-    def resolve(self, file_image: bytes | bytearray, sections: list["SectionHeader"]) -> None:
+    def resolve(self, file_image: bytes | bytearray, sections: list[SectionHeader]) -> None:
         if self._virtual_address == 0 or self._size == 0:
             return
 

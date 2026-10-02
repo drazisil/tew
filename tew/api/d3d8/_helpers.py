@@ -40,14 +40,15 @@ def vk_pump(fn):
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu_zig import EAX, ESP
 from tew.api.d3d8._layout import D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE
 from tew.api.win32_handlers import cleanup_stdcall
-from tew.logger import DEBUG, is_active as _log_active
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.logger import DEBUG
+from tew.logger import is_active as _log_active
 
 # ── D3D8 private bump-heap ──────────────────────────────────────────────────
 # Own bounded region, non-overlapping with the CRT heap (0x04000000 -
@@ -192,7 +193,7 @@ def _convert_to_bgra8(fmt: int, width: int, height: int, raw: bytes) -> bytes:
     return bytes(out)
 
 
-def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
+def _cleanup_com(cpu: CPU, memory: Memory, arg_bytes: int) -> None:
     """stdcall stack cleanup for COM methods: `this` (4 bytes) plus args.
 
     Same operation as cleanup_stdcall with the extra 4 bytes, so a real
@@ -203,13 +204,13 @@ def _cleanup_com(cpu: "CPU", memory: "Memory", arg_bytes: int) -> None:
 
 
 def _com_stub(
-    stubs: "Win32Handlers",
+    stubs: Win32Handlers,
     dll_name: str,
     name: str,
     handler,
     arg_bytes: int,
-    memory: "Memory",
-    expected_this: "int | None" = None,
+    memory: Memory,
+    expected_this: int | None = None,
 ) -> int:
     """Register a COM vtable handler and return its trampoline address."""
     from tew.logger import logger as _logger
@@ -217,7 +218,7 @@ def _com_stub(
     # See the logging comment inside _h for why D3D8 gets its own category.
     _com_category = "d3d8" if dll_name.startswith("d3d8") else "handlers"
 
-    def _h(cpu: "CPU") -> None:
+    def _h(cpu: CPU) -> None:
         if expected_this is not None:
             this = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
             if this != expected_this:
@@ -262,7 +263,7 @@ def _com_stub(
     return stubs.get_handler_address(dll_name, name) or 0
 
 
-def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
+def _alloc_resource_obj(data_size: int, memory: Memory) -> int:
     """Allocate a generic D3D resource COM object (for vertex/index buffers).
 
     Layout (12 bytes): [0] vtable ptr, [4] data ptr, [8] size.
@@ -280,7 +281,7 @@ def _alloc_resource_obj(data_size: int, memory: "Memory") -> int:
     return obj
 
 
-def _alloc_surface_obj(w: int, h: int, fmt: int, memory: "Memory") -> int:
+def _alloc_surface_obj(w: int, h: int, fmt: int, memory: Memory) -> int:
     """Allocate an IDirect3DSurface8 COM object with stored dimensions and format.
 
     Layout (24 bytes): [0] vtable ptr, [4] data ptr, [8] size,
@@ -302,7 +303,7 @@ def _alloc_surface_obj(w: int, h: int, fmt: int, memory: "Memory") -> int:
     return obj
 
 
-def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") -> int:
+def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: Memory) -> int:
     """Allocate an IDirect3DTexture8 COM object with one IDirect3DSurface8 per mip level.
 
     Layout: [0] vtable ptr, [4] mip0 data ptr, [8] mip0 data size,
@@ -342,6 +343,6 @@ def _alloc_texture_obj(w: int, h: int, fmt: int, levels: int, memory: "Memory") 
     return obj
 
 
-def _set_eax(cpu: "CPU", value: int) -> None:
+def _set_eax(cpu: CPU, value: int) -> None:
     """Set EAX; used as a single-expression handler body."""
     cpu.regs[EAX] = value

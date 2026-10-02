@@ -26,7 +26,8 @@ from tew import logger as logger_module
 from tew.api._state import CRTState
 from tew.api.user32_handlers import register_user32_gdi32_handlers
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 16 * 1024 * 1024
@@ -100,7 +101,6 @@ def test_hook_returning_none_falls_through_and_is_not_asserted_here():
 
     def hook(caption, text, u_type):
         calls.append((caption, text, u_type))
-        return None
 
     state.window_manager.set_messagebox_hook(hook)
     assert state.window_manager._messagebox_hook is hook

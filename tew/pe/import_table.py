@@ -1,10 +1,11 @@
 """PE Import Table parser."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
-from tew.helpers import hex_val, rva_to_offset, read_null_terminated
+from tew.helpers import hex_val, read_null_terminated, rva_to_offset
 
 if TYPE_CHECKING:
     from tew.pe.section_header import SectionHeader
@@ -76,7 +77,7 @@ class ImportDescriptor:
 
 def _read_hint_name(
     file_image: bytes | bytearray,
-    sections: list["SectionHeader"],
+    sections: list[SectionHeader],
     rva: int,
     iat_rva: int,
     iat_file_offset: int,
@@ -93,7 +94,7 @@ def _read_hint_name(
 
 def _parse_thunks(
     file_image: bytes | bytearray,
-    sections: list["SectionHeader"],
+    sections: list[SectionHeader],
     thunk_rva: int,
     first_thunk_rva: int,
     is_pe32plus: bool,
@@ -144,7 +145,7 @@ class ImportTable:
         self,
         data: bytes | bytearray,
         file_image: bytes | bytearray,
-        sections: list["SectionHeader"],
+        sections: list[SectionHeader],
         is_pe32plus: bool,
     ) -> None:
         self._descriptors: list[ImportDescriptor] = []

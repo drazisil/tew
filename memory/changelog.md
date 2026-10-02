@@ -6,6 +6,7 @@ addresses) are in git history: `git log -p -- memory/changelog.md`.
 - 2026-10-01 — automation: `gui_begin` event from GUI::OnBegin (0x00aec5e0), same fields as `gui_exit` minus code/sender, same log skip list
 - 2026-10-01 — `tew/automation/`: in-process automation event emitter; first source is `gui_exit` (GUI::OnExit class/name/text/tip/mBounds/exit code, read from guest memory in a logpoint)
 - 2026-10-01 — D3D8 BeginScene/EndScene per-frame logs demoted INFO -> DEBUG (~65 frames/s of log noise)
+- 2026-10-01 — logs: `socket` is now default-off like `memory`/`registry` (opt in with `LOG_CATEGORIES=+socket`); ERROR lines still show
 - 2026-10-01 — PERF: COM wrapper uses native stdcall cleanup and skips DEBUG f-strings when off; COM share of lobby time 45.5% -> 34.3%, guest CPU share 25% -> 31.5%
 - 2026-09-30 — MSJET35 crash buying a car: Jet asks VirtualAlloc for explicit addresses above 2 GB (0x814cf000.. at startup) and tew accepted them unbacked; now NULL + ERROR_INVALID_ADDRESS outside user space (also: released ranges reused, NULL + ERROR_NOT_ENOUGH_MEMORY when full)
 - 2026-09-30 — HOME avatar never drew -- tew's x87 FPTAN/FPATAN/FXTRACT/FYL2XP1 were no-ops and FXAM misclassified everything (tew-cpu 0.3.1)

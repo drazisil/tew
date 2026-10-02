@@ -10,10 +10,10 @@ import time
 
 import pytest
 
-from tew.api._state import CRTState, TEB_BASE
+from tew.api._state import TEB_BASE, CRTState
 from tew.api.kernel32_system import register_kernel32_system_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

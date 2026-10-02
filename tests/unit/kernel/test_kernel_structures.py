@@ -1,6 +1,7 @@
 """Tests for tew.kernel.kernel_structures.KernelStructures."""
 
 import pytest
+
 from tew.hardware.memory import Memory
 from tew.kernel.kernel_structures import KernelStructures
 

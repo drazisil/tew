@@ -1,24 +1,26 @@
 """Windows DLL loader — loads PE files into emulator memory."""
 
 from __future__ import annotations
-import os
-from dataclasses import dataclass, field
-from typing import Callable, TYPE_CHECKING
 
-from tew.logger import logger
+import os
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from tew.api.win32_handlers import log_register_dump
 from tew.fs import find_file_ci
 from tew.hardware.cpu_zig import FatalHaltError
-from tew.api.win32_handlers import log_register_dump
+from tew.logger import logger
 
 if TYPE_CHECKING:
-    from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
+    from tew.hardware.memory import Memory
 
 
 def should_invoke_dependency_dllmain(
     dep_was_loaded: bool,
-    imported_dll: "LoadedDLL | None",
-    on_dependency_loaded: "Callable[[LoadedDLL], None] | None",
+    imported_dll: LoadedDLL | None,
+    on_dependency_loaded: Callable[[LoadedDLL], None] | None,
 ) -> bool:
     """Decides whether a just-resolved PE-import dependency needs its own
     DllMain invoked. Pulled out as a standalone, easily unit-testable
@@ -43,7 +45,7 @@ def should_invoke_dependency_dllmain(
 
 
 def apply_base_relocations(
-    memory: "Memory",
+    memory: Memory,
     blocks: list,
     base_address: int,
     preferred_base: int,
@@ -143,8 +145,8 @@ def _make_unimplemented_handler(dll_name: str, func_name: str):
 
 
 def patch_iat_entry(
-    memory: "Memory",
-    win32_handlers: "Win32Handlers",
+    memory: Memory,
+    win32_handlers: Win32Handlers,
     iat_addr: int,
     dll_name: str,
     func_name: str,
@@ -289,8 +291,8 @@ class DLLLoader:
         return ["kernel32", "ntdll"]
 
     def load_dll(
-        self, dll_name: str, memory: "Memory",
-        on_dependency_loaded: "Callable[[LoadedDLL], None] | None" = None,
+        self, dll_name: str, memory: Memory,
+        on_dependency_loaded: Callable[[LoadedDLL], None] | None = None,
     ) -> LoadedDLL | None:
         from tew.pe.exe_file import EXEFile
 
@@ -446,7 +448,7 @@ class DLLLoader:
                 logger.debug("dll", f"  {line}")
             return None
 
-    def patch_dll_iats(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
+    def patch_dll_iats(self, memory: Memory, win32_handlers: Win32Handlers) -> None:
         """Patch newly-accumulated DLL IAT entries with Win32 stubs where available.
 
         See patch_iat_entry (module-level) for what happens to an unmatched
@@ -516,7 +518,7 @@ class DLLLoader:
                 f"({real_count} real DLL exports, {auto_handler_count} auto-stubs for unimplemented imports)",
             )
 
-    def patch_dll_exports(self, memory: "Memory", win32_handlers: "Win32Handlers") -> None:
+    def patch_dll_exports(self, memory: Memory, win32_handlers: Win32Handlers) -> None:
         """Patch DLL export addresses in-place with INT 0xFE; RET trampolines."""
         patched_count = 0
         for dll_name, dll in self._loaded_dlls.items():

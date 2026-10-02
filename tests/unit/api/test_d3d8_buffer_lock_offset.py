@@ -22,8 +22,8 @@ from __future__ import annotations
 import pytest
 
 from tew.api.d3d8.idirect3d8resource import make_vtable
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

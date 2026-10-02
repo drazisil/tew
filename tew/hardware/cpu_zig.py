@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import ctypes
 import math
-import os
 import struct
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from tew.hardware._kernel_lib import _lib
 from tew.hardware.memory import Memory
@@ -290,8 +290,14 @@ class _FpuStackProxy:
 
 class SavedCPUState:
     __slots__ = (
-        "regs", "eip", "eflags",
-        "fpu_stack", "fpu_top", "fpu_status_word", "fpu_control_word", "fpu_tag_word",
+        "eflags",
+        "eip",
+        "fpu_control_word",
+        "fpu_stack",
+        "fpu_status_word",
+        "fpu_tag_word",
+        "fpu_top",
+        "regs",
     )
 
     def __init__(
@@ -339,7 +345,7 @@ class ZigCPU:
         self.last_error:        Exception | None = None
         self._int_handler:      Callable | None  = None
         self._step_handler:     Callable | None  = None
-        self._kernel_structures: "KernelStructures | None" = None
+        self._kernel_structures: KernelStructures | None = None
         self._last_fs_base:     int = 0
         # Override flag for handle_exception() called from Python (not from Zig).
         # `halted` deliberately has no equivalent -- see its property below:
@@ -440,11 +446,11 @@ class ZigCPU:
     # ── Kernel structures / FS-GS sync ────────────────────────────────────────
 
     @property
-    def kernel_structures(self) -> "KernelStructures | None":
+    def kernel_structures(self) -> KernelStructures | None:
         return self._kernel_structures
 
     @kernel_structures.setter
-    def kernel_structures(self, ks: "KernelStructures | None") -> None:
+    def kernel_structures(self, ks: KernelStructures | None) -> None:
         self._kernel_structures = ks
         self._sync_fs_gs()
 
@@ -697,7 +703,7 @@ class ZigCPU:
 
     # ── Interrupt / step handler registration ────────────────────────────────
 
-    def on_interrupt(self, handler: Callable[[int, "ZigCPU"], None]) -> None:
+    def on_interrupt(self, handler: Callable[[int, ZigCPU], None]) -> None:
         self._int_handler = handler
 
     def on_step(self, handler: Callable) -> None:

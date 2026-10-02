@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 
 from tew.logger import logger
 
-
 # ── Dialog unit conversion ────────────────────────────────────────────────────
 # Defined here so callers that only need pe_resources don't have to import
 # window_manager.  The same functions are also available in window_manager.
@@ -243,7 +242,7 @@ class PEResources:
 
         _, type_data_off = struct.unpack_from("<II", data, type_entry_off)
         if not (type_data_off & 0x80000000):
-            logger.warn("window", f"[PEResources] Resource type entry is not a subdirectory")
+            logger.warn("window", "[PEResources] Resource type entry is not a subdirectory")
             return None
         name_dir_off = rsrc_raw + (type_data_off & 0x7FFFFFFF)
 
@@ -255,7 +254,7 @@ class PEResources:
 
         _, name_data_off = struct.unpack_from("<II", data, name_entry_off)
         if not (name_data_off & 0x80000000):
-            logger.warn("window", f"[PEResources] Resource name entry is not a subdirectory")
+            logger.warn("window", "[PEResources] Resource name entry is not a subdirectory")
             return None
         lang_dir_off = rsrc_raw + (name_data_off & 0x7FFFFFFF)
 

@@ -25,21 +25,22 @@ Returns D3D8_OBJ on success; halts loudly on any Vulkan failure.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu_zig import ZigCPU as CPU
-    from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
     from tew.api.window_manager import WindowManager
+    from tew.hardware.cpu_zig import ZigCPU as CPU
+    from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import cleanup_stdcall
-from tew.logger import logger
-from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
-from tew.api.d3d8._helpers import _com_stub, _set_eax, vk_pump
+from tew.api.d3d8 import _state
 from tew.api.d3d8._caps import _fill_adapter_identifier, _fill_d3d_caps8
-import tew.api.d3d8._state as _state
+from tew.api.d3d8._helpers import _com_stub, _set_eax, vk_pump
+from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
+from tew.api.win32_handlers import cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.logger import logger
 
 # Offset of DAT_6001c080 from dx8z.dll's preferred base (0x60000000).
 # This flag controls whether setvideomode takes the CreateDevice (1) or Reset (0) path.
@@ -57,7 +58,7 @@ _DAT_6001C080_OFFSET   = 0x6001C080 - _DX8Z_PREFERRED_BASE  # 0x1C080
 _ref_counts: dict[int, int] = {}
 
 
-def _add_ref(cpu: "CPU", mem: "Memory") -> None:
+def _add_ref(cpu: CPU, mem: Memory) -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) + 1
     _ref_counts[this] = count
@@ -65,7 +66,7 @@ def _add_ref(cpu: "CPU", mem: "Memory") -> None:
     cpu.regs[EAX] = count
 
 
-def _release(cpu: "CPU", mem: "Memory") -> None:
+def _release(cpu: CPU, mem: Memory) -> None:
     this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
     count = _ref_counts.get(this, 1) - 1
     if count > 0:
@@ -99,19 +100,19 @@ def _query_real_desktop_mode() -> tuple[int, int, int]:
     return 800, 600, 60
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
+def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowManager) -> list[int]:
     """Return the 16 trampoline addresses for the IDirect3D8 vtable."""
 
     # [5] GetAdapterIdentifier(Adapter, Flags, D3DADAPTER_IDENTIFIER8*)
     # Stack (past ret + this): Adapter, Flags, pIdent
-    def _get_adapter_identifier(cpu: "CPU", mem: "Memory") -> None:
+    def _get_adapter_identifier(cpu: CPU, mem: Memory) -> None:
         p_ident = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         logger.info("d3d8", f"GetAdapterIdentifier pIdent=0x{p_ident:08x}")
         _fill_adapter_identifier(p_ident, mem)
         cpu.regs[EAX] = S_OK
 
     # [7] EnumAdapterModes(Adapter, Mode, D3DDISPLAYMODE*)
-    def _enum_adapter_modes(cpu: "CPU", mem: "Memory") -> None:
+    def _enum_adapter_modes(cpu: CPU, mem: Memory) -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         if p_mode:
             width, height, refresh = _query_real_desktop_mode()
@@ -122,7 +123,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [8] GetAdapterDisplayMode(Adapter, D3DDISPLAYMODE*)
-    def _get_adapter_display_mode(cpu: "CPU", mem: "Memory") -> None:
+    def _get_adapter_display_mode(cpu: CPU, mem: Memory) -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_mode:
             width, height, refresh = _query_real_desktop_mode()
@@ -133,7 +134,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [13] GetDeviceCaps(Adapter, DevType, D3DCAPS8*)
-    def _get_device_caps(cpu: "CPU", mem: "Memory") -> None:
+    def _get_device_caps(cpu: CPU, mem: Memory) -> None:
         p_caps = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         logger.info("d3d8", f"GetDeviceCaps pCaps=0x{p_caps:08x}")
         _fill_d3d_caps8(p_caps, mem)
@@ -149,12 +150,18 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     #   ESP+20: BehaviorFlags
     #   ESP+24: pPresentationParameters
     #   ESP+28: ppReturnedDeviceInterface
-    def _create_device(cpu: "CPU", mem: "Memory") -> None:
+    def _create_device(cpu: CPU, mem: Memory) -> None:
         import ctypes
+
         import vulkan as vk
+        from sdl2 import (
+            SDL_SYSWM_WAYLAND,
+            SDL_GetVersion,
+            SDL_GetWindowWMInfo,
+            SDL_SetWindowSize,
+            SDL_SysWMinfo,
+        )
         from vulkan import ffi
-        from sdl2 import SDL_SysWMinfo, SDL_GetWindowWMInfo, SDL_SYSWM_WAYLAND, SDL_GetVersion, SDL_SetWindowSize
-        from sdl2.vulkan import SDL_Vulkan_CreateSurface
 
         pp_device  = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         hwnd       = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -543,7 +550,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [9]  CheckDeviceType(this, Adapter, CheckType, DisplayFmt, BackFmt, Windowed)
-    def _check_device_type(cpu: "CPU", mem: "Memory") -> None:
+    def _check_device_type(cpu: CPU, mem: Memory) -> None:
         adapter   = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dev_type  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         disp_fmt  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -555,7 +562,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [10] CheckDeviceFormat(this, Adapter, DevType, AdapterFmt, Usage, RType, CheckFmt)
-    def _check_device_format(cpu: "CPU", mem: "Memory") -> None:
+    def _check_device_format(cpu: CPU, mem: Memory) -> None:
         adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -568,12 +575,12 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [11] CheckDeviceMultiSampleType(this, Adapter, DevType, SurfaceFmt, Windowed, MultiSampleType)
-    def _check_multisample(cpu: "CPU", mem: "Memory") -> None:
+    def _check_multisample(cpu: CPU, mem: Memory) -> None:
         logger.info("d3d8", "CheckDeviceMultiSampleType -> D3DERR_NOTAVAIL (no MSAA)")
         cpu.regs[EAX] = D3DERR_NOTAVAIL
 
     # [12] CheckDepthStencilMatch(this, Adapter, DevType, AdapterFmt, RTFmt, DSFmt)
-    def _check_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+    def _check_depth_stencil(cpu: CPU, mem: Memory) -> None:
         adapter    = mem.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         dev_type   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         adapter_fmt= mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -678,6 +685,7 @@ def _platform_vulkan_extensions() -> list[str]:
     the (currently unreached) case where SDL genuinely isn't initialised yet.
     """
     import os
+
     from sdl2 import SDL_GetCurrentVideoDriver
     from sdl2.platform import SDL_GetPlatform
 
@@ -708,7 +716,7 @@ def _platform_vulkan_extensions() -> list[str]:
         return ["VK_KHR_surface", "VK_KHR_xlib_surface"]
 
 
-def make_create8(memory: "Memory") -> Callable:
+def make_create8(memory: Memory) -> Callable:
     """Return the Direct3DCreate8 handler function.
 
     Direct3DCreate8(SDKVersion: UINT) -> IDirect3D8*   [stdcall, 1 arg]
@@ -717,7 +725,7 @@ def make_create8(memory: "Memory") -> Callable:
     enumerates physical devices, then returns D3D8_OBJ.
     Halts loudly on any Vulkan failure.
     """
-    def _direct3d_create8(cpu: "CPU") -> None:
+    def _direct3d_create8(cpu: CPU) -> None:
         import vulkan as vk
 
         if _state._vk_instance is not None:

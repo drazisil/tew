@@ -22,22 +22,27 @@ import sys
 import time
 from os.path import dirname
 
-from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU as CPU, ESP, EBP, FatalHaltError
-from tew.kernel.kernel_structures import KernelStructures
-from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
-from tew.pe.exe_file import EXEFile
-from tew.api.win32_handlers import Win32Handlers, HANDLER_BASE, HANDLER_SIZE, MAX_HANDLERS
-from tew.api.crt_handlers import register_crt_handlers, patch_crt_internals
+from tew.api._state import HEAP_BASE, THREAD_STACK_BASE, EmulatorConfig
+from tew.api.crt_handlers import patch_crt_internals, register_crt_handlers
 from tew.api.kernel32_handlers import _invoke_dependency_dllmain
-from tew.api.pe_resources import PEResources
-from tew.api._state import EmulatorConfig, HEAP_BASE, THREAD_STACK_BASE
 from tew.api.nt_handlers import register_nt_handlers
-from tew.kernel.seh import dispatch_exception, STATUS_ACCESS_VIOLATION
-from tew.logger import logger, set_thread_id_provider, WARN, configure_logger
+from tew.api.pe_resources import PEResources
+from tew.api.win32_handlers import (
+    HANDLER_BASE,
+    HANDLER_SIZE,
+    MAX_HANDLERS,
+    Win32Handlers,
+)
 from tew.automation import AutomationEventEmitter, EventLogger
 from tew.automation.gui_events import install_gui_events, skip_noisy_classes
-
+from tew.hardware.cpu_zig import EBP, ESP, FatalHaltError
+from tew.hardware.cpu_zig import ZigCPU as CPU
+from tew.hardware.memory import Memory
+from tew.kernel.exception_diagnostics import diagnose_fault, diagnose_halt
+from tew.kernel.kernel_structures import KernelStructures
+from tew.kernel.seh import STATUS_ACCESS_VIOLATION, dispatch_exception
+from tew.logger import WARN, configure_logger, logger, set_thread_id_provider
+from tew.pe.exe_file import EXEFile
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 
@@ -279,6 +284,7 @@ _click_premove_injected = False
 #   TEW_CLICK_WHEN_FILE=<path>   e.g. ~/.emu32/MCity/MCity_Log.txt
 #   TEW_CLICK_WHEN_TEXT=<text>   e.g. "Done Getting Personas"
 from tew.file_trigger import FileTextTrigger
+
 _TEW_CLICK_WHEN_FILE = os.environ.get("TEW_CLICK_WHEN_FILE")
 _TEW_CLICK_WHEN_TEXT = os.environ.get("TEW_CLICK_WHEN_TEXT")
 _TEW_CLICK_WHEN_DELAY_SEC = float(os.environ.get("TEW_CLICK_WHEN_DELAY_SEC", "30.0"))
@@ -382,6 +388,7 @@ _tew_paused = False
 
 def _get_click_sdl_window_id():
     import sdl2
+
     import tew.api.d3d8._state as _d3d8_state
 
     entry = crt_state.window_manager.get_window(_d3d8_state._vk_hwnd)
@@ -673,6 +680,7 @@ logger.info("startup", "=== Starting Emulation ===")
 # TEW_PROFILE=<file>: cProfile the host. Stats are dumped explicitly before the
 # final os._exit(), which skips normal atexit handling.
 import cProfile as _cProfile
+
 _TEW_PROFILE = os.environ.get("TEW_PROFILE")
 _profiler = _cProfile.Profile() if _TEW_PROFILE else None
 if _profiler is not None:
@@ -740,9 +748,11 @@ def _run_timer_heartbeat() -> None:
     global _last_heartbeat_wall_time
     _heartbeat_count += 1
     if _pending_timers is None:
-        from tew.api.win32_handlers import pending_timers as _pt, _TIME_CALLBACK_EVENT_SET as _tces
-        from tew.api.user32_handlers import _invoke_emulated_proc as _iep, _get_dialog_sentinel as _gds
         from tew.api._state import EventHandle as _eh
+        from tew.api.user32_handlers import _get_dialog_sentinel as _gds
+        from tew.api.user32_handlers import _invoke_emulated_proc as _iep
+        from tew.api.win32_handlers import _TIME_CALLBACK_EVENT_SET as _tces
+        from tew.api.win32_handlers import pending_timers as _pt
         _pending_timers = _pt
         _invoke_emulated_proc_fn = _iep
         _get_dialog_sentinel_fn = _gds
