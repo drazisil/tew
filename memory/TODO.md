@@ -64,6 +64,30 @@ CONTINUE, Screen Tips X and its OK each fire 30s after the previous click
 (~90s of padding to the lobby). Trigger each on a log/stdout line instead,
 like the first two clicks.
 
+## Automation events: gaps before they can drive navigation
+`gui_begin`/`gui_exit` (tew/automation) give screen names, the widget tree
+(class, name, bounds) and exit codes. Still missing:
+- **Absolute position.** `mBounds` is parent-relative (`jumpCarsales` is
+  `[9, 2] 56, 12`). Add `parent` (GUI+0x38; `GUI::GetParent` returns it) to the
+  events and a subscriber that tracks the live tree (begin adds, exit removes)
+  and sums ancestor x/y. Unknown whether scroll offsets also apply.
+- **String-table labels.** A GUIStr with a null buffer holds a text id at +8
+  (`jumpCarAuc` = 0x0d37; the length matches the label), resolved only once
+  drawn. Print `#0xd37` instead of the `?(...)` fallback; map ids via text.eng.
+- **Safe-to-click signal.** Nothing says a screen accepts input (why clicks wait
+  a fixed 30s). Candidate: no modal `Generic` GMsgBox open (they bracket network
+  connects) and the target FEInterface has begun; maybe the first idle event.
+- **Names aren't unique.** Ten .gui files define an `<EDIT>`; look widgets up by
+  parent/screen plus name, not name alone.
+- **Visibility / enabled / z-order** (GUI.mStyle +0x3c, mZOrder +0x40,
+  mTabOrder +0x44) aren't captured.
+- **Box wording.** `GText` is in LOG_SKIP_CLASSES, so message-box text isn't
+  visible in the log; emit it for GMsgBox children if it's needed.
+- **First consumer.** From Home click `jumpCarsales` and wait for the Dealer
+  FEInterface to begin; then replace the fixed click delays with events.
+- `gui_begin` hooks GUI::OnBegin (0x00aec5e0); an override that never chains to
+  it would be missed. Watch for an exit with no begin.
+
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
 

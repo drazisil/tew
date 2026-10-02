@@ -34,7 +34,7 @@ from tew.api.win32_handlers import (
     Win32Handlers,
 )
 from tew.automation import AutomationEventEmitter, EventLogger
-from tew.automation.gui_events import install_gui_exit_events, skip_noisy_classes
+from tew.automation.gui_events import install_gui_events, skip_noisy_classes
 from tew.hardware.cpu_zig import EBP, ESP, FatalHaltError
 from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
@@ -706,11 +706,12 @@ if _TEW_WATCH_ADDR is not None:
 
 
 # Automation events (tew/automation): game-state facts read out of guest memory.
-# gui_exit fires whenever GUI::OnExit is entered. The log skips the noisy widget
-# classes (tew.automation.gui_events.LOG_SKIP_CLASSES); other subscribers see all.
+# gui_begin / gui_exit fire when GUI::OnBegin / GUI::OnExit are entered. The log
+# skips the noisy widget classes (tew.automation.gui_events.LOG_SKIP_CLASSES);
+# other subscribers see everything.
 automation = AutomationEventEmitter()
 automation.subscribe(EventLogger(skip=skip_noisy_classes))
-install_gui_exit_events(cpu, automation)
+install_gui_events(cpu, automation)
 # Steps per batch (also the virtual-clock tick interval).
 # _TIMER_waitticks spins without Sleep/SleepEx so multimedia timers never fire
 # from the normal SleepEx path.  Advancing the clock here lets due callbacks fire.

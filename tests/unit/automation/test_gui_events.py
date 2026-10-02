@@ -14,8 +14,8 @@ import pytest
 from tew.automation import AutomationEventEmitter
 from tew.automation.events import AutomationEvent
 from tew.automation.gui_events import (
-    GUI_ONEXIT_THUNK, GUI_VTABLE, LOG_SKIP_CLASSES, Bounds, GuestGuiReader,
-    install_gui_exit_events, skip_noisy_classes)
+    GUI_ONBEGIN, GUI_ONEXIT_THUNK, GUI_VTABLE, LOG_SKIP_CLASSES, Bounds, GuestGuiReader,
+    install_gui_events, skip_noisy_classes)
 from tew.hardware.cpu_zig import ECX, ESP
 from tew.logger import ERROR, set_emit_hook
 
@@ -115,15 +115,25 @@ class TestDescribe:
     def test_name_text_tip_and_bounds(self, img):
         put_guistr(img, FOO_OBJ, 0x48, "Login")
         put_guistr(img, FOO_OBJ, 0xF0, "kTxtHome", slot=8, buf=0x6100)     # pointer in the other slot
-        for i, v in enumerate((343, 153, 231, 120)):
+        for i, v in enumerate((153, 343, 231, 120)):        # memory order: y, x, w, h
             u32(img, FOO_OBJ + 0x60 + 4 + 4 * i, v)
         d = reader_for(img).describe(FOO_OBJ)
         assert d == {"name": "Login", "text": "", "tip": "kTxtHome", "bounds": Bounds(343, 153, 231, 120)}
         assert str(d["bounds"]) == "[343, 153] 231, 120"
 
     def test_negative_bounds(self, img):
-        u32(img, FOO_OBJ + 0x60 + 4, -5)
+        u32(img, FOO_OBJ + 0x60 + 8, -5)        # x is the second int
         assert reader_for(img).bounds(FOO_OBJ).x == -5
+
+    @pytest.mark.parametrize("in_memory, as_in_the_gui_file", [
+        ((260, 238, 351, 85), Bounds(238, 260, 351, 85)),    # Generic.GMsgBox  [238, 260] 351, 85
+        ((2, 9, 56, 12), Bounds(9, 2, 56, 12)),              # jumpCarsales     [9, 2] 56, 12
+        ((46, 288, 224, 13), Bounds(288, 46, 224, 13)),      # <EDIT> in Dlg.Msg [288, 46] 224, 13
+    ])
+    def test_bounds_come_out_in_the_gui_files_x_y_order(self, img, in_memory, as_in_the_gui_file):
+        for i, v in enumerate(in_memory):
+            u32(img, FOO_OBJ + 0x60 + 4 + 4 * i, v)
+        assert reader_for(img).bounds(FOO_OBJ) == as_in_the_gui_file
 
     def test_unrecognised_guistr_layout_shows_raw_values(self, img):
         u32(img, FOO_OBJ + 0x48 + 4, 0x6200)
@@ -146,14 +156,14 @@ class FakeCPU:
         self.logpoints[eip] = cb
 
 
-class TestInstallGuiExitEvents:
+class TestInstallGuiEvents:
 
-    def run_logpoint(self, img, this, code, sender, esp=0x7000):
+    def run_logpoint(self, img, this, code=0, sender=0, esp=0x7000, at=GUI_ONEXIT_THUNK):
         emitter = AutomationEventEmitter()
         events: list[AutomationEvent] = []
         emitter.subscribe(events.append)
         cpu = FakeCPU()
-        install_gui_exit_events(cpu, emitter)
+        install_gui_events(cpu, emitter)
         if esp + 12 <= len(img):
             u32(img, esp, 0x00AED673)       # return address
             u32(img, esp + 4, code)
@@ -161,14 +171,14 @@ class TestInstallGuiExitEvents:
         regs = [0] * 8
         regs[ESP], regs[ECX] = esp, this
         buf = (ctypes.c_uint8 * len(img)).from_buffer(img)
-        cpu.logpoints[GUI_ONEXIT_THUNK](GUI_ONEXIT_THUNK, regs, ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)), len(img))
+        cpu.logpoints[at](at, regs, ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)), len(img))
         del buf
         return events
 
-    def test_registers_on_the_onexit_thunk(self):
+    def test_registers_on_onbegin_and_the_onexit_thunk(self):
         cpu = FakeCPU()
-        install_gui_exit_events(cpu, AutomationEventEmitter())
-        assert list(cpu.logpoints) == [0x00405A5B]
+        install_gui_events(cpu, AutomationEventEmitter())
+        assert sorted(cpu.logpoints) == [0x00405A5B, 0x00AEC5E0]
 
     def test_emits_gui_exit_with_object_code_sender_and_return(self, img):
         put_guistr(img, FOO_OBJ, 0x48, "Generic")
@@ -184,6 +194,17 @@ class TestInstallGuiExitEvents:
         (event,) = self.run_logpoint(img, this=FOO_OBJ, code=4, sender=FOO_OBJ)
         assert event.data["cls"] == event.data["sender_cls"] == "Foo"
 
+    def test_onbegin_emits_gui_begin_with_object_fields_and_return_address(self, img):
+        put_guistr(img, FOO_OBJ, 0x48, "Login")
+        for i, v in enumerate((0, 0, 800, 600)):
+            u32(img, FOO_OBJ + 0x60 + 4 + 4 * i, v)
+        (event,) = self.run_logpoint(img, this=FOO_OBJ, at=GUI_ONBEGIN)
+        d = event.data
+        assert event.name == "gui_begin"
+        assert (d["this"], d["cls"], d["name"], d["bounds"], d["ret"]) == (
+            FOO_OBJ, "Foo", "Login", Bounds(0, 0, 800, 600), 0x00AED673)
+        assert "code" not in d and "sender" not in d      # OnBegin takes no arguments
+
     def test_esp_outside_memory_is_logged_as_an_error_and_emits_nothing(self, img):
         lines: list[tuple[int, str]] = []
         set_emit_hook(lambda level, line: lines.append((level, line)))
@@ -195,6 +216,16 @@ class TestInstallGuiExitEvents:
         assert [lvl for lvl, _ in lines] == [ERROR]
         assert "outside guest memory" in lines[0][1]
 
+    def test_onbegin_with_esp_outside_memory_is_also_an_error(self, img):
+        lines: list[tuple[int, str]] = []
+        set_emit_hook(lambda level, line: lines.append((level, line)))
+        try:
+            events = self.run_logpoint(img, this=FOO_OBJ, esp=len(img) - 4, at=GUI_ONBEGIN)
+        finally:
+            set_emit_hook(None)
+        assert events == []
+        assert "GUI::OnBegin" in lines[0][1] and "outside guest memory" in lines[0][1]
+
 
 class TestSkipNoisyClasses:
 
@@ -202,6 +233,10 @@ class TestSkipNoisyClasses:
     def test_listed_classes_are_skipped(self, cls):
         assert skip_noisy_classes(AutomationEvent("gui_exit", {"cls": cls})) is True
 
-    def test_other_classes_and_events_are_not(self):
-        assert skip_noisy_classes(AutomationEvent("gui_exit", {"cls": "MPersonaSelectDlg"})) is False
+    @pytest.mark.parametrize("name", ["gui_begin", "gui_exit"])
+    def test_both_gui_events_share_the_skip_list(self, name):
+        assert skip_noisy_classes(AutomationEvent(name, {"cls": "GText"})) is True
+        assert skip_noisy_classes(AutomationEvent(name, {"cls": "GDialog"})) is False
+
+    def test_other_events_are_never_skipped(self):
         assert skip_noisy_classes(AutomationEvent("other", {"cls": "GText"})) is False
