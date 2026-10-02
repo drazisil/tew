@@ -110,14 +110,6 @@ VALUES ( 1, 158, 0, 0, 0 )` (`Dbcode_TmpActionQuery` fails), then
 row to exist already (stale ~/.emu32 db, or the DB persisting between runs) or
 tew's Jet/DAO emulation reports 3022 wrongly. Not yet investigated.
 
-## D3D8 private heap exhausts at the pre-race test drive (~326s)
-112 MB bump heap (0x09000000-0x10000000) runs out allocating a 1,920,000-byte
-surface. Too small or leaking is unknown; PR #49 makes the error list live
-objects by kind/size. Suspects: `_alloc_surface_obj` always allocates `w*h*4`
-whatever the format (16-bit textures cost double); surfaces never Released.
-Reproduce: run to the test drive after the dealer (needs IMPLODE.DLL in
-~/.emu32/MCity).
-
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
 

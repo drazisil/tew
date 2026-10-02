@@ -120,6 +120,7 @@ from tew.api.d3d8._helpers import (
     _alloc_registry,
     _alloc_resource_obj,
     _alloc_surface_obj,
+    surface_origin,
     _alloc_texture_obj,
     _com_stub,
     _set_eax,
@@ -468,14 +469,25 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
 
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)
     def _get_back_buffer(cpu: CPU, mem: Memory) -> None:
+        # Real D3D8 AddRef's and returns the SAME back buffer every call, so
+        # hand out the canonical surface (shared with GetRenderTarget) instead
+        # of allocating a fresh width*height*4 surface per call: dx8z.dll
+        # calls this repeatedly, and 51 fresh 1,920,000-byte surfaces
+        # exhausted the D3D8 heap ~2 minutes into the test drive.
         pp_surface = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
-        # Report the game's own logical resolution, not the (possibly
-        # WINDOW_SCALE-enlarged) physical swapchain -- see _state._vk_logical_width.
-        w = _state._vk_logical_width  or 800
-        h = _state._vk_logical_height or 600
-        surf = _alloc_surface_obj(w, h, 0x16, mem)  # D3DFMT_X8R8G8B8 = 0x16
+        obj = _state._vk_backbuffer_surface_obj
+        if obj is None or obj not in _alloc_registry:
+            # Report the game's own logical resolution, not the (possibly
+            # WINDOW_SCALE-enlarged) physical swapchain -- see _state._vk_logical_width.
+            w = _state._vk_logical_width  or 800
+            h = _state._vk_logical_height or 600
+            obj = _alloc_surface_obj(w, h, 0x16, mem, surface_origin("GetBackBuffer", cpu, mem))  # D3DFMT_X8R8G8B8 = 0x16
+            _state._vk_backbuffer_surface_obj = obj
+            _ref_counts[obj] = 2  # the device's own reference + the caller's
+        else:
+            _ref_counts[obj] = _ref_counts.get(obj, 1) + 1
         if pp_surface:
-            mem.write32(pp_surface, surf)
+            mem.write32(pp_surface, obj)
         cpu.regs[EAX] = S_OK
 
     # [20] CreateTexture(W, H, Levels, Usage, Fmt, Pool, IDirect3DTexture8**)
@@ -534,7 +546,7 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         pp_surf = mem.read32((cpu.regs[ESP] + 28) & 0xFFFFFFFF)
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem))
+            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem, surface_origin("CreateRenderTarget", cpu, mem)))
         cpu.regs[EAX] = S_OK
 
     # [26] CreateDepthStencilSurface(W, H, Fmt, MultiSample, IDirect3DSurface8**)
@@ -544,7 +556,7 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         pp_surf = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem))
+            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem, surface_origin("CreateDepthStencilSurface", cpu, mem)))
         cpu.regs[EAX] = S_OK
 
     # [27] CreateImageSurface(W, H, Fmt, IDirect3DSurface8**)
@@ -554,7 +566,7 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         pp_surf = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
         if pp_surf:
-            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem))
+            mem.write32(pp_surf, _alloc_surface_obj(w or 1, h or 1, fmt, mem, surface_origin("CreateImageSurface", cpu, mem)))
         cpu.regs[EAX] = S_OK
 
     # [32] GetRenderTarget(IDirect3DSurface8**)

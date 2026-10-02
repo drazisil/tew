@@ -150,3 +150,55 @@ class TestDepthStencilIsCached:
         rt = get_render_target(cpu, mem, stubs)
         ds = get_depth_stencil(cpu, mem, stubs)
         assert rt != ds
+
+
+def get_back_buffer(cpu, mem, stubs) -> int:
+    pp_surf = STACK + 100
+    cpu.regs[ESP] = STACK
+    mem.write32(STACK + 4, D3DDEV_OBJ)
+    mem.write32(STACK + 8, 0)   # BackBuffer index
+    mem.write32(STACK + 12, 0)  # D3DBACKBUFFER_TYPE_MONO
+    mem.write32(STACK + 16, pp_surf)
+    stubs.get("d3d8dev", "Dev::GetBackBuffer")(cpu)
+    return mem.read32(pp_surf)
+
+
+class TestBackBufferIsCached:
+    """GetBackBuffer used to allocate a fresh width*height*4 surface per call;
+    dx8z.dll's repeated calls exhausted the D3D8 heap (51 x 1,920,000 bytes)."""
+
+    def test_repeat_calls_return_same_object(self, env):
+        cpu, mem, stubs = env
+        assert get_back_buffer(cpu, mem, stubs) == get_back_buffer(cpu, mem, stubs)
+
+    def test_repeat_calls_do_not_grow_the_registry(self, env):
+        cpu, mem, stubs = env
+        get_back_buffer(cpu, mem, stubs)
+        before = len(_alloc_registry)
+        for _ in range(60):
+            get_back_buffer(cpu, mem, stubs)
+        assert len(_alloc_registry) == before
+
+    def test_caller_release_does_not_free_the_device_copy(self, env):
+        cpu, mem, stubs = env
+        obj = get_back_buffer(cpu, mem, stubs)
+        cpu.regs[ESP] = STACK
+        mem.write32(STACK + 4, obj)
+        _release(cpu, mem)
+        assert obj in _alloc_registry
+        assert get_back_buffer(cpu, mem, stubs) == obj
+
+    def test_shared_with_get_render_target(self, env):
+        cpu, mem, stubs = env
+        assert get_back_buffer(cpu, mem, stubs) == get_render_target(cpu, mem, stubs)
+
+    def test_recreated_if_object_was_freed(self, env):
+        cpu, mem, stubs = env
+        obj = get_back_buffer(cpu, mem, stubs)
+        for _ in range(2):
+            cpu.regs[ESP] = STACK
+            mem.write32(STACK + 4, obj)
+            _release(cpu, mem)
+        assert obj not in _alloc_registry
+        again = get_back_buffer(cpu, mem, stubs)
+        assert again in _alloc_registry
