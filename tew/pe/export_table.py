@@ -1,10 +1,11 @@
 """PE Export Table parser."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
-from tew.helpers import hex_val, rva_to_offset, read_null_terminated
+from tew.helpers import hex_val, read_null_terminated, rva_to_offset
 
 if TYPE_CHECKING:
     from tew.pe.section_header import SectionHeader
@@ -37,7 +38,7 @@ class ExportTable:
         self,
         data: bytes | bytearray,
         file_image: bytes | bytearray,
-        sections: list["SectionHeader"],
+        sections: list[SectionHeader],
         export_dir_rva: int,
         export_dir_size: int,
     ) -> None:

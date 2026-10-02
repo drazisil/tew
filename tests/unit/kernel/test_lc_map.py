@@ -9,7 +9,7 @@ Structure:
 """
 
 import pytest
-from tew.hardware.memory import Memory
+
 from tew.api.lc_map import (
     LCMapFlags,
     LCMapStringArgs,
@@ -17,7 +17,7 @@ from tew.api.lc_map import (
     _to_uppercase,
     lc_map_wide_string,
 )
-
+from tew.hardware.memory import Memory
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers

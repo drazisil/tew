@@ -13,10 +13,10 @@ import pytest
 from tew.api._state import CRTState
 from tew.api.kernel32_system import register_kernel32_system_handlers
 from tew.api.win32_handlers import pending_timers
+from tew.hardware.cpu_zig import ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
 from tew.hardware.scheduler_zig import ThreadStatus
-
 
 MEM_SIZE = 4 * 1024 * 1024
 STACK    = 0x200000

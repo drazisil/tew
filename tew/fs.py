@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 
-def find_file_ci(linux_path: str) -> Optional[str]:
+def find_file_ci(linux_path: str) -> str | None:
     """Case-insensitive file lookup for Linux (Windows paths are case-insensitive).
     Returns the real on-disk path if found (any case), or None if not found.
     Resolves every path component case-insensitively, not just the final one.

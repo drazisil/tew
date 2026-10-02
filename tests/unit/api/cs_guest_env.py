@@ -12,9 +12,9 @@ from tew.api._state import CRTState
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.api.kernel32_sync import register_kernel32_sync_handlers
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP, ZigCPU
 from tew.hardware.memory import Memory
-from tew.kernel.kernel_structures import KernelStructures, MAIN_THREAD_ID
+from tew.kernel.kernel_structures import MAIN_THREAD_ID, KernelStructures
 
 # Real THREAD_STACK_BASE (0x08000000) + room for a background thread's stack.
 MEM_SIZE   = 0x08100000

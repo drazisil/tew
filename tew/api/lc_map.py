@@ -24,7 +24,6 @@ from typing import Final
 
 from tew.api.char_type import WideMemory, wide_strlen
 
-
 # ── Map flag constants ────────────────────────────────────────────────────────
 
 class LCMapFlags(IntFlag):

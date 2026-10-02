@@ -25,11 +25,10 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState, read_cstring
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
-
 
 # ── Win32 constants ───────────────────────────────────────────────────────────
 
@@ -134,17 +133,17 @@ def _send_http(
 
 def register_wininet_handlers(
     stubs: Win32Handlers,
-    memory: "Memory",
+    memory: Memory,
     state: CRTState,
 ) -> None:
     """Register all wininet.dll API handlers."""
 
-    def _internet_attempt_connect(cpu: "CPU") -> None:
+    def _internet_attempt_connect(cpu: CPU) -> None:
         """DWORD InternetAttemptConnect(DWORD dwReserved) → ERROR_SUCCESS"""
         cpu.regs[EAX] = 0   # ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 4)
 
-    def _internet_open_a(cpu: "CPU") -> None:
+    def _internet_open_a(cpu: CPU) -> None:
         """
         HINTERNET InternetOpenA(LPCSTR lpszAgent, DWORD dwAccessType,
             LPCSTR lpszProxyName, LPCSTR lpszProxyBypass, DWORD dwFlags)
@@ -157,7 +156,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 20)
 
-    def _internet_connect_a(cpu: "CPU") -> None:
+    def _internet_connect_a(cpu: CPU) -> None:
         """
         HINTERNET InternetConnectA(HINTERNET hInternet, LPCSTR lpszServerName,
             INTERNET_PORT nServerPort, LPCSTR lpszUserName, LPCSTR lpszPassword,
@@ -181,7 +180,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 32)
 
-    def _http_open_request_a(cpu: "CPU") -> None:
+    def _http_open_request_a(cpu: CPU) -> None:
         """
         HINTERNET HttpOpenRequestA(HINTERNET hConnect, LPCSTR lpszVerb,
             LPCSTR lpszObjectName, LPCSTR lpszVersion, LPCSTR lpszReferrer,
@@ -213,12 +212,12 @@ def register_wininet_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 32)
 
-    def _internet_set_option_a(cpu: "CPU") -> None:
+    def _internet_set_option_a(cpu: CPU) -> None:
         """BOOL InternetSetOptionA(HINTERNET, DWORD, LPVOID, DWORD) → TRUE"""
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
-    def _http_send_request_a(cpu: "CPU") -> None:
+    def _http_send_request_a(cpu: CPU) -> None:
         """
         BOOL HttpSendRequestA(HINTERNET hRequest, LPCSTR lpszHeaders,
             DWORD dwHeadersLength, LPVOID lpOptional, DWORD dwOptionalLength)
@@ -263,7 +262,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = 1 if ok else 0
         cleanup_stdcall(cpu, memory, 20)
 
-    def _http_query_info_a(cpu: "CPU") -> None:
+    def _http_query_info_a(cpu: CPU) -> None:
         """
         BOOL HttpQueryInfoA(HINTERNET hRequest, DWORD dwInfoLevel,
             LPVOID lpBuffer, LPDWORD lpdwBufferLength, LPDWORD lpdwIndex)
@@ -320,7 +319,7 @@ def register_wininet_handlers(
 
         cleanup_stdcall(cpu, memory, 20)
 
-    def _internet_read_file(cpu: "CPU") -> None:
+    def _internet_read_file(cpu: CPU) -> None:
         """
         BOOL InternetReadFile(HINTERNET hFile, LPVOID lpBuffer,
             DWORD dwNumberOfBytesToRead, LPDWORD lpdwNumberOfBytesRead)
@@ -351,7 +350,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
-    def _internet_open_url_a(cpu: "CPU") -> None:
+    def _internet_open_url_a(cpu: CPU) -> None:
         """
         HINTERNET InternetOpenUrlA(HINTERNET hInternet, LPCSTR lpszUrl,
             LPCSTR lpszHeaders, DWORD dwHeadersLength, DWORD dwFlags,
@@ -409,7 +408,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 24)
 
-    def _internet_query_data_available(cpu: "CPU") -> None:
+    def _internet_query_data_available(cpu: CPU) -> None:
         """
         BOOL InternetQueryDataAvailable(HINTERNET hFile,
             LPDWORD lpdwNumberOfBytesAvailable, DWORD dwReserved, DWORD_PTR dwContext)
@@ -438,7 +437,7 @@ def register_wininet_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 16)
 
-    def _internet_close_handle(cpu: "CPU") -> None:
+    def _internet_close_handle(cpu: CPU) -> None:
         """BOOL InternetCloseHandle(HINTERNET hInternet) → TRUE"""
         h = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         _handle_map.pop(h, None)

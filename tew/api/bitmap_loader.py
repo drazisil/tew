@@ -21,7 +21,6 @@ if TYPE_CHECKING:
 
 from tew.logger import logger
 
-
 # ── Data types ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -212,8 +211,8 @@ def create_sdl_texture(renderer: object, info: BitmapInfo) -> object | None:
     """
     from sdl2 import (
         SDL_CreateRGBSurfaceFrom,
-        SDL_FreeSurface,
         SDL_CreateTextureFromSurface,
+        SDL_FreeSurface,
     )
 
     pitch    = info.width * 3   # BGR24: 3 bytes per pixel, no row padding
@@ -260,7 +259,7 @@ def create_sdl_texture(renderer: object, info: BitmapInfo) -> object | None:
 def load_bitmap_texture(
     renderer: object,
     bitmap_id: int,
-    pe_resources: "PEResources",
+    pe_resources: PEResources,
 ) -> object | None:
     """Load bitmap resource *bitmap_id* from PE resources and create an SDL2 texture.
 

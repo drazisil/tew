@@ -8,10 +8,10 @@ covered here.  These tests cover only the pure-Python parse_dib path.
 from __future__ import annotations
 
 import struct
+
 import pytest
 
 from tew.api.bitmap_loader import BitmapInfo, parse_dib
-
 
 # ── Test helpers ──────────────────────────────────────────────────────────────
 

@@ -15,12 +15,13 @@ import os
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
-from tew.api._state import CRTState, THREAD_SENTINEL
+from tew.api._state import THREAD_SENTINEL, CRTState
 from tew.api.crt_handlers import _make_thread_return_handler
 from tew.api.msvcrt_handlers import register_msvcrt_handlers
 from tew.api.user32_handlers import _invoke_emulated_proc
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU as CPU, ESP
+from tew.hardware.cpu_zig import ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 from tew.hardware.scheduler_zig import ThreadStatus
 

@@ -1,10 +1,11 @@
 """PE Delay Import Table parser."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
-from tew.helpers import rva_to_offset, read_null_terminated
+from tew.helpers import read_null_terminated, rva_to_offset
 from tew.pe.import_table import ImportEntry, _read_hint_name
 
 if TYPE_CHECKING:
@@ -49,7 +50,7 @@ class DelayImportDescriptor:
 
 def _parse_delay_thunks(
     file_image: bytes | bytearray,
-    sections: list["SectionHeader"],
+    sections: list[SectionHeader],
     int_rva: int,
     first_thunk_rva: int,
     is_pe32plus: bool,
@@ -100,7 +101,7 @@ class DelayImportTable:
         self,
         data: bytes | bytearray,
         file_image: bytes | bytearray,
-        sections: list["SectionHeader"],
+        sections: list[SectionHeader],
         is_pe32plus: bool,
     ) -> None:
         self._descriptors: list[DelayImportDescriptor] = []

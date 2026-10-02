@@ -1,7 +1,8 @@
 """Black-box control-flow opcode tests against ZigCPU."""
 import pytest
+
+from tew.hardware.cpu_zig import CF_BIT, EAX, ECX, ESP, OF_BIT, SF_BIT, ZF_BIT, ZigCPU
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, ESP, CF_BIT, ZF_BIT, SF_BIT, OF_BIT
 
 
 @pytest.fixture

@@ -10,8 +10,8 @@ import pytest
 
 from tew.api._state import CRTState, DynamicModule
 from tew.api.kernel32_io import register_kernel32_io_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

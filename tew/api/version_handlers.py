@@ -21,20 +21,20 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState, read_cstring
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 
 def register_version_handlers(
     stubs: Win32Handlers,
-    memory: "Memory",
+    memory: Memory,
     state: CRTState,
 ) -> None:
     """Register all version.dll API handlers."""
 
-    def _get_file_version_info_size_a(cpu: "CPU") -> None:
+    def _get_file_version_info_size_a(cpu: CPU) -> None:
         lp_filename = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lpdw_handle = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         filename = read_cstring(lp_filename, memory) if lp_filename else ""
@@ -44,12 +44,12 @@ def register_version_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _get_file_version_info_a(cpu: "CPU") -> None:
+    def _get_file_version_info_a(cpu: CPU) -> None:
         logger.error("handlers", "[UNIMPLEMENTED] GetFileVersionInfoA — RT_VERSION parsing not implemented, halting")
         cpu.halted = True
         cpu.fatal_halt = True
 
-    def _ver_query_value_a(cpu: "CPU") -> None:
+    def _ver_query_value_a(cpu: CPU) -> None:
         logger.error("handlers", "[UNIMPLEMENTED] VerQueryValueA — RT_VERSION parsing not implemented, halting")
         cpu.halted = True
         cpu.fatal_halt = True

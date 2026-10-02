@@ -5,21 +5,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api._state import CRTState
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
-    from tew.api._state import CRTState
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import cleanup_stdcall
 from tew.api._state import TEB_BASE, EventHandle
+from tew.api.win32_handlers import cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 
 def register_kernel32_sync_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register critical section and TLS handlers."""
 
@@ -74,7 +74,7 @@ def register_kernel32_sync_handlers(
         memory.write32(ptr + 0x10, 0)            # LockSemaphore (created lazily)
         memory.write32(ptr + 0x14, 0)            # SpinCount
 
-    def _init_cs(cpu: "CPU") -> None:
+    def _init_cs(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         _write_initialized_cs(ptr)
         # kernel32's InitializeCriticalSection is void; ntdll's own
@@ -84,7 +84,7 @@ def register_kernel32_sync_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _init_cs_spin(cpu: "CPU") -> None:
+    def _init_cs_spin(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         # spin_count (arg at ESP+8) is dropped: see _write_initialized_cs.
         _write_initialized_cs(ptr)
@@ -94,7 +94,7 @@ def register_kernel32_sync_handlers(
     # ntdll's own RtlInitializeCriticalSectionAndSpinCount -- same struct/
     # effect as kernel32's version above (which forwards to it on real
     # Windows), but returns NTSTATUS (0 = STATUS_SUCCESS) instead of BOOL.
-    def _rtl_init_cs_spin(cpu: "CPU") -> None:
+    def _rtl_init_cs_spin(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         _write_initialized_cs(ptr)
         cpu.regs[EAX] = 0  # STATUS_SUCCESS
@@ -192,7 +192,7 @@ def register_kernel32_sync_handlers(
 
     # Contended Enter. Returning normally continues into the acquire path
     # with this thread as owner; blocking re-runs this INT 0xFE when woken.
-    def _cs_enter_wait(cpu: "CPU") -> None:
+    def _cs_enter_wait(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         h, event = _lock_semaphore(ptr)
         if event.signaled:
@@ -202,7 +202,7 @@ def register_kernel32_sync_handlers(
             cpu, memory, frozenset([h]), (cpu.eip - 2) & 0xFFFFFFFF)
 
     # Leave with waiters: wake one (XP's RtlpUnWaitCriticalSection).
-    def _cs_leave_wake(cpu: "CPU") -> None:
+    def _cs_leave_wake(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         h, event = _lock_semaphore(ptr)
         event.signaled = True
@@ -222,7 +222,7 @@ def register_kernel32_sync_handlers(
     # unlink DebugInfo from RtlCriticalSectionList, zero and free it, then
     # zero the whole 24-byte struct. A DebugInfo of 0 (already deleted, or
     # never initialized) skips the debug-block part, as on XP.
-    def _delete_cs(cpu: "CPU") -> None:
+    def _delete_cs(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if memory.read32((ptr + 0x10) & 0xFFFFFFFF) != 0:
             h, _event = _lock_semaphore(ptr)
@@ -241,7 +241,7 @@ def register_kernel32_sync_handlers(
     # InitializeSListHead(PSLIST_HEADER) -> void
     # SLIST_HEADER is an 8-byte (32-bit) aligned union (Depth/Sequence/Next);
     # zeroing it is the real implementation's own effect (empty, depth 0).
-    def _init_slist_head(cpu: "CPU") -> None:
+    def _init_slist_head(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         memory.write32(ptr,     0)
         memory.write32(ptr + 4, 0)
@@ -255,7 +255,7 @@ def register_kernel32_sync_handlers(
     # by the real init -- acquire/exclusive/shared semantics aren't modeled
     # since nothing has needed them yet; add RtlAcquireResourceShared/
     # Exclusive/RtlReleaseResource for real if that ever halts.
-    def _rtl_init_resource(cpu: "CPU") -> None:
+    def _rtl_init_resource(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         memory.write32(ptr + 0x00, 0)
         memory.write32(ptr + 0x04, 0xFFFFFFFF)
@@ -279,7 +279,7 @@ def register_kernel32_sync_handlers(
     # behavior and is allowed here without changing state; a genuinely
     # contested acquire (different thread, already held) returns FALSE --
     # true blocking isn't implemented, so Wait=TRUE can't actually wait.
-    def _rtl_acquire_resource_exclusive(cpu: "CPU") -> None:
+    def _rtl_acquire_resource_exclusive(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         tid = state.tls_current_thread_id()
         number_active = memory.read32((ptr + 0x28) & 0xFFFFFFFF)
@@ -295,7 +295,7 @@ def register_kernel32_sync_handlers(
             cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 8)
 
-    def _rtl_release_resource(cpu: "CPU") -> None:
+    def _rtl_release_resource(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         memory.write32(ptr + 0x28, 0)  # NumberOfActive = 0
         memory.write32(ptr + 0x2C, 0)  # ExclusiveOwnerThread = NULL
@@ -315,7 +315,7 @@ def register_kernel32_sync_handlers(
 
     TLS_OUT_OF_INDEXES = 0xFFFFFFFF
 
-    def _tls_alloc(cpu: "CPU") -> None:
+    def _tls_alloc(cpu: CPU) -> None:
         if state.next_tls_slot >= state.tls_max_slots:
             cpu.regs[EAX] = TLS_OUT_OF_INDEXES
             return
@@ -324,7 +324,7 @@ def register_kernel32_sync_handlers(
         state.scheduler.tls_alloc_slot(slot)
         cpu.regs[EAX] = slot
 
-    def _tls_set_value(cpu: "CPU") -> None:
+    def _tls_set_value(cpu: CPU) -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         val = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if not state.scheduler.tls_slot_allocated(idx):
@@ -338,7 +338,7 @@ def register_kernel32_sync_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 8)
 
-    def _tls_get_value(cpu: "CPU") -> None:
+    def _tls_get_value(cpu: CPU) -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if not state.scheduler.tls_slot_allocated(idx):
             # Win32: returns 0 (NULL) for an invalid index; never halts.
@@ -350,7 +350,7 @@ def register_kernel32_sync_handlers(
         cpu.regs[EAX] = state.tls_thread_store(tid).get(idx, 0)
         cleanup_stdcall(cpu, memory, 4)
 
-    def _tls_free(cpu: "CPU") -> None:
+    def _tls_free(cpu: CPU) -> None:
         idx = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if not state.scheduler.tls_slot_allocated(idx):
             # Win32: returns FALSE for an unallocated index; never halts.

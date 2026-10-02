@@ -9,9 +9,9 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.user32_handlers import register_user32_gdi32_handlers
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
-
 
 # ── Shared test infrastructure ────────────────────────────────────────────────
 
@@ -109,7 +109,6 @@ class TestChainManagement:
         hhk_a = install_hook(stubs, cpu, mem, WH_KEYBOARD, PROC_A_ADDR)
         hhk_b = install_hook(stubs, cpu, mem, WH_KEYBOARD, PROC_B_ADDR)
         # hhk_b installed second → should be first in chain
-        from tew.api import user32_handlers as _u32
         # Access closure state indirectly through behaviour: CallNextHookEx on hhk_b
         # (first in chain) should reach hhk_a (second); on hhk_a should return 0.
         result_from_b = call_next(stubs, cpu, mem, hhk_b)

@@ -9,9 +9,8 @@ delegates to — covering every source-handle category the emulator recognises.
 
 import pytest
 
-from tew.api._state import CRTState, FileHandleEntry, MutexHandle, EventHandle
+from tew.api._state import CRTState, EventHandle, FileHandleEntry, MutexHandle
 from tew.api.kernel32_io import _duplicate_handle_entry
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures

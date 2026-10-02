@@ -12,26 +12,28 @@ from __future__ import annotations
 
 import ntpath
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import (
-    Win32Handlers, cleanup_stdcall, DLLMAIN_TRAMPOLINE, DLLMAIN_HANDLE_STORE,
-    unimplemented_halt as _halt,
-)
 from tew.api._state import CRTState, DynamicModule, read_cstring, read_wide_string
-from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+from tew.api.user32_handlers import _get_dialog_sentinel, _invoke_emulated_proc
+from tew.api.win32_handlers import (
+    DLLMAIN_HANDLE_STORE,
+    DLLMAIN_TRAMPOLINE,
+    Win32Handlers,
+    cleanup_stdcall,
+)
 from tew.fs import find_file_ci
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 
 def _load_dll_with_dllmain(
-    cpu: "CPU", memory: "Memory", stubs: Win32Handlers,
+    cpu: CPU, memory: Memory, stubs: Win32Handlers,
     state: CRTState, dll_loader, loaded, handle: int, arg_bytes: int,
 ) -> None:
     """If DLL has an entry point, invoke DllMain via stack trick; otherwise just return handle."""
@@ -51,8 +53,8 @@ def _load_dll_with_dllmain(
 
 
 def _invoke_dependency_dllmain(
-    cpu: "CPU", memory: "Memory", state: CRTState, loaded,
-    dll_loader: Optional["DLLLoader"] = None, stubs: Optional["Win32Handlers"] = None,
+    cpu: CPU, memory: Memory, state: CRTState, loaded,
+    dll_loader: DLLLoader | None = None, stubs: Win32Handlers | None = None,
 ) -> bool:
     """Synchronously run a dependency DLL's own DllMain(DLL_PROCESS_ATTACH).
 
@@ -125,9 +127,9 @@ def _invoke_dependency_dllmain(
 
 def register_kernel32_handlers(
     stubs: Win32Handlers,
-    memory: "Memory",
+    memory: Memory,
     state: CRTState,
-    dll_loader: Optional["DLLLoader"] = None,
+    dll_loader: DLLLoader | None = None,
 ) -> None:
     """Register all kernel32.dll handlers."""
 
@@ -158,7 +160,7 @@ def register_kernel32_handlers(
             return stub_handle
         return 0
 
-    def _get_module_handle_a(cpu: "CPU") -> None:
+    def _get_module_handle_a(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name = read_cstring(lp, memory) if lp != 0 else ""
         handle = _resolve_module_handle(name)
@@ -169,7 +171,7 @@ def register_kernel32_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 4)
 
-    def _get_module_handle_w(cpu: "CPU") -> None:
+    def _get_module_handle_w(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name = read_wide_string(lp, memory) if lp != 0 else ""
         handle = _resolve_module_handle(name)
@@ -185,7 +187,7 @@ def register_kernel32_handlers(
 
     # ── GetProcAddress ────────────────────────────────────────────────────────
 
-    def _get_proc_address(cpu: "CPU") -> None:
+    def _get_proc_address(cpu: CPU) -> None:
         h_module  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name_ptr  = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         proc_name: str
@@ -194,7 +196,7 @@ def register_kernel32_handlers(
         else:
             proc_name = read_cstring(name_ptr, memory)
 
-        dll_name: Optional[str] = None
+        dll_name: str | None = None
         if h_module == 0x00400000:
             dll_name = None
         else:
@@ -260,7 +262,7 @@ def register_kernel32_handlers(
         return norm
 
     def _load_dll_by_path(name: str, arg_bytes: int,
-                          cpu: "CPU", memory: "Memory") -> bool:
+                          cpu: CPU, memory: Memory) -> bool:
         """Try to load a path-based DLL. Returns True if handled (caller should return)."""
         linux_path = state.translate_windows_path(name)
         while True:
@@ -292,7 +294,7 @@ def register_kernel32_handlers(
                             # the DLL (TLS init, critical sections, etc.) can run
                             # normally without any other patches.
                             base = loaded.base_address
-                            def _authlogin_alloc(cpu: "CPU") -> None:
+                            def _authlogin_alloc(cpu: CPU) -> None:
                                 sz = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
                                 cpu.regs[EAX] = state.simple_alloc(sz or 1)
                                 # __cdecl: caller cleans the stack — no cleanup_stdcall
@@ -358,7 +360,7 @@ def register_kernel32_handlers(
             return True
 
     def _load_dll_by_name(name: str, arg_bytes: int,
-                          cpu: "CPU", memory: "Memory") -> None:
+                          cpu: CPU, memory: Memory) -> None:
         """Try to load a name-only DLL (no path separator)."""
         if dll_loader:
             was_loaded = dll_loader.get_dll(name) is not None
@@ -393,7 +395,7 @@ def register_kernel32_handlers(
             cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, arg_bytes)
 
-    def _load_library_a(cpu: "CPU") -> None:
+    def _load_library_a(cpu: CPU) -> None:
         name_ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory)
         if (name.startswith("\\") or name.startswith("/")) and \
@@ -418,7 +420,7 @@ def register_kernel32_handlers(
         | 0x1000  # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
     )
 
-    def _load_library_ex_common(name: str, dw_flags: int, cpu: "CPU", memory: "Memory",
+    def _load_library_ex_common(name: str, dw_flags: int, cpu: CPU, memory: Memory,
                                 caller_label: str) -> None:
         if dw_flags & ~_LOAD_LIBRARY_SEARCH_FLAGS:
             logger.error("handlers",
@@ -435,23 +437,23 @@ def register_kernel32_handlers(
         else:
             _load_dll_by_name(name, 12, cpu, memory)
 
-    def _load_library_ex_a(cpu: "CPU") -> None:
+    def _load_library_ex_a(cpu: CPU) -> None:
         name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         name = read_cstring(name_ptr, memory) if name_ptr else ""
         _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExA")
 
-    def _load_library_ex_w(cpu: "CPU") -> None:
+    def _load_library_ex_w(cpu: CPU) -> None:
         name_ptr = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         dw_flags = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         name = read_wide_string(name_ptr, memory) if name_ptr else ""
         _load_library_ex_common(name, dw_flags, cpu, memory, "LoadLibraryExW")
 
-    def _free_library(cpu: "CPU") -> None:
+    def _free_library(cpu: CPU) -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
-    def _disable_thread_lib(cpu: "CPU") -> None:
+    def _disable_thread_lib(cpu: CPU) -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -463,11 +465,11 @@ def register_kernel32_handlers(
 
     # ── Delegate to sub-modules ───────────────────────────────────────────────
 
-    from tew.api.kernel32_memory import register_kernel32_memory_handlers
-    from tew.api.kernel32_sync   import register_kernel32_sync_handlers
+    from tew.api.kernel32_io import register_kernel32_io_handlers
     from tew.api.kernel32_locale import register_kernel32_locale_handlers
+    from tew.api.kernel32_memory import register_kernel32_memory_handlers
+    from tew.api.kernel32_sync import register_kernel32_sync_handlers
     from tew.api.kernel32_system import register_kernel32_system_handlers
-    from tew.api.kernel32_io     import register_kernel32_io_handlers
 
     register_kernel32_memory_handlers(stubs, memory, state)
     register_kernel32_sync_handlers(stubs, memory, state)

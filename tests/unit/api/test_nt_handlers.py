@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import pytest
 
-from tew.api.nt_handlers import register_nt_handlers, STATUS_SUCCESS
+from tew.api.nt_handlers import STATUS_SUCCESS, register_nt_handlers
 from tew.api.nt_syscall import NtSyscallDispatcher
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, EDX
+from tew.hardware.memory import Memory
 
 
 class _FakeCPU:

@@ -16,18 +16,18 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.wininet_handlers import (
-    register_wininet_handlers,
-    _handle_map,
-    InetSession,
-    InetConnection,
-    InetRequest,
-    HTTP_QUERY_STATUS_CODE,
     HTTP_QUERY_FLAG_NUMBER,
+    HTTP_QUERY_STATUS_CODE,
     INTERNET_DEFAULT_HTTP_PORT,
     INTERNET_DEFAULT_HTTPS_PORT,
+    InetConnection,
+    InetRequest,
+    InetSession,
+    _handle_map,
+    register_wininet_handlers,
 )
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:
