@@ -25,7 +25,31 @@ with no signal. Return a failure and have `cpu_zig.py` raise.
 `cpu/src/scheduler.zig` bumps each new stack by 256 KB from 0x08000000 and
 never reuses them; past ~512 threads they hit the DLL slots at 0x10000000.
 
+## D3D8 render states are never applied (found 2026-10-02)
+`Dev::SetRenderState` is `_ok` (returns S_OK, applies nothing); the pipeline is
+fixed SRC_ALPHA/INV_SRC_ALPHA, no depth test. Probe of one trade-in frame
+(600 draws): 319 draw with ZENABLE/ZWRITE on (the 3D car), 125 additive
+(SRCALPHA,ONE), 49 multiply (DESTCOLOR,ZERO). Probable cause of parts drawn
+in the wrong order (steering wheel outside the car) and wrong glows/darkening.
+Needs: track states, depth buffer cleared by `Clear`, ZFUNC, blend factors per
+draw (pipeline variants). Until then SetRenderState should not claim success.
+Also `DrawPrimitive` skips PrimType 6 (fan, ~870/run) and 2 (line list,
+~5300/run) but returns S_OK; `DrawIndexedPrimitive`/`UP` just halt.
+
+## DealerTradeIn dialog: black screen, buttons off the frame
+Per-frame probe: dim layer (alpha 84, `GDialogs.gui` `mColor=[84,0,0,0]` is
+ARGB) arrives intact and blends right, so it is not the black. Dialog frame
+draws at ~(222,118) 356x363, not the `[409,122]` gui_begin logs (bounds there
+are pre-layout). OK/Cancel images draw at y=481 = the frame's bottom edge:
+fits `GUI::Layout` (0x00aebe20) doing `y = Bottom - height` with height 0, not
+proven. Next: framebuffer screenshot of that frame; log bounds after layout.
+Ghidra: `GUI` struct (452 B) lacks the x/y fields at +0x64/+0x68; derived-class
+`this` is typed GUI, so check the owning class before trusting an offset.
+
 ## Rendering gaps
+- SDL window steals input focus while drawing (can't click elsewhere). Only
+  creation calls `SDL_RaiseWindow`; suspect repeated `ShowWindow` ->
+  `SDL_ShowWindow` (user32_handlers.py). Log its calls first.
 - FEUI dialog backgrounds don't draw (Exit dialog shows only its buttons).
 - Persona-select highlight bar overdraws the list's column divider. Trace
   the quad's DrawPrimitive before touching blend state; never enable the
