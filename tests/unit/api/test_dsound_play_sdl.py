@@ -30,20 +30,20 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pytest
 
 import tew.api.dsound_handlers as dsh
+from tew import logger as logger_module
 from tew.api._state import CRTState
 from tew.api.dsound_handlers import (
-    register_dsound_handlers,
-    _mix_into,
-    _open_sdl_audio,
-    _DSBuffer,
     DS_OBJ,
     DS_OK,
     DSBCAPS_PRIMARYBUFFER,
     DSBPLAY_LOOPING,
+    _DSBuffer,
+    _mix_into,
+    _open_sdl_audio,
+    register_dsound_handlers,
 )
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
-from tew import logger as logger_module
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:
@@ -74,7 +74,7 @@ DESC_ADDR = 0x320000
 
 @pytest.fixture(scope="module", autouse=True)
 def _sdl_audio_subsystem():
-    from sdl2 import SDL_Init, SDL_Quit, SDL_INIT_AUDIO
+    from sdl2 import SDL_INIT_AUDIO, SDL_Init, SDL_Quit
     rc = SDL_Init(SDL_INIT_AUDIO)
     assert rc == 0, "SDL_Init(SDL_INIT_AUDIO) failed even with the dummy driver"
     yield

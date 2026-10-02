@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR/branch supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.15.2"
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Non-blocking, same as the Harness pipeline it replaces: pre-existing
+    # lint debt hasn't been paid down yet. Findings show as annotations but
+    # don't fail the run.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ruff check
+        run: uvx ruff check . --output-format=github
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # cpu/ is a submodule (drazisil/tew-cpu, public). checkout rewrites the
+      # git@github.com: URL in .gitmodules to HTTPS, so no SSH key is needed.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build libcpu.so
+        working-directory: cpu
+        run: |
+          zig build
+          ls -la zig-out/lib/
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra test --python "$PYTHON_VERSION"
+
+      - name: Run tests
+        run: |
+          mkdir -p test-results
+          uv run --frozen pytest \
+            --cov=tew --cov-report=term-missing --cov-report=xml \
+            --junitxml=test-results/junit.xml
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "### Coverage"
+            uv run --frozen coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY" || echo "no coverage data to summarise"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results/junit.xml
+            coverage.xml
+          if-no-files-found: warn

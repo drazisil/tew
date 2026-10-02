@@ -10,31 +10,31 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu_zig import EAX, ECX
 from tew.api.win32_handlers import cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ECX
 from tew.logger import logger
 
 
-def register_ifc22_handlers(stubs: "Win32Handlers", memory: "Memory") -> None:
+def register_ifc22_handlers(stubs: Win32Handlers, memory: Memory) -> None:
     """Register all IFC22.dll stubs."""
 
-    def _ctor_noop(cpu: "CPU") -> None:
+    def _ctor_noop(cpu: CPU) -> None:
         cpu.regs[EAX] = cpu.regs[ECX]
 
-    def _dtor_noop(cpu: "CPU") -> None:
+    def _dtor_noop(cpu: CPU) -> None:
         pass
 
-    def _initialize(cpu: "CPU") -> None:
+    def _initialize(cpu: CPU) -> None:
         logger.info("handlers", "[ifc22] CImmMouse::Initialize -> 0 (no FFB hardware)")
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 16)
 
     def _halt_ffb(name: str):
-        def _h(cpu: "CPU") -> None:
+        def _h(cpu: CPU) -> None:
             logger.error("handlers", f"[UNIMPLEMENTED] ifc22 FFB method {name} — halting")
             cpu.halted = True
             cpu.fatal_halt = True

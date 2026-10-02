@@ -16,14 +16,22 @@ implementation would produce wParam=0 for every case below.
 """
 
 from sdl2 import (
-    SDL_Event, SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP, SDL_MOUSEMOTION,
-    SDL_WINDOWEVENT, SDL_WINDOWEVENT_FOCUS_LOST,
-    SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT,
+    SDL_BUTTON_LEFT,
+    SDL_BUTTON_RIGHT,
+    SDL_MOUSEBUTTONDOWN,
+    SDL_MOUSEBUTTONUP,
+    SDL_MOUSEMOTION,
+    SDL_WINDOWEVENT,
+    SDL_WINDOWEVENT_FOCUS_LOST,
+    SDL_Event,
 )
 
 from tew.api.window_manager import (
-    WindowManager, WindowEntry,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_LBUTTONDOWN,
+    WM_LBUTTONUP,
+    WM_MOUSEMOVE,
+    WindowEntry,
+    WindowManager,
 )
 
 HWND = 0x1034

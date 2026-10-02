@@ -22,12 +22,12 @@ from __future__ import annotations
 import pytest
 
 import tew.api.d3d8._state as state
-from tew.api.d3d8.idirect3d8device import make_vtable
-from tew.api.d3d8.idirect3d8resource import _ref_counts, _release
 from tew.api.d3d8._helpers import _alloc_registry
 from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK
-from tew.hardware.memory import Memory
+from tew.api.d3d8.idirect3d8device import make_vtable
+from tew.api.d3d8.idirect3d8resource import _ref_counts, _release
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

@@ -17,15 +17,14 @@ import struct
 import pytest
 
 from tew.api.pe_resources import (
-    PEResources,
-    DialogTemplate,
     DialogControl,
-    _read_var_field,
+    DialogTemplate,
+    PEResources,
     _align4,
+    _read_var_field,
     du_to_px_x,
     du_to_px_y,
 )
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

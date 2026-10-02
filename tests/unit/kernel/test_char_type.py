@@ -8,7 +8,7 @@ Structure:
 """
 
 import pytest
-from tew.hardware.memory import Memory
+
 from tew.api.char_type import (
     CT_CTYPE1,
     CT_CTYPE2,
@@ -18,7 +18,7 @@ from tew.api.char_type import (
     classify_ctype1,
     classify_wide_string,
 )
-
+from tew.hardware.memory import Memory
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers

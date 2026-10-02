@@ -5,8 +5,8 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.version_handlers import register_version_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

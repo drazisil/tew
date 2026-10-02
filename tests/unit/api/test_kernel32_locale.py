@@ -5,8 +5,8 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.kernel32_locale import register_kernel32_locale_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

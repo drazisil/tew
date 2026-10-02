@@ -7,25 +7,25 @@ emulator memory before any game code executes.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api._state import EmulatorConfig
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
     from tew.loader.dll_loader import DLLLoader
-    from tew.api._state import EmulatorConfig
 
+from tew.api._state import THREAD_SENTINEL, CRTState
 from tew.api.win32_handlers import Win32Handlers
-from tew.api._state import CRTState, THREAD_SENTINEL
 from tew.logger import logger
 
 
 def register_crt_handlers(
     stubs: Win32Handlers,
-    memory: "Memory",
-    dll_loader: Optional["DLLLoader"] = None,
-    config: Optional["EmulatorConfig"] = None,
-    registry_dir: Optional[str] = None,
+    memory: Memory,
+    dll_loader: DLLLoader | None = None,
+    config: EmulatorConfig | None = None,
+    registry_dir: str | None = None,
 ) -> CRTState:
     """Register all default Win32 API stubs needed for MSVC CRT startup.
 
@@ -113,19 +113,19 @@ def register_crt_handlers(
     # ── Per-DLL handler registration ──────────────────────────────────────────
     # Import here to keep top-level imports free of circular dependencies and
     # to allow individual modules to be loaded/tested in isolation.
+    from tew.api.advapi32_handlers import register_advapi32_handlers
+    from tew.api.d3d8 import register_d3d8_handlers
+    from tew.api.dinput_handlers import register_dinput_handlers
+    from tew.api.dsound_handlers import register_dsound_handlers
+    from tew.api.ifc22_handlers import register_ifc22_handlers
     from tew.api.kernel32_handlers import register_kernel32_handlers
     from tew.api.kernel32_io import register_winmm_handlers
     from tew.api.msvcrt_handlers import register_msvcrt_handlers
-    from tew.api.user32_handlers import register_user32_gdi32_handlers
     from tew.api.ole32_handlers import register_ole32_handlers
-    from tew.api.advapi32_handlers import register_advapi32_handlers
-    from tew.api.d3d8 import register_d3d8_handlers
+    from tew.api.user32_handlers import register_user32_gdi32_handlers
     from tew.api.version_handlers import register_version_handlers
     from tew.api.wininet_handlers import register_wininet_handlers
     from tew.api.wsock32_handlers import register_wsock32_handlers
-    from tew.api.dinput_handlers import register_dinput_handlers
-    from tew.api.ifc22_handlers import register_ifc22_handlers
-    from tew.api.dsound_handlers import register_dsound_handlers
 
     register_kernel32_handlers(stubs, memory, state, dll_loader)
     register_winmm_handlers(stubs, memory, state)
@@ -148,7 +148,7 @@ def register_crt_handlers(
 
 def patch_crt_internals(
     stubs: Win32Handlers,
-    memory: "Memory",
+    memory: Memory,
     state: CRTState,
 ) -> None:
     """Patch CRT internal functions at hardcoded game addresses.
@@ -179,9 +179,9 @@ def patch_crt_internals(
 _THREAD_END_STACK_DUMP_TIDS: set[int] = {1011, 1012}
 
 
-def _make_thread_return_handler(state: CRTState, memory: "Memory"):
+def _make_thread_return_handler(state: CRTState, memory: Memory):
     """Build the handler called when a spawned thread returns to THREAD_SENTINEL."""
-    def _handler(cpu: "CPU") -> None:
+    def _handler(cpu: CPU) -> None:
         thread = state.scheduler.current_thread()
         logger.debug("thread", f"Thread {thread.thread_id} returned normally")
         if thread.thread_id in _THREAD_END_STACK_DUMP_TIDS:

@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from tew.logger import logger
 
+from tew.logger import logger
 
 # Parsed INI data: {section_lower: {key_lower: value_original_case}}
 IniData = dict[str, dict[str, str]]

@@ -9,12 +9,23 @@ from __future__ import annotations
 
 import pytest
 
+from tests.unit.api.cs_guest_env import (
+    CODE_BASE,
+    CS_ADDR,
+    CS_ADDR2,
+    LOCK_FREE,
+    MAIN_TID,
+    OFF_DEBUG,
+    OFF_LOCK,
+    OFF_OWNER,
+    OFF_REC,
+    OFF_SEMAPHORE,
+    OFF_SPIN,
+    STACK_TOP,
+    make_cs_env,
+)
 from tew.api._state import EventHandle
 from tew.hardware.cpu_zig import ESP, FatalHaltError
-from tests.unit.api.cs_guest_env import (
-    CODE_BASE, CS_ADDR, CS_ADDR2, LOCK_FREE, MAIN_TID, OFF_DEBUG, OFF_LOCK,
-    OFF_OWNER, OFF_REC, OFF_SEMAPHORE, OFF_SPIN, STACK_TOP, make_cs_env,
-)
 
 DBG_CS    = 0x04  # RTL_CRITICAL_SECTION_DEBUG.CriticalSection
 DBG_FLINK = 0x08  # .ProcessLocksList.Flink

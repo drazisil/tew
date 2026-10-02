@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import os
 import tempfile
+
 import pytest
 
-from tew.api._state import CRTState, FileHandleEntry, TEB_BASE
+from tew.api._state import TEB_BASE, CRTState, FileHandleEntry
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.api.win32_errors import Win32Error
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 MEM_SIZE = 128 * 1024 * 1024  # must clear the heap base (simple_alloc starts at 0x04000000)
 STACK    = 0x200000

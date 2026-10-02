@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from tew.api.window_manager import WindowManager
 from tew.fs import find_file_ci
@@ -20,8 +20,8 @@ from tew.kernel.kernel import Kernel
 from tew.kernel.kernel_structures import MAIN_THREAD_ID
 
 if TYPE_CHECKING:
-    from tew.hardware.memory import Memory
     from tew.api.pe_resources import PEResources
+    from tew.hardware.memory import Memory
 
 
 # ── Win32 CreateFile dwCreationDisposition values ───────────────────────────────
@@ -58,7 +58,7 @@ class FileHandleEntry:
     data: bytes          # file contents (empty bytes for write-only)
     position: int        # current read/write position
     writable: bool
-    fd: Optional[int]    # host file descriptor (None = no real file backing)
+    fd: int | None    # host file descriptor (None = no real file backing)
     # True when the guest's CreateFile/fopen call also requested read access
     # (GENERIC_READ, or an fopen mode with "+") alongside write access --
     # distinct from `writable`, which only tracks whether *write* access was
@@ -75,7 +75,7 @@ class FileHandleEntry:
 
 @dataclass
 class FileMappingHandle:
-    file_handle: Optional[int]  # underlying HANDLE from CreateFile, or None for an
+    file_handle: int | None  # underlying HANDLE from CreateFile, or None for an
                                  # anonymous (page-file-backed) mapping
     protect: int                # flProtect (PAGE_READONLY / PAGE_READWRITE / ...)
     max_size: int                # 0 means "size of the underlying file"
@@ -90,7 +90,7 @@ class MappedView:
     writable: bool
 
 
-def file_entry_size(entry: "FileHandleEntry") -> int:
+def file_entry_size(entry: FileHandleEntry) -> int:
     """Return the real length of a file handle's backing data.
 
     `len(entry.data)` is wrong for any fd-backed handle (`entry.fd is not
@@ -114,7 +114,7 @@ class MutexHandle:
     type: str = "mutex"
     locked: bool = False
     name: str = ""
-    owner_tid: Optional[int] = None   # thread ID holding the mutex; None = unowned
+    owner_tid: int | None = None   # thread ID holding the mutex; None = unowned
     recursion_count: int = 0          # depth of recursive acquisitions by owner_tid
 
 
@@ -160,7 +160,7 @@ class EmulatorConfig:
 
 def load_registry_json(
     base_dir: str | None = None,
-    config: "EmulatorConfig | None" = None,
+    config: EmulatorConfig | None = None,
 ) -> RegistryMap:
     """Load fake registry values from registry.json in the project root.
     Keys and value names are normalized to lowercase. Returns empty map on error.
@@ -282,6 +282,7 @@ def _win32_error_from_errno(e: OSError):
     setting GetLastError() correctly on a CreateFile failure real guest code
     may branch on (e.g. ERROR_FILE_NOT_FOUND vs ERROR_ACCESS_DENIED)."""
     import errno
+
     from tew.api.win32_errors import Win32Error
     if e.errno == errno.ENOENT:
         return Win32Error.ERROR_PATH_NOT_FOUND
@@ -324,7 +325,7 @@ class CRTState:
         # Needed by simple_alloc/simple_free to fill handed-out/freed memory
         # with the MSVC debug-heap's own guard patterns -- see simple_alloc's
         # docstring for why.
-        self.memory: "Memory | None" = None
+        self.memory: Memory | None = None
 
         # ── Heap allocator ────────────────────────────────────────────────
         self.next_heap_alloc: int = HEAP_BASE
@@ -423,7 +424,7 @@ class CRTState:
         # patch (patch_internals.py) write real text into the same stream
         # real puts()/printf() output lands in, instead of only the
         # game's own unrendered on-screen "SYSTEM" debug console.
-        self.guest_stdout_handle: Optional[int] = None
+        self.guest_stdout_handle: int | None = None
 
         # ── Channel_DebugPrint host-side log file ────────────────────────────
         # channel_log.txt -- a real host file Channel_DebugPrint's patch
@@ -435,7 +436,7 @@ class CRTState:
         # this at all (the real game routes Channel_DebugPrint to its own
         # unrendered on-screen debug console, never to real stdout), so this
         # is opened directly by tew itself, lazily, on first write.
-        self.channel_log_fd: Optional[int] = None
+        self.channel_log_fd: int | None = None
 
         # ── Byte-range file locks (LockFile/UnlockFile) ─────────────────────
         # Keyed by real host path (not handle -- real Win32 byte-range locks
@@ -451,7 +452,7 @@ class CRTState:
         # ── Window / dialog system ────────────────────────────────────────
         self.window_manager: WindowManager = WindowManager()
         # pe_resources is set by run_exe.py after the PE is loaded
-        self.pe_resources: Optional["PEResources"] = None
+        self.pe_resources: PEResources | None = None
 
         # ── Fatal dialogs ─────────────────────────────────────────────────
         # Every MessageBoxA/W shown with a stop/hand icon (MB_ICONERROR /
@@ -641,7 +642,7 @@ class CRTState:
         return linux_path.replace("/", "\\")
 
     def open_file_handle(
-        self, win_name: str, writable: bool, memory: "Memory", no_create_prompt: bool = False,
+        self, win_name: str, writable: bool, memory: Memory, no_create_prompt: bool = False,
         disposition: int = CREATE_ALWAYS, also_readable: bool = False,
     ) -> int:
         """Open a file and register it in file_handle_map. Returns the handle.
@@ -666,8 +667,8 @@ class CRTState:
         _winmain_check3) that faked that copy's success without ever running
         it -- removed; see changelog.md "2026-08-07".
         """
-        from tew.logger import logger
         from tew.api.win32_errors import Win32Error
+        from tew.logger import logger
         # Device namespace paths (\\.\xxx) are kernel driver handles — never a
         # real file.  Return INVALID_HANDLE_VALUE without touching the OS.
         normalized = win_name.replace("\\", "/")
@@ -819,7 +820,7 @@ class CRTState:
 
 # ── String helpers (take memory as arg, no state needed) ─────────────────────
 
-def read_cstring(ptr: int, memory: "Memory", max_len: int = 260) -> str:
+def read_cstring(ptr: int, memory: Memory, max_len: int = 260) -> str:
     """Read a null-terminated ANSI string from emulator memory.
 
     Reads the whole (up to max_len) span in one bulk call and scans for
@@ -845,7 +846,7 @@ def read_cstring(ptr: int, memory: "Memory", max_len: int = 260) -> str:
     return data.decode("latin-1")
 
 
-def read_wide_string(ptr: int, memory: "Memory", max_len: int = 260) -> str:
+def read_wide_string(ptr: int, memory: Memory, max_len: int = 260) -> str:
     """Read a null-terminated UTF-16LE string from emulator memory.
 
     Same bulk-read rationale as read_cstring above -- one FFI call instead

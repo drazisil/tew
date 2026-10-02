@@ -1,18 +1,20 @@
 """Crash analysis and diagnostic reporting for the emulator."""
 
 from __future__ import annotations
+
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
-from tew.hardware.cpu_zig import REG_NAMES, ESP, EBP, FatalHaltError
+from tew.hardware.cpu_zig import EBP, ESP, REG_NAMES, FatalHaltError
 from tew.logger import logger
 
 if TYPE_CHECKING:
+    from tew.api._state import CRTState
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api._state import CRTState
     from tew.loader.import_resolver import ImportResolver
 
 # Real address of the debug CRT's _CrtDumpMemoryLeaks in MCity_d.exe (confirmed
@@ -55,7 +57,7 @@ def _classify_static_region(value: int) -> str | None:
     return None
 
 
-def _annotate_address(value: int, import_resolver: "ImportResolver | None") -> str:
+def _annotate_address(value: int, import_resolver: ImportResolver | None) -> str:
     if import_resolver:
         dll = import_resolver.find_dll_for_address(value)
         if dll:
@@ -65,8 +67,8 @@ def _annotate_address(value: int, import_resolver: "ImportResolver | None") -> s
 
 
 def _walk_ebp_chain(
-    cpu: "CPU",
-    import_resolver: "ImportResolver | None",
+    cpu: CPU,
+    import_resolver: ImportResolver | None,
     ebp_val: int,
     log_fn: LogFn,
     category: str,
@@ -97,8 +99,8 @@ def _walk_ebp_chain(
 
 
 def _dump_cpu_state(
-    cpu: "CPU",
-    import_resolver: "ImportResolver | None",
+    cpu: CPU,
+    import_resolver: ImportResolver | None,
     log_fn: LogFn,
     category: str,
     stack_slots: int,
@@ -137,7 +139,7 @@ def _dump_cpu_state(
     _walk_ebp_chain(cpu, import_resolver, ebp, log_fn, category)
 
 
-def _collect_register_dump(cpu: "CPU", annotate_validity: bool = False) -> dict:
+def _collect_register_dump(cpu: CPU, annotate_validity: bool = False) -> dict:
     regs = {}
     for i in range(8):
         val = cpu.regs[i] & 0xFFFFFFFF
@@ -148,7 +150,7 @@ def _collect_register_dump(cpu: "CPU", annotate_validity: bool = False) -> dict:
     return regs
 
 
-def _collect_stack_dump(cpu: "CPU", import_resolver: "ImportResolver | None", stack_slots: int) -> list[dict]:
+def _collect_stack_dump(cpu: CPU, import_resolver: ImportResolver | None, stack_slots: int) -> list[dict]:
     esp = cpu.regs[ESP] & 0xFFFFFFFF
     slots = []
     for i in range(stack_slots):
@@ -166,7 +168,7 @@ def _collect_stack_dump(cpu: "CPU", import_resolver: "ImportResolver | None", st
     return slots
 
 
-def _collect_ebp_chain(cpu: "CPU", import_resolver: "ImportResolver | None", ebp_val: int, max_frames: int = 32) -> list[dict]:
+def _collect_ebp_chain(cpu: CPU, import_resolver: ImportResolver | None, ebp_val: int, max_frames: int = 32) -> list[dict]:
     frames = []
     frame_ebp = ebp_val
     depth = 0
@@ -193,7 +195,7 @@ def _collect_ebp_chain(cpu: "CPU", import_resolver: "ImportResolver | None", ebp
     return frames
 
 
-def _collect_dll_table(import_resolver: "ImportResolver | None") -> list[dict]:
+def _collect_dll_table(import_resolver: ImportResolver | None) -> list[dict]:
     if not import_resolver:
         return []
     return [
@@ -202,7 +204,7 @@ def _collect_dll_table(import_resolver: "ImportResolver | None") -> list[dict]:
     ]
 
 
-def _write_crash_log(kind: str, cpu: "CPU", import_resolver: "ImportResolver | None", extra: dict | None = None) -> Path:
+def _write_crash_log(kind: str, cpu: CPU, import_resolver: ImportResolver | None, extra: dict | None = None) -> Path:
     """Writes the structured crash dump consumed by tools/crashlog_reader.py.
 
     Always overwrites CRASH_LOG_PATH -- one crash file per run, matching the
@@ -232,7 +234,7 @@ def _write_crash_log(kind: str, cpu: "CPU", import_resolver: "ImportResolver | N
     return CRASH_LOG_PATH
 
 
-def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> None:
+def _dump_crt_memory_leaks(cpu: CPU, memory: Memory, state: CRTState) -> None:
     """Calls the guest's own _CrtDumpMemoryLeaks (see _CRT_DUMP_MEMORY_LEAKS_ADDR
     above) via a nested emulated call, right before a fault is finalized.
 
@@ -256,7 +258,7 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
     a real chance -- if it doesn't, that gap (not this dump call) is the
     actual bug worth understanding.
     """
-    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
+    from tew.api.user32_handlers import _get_dialog_sentinel, _invoke_emulated_proc
     logger.info("exception",
         "Invoking guest _CrtDumpMemoryLeaks before finalizing this fault -- "
         "real per-block leak lines (if any) follow at DEBUG under [exception].")
@@ -315,10 +317,10 @@ def _dump_crt_memory_leaks(cpu: "CPU", memory: "Memory", state: "CRTState") -> N
 
 
 def diagnose_fault(
-    cpu: "CPU",
-    import_resolver: "ImportResolver | None",
-    memory: "Memory | None" = None,
-    state: "CRTState | None" = None,
+    cpu: CPU,
+    import_resolver: ImportResolver | None,
+    memory: Memory | None = None,
+    state: CRTState | None = None,
 ) -> None:
     """
     Called after the run loop detects cpu.faulted == True.
@@ -375,7 +377,7 @@ def diagnose_fault(
     logger.error("exception", "Execution stopped.")
 
 
-def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
+def diagnose_halt(cpu: CPU, import_resolver: ImportResolver | None) -> None:
     """
     Called after the run loop detects cpu.halted == True without a CPU fault.
 
@@ -397,8 +399,8 @@ def diagnose_halt(cpu: "CPU", import_resolver: "ImportResolver | None") -> None:
 
 
 def diagnose_thread_end(
-    cpu: "CPU",
-    import_resolver: "ImportResolver | None",
+    cpu: CPU,
+    import_resolver: ImportResolver | None,
     thread_id: int,
     stack_slots: int = 48,
 ) -> None:

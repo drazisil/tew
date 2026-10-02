@@ -11,9 +11,14 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall, pending_timers, PendingTimer
 from tew.api._state import CRTState, EventHandle, RegistryEntry, save_registry_json
+from tew.api.win32_handlers import (
+    PendingTimer,
+    Win32Handlers,
+    cleanup_stdcall,
+    pending_timers,
+)
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # ── Win32 error constants ────────────────────────────────────────────────────
@@ -42,7 +47,7 @@ _reg_key_names: dict[int, str] = {
 }
 
 
-def _read_ansi_str(ptr: int, memory: "Memory", max_len: int = 256) -> str:
+def _read_ansi_str(ptr: int, memory: Memory, max_len: int = 256) -> str:
     s = []
     for i in range(max_len):
         c = memory.read8(ptr + i)
@@ -52,7 +57,7 @@ def _read_ansi_str(ptr: int, memory: "Memory", max_len: int = 256) -> str:
     return "".join(s)
 
 
-def _read_wide_str(ptr: int, memory: "Memory", max_chars: int = 256) -> str:
+def _read_wide_str(ptr: int, memory: Memory, max_chars: int = 256) -> str:
     """Read a null-terminated UTF-16LE string from emulator memory."""
     s = []
     for i in range(max_chars):
@@ -65,7 +70,7 @@ def _read_wide_str(ptr: int, memory: "Memory", max_chars: int = 256) -> str:
     return "".join(s)
 
 
-def _write_wide_str(ptr: int, s: str, memory: "Memory") -> None:
+def _write_wide_str(ptr: int, s: str, memory: Memory) -> None:
     """Write a null-terminated UTF-16LE string into emulator memory."""
     for i, ch in enumerate(s):
         cp = ord(ch)
@@ -76,7 +81,7 @@ def _write_wide_str(ptr: int, s: str, memory: "Memory") -> None:
     memory.write8(ptr + len(s) * 2 + 1, 0)
 
 
-def _write_ansi_str(ptr: int, s: str, memory: "Memory") -> None:
+def _write_ansi_str(ptr: int, s: str, memory: Memory) -> None:
     for i, ch in enumerate(s):
         memory.write8(ptr + i, ord(ch))
     memory.write8(ptr + len(s), 0)
@@ -99,7 +104,7 @@ def _reg_build_path(h_key_in: int, sub_key: str) -> str:
     return parent or sub
 
 
-def _reg_list_subkeys(h_key: int, state: "CRTState") -> list[str]:
+def _reg_list_subkeys(h_key: int, state: CRTState) -> list[str]:
     """Immediate child subkey names under h_key, derived from registry_values paths."""
     parent_path = (_reg_key_names.get(h_key) or "").lower()
     if parent_path:
@@ -115,8 +120,8 @@ def _reg_list_subkeys(h_key: int, state: "CRTState") -> list[str]:
 def _reg_query_value(
     key_handle: int,
     value_name: str,
-    state: "CRTState",
-) -> "RegistryEntry | None":
+    state: CRTState,
+) -> RegistryEntry | None:
     key_name = (_reg_key_names.get(key_handle) or "").lower()
     lower_value = value_name.lower()
     for pattern, values in state.registry_values.items():
@@ -143,9 +148,9 @@ TIME_PERIODIC = 1
 
 
 def register_advapi32_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
-    state: "CRTState",
+    stubs: Win32Handlers,
+    memory: Memory,
+    state: CRTState,
 ) -> None:
     """Register all advapi32.dll (and winmm.dll) handlers."""
 
@@ -154,7 +159,7 @@ def register_advapi32_handlers(
     # ── advapi32.dll: Registry API ────────────────────────────────────────────
 
     # RegOpenKeyA(hKey, lpSubKey, phkResult) - stdcall, 3 args (12 bytes)
-    def _reg_open_key_a(cpu: "CPU") -> None:
+    def _reg_open_key_a(cpu: CPU) -> None:
         global _next_reg_key
         h_key_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -173,7 +178,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegOpenKeyA", _reg_open_key_a)
 
     # RegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult) - 5 args (20 bytes)
-    def _reg_open_key_ex_a(cpu: "CPU") -> None:
+    def _reg_open_key_ex_a(cpu: CPU) -> None:
         global _next_reg_key
         h_key_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -195,7 +200,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegOpenKeyExA", _reg_open_key_ex_a)
 
     # RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult) - 5 args (20 bytes)
-    def _reg_open_key_ex_w(cpu: "CPU") -> None:
+    def _reg_open_key_ex_w(cpu: CPU) -> None:
         global _next_reg_key
         h_key_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -217,7 +222,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegOpenKeyExW", _reg_open_key_ex_w)
 
     # RegCreateKeyA(hKey, lpSubKey, phkResult) - 3 args (12 bytes)
-    def _reg_create_key_a(cpu: "CPU") -> None:
+    def _reg_create_key_a(cpu: CPU) -> None:
         global _next_reg_key
         h_key_in   = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -237,7 +242,7 @@ def register_advapi32_handlers(
 
     # RegCreateKeyExA(hKey, lpSubKey, Reserved, lpClass, dwOptions, samDesired,
     #                 lpSecurityAttributes, phkResult, lpdwDisposition) - 9 args (36 bytes)
-    def _reg_create_key_ex_a(cpu: "CPU") -> None:
+    def _reg_create_key_ex_a(cpu: CPU) -> None:
         global _next_reg_key
         h_key_in         = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key       = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -261,7 +266,7 @@ def register_advapi32_handlers(
     # RegQueryValueA(hKey, lpSubKey, lpValue, lpcbValue) - 4 args (16 bytes)
     # Retrieves the default (unnamed) value of hKey\lpSubKey (or hKey if lpSubKey
     # is NULL). Data type must be REG_SZ. lpcbValue is buffer size in/out in bytes.
-    def _reg_query_value_a(cpu: "CPU") -> None:
+    def _reg_query_value_a(cpu: CPU) -> None:
         h_key      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_sub_key = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_value   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -298,7 +303,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegQueryValueA", _reg_query_value_a)
 
     # RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData) - 6 args (24 bytes)
-    def _reg_query_value_ex_a(cpu: "CPU") -> None:
+    def _reg_query_value_ex_a(cpu: CPU) -> None:
         h_key        = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_val_name  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_type      = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -341,7 +346,7 @@ def register_advapi32_handlers(
     # RegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData) - 6 args (24 bytes)
     # Same as RegQueryValueExA but value name is UTF-16LE and REG_SZ output is UTF-16LE.
     # lpcbData is in bytes (each char = 2 bytes, plus 2-byte null terminator).
-    def _reg_query_value_ex_w(cpu: "CPU") -> None:
+    def _reg_query_value_ex_w(cpu: CPU) -> None:
         h_key       = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_val_name = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_type     = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -382,7 +387,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegQueryValueExW", _reg_query_value_ex_w)
 
     # RegSetValueExA(hKey, lpValueName, Reserved, dwType, lpData, cbData) - 6 args (24 bytes)
-    def _reg_set_value_ex_a(cpu: "CPU") -> None:
+    def _reg_set_value_ex_a(cpu: CPU) -> None:
         h_key      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         lp_val     = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         dw_type    = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -404,7 +409,7 @@ def register_advapi32_handlers(
             state.registry_values[key_name] = {}
         state.registry_values[key_name][value_name.lower()] = RegistryEntry(type=dw_type, value=value)
         logger.info("registry",
-            f'RegSetValueExA("{key_name}", "{value_name}") = {repr(value)}')
+            f'RegSetValueExA("{key_name}", "{value_name}") = {value!r}')
         save_registry_json(state.registry_values)
         cpu.regs[EAX] = ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 24)
@@ -412,7 +417,7 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegSetValueExA", _reg_set_value_ex_a)
 
     # RegDeleteValueA(hKey, lpValueName) - 2 args (8 bytes)
-    def _reg_delete_value_a(cpu: "CPU") -> None:
+    def _reg_delete_value_a(cpu: CPU) -> None:
         h_key      = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_val     = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         value_name = _read_ansi_str(lp_val, memory).lower() if lp_val else ""
@@ -432,14 +437,14 @@ def register_advapi32_handlers(
     stubs.register_handler("advapi32.dll", "RegDeleteValueA", _reg_delete_value_a)
 
     # RegCloseKey(hKey) - 1 arg (4 bytes)
-    def _reg_close_key(cpu: "CPU") -> None:
+    def _reg_close_key(cpu: CPU) -> None:
         cpu.regs[EAX] = ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 4)
 
     stubs.register_handler("advapi32.dll", "RegCloseKey", _reg_close_key)
 
     # RegFlushKey(hKey) - 1 arg (4 bytes)
-    def _reg_flush_key(cpu: "CPU") -> None:
+    def _reg_flush_key(cpu: CPU) -> None:
         cpu.regs[EAX] = ERROR_SUCCESS
         cleanup_stdcall(cpu, memory, 4)
 
@@ -470,7 +475,7 @@ def register_advapi32_handlers(
     # the same handle-block scheduler machinery WaitForSingleObject uses,
     # parked on a shared, permanently-unsignaled sentinel event (which key
     # is irrelevant: none of them will ever wake it).
-    def _reg_notify_change_key_value(cpu: "CPU") -> None:
+    def _reg_notify_change_key_value(cpu: CPU) -> None:
         nonlocal _reg_notify_wait_handle
         h_key = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         h_event = memory.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -503,7 +508,7 @@ def register_advapi32_handlers(
 
     # RegEnumKeyExA(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
     #               lpftLastWriteTime) - 8 args (32 bytes)
-    def _reg_enum_key_ex_a(cpu: "CPU") -> None:
+    def _reg_enum_key_ex_a(cpu: CPU) -> None:
         h_key     = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         dw_index  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_name   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -540,7 +545,7 @@ def register_advapi32_handlers(
     # Older, simpler sibling of RegEnumKeyExA: cchName is the buffer size
     # passed by value (not a pointer to a DWORD), and there's no class/
     # last-write-time output.
-    def _reg_enum_key_a(cpu: "CPU") -> None:
+    def _reg_enum_key_a(cpu: CPU) -> None:
         h_key    = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         dw_index = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_name  = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -567,7 +572,7 @@ def register_advapi32_handlers(
 
     # RegEnumValueA(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType,
     #               lpData, lpcbData) - 8 args (32 bytes)
-    def _reg_enum_value_a(cpu: "CPU") -> None:
+    def _reg_enum_value_a(cpu: CPU) -> None:
         h_key           = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         dw_index        = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         lp_value_name   = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -628,7 +633,7 @@ def register_advapi32_handlers(
     # ── advapi32.dll: Event Log API ───────────────────────────────────────────
 
     # OpenEventLogA(lpUNCServerName, lpSourceName) - 2 args (8 bytes)
-    def _open_event_log_a(cpu: "CPU") -> None:
+    def _open_event_log_a(cpu: CPU) -> None:
         cpu.regs[EAX] = 0xBEEF0200  # fake event log handle
         cleanup_stdcall(cpu, memory, 8)
 
@@ -636,14 +641,14 @@ def register_advapi32_handlers(
 
     # ReportEventA(hEventLog, wType, wCategory, dwEventID, lpUserSid, wNumStrings,
     #              dwDataSize, lpStrings, lpRawData) - 9 args (36 bytes)
-    def _report_event_a(cpu: "CPU") -> None:
+    def _report_event_a(cpu: CPU) -> None:
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 36)
 
     stubs.register_handler("advapi32.dll", "ReportEventA", _report_event_a)
 
     # CloseEventLog(hEventLog) - 1 arg (4 bytes)
-    def _close_event_log(cpu: "CPU") -> None:
+    def _close_event_log(cpu: CPU) -> None:
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
@@ -652,7 +657,7 @@ def register_advapi32_handlers(
     # ── advapi32.dll: Security/User API ──────────────────────────────────────
 
     # GetUserNameA(lpBuffer, pcbBuffer) - 2 args (8 bytes)
-    def _get_user_name_a(cpu: "CPU") -> None:
+    def _get_user_name_a(cpu: CPU) -> None:
         lp_buffer  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         pcb_buffer = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         username   = "Player\0"
@@ -671,14 +676,14 @@ def register_advapi32_handlers(
     MMSYSERR_NODRIVER = 10
 
     # mixerGetNumDevs() -> UINT [stdcall, no args] — 1 = our SDL2 wave device
-    def _mixer_get_num_devs(cpu: "CPU") -> None:
+    def _mixer_get_num_devs(cpu: CPU) -> None:
         logger.debug("handlers", "[winmm] mixerGetNumDevs -> 1")
         cpu.regs[EAX] = 1
 
     stubs.register_handler("winmm.dll", "mixerGetNumDevs", _mixer_get_num_devs)
 
     # mixerGetLineInfoA(hmxobj, pmxl, fdwInfo) -> MMRESULT [stdcall, 3 args (12 bytes)]
-    def _mixer_get_line_info_a(cpu: "CPU") -> None:
+    def _mixer_get_line_info_a(cpu: CPU) -> None:
         logger.warn("handlers", "[winmm] mixerGetLineInfoA -> MMSYSERR_NODRIVER")
         cpu.regs[EAX] = MMSYSERR_NODRIVER
         cleanup_stdcall(cpu, memory, 12)
@@ -686,7 +691,7 @@ def register_advapi32_handlers(
     stubs.register_handler("winmm.dll", "mixerGetLineInfoA", _mixer_get_line_info_a)
 
     # mixerGetLineControlsA(hmxobj, pmxlc, fdwControls) -> MMRESULT [stdcall, 3 args (12 bytes)]
-    def _mixer_get_line_controls_a(cpu: "CPU") -> None:
+    def _mixer_get_line_controls_a(cpu: CPU) -> None:
         logger.warn("handlers", "[winmm] mixerGetLineControlsA -> MMSYSERR_NODRIVER")
         cpu.regs[EAX] = MMSYSERR_NODRIVER
         cleanup_stdcall(cpu, memory, 12)
@@ -694,7 +699,7 @@ def register_advapi32_handlers(
     stubs.register_handler("winmm.dll", "mixerGetLineControlsA", _mixer_get_line_controls_a)
 
     # mixerGetControlDetailsA(hmxobj, pmxcd, fdwDetails) -> MMRESULT [stdcall, 3 args (12 bytes)]
-    def _mixer_get_control_details_a(cpu: "CPU") -> None:
+    def _mixer_get_control_details_a(cpu: CPU) -> None:
         logger.warn("handlers", "[winmm] mixerGetControlDetailsA -> MMSYSERR_NODRIVER")
         cpu.regs[EAX] = MMSYSERR_NODRIVER
         cleanup_stdcall(cpu, memory, 12)
@@ -702,7 +707,7 @@ def register_advapi32_handlers(
     stubs.register_handler("winmm.dll", "mixerGetControlDetailsA", _mixer_get_control_details_a)
 
     # mixerSetControlDetails(hmxobj, pmxcd, fdwDetails) -> MMRESULT [stdcall, 3 args (12 bytes)]
-    def _mixer_set_control_details(cpu: "CPU") -> None:
+    def _mixer_set_control_details(cpu: CPU) -> None:
         logger.warn("handlers", "[winmm] mixerSetControlDetails -> MMSYSERR_NODRIVER")
         cpu.regs[EAX] = MMSYSERR_NODRIVER
         cleanup_stdcall(cpu, memory, 12)
@@ -713,7 +718,7 @@ def register_advapi32_handlers(
     # Spec: fill *pwoc with WAVEOUTCAPSA (up to cbwoc bytes); NOERROR on success,
     #       MMSYSERR_BADDEVICEID if uDeviceID >= waveOutGetNumDevs().
     # We present one stereo PCM device (backed by SDL2 audio).
-    def _wave_out_get_dev_caps_a(cpu: "CPU") -> None:
+    def _wave_out_get_dev_caps_a(cpu: CPU) -> None:
         u_device_id = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         pwoc        = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         cbwoc       = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -777,7 +782,7 @@ def register_advapi32_handlers(
 
     # timeGetDevCaps(ptc, cbtc) - 2 args (8 bytes)
     # VERIFIED: _TIMER_init checks result != 0 → abortmessage("MULTIMEDIA TIMER NOT FOUND")
-    def _time_get_dev_caps(cpu: "CPU") -> None:
+    def _time_get_dev_caps(cpu: CPU) -> None:
         ptc = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if ptc != 0:
             memory.write32(ptc,     1)           # wPeriodMin = 1 ms
@@ -789,7 +794,7 @@ def register_advapi32_handlers(
 
     # timeBeginPeriod(uPeriod) - 1 arg (4 bytes)
     # VERIFIED: _TIMER_init checks result != 0 → abortmessage("FAILED TO INITIALIZE MULTIMEDIA TIMER")
-    def _time_begin_period(cpu: "CPU") -> None:
+    def _time_begin_period(cpu: CPU) -> None:
         period = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.info("handlers", f"[winmm] timeBeginPeriod({period}) -> 0")
         cpu.regs[EAX] = TIMERR_NOERROR
@@ -799,7 +804,7 @@ def register_advapi32_handlers(
 
     # timeEndPeriod(uPeriod) - 1 arg (4 bytes)
     # VERIFIED: mmtimer_callback calls timeEndPeriod in shutdown path; return value not checked.
-    def _time_end_period(cpu: "CPU") -> None:
+    def _time_end_period(cpu: CPU) -> None:
         cpu.regs[EAX] = TIMERR_NOERROR
         cleanup_stdcall(cpu, memory, 4)
 
@@ -807,7 +812,7 @@ def register_advapi32_handlers(
 
     # timeGetTime() - no args, no stack cleanup
     # VERIFIED: mmtimer_callback uses timeGetTime for scheduling next timeSetEvent delay.
-    def _time_get_time(cpu: "CPU") -> None:
+    def _time_get_time(cpu: CPU) -> None:
         cpu.regs[EAX] = state.virtual_ticks_ms & 0xFFFFFFFF
 
     stubs.register_handler("winmm.dll", "timeGetTime", _time_get_time)
@@ -815,7 +820,7 @@ def register_advapi32_handlers(
     # timeSetEvent(uDelay, uResolution, lpTimeProc, dwUser, fuEvent) - 5 args (20 bytes)
     # VERIFIED: mmtimer_callback: if result == 0 → "timeSetEvent failed, shutting down timer".
     #           Must return non-zero or game timer system shuts down permanently.
-    def _time_set_event(cpu: "CPU") -> None:
+    def _time_set_event(cpu: CPU) -> None:
         global _next_timer_id
         base          = cpu.regs[ESP]
         u_delay       = memory.read32(base + 4)
@@ -846,7 +851,7 @@ def register_advapi32_handlers(
 
     # timeKillEvent(uTimerID) - 1 arg (4 bytes)
     # VERIFIED: _TIMER_restore calls timeKillEvent to cancel the timer.
-    def _time_kill_event(cpu: "CPU") -> None:
+    def _time_kill_event(cpu: CPU) -> None:
         timer_id = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         pending_timers.pop(timer_id, None)
         cpu.regs[EAX] = TIMERR_NOERROR

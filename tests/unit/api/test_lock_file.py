@@ -13,11 +13,12 @@ from more than one handle.
 """
 from __future__ import annotations
 
-from tew.api._state import CRTState, EmulatorConfig, TEB_BASE
+from tew.api._state import TEB_BASE, EmulatorConfig
 from tew.api.crt_handlers import register_crt_handlers
-from tew.api.win32_handlers import Win32Handlers
 from tew.api.win32_errors import Win32Error
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.api.win32_handlers import Win32Handlers
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 96 * 1024 * 1024

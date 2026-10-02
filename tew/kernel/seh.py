@@ -71,8 +71,8 @@ if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP, EBP
 from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, EBP, ESP
 from tew.logger import logger
 
 # ── EXCEPTION_DISPOSITION values (winnt.h) ────────────────────────────────────
@@ -157,7 +157,7 @@ class SehHandlerEscaped(Exception):
         super().__init__(f"SEH handler at 0x{handler_addr:08x} escaped to 0x{eip:08x}")
 
 
-def install(stubs: Win32Handlers, memory: "Memory") -> None:
+def install(stubs: Win32Handlers, memory: Memory) -> None:
     """Writes the SEH return sentinel's trampoline bytes and registers its
     (side-effect-free) handler. Call once during handler registration,
     mirroring THREAD_SENTINEL's own installation in crt_handlers.py."""
@@ -166,13 +166,13 @@ def install(stubs: Win32Handlers, memory: "Memory") -> None:
     memory.write8(SEH_RETURN_SENTINEL + 2, 0xC3)  # RET (never actually reached --
                                                     # the handler below halts first)
 
-    def _sentinel_handler(cpu: "CPU") -> None:
+    def _sentinel_handler(cpu: CPU) -> None:
         cpu.halted = True
 
     stubs.patch_address(SEH_RETURN_SENTINEL, "_sehReturnSentinel", _sentinel_handler)
 
 
-def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[int]) -> int:
+def _invoke_handler(cpu: CPU, memory: Memory, handler_addr: int, args: list[int]) -> int:
     """Calls handler_addr(*args) [PEXCEPTION_ROUTINE ABI: 4 args, pushed
     left-to-right so arg1 ends up at [ESP+4]] and returns its EAX
     (disposition). Restores ESP to its exact pre-call value on a normal
@@ -268,7 +268,7 @@ def _invoke_handler(cpu: "CPU", memory: "Memory", handler_addr: int, args: list[
 
 
 def _write_exception_record(
-    memory: "Memory", addr: int, code: int, address: int,
+    memory: Memory, addr: int, code: int, address: int,
     parameters: tuple[int, ...], noncontinuable: bool,
 ) -> None:
     flags = EXCEPTION_NONCONTINUABLE if noncontinuable else 0
@@ -283,7 +283,7 @@ def _write_exception_record(
         memory.write32(addr + 0x14 + i * 4, val & 0xFFFFFFFF)
 
 
-def _write_context(memory: "Memory", addr: int, cpu: "CPU") -> None:
+def _write_context(memory: Memory, addr: int, cpu: CPU) -> None:
     """Captures the CPU's current integer register state into a real x86
     CONTEXT structure (winnt.h layout -- public, stable). FloatSave/
     ExtendedRegisters are zeroed: this emulator's FPU/MMX state isn't
@@ -304,7 +304,7 @@ def _write_context(memory: "Memory", addr: int, cpu: "CPU") -> None:
     memory.write32(addr + 0xC4, cpu.regs[4])       # Esp
 
 
-def _apply_context(memory: "Memory", addr: int, cpu: "CPU") -> None:
+def _apply_context(memory: Memory, addr: int, cpu: CPU) -> None:
     """Reverse of _write_context -- applies a (possibly handler-modified)
     CONTEXT back onto the CPU. Only used for ExceptionContinueExecution,
     which is rare (see module docstring)."""
@@ -321,7 +321,7 @@ def _apply_context(memory: "Memory", addr: int, cpu: "CPU") -> None:
 
 
 def dispatch_exception(
-    cpu: "CPU", memory: "Memory", exception_code: int, exception_address: int,
+    cpu: CPU, memory: Memory, exception_code: int, exception_address: int,
     parameters: tuple[int, ...] = (), noncontinuable: bool = False,
 ) -> bool:
     """Dispatches a hardware or software exception through the real SEH
@@ -415,11 +415,11 @@ def dispatch_exception(
     return False
 
 
-def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
+def register_seh_handlers(stubs: Win32Handlers, memory: Memory) -> None:
     """Registers real RtlUnwind and RaiseException implementations,
     replacing the previous `_halt` placeholders in kernel32_io.py."""
 
-    def _raise_exception(cpu: "CPU") -> None:
+    def _raise_exception(cpu: CPU) -> None:
         # RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
         #                 DWORD nNumberOfArguments, const ULONG_PTR* lpArguments) [stdcall]
         esp = cpu.regs[ESP] & 0xFFFFFFFF
@@ -448,7 +448,7 @@ def register_seh_handlers(stubs: Win32Handlers, memory: "Memory") -> None:
         # matching real semantics (control resumes wherever the handler
         # sent it, not after the RaiseException call).
 
-    def _rtl_unwind(cpu: "CPU") -> None:
+    def _rtl_unwind(cpu: CPU) -> None:
         # RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
         #           PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue) [stdcall]
         esp = cpu.regs[ESP] & 0xFFFFFFFF

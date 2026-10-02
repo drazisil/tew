@@ -1,8 +1,9 @@
 """COFF File Header parser."""
 
 from __future__ import annotations
+
 import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from tew.helpers import hex_val
 
@@ -53,7 +54,7 @@ class COFFFileHeader:
         return self._characteristics
 
     def __str__(self) -> str:
-        dt = datetime.fromtimestamp(self._time_date_stamp, tz=timezone.utc).strftime(
+        dt = datetime.fromtimestamp(self._time_date_stamp, tz=UTC).strftime(
             "%a, %d %b %Y %H:%M:%S GMT"
         )
         return "\n".join([

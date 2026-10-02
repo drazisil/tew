@@ -9,11 +9,11 @@ hang. See memory/changelog.md, "FUN_0448a033 hang" investigation.
 from __future__ import annotations
 
 import pytest
+
 from tew.api._state import CRTState
 from tew.api.msvcrt_handlers import register_msvcrt_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
-
+from tew.hardware.memory import Memory
 
 # ── Shared test infrastructure ────────────────────────────────────────────────
 

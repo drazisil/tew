@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import time as _time_module
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, EBP, ESI, EDI
-from tew.api.win32_handlers import cleanup_stdcall
-from tew.api._state import CRTState, FileHandleEntry, TEB_BASE
+from tew.api._state import TEB_BASE, CRTState, FileHandleEntry
 from tew.api.win32_errors import Win32Error
+from tew.api.win32_handlers import cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
 
 # This emulator only ever has one fake machine -- an arbitrary but stable
@@ -27,16 +27,16 @@ _COMPUTER_NAME = "MCITY-PC"
 _QPC_FREQ: int = 1_000_000
 
 
-def _fire_due_timers(cpu: "CPU", memory: "Memory", state: CRTState) -> None:
+def _fire_due_timers(cpu: CPU, memory: Memory, state: CRTState) -> None:
     """Invoke any timer callbacks whose due_at <= virtual_ticks_ms."""
-    from tew.api.win32_handlers import pending_timers, _TIME_CALLBACK_EVENT_SET
+    from tew.api.win32_handlers import _TIME_CALLBACK_EVENT_SET, pending_timers
     if not pending_timers:
         return
     due = [t for t in list(pending_timers.values()) if t.due_at <= state.virtual_ticks_ms]
     if not due:
         return
-    from tew.api.user32_handlers import _invoke_emulated_proc, _get_dialog_sentinel
     from tew.api._state import EventHandle
+    from tew.api.user32_handlers import _get_dialog_sentinel, _invoke_emulated_proc
     sentinel = _get_dialog_sentinel(state, memory)
     for timer in due:
         if timer.fu_event & _TIME_CALLBACK_EVENT_SET:
@@ -54,18 +54,18 @@ def _fire_due_timers(cpu: "CPU", memory: "Memory", state: CRTState) -> None:
 
 
 def register_kernel32_system_handlers(
-    stubs: "Win32Handlers",
-    memory: "Memory",
+    stubs: Win32Handlers,
+    memory: Memory,
     state: CRTState,
 ) -> None:
     """Register version, time, process info, environment, and Sleep handlers."""
 
     # ── Version ──────────────────────────────────────────────────────────────
 
-    def _get_version(cpu: "CPU") -> None:
+    def _get_version(cpu: CPU) -> None:
         cpu.regs[EAX] = (2600 << 16) | (1 << 8) | 5  # WinXP 5.1.2600
 
-    def _get_version_ex_a(cpu: "CPU") -> None:
+    def _get_version_ex_a(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         memory.write32(lp + 4,  5)
         memory.write32(lp + 8,  1)
@@ -78,7 +78,7 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
-    def _get_version_ex_w(cpu: "CPU") -> None:
+    def _get_version_ex_w(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         memory.write32(lp + 4,  5)
         memory.write32(lp + 8,  1)
@@ -97,20 +97,20 @@ def register_kernel32_system_handlers(
 
     # ── Command line / startup ────────────────────────────────────────────────
 
-    def _get_cmd_a(cpu: "CPU") -> None:
+    def _get_cmd_a(cpu: CPU) -> None:
         cpu.regs[EAX] = 0x00210024
 
-    def _get_cmd_w(cpu: "CPU") -> None:
+    def _get_cmd_w(cpu: CPU) -> None:
         cpu.regs[EAX] = 0x00210070
 
-    def _get_startup_a(cpu: "CPU") -> None:
+    def _get_startup_a(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         for i in range(0, 68, 4):
             memory.write32(lp + i, 0)
         memory.write32(lp, 68)
         cleanup_stdcall(cpu, memory, 4)
 
-    def _get_startup_w(cpu: "CPU") -> None:
+    def _get_startup_w(cpu: CPU) -> None:
         lp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         for i in range(0, 68, 4):
             memory.write32(lp + i, 0)
@@ -124,23 +124,23 @@ def register_kernel32_system_handlers(
 
     # ── Process / thread identity ─────────────────────────────────────────────
 
-    def _get_current_process(cpu: "CPU") -> None:
+    def _get_current_process(cpu: CPU) -> None:
         cpu.regs[EAX] = 0xFFFFFFFF
 
-    def _get_current_process_id(cpu: "CPU") -> None:
+    def _get_current_process_id(cpu: CPU) -> None:
         # Must match GetWindowThreadProcessId's hardcoded fake PID
         # (user32_handlers.py, "our fake PID") -- this emulator only ever
         # has one fake process, so both need to agree on its ID or any
         # code comparing them (e.g. "is this window mine?") never matches.
         cpu.regs[EAX] = 1
 
-    def _get_current_thread_id(cpu: "CPU") -> None:
+    def _get_current_thread_id(cpu: CPU) -> None:
         cpu.regs[EAX] = state.tls_current_thread_id()
 
-    def _get_current_thread(cpu: "CPU") -> None:
+    def _get_current_thread(cpu: CPU) -> None:
         cpu.regs[EAX] = 0xFFFFFFFE
 
-    def _get_computer_name_a(cpu: "CPU") -> None:
+    def _get_computer_name_a(cpu: CPU) -> None:
         lp_buffer = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_size   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf_capacity = memory.read32(lp_size) if lp_size else 0
@@ -164,7 +164,7 @@ def register_kernel32_system_handlers(
                 f'need {len(_COMPUTER_NAME) + 1})')
         cleanup_stdcall(cpu, memory, 8)
 
-    def _get_computer_name_w(cpu: "CPU") -> None:
+    def _get_computer_name_w(cpu: CPU) -> None:
         lp_buffer = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         lp_size   = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         buf_capacity = memory.read32(lp_size) if lp_size else 0
@@ -194,11 +194,11 @@ def register_kernel32_system_handlers(
 
     # ── Error / tick / time ───────────────────────────────────────────────────
 
-    def _get_last_error(cpu: "CPU") -> None:
+    def _get_last_error(cpu: CPU) -> None:
         cpu.regs[EAX] = memory.read32(TEB_BASE + 0x34)
         cleanup_stdcall(cpu, memory, 0)
 
-    def _set_last_error(cpu: "CPU") -> None:
+    def _set_last_error(cpu: CPU) -> None:
         err = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if err == 6:  # ERROR_INVALID_HANDLE
             ret = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
@@ -209,7 +209,7 @@ def register_kernel32_system_handlers(
     # Monotonic start time captured at registration so tick counts are relative.
     _start_time = _time_module.monotonic()
 
-    def _get_tick_count(cpu: "CPU") -> None:
+    def _get_tick_count(cpu: CPU) -> None:
         """GetTickCount() -> DWORD  (milliseconds since emulator start).
 
         Returns the virtual tick clock, which advances by dwMilliseconds per
@@ -221,7 +221,7 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = state.virtual_ticks_ms & 0xFFFFFFFF
         cleanup_stdcall(cpu, memory, 0)
 
-    def _query_performance_counter(cpu: "CPU") -> None:
+    def _query_performance_counter(cpu: CPU) -> None:
         """QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) -> BOOL."""
         p = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if p:
@@ -231,7 +231,7 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = 1  # TRUE
         cleanup_stdcall(cpu, memory, 4)
 
-    def _query_performance_frequency(cpu: "CPU") -> None:
+    def _query_performance_frequency(cpu: CPU) -> None:
         """QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) -> BOOL."""
         p = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if p:
@@ -248,7 +248,7 @@ def register_kernel32_system_handlers(
 
     # ── System info ───────────────────────────────────────────────────────────
 
-    def _get_system_info(cpu: "CPU") -> None:
+    def _get_system_info(cpu: CPU) -> None:
         ptr = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         for i in range(0, 36, 4):
             memory.write32(ptr + i, 0)
@@ -268,26 +268,26 @@ def register_kernel32_system_handlers(
 
     # ── Exit / debug ──────────────────────────────────────────────────────────
 
-    def _exit_process(cpu: "CPU") -> None:
+    def _exit_process(cpu: CPU) -> None:
         code = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         logger.info("handlers", f"ExitProcess({code})")
         cpu.halted = True
         cpu.fatal_halt = True
 
-    def _is_debugger_present(cpu: "CPU") -> None:
+    def _is_debugger_present(cpu: CPU) -> None:
         cpu.regs[EAX] = 0
 
-    def _is_processor_feature_present(cpu: "CPU") -> None:
+    def _is_processor_feature_present(cpu: CPU) -> None:
         feature = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         supported = feature in (2, 3, 8)  # CMPXCHG8B, MMX, RDTSC
         cpu.regs[EAX] = 1 if supported else 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _set_unhandled_ex(cpu: "CPU") -> None:
+    def _set_unhandled_ex(cpu: CPU) -> None:
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _unhandled_ex(cpu: "CPU") -> None:
+    def _unhandled_ex(cpu: CPU) -> None:
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
@@ -316,25 +316,25 @@ def register_kernel32_system_handlers(
     _env_block_w: int | None = None
     _env_block_a: int | None = None
 
-    def _get_env_strings_w(cpu: "CPU") -> None:
+    def _get_env_strings_w(cpu: CPU) -> None:
         nonlocal _env_block_w
         if _env_block_w is None:
             _env_block_w = state.simple_alloc(2)
             memory.write16(_env_block_w, 0)
         cpu.regs[EAX] = _env_block_w
 
-    def _free_env_strings_w(cpu: "CPU") -> None:
+    def _free_env_strings_w(cpu: CPU) -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
-    def _get_env_strings(cpu: "CPU") -> None:
+    def _get_env_strings(cpu: CPU) -> None:
         nonlocal _env_block_a
         if _env_block_a is None:
             _env_block_a = state.simple_alloc(1)
             memory.write8(_env_block_a, 0)
         cpu.regs[EAX] = _env_block_a
 
-    def _free_env_strings_a(cpu: "CPU") -> None:
+    def _free_env_strings_a(cpu: CPU) -> None:
         cpu.regs[EAX] = 1
         cleanup_stdcall(cpu, memory, 4)
 
@@ -345,7 +345,7 @@ def register_kernel32_system_handlers(
 
     # ── Standard handles / file type ──────────────────────────────────────────
 
-    def _get_std_handle(cpu: "CPU") -> None:
+    def _get_std_handle(cpu: CPU) -> None:
         n = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         handle = (0x00000100 + (n & 0xFF)) & 0xFFFFFFFF
         if handle not in state.file_handle_map:
@@ -361,7 +361,7 @@ def register_kernel32_system_handlers(
         cpu.regs[EAX] = handle
         cleanup_stdcall(cpu, memory, 4)
 
-    def _get_file_type(cpu: "CPU") -> None:
+    def _get_file_type(cpu: CPU) -> None:
         hf = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         entry = state.file_handle_map.get(hf)
         if entry is None:
@@ -393,11 +393,11 @@ def register_kernel32_system_handlers(
 
     # ── Pointer encode/decode (identity) ─────────────────────────────────────
 
-    def _encode_ptr(cpu: "CPU") -> None:
+    def _encode_ptr(cpu: CPU) -> None:
         cpu.regs[EAX] = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cleanup_stdcall(cpu, memory, 4)
 
-    def _decode_ptr(cpu: "CPU") -> None:
+    def _decode_ptr(cpu: CPU) -> None:
         cpu.regs[EAX] = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cleanup_stdcall(cpu, memory, 4)
 
@@ -406,7 +406,7 @@ def register_kernel32_system_handlers(
 
     # ── InterlockedCompareExchange ────────────────────────────────────────────
 
-    def _interlocked_cmpxchg(cpu: "CPU") -> None:
+    def _interlocked_cmpxchg(cpu: CPU) -> None:
         dest      = memory.read32((cpu.regs[ESP] +  4) & 0xFFFFFFFF)
         exchange  = memory.read32((cpu.regs[ESP] +  8) & 0xFFFFFFFF)
         comparand = memory.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -420,7 +420,7 @@ def register_kernel32_system_handlers(
 
     # ── Sleep ─────────────────────────────────────────────────────────────────
 
-    def _sleep(cpu: "CPU") -> None:
+    def _sleep(cpu: CPU) -> None:
         dw_ms = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         return_eip = memory.read32(cpu.regs[ESP] & 0xFFFFFFFF)
         cpu.regs[ESP] = (cpu.regs[ESP] + 8) & 0xFFFFFFFF  # stdcall: pop ret addr + 4-byte arg

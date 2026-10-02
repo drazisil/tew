@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 
 from tew.api.nt_syscall import NtSyscallDispatcher
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX
+from tew.hardware.memory import Memory
 
 
 class _FakeCPU:

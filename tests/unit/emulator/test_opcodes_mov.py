@@ -1,7 +1,8 @@
 """Black-box data-movement opcode tests against ZigCPU."""
 import pytest
+
+from tew.hardware.cpu_zig import EAX, EBX, ECX, EDX, ESP, ZigCPU
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
 
 
 @pytest.fixture

@@ -57,7 +57,7 @@ class Kernel:
       call scheduler.unblock_handle() so blocked threads become READY.
     """
 
-    def __init__(self, state: "CRTState") -> None:
+    def __init__(self, state: CRTState) -> None:
         self._state = state
         self._async_select: dict[int, _AsyncSelectReg]  = {}
         self._event_select: dict[int, _EventSelectReg]  = {}

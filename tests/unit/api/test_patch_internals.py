@@ -13,17 +13,17 @@ from pathlib import Path
 
 import pytest
 
+from tew import logger as logger_module
 from tew.api._state import CRTState, EmulatorConfig, FileHandleEntry
 from tew.api.patch_internals import patch_crt_internals
 from tew.api.win32_handlers import (
-    Win32Handlers,
     DIALOG_TRAMPOLINE,
-    DLLMAIN_TRAMPOLINE,
     DLLMAIN_HANDLE_STORE,
+    DLLMAIN_TRAMPOLINE,
+    Win32Handlers,
 )
+from tew.hardware.cpu_zig import EAX, EBP, ESP
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import EAX, ESP, EBP, ZF_BIT
-from tew import logger as logger_module
 
 MEM_SIZE = 64 * 1024 * 1024  # must cover SNDMEMI_STRUCT_PTR (~33MB)
 STACK    = 0x200000

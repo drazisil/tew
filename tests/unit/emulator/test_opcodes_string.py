@@ -1,7 +1,8 @@
 """Black-box string operation opcode tests against ZigCPU."""
 import pytest
+
+from tew.hardware.cpu_zig import EAX, ECX, EDI, ESI, ESP, ZF_BIT, ZigCPU
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, ESI, EDI, ESP, ZF_BIT
 
 
 @pytest.fixture
