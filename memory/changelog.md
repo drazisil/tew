@@ -5,6 +5,7 @@ addresses) are in git history: `git log -p -- memory/changelog.md`.
 
 - 2026-10-02 — D3D8: SetViewport stored; Clear clipped to viewport∩rects, draws scissored to it (camera sub-viewport clear was wiping the rest of the frame: Exit/DealerTradeIn dialogs); SetRenderState/GetRenderState tracked, pipeline per (blend enable, src, dst)
 - 2026-10-02 — D3D8 heap-exhaustion error now lists what fills the heap (live objects by kind/size, bytes on free lists) so "too small" vs "leak" is visible
+- 2026-10-02 — seh: RtlUnwind clears its stale per-dispatch stash, restores EBX/ESI/EDI/EBP for game-initiated unwinds, logs caller + exception code at INFO; INT3 game asserts log site + EBP-chain callers at INFO (first 3 per site, then 1/1000; was DEBUG, so asserts swallowed by the game's catch(...) were invisible)
 - 2026-10-01 — automation: `gui_begin` event from GUI::OnBegin (0x00aec5e0), same fields as `gui_exit` minus code/sender, same log skip list
 - 2026-10-01 — `tew/automation/`: in-process automation event emitter; first source is `gui_exit` (GUI::OnExit class/name/text/tip/mBounds/exit code, read from guest memory in a logpoint)
 - 2026-10-01 — D3D8 BeginScene/EndScene per-frame logs demoted INFO -> DEBUG (~65 frames/s of log noise)
