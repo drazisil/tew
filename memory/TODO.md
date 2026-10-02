@@ -36,6 +36,14 @@ car), cull mode, alpha test. `DrawPrimitive` still skips PrimType 6 (fan,
 logged and skipped (no render pass to clear a sub-rect in).
 
 ## Rendering gaps
+- In-game 3D is badly warped: the track and pit-lane ground are sheared wedges
+  with black voids, the grandstand roof is faceted, the hood/car body has
+  misplaced polygons. Changes with camera angle, so suspect projection/clipping
+  or missing depth test, not the skipped `PrimType` 2/6 draws (those leave
+  holes). Trace one large ground triangle's vertices through DrawPrimitive.
+- In-game Options (Controls > Assign Functions) panel has no background: the
+  car and track show through, so the controller-mapping list text is unreadable.
+  Same family as the FEUI dialog backgrounds below.
 - SDL window steals input focus while drawing (can't click elsewhere). Only
   creation calls `SDL_RaiseWindow`; suspect repeated `ShowWindow` ->
   `SDL_ShowWindow` (user32_handlers.py). Log its calls first.
@@ -74,9 +82,11 @@ Harmless while no APC source exists (QueueUserAPC, ReadFileEx, WriteFileEx
 are unimplemented). Wire it in if any of those are added.
 
 ## Auto-clicks after the Mayor's letter use fixed 30s delays
-CONTINUE, Screen Tips X and its OK each fire 30s after the previous click
-(~90s of padding to the lobby). Trigger each on a log/stdout line instead,
-like the first two clicks.
+CONTINUE, Screen Tips X and its OK, then the Racing menu, its Test Drive item
+and the TEST DRIVE button each fire 30s after the previous click. Trigger each
+on a log/stdout line or a `gui_begin` event instead, like the first two clicks.
+The menu item position (446,141) and TEST DRIVE (274,396) were read off
+screenshots; the menu is built in code, so there is no GUI-file source.
 
 ## Automation events: gaps before they can drive navigation
 `gui_begin`/`gui_exit` (tew/automation) give screen names, the widget tree

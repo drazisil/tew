@@ -306,6 +306,13 @@ if _TEW_CLICK_WHEN_FILE or _TEW_CLICK_WHEN_TEXT:
 #   2. Mayor's letter CONTINUE (399,540): 30s after stdout.txt "New mail IDs detected!"
 #   3. Screen Tips popup X (563,215): 30s after step 2
 #   4. OK on the notice that follows (398,335): 30s after step 3
+#   5. Racing button in the top nav bar (444,13): 30s after step 4. Lframe2 bar
+#      at [0,0] on scn.home, but3_race at [385,-1] 118x29 -> centre (444,13)
+#   6. Test Drive, the last item of the Racing menu (446,141): 30s after step 5.
+#      The menu is built in code (LFrame_MakeRaceMenu), so the position comes
+#      from a screenshot of the open menu, not the GUI files
+#   7. TEST DRIVE (the <OK> button) on the TestDrive dialog (274,396): the dialog
+#      is re-centred by layout to [212,180] 375x239, <OK> at [0,209] 124x30 (centre y=180+209+15=404; 396 is the visual centre per screenshot)
 # The server always reports a first visit, so all four screens show every run.
 # Steps 3-4 use a fixed delay: a file trigger only reads past the size it saw
 # at startup, and misses text once the rewritten stdout.txt has grown past it.
@@ -316,6 +323,9 @@ if not _TEW_NO_AUTO and not (_TEW_CLICK_AT or _TEW_CLICK_AFTER_SEC or _click_fil
         ("C:\\MCity\\stdout.txt", "New mail IDs detected!", (399, 540)),
         (None, None, (563, 215)),
         (None, None, (398, 335)),
+        (None, None, (444, 13)),
+        (None, None, (446, 141)),
+        (None, None, (274, 396)),
     ):
         if _win_path is None:
             _auto_click_steps.append((None, None, None, _xy))
