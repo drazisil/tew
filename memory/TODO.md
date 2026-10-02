@@ -112,6 +112,22 @@ like the first two clicks.
 - `gui_begin` hooks GUI::OnBegin (0x00aec5e0); an override that never chains to
   it would be missed. Watch for an exit with no begin.
 
+## DAO duplicate-key INSERT into Vehicle (file for later)
+`dblog.txt`: `DAOERROR (3022) ... would create duplicate values in the index, primary
+key` on `INSERT INTO Vehicle ( VehicleID, SkinID, Flags, Class, InfoSetting )
+VALUES ( 1, 158, 0, 0, 0 )` (`Dbcode_TmpActionQuery` fails), then
+`DBPart_ModelData_PUTCACHE: veh: 1 EMPTY`. Unknown whether the game expects the
+row to exist already (stale ~/.emu32 db, or the DB persisting between runs) or
+tew's Jet/DAO emulation reports 3022 wrongly. Not yet investigated.
+
+## `PSimWag_GetWagInfo: unhandled exception` (dblog.txt, 4x per run)
+A C++ `catch(...)` in DBParts_FillVehicleInfo (0x0095d250); likely raised under
+`_asin` (call at 0x00700c48 -> CRT `__87except`). tew logs no RaiseException or
+CPU fault for it, only an RtlUnwind "doesn't match original frame" WARN, so the
+catch is reached without a dispatch tew sees. Next: run
+chore/rtlunwind-caller-logging (logs the RtlUnwind caller) and check the FPU
+control word at the time.
+
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
 
