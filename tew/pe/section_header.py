@@ -1,6 +1,7 @@
 """PE Section Header parser."""
 
 from __future__ import annotations
+
 import struct
 
 from tew.helpers import hex_val

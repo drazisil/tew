@@ -8,14 +8,15 @@ Three techniques demonstrated:
 """
 from __future__ import annotations
 
-from hypothesis import given, settings, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, rule
 
+from tests.unit.api.cs_guest_env import SMALL_MEM_SIZE, make_cs_env
 from tew.api._state import CRTState
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.hardware.cpu_zig import EAX, ESP
 from tew.hardware.memory import Memory
-from tests.unit.api.cs_guest_env import SMALL_MEM_SIZE, make_cs_env
 
 # ── Shared constants ──────────────────────────────────────────────────────────
 

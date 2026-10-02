@@ -1,6 +1,7 @@
 """PE Base Relocation Table parser."""
 
 from __future__ import annotations
+
 import struct
 
 from tew.helpers import hex_val

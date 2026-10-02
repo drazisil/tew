@@ -13,8 +13,11 @@ a missing-file failure is expected/recoverable, not fatal.
 from __future__ import annotations
 
 from tew.api._state import (
-    CRTState, EmulatorConfig, TEB_BASE,
-    CREATE_NEW, OPEN_EXISTING,
+    CREATE_NEW,
+    OPEN_EXISTING,
+    TEB_BASE,
+    CRTState,
+    EmulatorConfig,
 )
 from tew.api.win32_errors import Win32Error
 from tew.hardware.memory import Memory

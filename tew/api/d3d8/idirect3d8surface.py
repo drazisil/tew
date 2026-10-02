@@ -33,18 +33,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
+from tew.api.d3d8 import _state
 from tew.api.d3d8._helpers import (
-    _com_stub, _set_eax, _alloc_registry,
-    _format_bytes_per_pixel, _convert_to_bgra8,
+    _alloc_registry,
+    _com_stub,
+    _convert_to_bgra8,
+    _format_bytes_per_pixel,
+    _set_eax,
 )
+from tew.api.d3d8._layout import D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
 from tew.api.d3d8.idirect3d8resource import _add_ref, _release
-import tew.api.d3d8._state as _state
+from tew.hardware.cpu_zig import EAX, ESP
 
 # D3DSURFACE_DESC field offsets
 _DESC_FORMAT        = 0   # D3DFORMAT
@@ -64,25 +67,25 @@ _OBJ_HEIGHT         = 16
 _OBJ_FORMAT         = 20
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def make_vtable(stubs: Win32Handlers, memory: Memory) -> list[int]:
     """Return the 11 trampoline addresses for the IDirect3DSurface8 vtable."""
 
     # [3] GetDevice — writes D3DDEV_OBJ into the out-pointer
-    def _get_device(cpu: "CPU", mem: "Memory") -> None:
+    def _get_device(cpu: CPU, mem: Memory) -> None:
         pp_device = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
         cpu.regs[EAX] = S_OK
 
     # [7] GetContainer — surfaces created by us have no parent container
-    def _get_container(cpu: "CPU", mem: "Memory") -> None:
+    def _get_container(cpu: CPU, mem: Memory) -> None:
         ppv = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if ppv:
             mem.write32(ppv, 0)
         cpu.regs[EAX] = D3DERR_NOTAVAIL
 
     # [8] GetDesc(D3DSURFACE_DESC*) — fills all 8 fields from stored object data
-    def _get_desc(cpu: "CPU", mem: "Memory") -> None:
+    def _get_desc(cpu: CPU, mem: Memory) -> None:
         this    = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p_desc  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         if p_desc:
@@ -101,7 +104,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [9] LockRect(D3DLOCKED_RECT*, CONST RECT*, DWORD)
-    def _lock_rect(cpu: "CPU", mem: "Memory") -> None:
+    def _lock_rect(cpu: CPU, mem: Memory) -> None:
         this       = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         p_locked   = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         p_rect     = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -145,7 +148,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # LockRect/UnlockRect calls vs. 0 Texture LockRect/UnlockRect calls in a
     # real run). Destroys and replaces any previous image for this surface
     # so repeated locks (animation, streaming) don't leak a VkImage each time.
-    def _unlock_rect(cpu: "CPU", mem: "Memory") -> None:
+    def _unlock_rect(cpu: CPU, mem: Memory) -> None:
         this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         w = mem.read32((this + _OBJ_WIDTH) & 0xFFFFFFFF)
         h = mem.read32((this + _OBJ_HEIGHT) & 0xFFFFFFFF)
@@ -159,10 +162,13 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
                 f"Surface::UnlockRect this=0x{this:08x} w={w} h={h} fmt=0x{fmt:x} "
                 f"bpp={bpp} -> uploading real Vulkan image")
 
-            from tew.api.d3d8._pipeline import (
-                upload_texture_image, allocate_descriptor_set, update_descriptor_set,
-            )
             import vulkan as vk
+
+            from tew.api.d3d8._pipeline import (
+                allocate_descriptor_set,
+                update_descriptor_set,
+                upload_texture_image,
+            )
             entry = _alloc_registry.get(this)
             if entry is not None and entry.get("vk_image") is not None:
                 old_img, old_mem, old_view = entry["vk_image"]
@@ -193,7 +199,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     from tew.logger import logger as _log
     _qi_seen: set = set()
 
-    def _query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _query_interface(cpu: CPU, mem: Memory) -> None:
         riid_ptr = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         ppv      = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         try:

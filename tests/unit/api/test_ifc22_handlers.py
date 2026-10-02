@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 
 from tew.api.ifc22_handlers import register_ifc22_handlers
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ECX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

@@ -5,10 +5,7 @@ from __future__ import annotations
 import socket as _socket_module
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from tew.kernel.kernel import Kernel, FD_CONNECT, FD_READ, FD_WRITE
-
+from tew.kernel.kernel import FD_CONNECT, FD_READ, Kernel
 
 # ── Minimal state stub ────────────────────────────────────────────────────────
 
@@ -130,8 +127,8 @@ def test_tick_async_select_fd_read_posts_message():
 
 def test_tick_event_select_fd_connect_signals_event():
     """A writable socket triggers EventSelect SetEvent + unblock_handle."""
-    from tew.api.wsock32_handlers import SocketEntry
     from tew.api._state import EventHandle
+    from tew.api.wsock32_handlers import SocketEntry
 
     k, state = _make_kernel()
     server, client = _make_connected_pair()
@@ -156,8 +153,8 @@ def test_tick_event_select_fd_connect_signals_event():
 
 def test_tick_fd_connect_fires_only_once():
     """FD_CONNECT is a one-shot event — second tick must not re-deliver."""
-    from tew.api.wsock32_handlers import SocketEntry
     from tew.api._state import EventHandle
+    from tew.api.wsock32_handlers import SocketEntry
 
     k, state = _make_kernel()
     server, client = _make_connected_pair()

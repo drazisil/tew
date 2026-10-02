@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import pytest
 
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP, EBP, FatalHaltError
+from tew.hardware.cpu_zig import EAX, FatalHaltError
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 1 * 1024 * 1024

@@ -1,6 +1,7 @@
 """PE file parser — top-level EXEFile class."""
 
 from __future__ import annotations
+
 import struct
 from pathlib import Path
 

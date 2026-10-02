@@ -1,6 +1,7 @@
 """PE Optional Header parser (PE32 and PE32+)."""
 
 from __future__ import annotations
+
 import struct
 
 from tew.helpers import hex_val

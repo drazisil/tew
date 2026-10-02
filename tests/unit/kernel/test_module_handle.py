@@ -8,9 +8,8 @@ exercise the pure lookup helpers without a full CPU emulation loop.
 
 import pytest
 
-from tew.hardware.memory import Memory
 from tew.api.win32_handlers import Win32Handlers
-
+from tew.hardware.memory import Memory
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures

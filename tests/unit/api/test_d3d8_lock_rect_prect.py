@@ -17,8 +17,8 @@ from __future__ import annotations
 import pytest
 
 from tew.api.d3d8.idirect3d8surface import make_vtable
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 _OBJ_DATA   = 4
 _OBJ_WIDTH  = 12

@@ -105,25 +105,32 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.cpu_zig import ZigCPU as CPU
-    from tew.hardware.memory import Memory
     from tew.api.win32_handlers import Win32Handlers
     from tew.api.window_manager import WindowManager
+    from tew.hardware.cpu_zig import ZigCPU as CPU
+    from tew.hardware.memory import Memory
 
 import ctypes
 import os
 import struct as _struct
 
-from tew.hardware.cpu_zig import EAX, ECX, ESP
-from tew.logger import logger
-from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
-from tew.api.d3d8._helpers import _alloc_resource_obj, _alloc_surface_obj, _alloc_texture_obj, _com_stub, _set_eax, vk_pump
+from tew.api.d3d8 import _state
 from tew.api.d3d8._caps import _fill_d3d_caps8
-from tew.api.win32_handlers import log_register_dump
-from tew.api.d3d8.idirect3d8resource import _ref_counts, _dec_ref_and_maybe_free
+from tew.api.d3d8._helpers import (
+    _alloc_registry,
+    _alloc_resource_obj,
+    _alloc_surface_obj,
+    _alloc_texture_obj,
+    _com_stub,
+    _set_eax,
+    vk_pump,
+)
+from tew.api.d3d8._layout import D3D8_OBJ, D3DDEV_OBJ, S_OK
+from tew.api.d3d8.idirect3d8resource import _dec_ref_and_maybe_free, _ref_counts
 from tew.api.d3d8.idirect3d8texture import _get_surface_ptr
-from tew.api.d3d8._helpers import _alloc_registry
-import tew.api.d3d8._state as _state
+from tew.api.win32_handlers import log_register_dump
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.logger import logger
 
 
 def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
@@ -146,7 +153,7 @@ def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
     return r, g, b, a
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "WindowManager") -> list[int]:
+def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowManager) -> list[int]:
     """Return the 97 trampoline addresses for the IDirect3DDevice8 vtable."""
 
     def _ok(name: str, arg_bytes: int) -> int:
@@ -162,7 +169,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
             lambda cpu, mem: _set_eax(cpu, val), arg_bytes, memory, D3DDEV_OBJ)
 
     def _halt(name: str, arg_bytes: int) -> int:
-        def _handler(cpu: "CPU", mem: "Memory") -> None:
+        def _handler(cpu: CPU, mem: Memory) -> None:
             logger.error("d3d8", f"UNIMPLEMENTED: {name} — halting")
             log_register_dump(cpu, "d3d8")
             cpu.halted = True
@@ -170,20 +177,20 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         return _com_stub(stubs, "d3d8dev", name, _handler, arg_bytes, memory, D3DDEV_OBJ)
 
     # [6] GetDirect3D(IDirect3D8**)
-    def _get_direct3d(cpu: "CPU", mem: "Memory") -> None:
+    def _get_direct3d(cpu: CPU, mem: Memory) -> None:
         pp = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if pp:
             mem.write32(pp, D3D8_OBJ)
         cpu.regs[EAX] = S_OK
 
     # [7] GetDeviceCaps(D3DCAPS8*)
-    def _get_device_caps(cpu: "CPU", mem: "Memory") -> None:
+    def _get_device_caps(cpu: CPU, mem: Memory) -> None:
         p_caps = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         _fill_d3d_caps8(p_caps, mem)
         cpu.regs[EAX] = S_OK
 
     # [8] GetDisplayMode(D3DDISPLAYMODE*)
-    def _get_display_mode(cpu: "CPU", mem: "Memory") -> None:
+    def _get_display_mode(cpu: CPU, mem: Memory) -> None:
         p_mode = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_mode:
             mem.write32(p_mode,      800)
@@ -193,7 +200,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [9] GetCreationParameters(D3DDEVICE_CREATION_PARAMETERS*)
-    def _get_creation_params(cpu: "CPU", mem: "Memory") -> None:
+    def _get_creation_params(cpu: CPU, mem: Memory) -> None:
         p = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p:
             mem.write32(p,      0)       # AdapterOrdinal
@@ -210,7 +217,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # already assumes for D3DCOLOR (byte 0=B, 1=G, 2=R, 3=A, i.e. a little-
     # endian 0xAARRGGBB u32) -- so no format-conversion is needed, just a
     # direct read of the surface's pixel bytes into an SDL cursor.
-    def _set_cursor_properties(cpu: "CPU", mem: "Memory") -> None:
+    def _set_cursor_properties(cpu: CPU, mem: Memory) -> None:
         x_hot = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         y_hot = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         surf  = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -230,8 +237,11 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
         try:
             from sdl2 import (
-                SDL_CreateRGBSurfaceFrom, SDL_FreeSurface,
-                SDL_CreateColorCursor, SDL_SetCursor, SDL_FreeCursor,
+                SDL_CreateColorCursor,
+                SDL_CreateRGBSurfaceFrom,
+                SDL_FreeCursor,
+                SDL_FreeSurface,
+                SDL_SetCursor,
             )
             pitch = width * 4
             # FIXED (2026-09-14): was width*height*4 individual read8()
@@ -274,8 +284,8 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # without ever calling SDL_ShowCursor -- so even a correctly-set custom
     # cursor image (once SetCursorProperties above is fixed) would never
     # actually be shown.
-    def _show_cursor(cpu: "CPU", mem: "Memory") -> None:
-        from sdl2 import SDL_ShowCursor, SDL_ENABLE, SDL_DISABLE
+    def _show_cursor(cpu: CPU, mem: Memory) -> None:
+        from sdl2 import SDL_DISABLE, SDL_ENABLE, SDL_ShowCursor
         b_show = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         previous = _state._cursor_shown
         SDL_ShowCursor(SDL_ENABLE if b_show else SDL_DISABLE)
@@ -301,9 +311,10 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # per-image views/framebuffers need destroying and recreating here,
     # mirroring IDirect3D8::CreateDevice's own swapchain-creation block
     # (idirect3d8.py) at the new size.
-    def _reset(cpu: "CPU", mem: "Memory") -> None:
+    def _reset(cpu: CPU, mem: Memory) -> None:
         import vulkan as vk
-        from tew.api.d3d8._pipeline import create_image_views, create_framebuffers
+
+        from tew.api.d3d8._pipeline import create_framebuffers, create_image_views
 
         pp_params = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         back_w = mem.read32(pp_params & 0xFFFFFFFF)       if pp_params else 0
@@ -412,7 +423,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [16] GetBackBuffer(UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface8**)
-    def _get_back_buffer(cpu: "CPU", mem: "Memory") -> None:
+    def _get_back_buffer(cpu: CPU, mem: Memory) -> None:
         pp_surface = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         # Report the game's own logical resolution, not the (possibly
         # WINDOW_SCALE-enlarged) physical swapchain -- see _state._vk_logical_width.
@@ -424,7 +435,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [20] CreateTexture(W, H, Levels, Usage, Fmt, Pool, IDirect3DTexture8**)
-    def _create_texture(cpu: "CPU", mem: "Memory") -> None:
+    def _create_texture(cpu: CPU, mem: Memory) -> None:
         w          = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h          = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         levels     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -436,7 +447,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [21] CreateVolumeTexture(W, H, D, Levels, Usage, Fmt, Pool, IDirect3DVolumeTexture8**)
-    def _create_volume_texture(cpu: "CPU", mem: "Memory") -> None:
+    def _create_volume_texture(cpu: CPU, mem: Memory) -> None:
         w          = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h          = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         levels     = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -447,7 +458,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [22] CreateCubeTexture(EdgeLength, Levels, Usage, Fmt, Pool, IDirect3DCubeTexture8**)
-    def _create_cube_texture(cpu: "CPU", mem: "Memory") -> None:
+    def _create_cube_texture(cpu: CPU, mem: Memory) -> None:
         edge       = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         levels     = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         fmt        = mem.read32((cpu.regs[ESP] + 20) & 0xFFFFFFFF)
@@ -457,7 +468,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [23] CreateVertexBuffer(Length, Usage, FVF, Pool, IDirect3DVertexBuffer8**)
-    def _create_vertex_buffer(cpu: "CPU", mem: "Memory") -> None:
+    def _create_vertex_buffer(cpu: CPU, mem: Memory) -> None:
         length = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         pp_vb  = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if pp_vb:
@@ -465,7 +476,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [24] CreateIndexBuffer(Length, Usage, Fmt, Pool, IDirect3DIndexBuffer8**)
-    def _create_index_buffer(cpu: "CPU", mem: "Memory") -> None:
+    def _create_index_buffer(cpu: CPU, mem: Memory) -> None:
         length = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         pp_ib  = mem.read32((cpu.regs[ESP] + 24) & 0xFFFFFFFF)
         if pp_ib:
@@ -473,7 +484,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [25] CreateRenderTarget(W, H, Fmt, MultiSample, Lockable, IDirect3DSurface8**)
-    def _create_render_target(cpu: "CPU", mem: "Memory") -> None:
+    def _create_render_target(cpu: CPU, mem: Memory) -> None:
         w       = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h       = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -483,7 +494,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [26] CreateDepthStencilSurface(W, H, Fmt, MultiSample, IDirect3DSurface8**)
-    def _create_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+    def _create_depth_stencil(cpu: CPU, mem: Memory) -> None:
         w       = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h       = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -493,7 +504,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [27] CreateImageSurface(W, H, Fmt, IDirect3DSurface8**)
-    def _create_image_surface(cpu: "CPU", mem: "Memory") -> None:
+    def _create_image_surface(cpu: CPU, mem: Memory) -> None:
         w       = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         h       = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         fmt     = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -503,7 +514,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [32] GetRenderTarget(IDirect3DSurface8**)
-    def _get_render_target(cpu: "CPU", mem: "Memory") -> None:
+    def _get_render_target(cpu: CPU, mem: Memory) -> None:
         # FIXED: previously allocated a brand-new surface object on every
         # call. Real D3D8 AddRef's and returns the SAME underlying surface
         # every time -- the caller's matching Release() only drops their own
@@ -526,7 +537,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [33] GetDepthStencilSurface(IDirect3DSurface8**)
-    def _get_depth_stencil(cpu: "CPU", mem: "Memory") -> None:
+    def _get_depth_stencil(cpu: CPU, mem: Memory) -> None:
         # Same fix as _get_render_target -- see its comment.
         pp_surf = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if _state._vk_depth_stencil_surface_obj is None:
@@ -609,7 +620,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # mid-frame (continuing to accumulate draws before the eventual Present),
     # this is a no-op -- the command buffer and render pass are already open
     # and recording from the earlier BeginScene call in this same frame.
-    def _begin_scene(cpu: "CPU", mem: "Memory") -> None:
+    def _begin_scene(cpu: CPU, mem: Memory) -> None:
         import vulkan as vk
 
         if _state._vk_device is None:
@@ -781,7 +792,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # happens exactly once per frame, in Present, right before submission --
     # see _finalize_frame_for_present. EndScene itself no longer needs to do
     # anything beyond the existing device-initialized check.
-    def _end_scene(cpu: "CPU", mem: "Memory") -> None:
+    def _end_scene(cpu: CPU, mem: Memory) -> None:
         if _state._vk_device is None:
             logger.error("d3d8", "EndScene: device not initialised — halting")
             cpu.halted = True
@@ -791,7 +802,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         logger.info("d3d8", "EndScene: OK")
         cpu.regs[EAX] = S_OK
 
-    def _finalize_frame_for_present(cpu: "CPU", mem: "Memory") -> None:
+    def _finalize_frame_for_present(cpu: CPU, mem: Memory) -> None:
         """Ends the render pass (or applies the manual fallback barrier) and
         the command buffer -- run once per frame, from Present, right before
         vkQueueSubmit. See _begin_scene/_end_scene comments for why this
@@ -836,7 +847,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     #   ESP+20: Color (D3DCOLOR = 0xAARRGGBB)
     #   ESP+24: Z
     #   ESP+28: Stencil
-    def _clear(cpu: "CPU", mem: "Memory") -> None:
+    def _clear(cpu: CPU, mem: Memory) -> None:
         import vulkan as vk
 
         if _state._vk_device is None:
@@ -906,7 +917,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     # _finalize_frame_for_present) before submitting, since EndScene no
     # longer does that itself (a logical frame may span multiple
     # BeginScene/EndScene brackets before the real Present call).
-    def _present(cpu: "CPU", mem: "Memory") -> None:
+    def _present(cpu: CPU, mem: Memory) -> None:
         import vulkan as vk
 
         if _state._vk_device is None:
@@ -963,28 +974,28 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
 
     # [51] GetRenderState(State, DWORD* pValue)
-    def _get_render_state(cpu: "CPU", mem: "Memory") -> None:
+    def _get_render_state(cpu: CPU, mem: Memory) -> None:
         p_val = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_val:
             mem.write32(p_val, 0)
         cpu.regs[EAX] = S_OK
 
     # [53] EndStateBlock(DWORD* pToken)
-    def _end_state_block(cpu: "CPU", mem: "Memory") -> None:
+    def _end_state_block(cpu: CPU, mem: Memory) -> None:
         p_token = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_token:
             mem.write32(p_token, 0xD3D50001)
         cpu.regs[EAX] = S_OK
 
     # [57] CreateStateBlock(Type, DWORD* pToken)
-    def _create_state_block(cpu: "CPU", mem: "Memory") -> None:
+    def _create_state_block(cpu: CPU, mem: Memory) -> None:
         p_token = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_token:
             mem.write32(p_token, 0xD3D50002)
         cpu.regs[EAX] = S_OK
 
     # [60] GetTexture(Stage, IDirect3DBaseTexture8** ppTexture)
-    def _get_texture(cpu: "CPU", mem: "Memory") -> None:
+    def _get_texture(cpu: CPU, mem: Memory) -> None:
         stage  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         pp_tex = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         tex = _state._bound_textures.get(stage, 0)
@@ -995,7 +1006,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [61] SetTexture(Stage, IDirect3DBaseTexture8* pTexture)
-    def _set_texture(cpu: "CPU", mem: "Memory") -> None:
+    def _set_texture(cpu: CPU, mem: Memory) -> None:
         stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         tex   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         prev = _state._bound_textures.get(stage, 0)
@@ -1013,7 +1024,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [62] GetTextureStageState(Stage, Type, DWORD* pValue)
-    def _get_texture_stage_state(cpu: "CPU", mem: "Memory") -> None:
+    def _get_texture_stage_state(cpu: CPU, mem: Memory) -> None:
         stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         typ   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         p_val = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -1022,7 +1033,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [63] SetTextureStageState(Stage, Type, DWORD Value)
-    def _set_texture_stage_state(cpu: "CPU", mem: "Memory") -> None:
+    def _set_texture_stage_state(cpu: CPU, mem: Memory) -> None:
         stage = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         typ   = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         value = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -1030,7 +1041,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         cpu.regs[EAX] = S_OK
 
     # [64] ValidateDevice(DWORD* pNumPasses)
-    def _validate_device(cpu: "CPU", mem: "Memory") -> None:
+    def _validate_device(cpu: CPU, mem: Memory) -> None:
         p_passes = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_passes:
             mem.write32(p_passes, 1)
@@ -1038,35 +1049,35 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
 
 
     # [75] CreateVertexShader(pDecl, pFunction, DWORD* pHandle, Usage)
-    def _create_vertex_shader(cpu: "CPU", mem: "Memory") -> None:
+    def _create_vertex_shader(cpu: CPU, mem: Memory) -> None:
         p_handle = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
         if p_handle:
             mem.write32(p_handle, 0xD3D30001)
         cpu.regs[EAX] = S_OK
 
     # [77] GetVertexShader(DWORD* pHandle)
-    def _get_vertex_shader(cpu: "CPU", mem: "Memory") -> None:
+    def _get_vertex_shader(cpu: CPU, mem: Memory) -> None:
         p_handle = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_handle:
             mem.write32(p_handle, 0xD3D30001)
         cpu.regs[EAX] = S_OK
 
     # [84] GetStreamSource(StreamNum, IDirect3DVertexBuffer8**, UINT* pStride)
-    def _get_stream_source(cpu: "CPU", mem: "Memory") -> None:
+    def _get_stream_source(cpu: CPU, mem: Memory) -> None:
         pp_vb = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if pp_vb:
             mem.write32(pp_vb, 0)
         cpu.regs[EAX] = S_OK
 
     # [87] CreatePixelShader(pFunction, DWORD* pHandle)
-    def _create_pixel_shader(cpu: "CPU", mem: "Memory") -> None:
+    def _create_pixel_shader(cpu: CPU, mem: Memory) -> None:
         p_handle = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         if p_handle:
             mem.write32(p_handle, 0xD3D40001)
         cpu.regs[EAX] = S_OK
 
     # [89] GetPixelShader(DWORD* pHandle)
-    def _get_pixel_shader(cpu: "CPU", mem: "Memory") -> None:
+    def _get_pixel_shader(cpu: CPU, mem: Memory) -> None:
         p_handle = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if p_handle:
             mem.write32(p_handle, 0xD3D40001)
@@ -1200,7 +1211,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
         return diffuse_off, uv_off
 
     # [70] DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount)
-    def _draw_primitive(cpu: "CPU", mem: "Memory") -> None:
+    def _draw_primitive(cpu: CPU, mem: Memory) -> None:
         prim_type  = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         start_vert = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         prim_count = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)
@@ -1331,7 +1342,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     dev[74] = _ok  ("Dev::ProcessVertices", 20)
     dev[75] = _com_stub(stubs, "d3d8dev", "Dev::CreateVertexShader",
                 _create_vertex_shader, 16, memory, D3DDEV_OBJ)
-    def _set_vertex_shader(cpu: "CPU", mem: "Memory") -> None:
+    def _set_vertex_shader(cpu: CPU, mem: Memory) -> None:
         handle = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         _state._draw_vertex_fvf = handle
         cpu.regs[EAX] = S_OK
@@ -1344,7 +1355,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory", window_manager: "Windo
     dev[80] = _ok  ("Dev::GetVertexShaderConstant",   12)
     dev[81] = _ok  ("Dev::GetVertexShaderDeclaration", 12)
     dev[82] = _ok  ("Dev::GetVertexShaderFunction",    12)
-    def _set_stream_source(cpu: "CPU", mem: "Memory") -> None:
+    def _set_stream_source(cpu: CPU, mem: Memory) -> None:
         # StreamNumber=ESP+8, pStreamData=ESP+12, Stride=ESP+16
         p_buf  = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         stride = mem.read32((cpu.regs[ESP] + 16) & 0xFFFFFFFF)

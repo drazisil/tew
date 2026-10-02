@@ -20,8 +20,8 @@ import pytest
 
 from tew.api.d3d8 import idirect3d8
 from tew.api.d3d8.idirect3d8 import _add_ref, _release
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _FakeCPU:
