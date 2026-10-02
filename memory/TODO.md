@@ -25,32 +25,20 @@ with no signal. Return a failure and have `cpu_zig.py` raise.
 `cpu/src/scheduler.zig` bumps each new stack by 256 KB from 0x08000000 and
 never reuses them; past ~512 threads they hit the DLL slots at 0x10000000.
 
-## D3D8 render states are never applied (found 2026-10-02)
-`Dev::SetRenderState` is `_ok` (returns S_OK, applies nothing); the pipeline is
-fixed SRC_ALPHA/INV_SRC_ALPHA, no depth test. Probe of one trade-in frame
-(600 draws): 319 draw with ZENABLE/ZWRITE on (the 3D car), 125 additive
-(SRCALPHA,ONE), 49 multiply (DESTCOLOR,ZERO). Probable cause of parts drawn
-in the wrong order (steering wheel outside the car) and wrong glows/darkening.
-Needs: track states, depth buffer cleared by `Clear`, ZFUNC, blend factors per
-draw (pipeline variants). Until then SetRenderState should not claim success.
-Also `DrawPrimitive` skips PrimType 6 (fan, ~870/run) and 2 (line list,
-~5300/run) but returns S_OK; `DrawIndexedPrimitive`/`UP` just halt.
-
-## DealerTradeIn dialog: black screen, buttons off the frame
-Per-frame probe: dim layer (alpha 84, `GDialogs.gui` `mColor=[84,0,0,0]` is
-ARGB) arrives intact and blends right, so it is not the black. Dialog frame
-draws at ~(222,118) 356x363, not the `[409,122]` gui_begin logs (bounds there
-are pre-layout). OK/Cancel images draw at y=481 = the frame's bottom edge:
-fits `GUI::Layout` (0x00aebe20) doing `y = Bottom - height` with height 0, not
-proven. Next: framebuffer screenshot of that frame; log bounds after layout.
-Ghidra: `GUI` struct (452 B) lacks the x/y fields at +0x64/+0x68; derived-class
-`this` is typed GUI, so check the owning class before trusting an offset.
+## D3D8 render state: only blending is applied
+PR #48 tracks SetRenderState/GetRenderState and builds a pipeline per
+(ALPHABLENDENABLE, SRCBLEND, DESTBLEND). Still not applied: depth buffer +
+ZENABLE/ZWRITE/ZFUNC (319 of 600 trade-in draws are the 3D car with Z on;
+likely cause of parts drawn in the wrong order, e.g. steering wheel outside the
+car), cull mode, alpha test. `DrawPrimitive` still skips PrimType 6 (fan,
+~870/run) and 2 (line list, ~5300/run) but returns S_OK (missing car parts);
+`DrawIndexedPrimitive`/`UP` just halt. A partial `Clear` outside BeginScene is
+logged and skipped (no render pass to clear a sub-rect in).
 
 ## Rendering gaps
 - SDL window steals input focus while drawing (can't click elsewhere). Only
   creation calls `SDL_RaiseWindow`; suspect repeated `ShowWindow` ->
   `SDL_ShowWindow` (user32_handlers.py). Log its calls first.
-- FEUI dialog backgrounds don't draw (Exit dialog shows only its buttons).
 - Persona-select highlight bar overdraws the list's column divider. Trace
   the quad's DrawPrimitive before touching blend state; never enable the
   swapchain alpha write mask (the window goes transparent).
@@ -72,7 +60,9 @@ check tew's CreateMutex/CloseHandle.
 ## Missing opcodes (fix when one shows up)
 DAA/DAS/AAA/AAS, MOV Sreg (0x8E), AAM/AAD/SALC, far CALL/JMP/RET, BOUND,
 ARPL, INTO, IRET, port I/O, CLI/STI. Any that runs reports
-`Unknown opcode: 0xXX at EIP=...`.
+`Unknown opcode: 0xXX at EIP=...`. x87: FLDENV, FNSTENV, FRSTOR, FNSAVE, FBLD,
+FBSTP now fault loudly (tew-cpu 0.3.2, PR #4) instead of silently doing
+nothing; implement the one that trips.
 
 ## Game debug output (`dprintf` 0x00a34c40) is gated off
 Gates: `_winmsgdebugflag` (0x016f3658) >= level; channel byte at
@@ -120,22 +110,13 @@ VALUES ( 1, 158, 0, 0, 0 )` (`Dbcode_TmpActionQuery` fails), then
 row to exist already (stale ~/.emu32 db, or the DB persisting between runs) or
 tew's Jet/DAO emulation reports 3022 wrongly. Not yet investigated.
 
-## `PSimWag_GetWagInfo: unhandled exception` = RunEngSim writes nothing
-The catch(...) in DBParts_FillVehicleInfo (0x0095d250) swallows a game assert
-(INT3 in _Nfs_DebugBreak 0x00688c68, STATUS_BREAKPOINT): the torque curve at
-car+0x80 is all zero. Hit #1 `iPeakT > 0` dyno2000.c:1146 (FUN_00526340,
-caller 0x0052648d); dealer cars hit #2 `MaxTorque > 0.f` pSimPart.c
-(PSimPart_CrossFlowPipe 0x006f2440). Curve = RunEngSim output copied in
-Dyno2000_RunDyno (0x00522fa0). Probe: the DDYNO2000 struct (EBP-0x3EC, 0x3EC
-bytes) is byte-identical before/after RunEngSim (0x00536e90, thunk 0x0040b203,
-call 0x00523456) for the first car AND a clean dealer Buick, inputs sane (bore,
-stroke, compression, cam, flow tables match the MDB Physics rows). FPU CW is
-0x133F (normal). So RunEngSim takes an early exit / never writes in tew. Next:
-find its early-exit condition and any unimplemented instruction under it.
-Ruled out: part tree/attachments (Part rows match StockAssembly), m80 FSTP/FLD
-(was a real bug, fixed on tew-cpu branch fix/x87-m80-store-load, uncommitted).
-Dealer data ("He's got cars!" onward in dblog.txt) is the clean source; Part and
-Vehicle rows are game-written and untrusted.
+## D3D8 private heap exhausts at the pre-race test drive (~326s)
+112 MB bump heap (0x09000000-0x10000000) runs out allocating a 1,920,000-byte
+surface. Too small or leaking is unknown; PR #49 makes the error list live
+objects by kind/size. Suspects: `_alloc_surface_obj` always allocates `w*h*4`
+whatever the format (16-bit textures cost double); surfaces never Released.
+Reproduce: run to the test drive after the dealer (needs IMPLODE.DLL in
+~/.emu32/MCity).
 
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
