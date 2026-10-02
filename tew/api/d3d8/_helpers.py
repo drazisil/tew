@@ -97,10 +97,32 @@ def _heap_alloc(size: int, kind: str = "misc") -> int:
             f"D3D8 private heap exhausted: alloc of {size} bytes ({kind}) at 0x{addr:x} "
             f"would push the heap cursor to 0x{new_cursor:x}, past D3D8_HEAP_LIMIT "
             f"(0x{D3D8_HEAP_LIMIT:x}) -- this would silently alias the DLL range "
-            f"instead of failing"
+            f"instead of failing\n{_heap_breakdown()}"
         )
     _next_heap_addr = new_cursor
     return addr
+
+
+def _heap_breakdown(top: int = 8) -> str:
+    """What is filling the heap: live registry entries grouped by (kind, data
+    size) and the bytes parked on free lists. Used in the exhaustion error so
+    "too small" can be told apart from "leaking" without a debugger."""
+    live: dict[tuple[str, int], list[int]] = {}
+    for entry in _alloc_registry.values():
+        key = (entry["kind"], entry.get("data_size", entry.get("obj_size", 0)))
+        slot = live.setdefault(key, [0, 0])
+        slot[0] += 1
+        slot[1] += key[1]
+    live_total = sum(v[1] for v in live.values())
+    free_total = sum(sz * len(blocks) for (_, sz), blocks in _free_lists.items())
+    lines = [
+        f"  heap used {_next_heap_addr - D3D8_HEAP_BASE} of {D3D8_HEAP_LIMIT - D3D8_HEAP_BASE} bytes; "
+        f"live registry data {live_total} bytes in {sum(v[0] for v in live.values())} objects; "
+        f"{free_total} bytes sitting on free lists"
+    ]
+    for (kind, size), (count, total) in sorted(live.items(), key=lambda kv: -kv[1][1])[:top]:
+        lines.append(f"  live {kind} x{count} @ {size} bytes each = {total} bytes")
+    return "\n".join(lines)
 
 
 def _heap_free(addr: int, size: int, kind: str = "misc") -> None:
