@@ -120,13 +120,22 @@ VALUES ( 1, 158, 0, 0, 0 )` (`Dbcode_TmpActionQuery` fails), then
 row to exist already (stale ~/.emu32 db, or the DB persisting between runs) or
 tew's Jet/DAO emulation reports 3022 wrongly. Not yet investigated.
 
-## `PSimWag_GetWagInfo: unhandled exception` (dblog.txt, 4x per run)
-A C++ `catch(...)` in DBParts_FillVehicleInfo (0x0095d250); likely raised under
-`_asin` (call at 0x00700c48 -> CRT `__87except`). tew logs no RaiseException or
-CPU fault for it, only an RtlUnwind "doesn't match original frame" WARN, so the
-catch is reached without a dispatch tew sees. Next: run
-chore/rtlunwind-caller-logging (logs the RtlUnwind caller) and check the FPU
-control word at the time.
+## `PSimWag_GetWagInfo: unhandled exception` = RunEngSim writes nothing
+The catch(...) in DBParts_FillVehicleInfo (0x0095d250) swallows a game assert
+(INT3 in _Nfs_DebugBreak 0x00688c68, STATUS_BREAKPOINT): the torque curve at
+car+0x80 is all zero. Hit #1 `iPeakT > 0` dyno2000.c:1146 (FUN_00526340,
+caller 0x0052648d); dealer cars hit #2 `MaxTorque > 0.f` pSimPart.c
+(PSimPart_CrossFlowPipe 0x006f2440). Curve = RunEngSim output copied in
+Dyno2000_RunDyno (0x00522fa0). Probe: the DDYNO2000 struct (EBP-0x3EC, 0x3EC
+bytes) is byte-identical before/after RunEngSim (0x00536e90, thunk 0x0040b203,
+call 0x00523456) for the first car AND a clean dealer Buick, inputs sane (bore,
+stroke, compression, cam, flow tables match the MDB Physics rows). FPU CW is
+0x133F (normal). So RunEngSim takes an early exit / never writes in tew. Next:
+find its early-exit condition and any unimplemented instruction under it.
+Ruled out: part tree/attachments (Part rows match StockAssembly), m80 FSTP/FLD
+(was a real bug, fixed on tew-cpu branch fix/x87-m80-store-load, uncommitted).
+Dealer data ("He's got cars!" onward in dblog.txt) is the clean source; Part and
+Vehicle rows are game-written and untrusted.
 
 ## Test helper: lightweight scheduler mock
 For queue/packet tests that only need `current_idx`/thread status.
