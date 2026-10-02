@@ -5,9 +5,9 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.user32_handlers import register_user32_gdi32_handlers
-from tew.api.window_manager import WindowEntry, WS_VISIBLE
-from tew.hardware.memory import Memory
+from tew.api.window_manager import WS_VISIBLE, WindowEntry
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

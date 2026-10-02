@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from enum import IntFlag
 from typing import Final, Protocol
 
-
 # ── dwInfoType constants ─────────────────────────────────────────────────────
 
 CT_CTYPE1: Final[int] = 1  # Character-type (alpha / digit / space / …)
@@ -109,7 +108,7 @@ def _build_ctype1_table() -> list[int]:
     table: list[int] = [int(F.NONE)] * 128
 
     # Control: 0x00–0x08, 0x0E–0x1F, 0x7F
-    for cp in [*range(0x00, 0x09), *range(0x0E, 0x20), 0x7F]:
+    for cp in [*range(0x09), *range(0x0E, 0x20), 0x7F]:
         table[cp] = int(F.CNTRL)
 
     # Tab 0x09: control + space + blank

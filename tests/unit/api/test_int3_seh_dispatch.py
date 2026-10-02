@@ -13,11 +13,13 @@ gives the CPU's real SEH chain a chance before falling back to a halt.
 """
 
 import pytest
-from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, ESP, EAX, FatalHaltError
-from tew.kernel.kernel_structures import KernelStructures
+
 from tew.api.win32_handlers import Win32Handlers
-from tew.kernel.seh import install as seh_install, register_seh_handlers
+from tew.hardware.cpu_zig import ESP, FatalHaltError, ZigCPU
+from tew.hardware.memory import Memory
+from tew.kernel.kernel_structures import KernelStructures
+from tew.kernel.seh import install as seh_install
+from tew.kernel.seh import register_seh_handlers
 
 MEM_SIZE = 0x00400000
 STACK_TOP = 0x00040000

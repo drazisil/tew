@@ -10,26 +10,31 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
     from tew.api._state import CRTState
+    from tew.api.win32_handlers import Win32Handlers
+    from tew.hardware.memory import Memory
 
-from tew.logger import logger
+from tew.api.d3d8._helpers import _cleanup_com, _set_eax
 from tew.api.d3d8._layout import (
-    D3D8_OBJ, D3D8_VTABLE,
-    D3DDEV_OBJ, D3DDEV_VTABLE,
-    D3DRES_VTABLE, D3DSURF_VTABLE, D3DTEX_VTABLE,
+    D3D8_OBJ,
+    D3D8_VTABLE,
+    D3DDEV_OBJ,
+    D3DDEV_VTABLE,
+    D3DRES_VTABLE,
+    D3DSURF_VTABLE,
+    D3DTEX_VTABLE,
     S_OK,
 )
-from tew.api.d3d8._helpers import _cleanup_com, _set_eax
+from tew.api.d3d8.idirect3d8 import make_create8
+from tew.api.d3d8.idirect3d8 import make_vtable as _make_d3d8_vtable
+from tew.api.d3d8.idirect3d8device import make_vtable as _make_dev_vtable
 from tew.api.d3d8.idirect3d8resource import make_vtable as _make_res_vtable
 from tew.api.d3d8.idirect3d8surface import make_vtable as _make_surf_vtable
 from tew.api.d3d8.idirect3d8texture import make_vtable as _make_tex_vtable
-from tew.api.d3d8.idirect3d8 import make_vtable as _make_d3d8_vtable, make_create8
-from tew.api.d3d8.idirect3d8device import make_vtable as _make_dev_vtable
+from tew.logger import logger
 
 
-def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRTState") -> None:
+def register_d3d8_handlers(stubs: Win32Handlers, memory: Memory, state: CRTState) -> None:
     """Register all D3D8 COM stubs and write vtable pointers into memory."""
 
     # ── IDirect3DResource8/Buffer vtable ─────────────────────────────────────
@@ -66,13 +71,13 @@ def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRT
     stubs.register_handler("d3d8.dll", "Direct3DCreate8", make_create8(memory))
 
     # DebugSetMute(bMute)  — silences D3D debug output; no-op here
-    def _debug_set_mute(cpu: "CPU") -> None:  # type: ignore[name-defined]
+    def _debug_set_mute(cpu: CPU) -> None:  # type: ignore[name-defined]
         _cleanup_com(cpu, memory, 4)
 
     stubs.register_handler("d3d8.dll", "DebugSetMute", _debug_set_mute)
 
     # Direct3D8EnableMaximizedWindowedModeShim(bEnable) -> BOOL
-    def _enable_maximized_windowed_shim(cpu: "CPU") -> None:  # type: ignore[name-defined]
+    def _enable_maximized_windowed_shim(cpu: CPU) -> None:  # type: ignore[name-defined]
         _set_eax(cpu, 0)  # FALSE (shim not active)
         _cleanup_com(cpu, memory, 4)
 
@@ -83,14 +88,14 @@ def register_d3d8_handlers(stubs: "Win32Handlers", memory: "Memory", state: "CRT
     )
 
     # ValidatePixelShader(pPixelShader, pCaps, bReturn, pErrorString)
-    def _validate_pixel_shader(cpu: "CPU") -> None:  # type: ignore[name-defined]
+    def _validate_pixel_shader(cpu: CPU) -> None:  # type: ignore[name-defined]
         _set_eax(cpu, S_OK)
         _cleanup_com(cpu, memory, 16)
 
     stubs.register_handler("d3d8.dll", "ValidatePixelShader", _validate_pixel_shader)
 
     # ValidateVertexShader(pVertexShader, pVertexDecl, pCaps, bReturn, pErrorString)
-    def _validate_vertex_shader(cpu: "CPU") -> None:  # type: ignore[name-defined]
+    def _validate_vertex_shader(cpu: CPU) -> None:  # type: ignore[name-defined]
         _set_eax(cpu, S_OK)
         _cleanup_com(cpu, memory, 16)
 

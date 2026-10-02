@@ -1,6 +1,7 @@
 """PE TLS (Thread-Local Storage) Directory parser."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
@@ -15,7 +16,7 @@ class TLSDirectory:
         self,
         data: bytes | bytearray,
         file_image: bytes | bytearray,
-        sections: list["SectionHeader"],
+        sections: list[SectionHeader],
         is_pe32plus: bool,
         image_base: int,
     ) -> None:

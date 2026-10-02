@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import pytest
 
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
-from tew.hardware.scheduler_zig import ZigScheduler, ThreadStatus
+from tew.hardware.scheduler_zig import ThreadStatus, ZigScheduler
 
 # Real THREAD_STACK_BASE (0x08000000) + room for a couple of THREAD_STACK_SIZE
 # background-thread stacks, plus TEB_BASE (0x00320000) for TLS/last-error --

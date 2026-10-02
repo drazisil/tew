@@ -1,8 +1,14 @@
 """Tests for tew.loader.dll_loader — address mapping and search logic."""
 
 import pytest
+
 from tew.hardware.memory import Memory
-from tew.loader.dll_loader import DLLLoader, LoadedDLL, apply_base_relocations, should_invoke_dependency_dllmain
+from tew.loader.dll_loader import (
+    DLLLoader,
+    LoadedDLL,
+    apply_base_relocations,
+    should_invoke_dependency_dllmain,
+)
 
 
 class TestAddressMapping:

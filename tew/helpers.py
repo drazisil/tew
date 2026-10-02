@@ -1,6 +1,7 @@
 """Shared helper utilities for PE parsing."""
 
 from __future__ import annotations
+
 import struct
 from typing import TYPE_CHECKING
 
@@ -18,7 +19,7 @@ def hex_val(value: int, pad: int = 8) -> str:
     return "0x" + format(value & ((1 << (pad * 4)) - 1), f"0{pad}X")
 
 
-def rva_to_offset(rva: int, sections: list["SectionHeader"]) -> int:
+def rva_to_offset(rva: int, sections: list[SectionHeader]) -> int:
     """
     Convert a Relative Virtual Address to a file offset using section headers.
     Returns -1 if no section contains the RVA.

@@ -36,18 +36,17 @@ from __future__ import annotations
 import select as _select_module
 import socket as _socket_module
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
 
-from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
 from tew.api._state import CRTState, read_cstring
+from tew.api.win32_handlers import Win32Handlers, cleanup_stdcall
+from tew.hardware.cpu_zig import EAX, ESP
 from tew.logger import logger
-
 
 # ── WinSock constants ─────────────────────────────────────────────────────────
 
@@ -123,7 +122,7 @@ def _alloc_socket(af: int, type_: int, proto: int) -> int:
 
 # ── sockaddr_in helpers ───────────────────────────────────────────────────────
 
-def _read_sockaddr_in(ptr: int, memory: "Memory") -> tuple[str, int]:
+def _read_sockaddr_in(ptr: int, memory: Memory) -> tuple[str, int]:
     """Parse a sockaddr_in struct from emulator memory.
 
     Returns (ip_string, port_number) in host byte order.
@@ -146,7 +145,7 @@ def _read_sockaddr_in(ptr: int, memory: "Memory") -> tuple[str, int]:
 
 # ── fd_set helpers ────────────────────────────────────────────────────────────
 
-def _read_fd_set(ptr: int, memory: "Memory") -> list[int]:
+def _read_fd_set(ptr: int, memory: Memory) -> list[int]:
     """Read a Win32 fd_set struct and return the list of socket handles.
 
     fd_set layout:
@@ -163,7 +162,7 @@ def _read_fd_set(ptr: int, memory: "Memory") -> list[int]:
     return handles
 
 
-def _write_fd_set(ptr: int, handles: list[int], memory: "Memory") -> None:
+def _write_fd_set(ptr: int, handles: list[int], memory: Memory) -> None:
     """Write a list of socket handles back into a Win32 fd_set struct."""
     if not ptr:
         return
@@ -176,7 +175,7 @@ def _write_fd_set(ptr: int, handles: list[int], memory: "Memory") -> None:
 
 def register_wsock32_handlers(
     stubs: Win32Handlers,
-    memory: "Memory",
+    memory: Memory,
     state: CRTState,
 ) -> None:
     """Register all wsock32.dll (and ws2_32.dll) socket API handlers."""
@@ -220,7 +219,7 @@ def register_wsock32_handlers(
 
     # ── WSA startup / teardown ────────────────────────────────────────────────
 
-    def _wsa_startup(cpu: "CPU") -> None:
+    def _wsa_startup(cpu: CPU) -> None:
         """WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) -> int.
 
         Real WSAStartup echoes wVersionRequested straight back as wVersion
@@ -256,33 +255,33 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _wsa_cleanup(cpu: "CPU") -> None:
+    def _wsa_cleanup(cpu: CPU) -> None:
         """WSACleanup() -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 0)
 
-    def _wsa_get_last_error(cpu: "CPU") -> None:
+    def _wsa_get_last_error(cpu: CPU) -> None:
         """WSAGetLastError() -> int."""
         cpu.regs[EAX] = _wsa_last_error
         cleanup_stdcall(cpu, memory, 0)
 
-    def _wsa_set_last_error(cpu: "CPU") -> None:
+    def _wsa_set_last_error(cpu: CPU) -> None:
         """WSASetLastError(int iError) -> void."""
         global _wsa_last_error
         _wsa_last_error = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cleanup_stdcall(cpu, memory, 4)
 
-    def _wsa_cancel_blocking_call(cpu: "CPU") -> None:
+    def _wsa_cancel_blocking_call(cpu: CPU) -> None:
         """WSACancelBlockingCall() -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 0)
 
-    def _wsa_is_blocking(cpu: "CPU") -> None:
+    def _wsa_is_blocking(cpu: CPU) -> None:
         """WSAIsBlocking() -> BOOL.  Always FALSE — no blocking calls in emulator."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 0)
 
-    def _wsa_async_select(cpu: "CPU") -> None:
+    def _wsa_async_select(cpu: CPU) -> None:
         """WSAAsyncSelect(s, hWnd, wMsg, lEvent) -> int."""
         s       = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         h_wnd   = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -292,7 +291,7 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 16)
 
-    def _wsa_event_select(cpu: "CPU") -> None:
+    def _wsa_event_select(cpu: CPU) -> None:
         """WSAEventSelect(s, hEventObject, lNetworkEvents) -> int."""
         s            = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         h_event_obj  = memory.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
@@ -301,22 +300,22 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 12)
 
-    def _wsa_async_get_host_by_addr(cpu: "CPU") -> None:
+    def _wsa_async_get_host_by_addr(cpu: CPU) -> None:
         """WSAAsyncGetHostByAddr(...) -> HANDLE.  Not supported."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 24)
 
-    def _wsa_async_get_host_by_name(cpu: "CPU") -> None:
+    def _wsa_async_get_host_by_name(cpu: CPU) -> None:
         """WSAAsyncGetHostByName(hWnd, wMsg, name, buf, buflen) -> HANDLE."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 20)
 
-    def _wsa_cancel_async_request(cpu: "CPU") -> None:
+    def _wsa_cancel_async_request(cpu: CPU) -> None:
         """WSACancelAsyncRequest(hAsyncTaskHandle) -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _wsa_fd_is_set(cpu: "CPU") -> None:
+    def _wsa_fd_is_set(cpu: CPU) -> None:
         """__WSAFDIsSet(SOCKET fd, fd_set* set) -> int."""
         fd  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         ptr = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -326,7 +325,7 @@ def register_wsock32_handlers(
 
     # ── Socket lifecycle ──────────────────────────────────────────────────────
 
-    def _socket(cpu: "CPU") -> None:
+    def _socket(cpu: CPU) -> None:
         """socket(af, type, protocol) -> SOCKET."""
         af    = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         type_ = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -336,7 +335,7 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = h
         cleanup_stdcall(cpu, memory, 12)
 
-    def _closesocket(cpu: "CPU") -> None:
+    def _closesocket(cpu: CPU) -> None:
         """closesocket(s) -> int."""
         s = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         state.kernel.unregister_socket(s)
@@ -357,7 +356,7 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _connect(cpu: "CPU") -> None:
+    def _connect(cpu: CPU) -> None:
         """connect(s, sockaddr*, namelen) -> int."""
         global _wsa_last_error
         s       = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -401,26 +400,26 @@ def register_wsock32_handlers(
 
         cleanup_stdcall(cpu, memory, 12)
 
-    def _bind(cpu: "CPU") -> None:
+    def _bind(cpu: CPU) -> None:
         """bind(s, addr, namelen) -> int."""
         logger.error("handlers", "[UNIMPLEMENTED] bind — halting")
         cpu.halted = True
         cpu.fatal_halt = True
 
-    def _listen(cpu: "CPU") -> None:
+    def _listen(cpu: CPU) -> None:
         """listen(s, backlog) -> int."""
         logger.error("handlers", "[UNIMPLEMENTED] listen — halting")
         cpu.halted = True
         cpu.fatal_halt = True
 
-    def _accept(cpu: "CPU") -> None:
+    def _accept(cpu: CPU) -> None:
         """accept(s, addr, addrlen) -> SOCKET.  Not supported."""
         global _wsa_last_error
         _wsa_last_error = WSAEWOULDBLOCK
         cpu.regs[EAX] = INVALID_SOCKET
         cleanup_stdcall(cpu, memory, 12)
 
-    def _shutdown(cpu: "CPU") -> None:
+    def _shutdown(cpu: CPU) -> None:
         """shutdown(s, how) -> int."""
         s = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         entry = _socket_map.get(s)
@@ -432,19 +431,19 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _getpeername(cpu: "CPU") -> None:
+    def _getpeername(cpu: CPU) -> None:
         """getpeername(s, name, namelen) -> int."""
         cpu.regs[EAX] = SOCKET_ERROR
         cleanup_stdcall(cpu, memory, 12)
 
-    def _getsockname(cpu: "CPU") -> None:
+    def _getsockname(cpu: CPU) -> None:
         """getsockname(s, name, namelen) -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 12)
 
     # ── Data transfer ─────────────────────────────────────────────────────────
 
-    def _send(cpu: "CPU") -> None:
+    def _send(cpu: CPU) -> None:
         """send(s, buf, len, flags) -> int (bytes sent, or SOCKET_ERROR)."""
         global _wsa_last_error
         s      = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -477,7 +476,7 @@ def register_wsock32_handlers(
 
         cleanup_stdcall(cpu, memory, 16)
 
-    def _recv(cpu: "CPU") -> None:
+    def _recv(cpu: CPU) -> None:
         """recv(s, buf, len, flags) -> int (bytes received, or SOCKET_ERROR)."""
         global _wsa_last_error
         s      = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -573,7 +572,7 @@ def register_wsock32_handlers(
 
         cleanup_stdcall(cpu, memory, 16)
 
-    def _sendto(cpu: "CPU") -> None:
+    def _sendto(cpu: CPU) -> None:
         """sendto(s, buf, len, flags, to, tolen) -> int."""
         global _wsa_last_error
         s      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -619,7 +618,7 @@ def register_wsock32_handlers(
 
         cleanup_stdcall(cpu, memory, 24)
 
-    def _recvfrom(cpu: "CPU") -> None:
+    def _recvfrom(cpu: CPU) -> None:
         """recvfrom(s, buf, len, flags, from, fromlen) -> int."""
         global _wsa_last_error
         s      = memory.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
@@ -651,17 +650,17 @@ def register_wsock32_handlers(
 
     # ── Socket options ────────────────────────────────────────────────────────
 
-    def _setsockopt(cpu: "CPU") -> None:
+    def _setsockopt(cpu: CPU) -> None:
         """setsockopt(s, level, optname, optval, optlen) -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 20)
 
-    def _getsockopt(cpu: "CPU") -> None:
+    def _getsockopt(cpu: CPU) -> None:
         """getsockopt(s, level, optname, optval, optlen) -> int."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 20)
 
-    def _ioctlsocket(cpu: "CPU") -> None:
+    def _ioctlsocket(cpu: CPU) -> None:
         """ioctlsocket(s, cmd, argp) -> int.
 
         Handles FIONBIO to set/clear non-blocking mode on the socket.
@@ -684,7 +683,7 @@ def register_wsock32_handlers(
 
     # ── select ────────────────────────────────────────────────────────────────
 
-    def _select(cpu: "CPU") -> None:
+    def _select(cpu: CPU) -> None:
         """select(nfds, readfds, writefds, exceptfds, timeout) -> int.
 
         Reads Win32 fd_set structs from memory, maps handles to Python sockets,
@@ -830,7 +829,7 @@ def register_wsock32_handlers(
 
     # ── Name resolution ───────────────────────────────────────────────────────
 
-    def _inet_addr(cpu: "CPU") -> None:
+    def _inet_addr(cpu: CPU) -> None:
         """inet_addr(cp) -> u_long (network byte order, or INADDR_NONE)."""
         lp_cp = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         if not lp_cp:
@@ -848,7 +847,7 @@ def register_wsock32_handlers(
 
         cleanup_stdcall(cpu, memory, 4)
 
-    def _inet_ntoa(cpu: "CPU") -> None:
+    def _inet_ntoa(cpu: CPU) -> None:
         """inet_ntoa(in) -> char*.
         in_addr is passed by value (4-byte IP, network byte order = big-endian).
         Returns pointer to static 16-byte buffer with dotted-decimal string.
@@ -866,7 +865,7 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = _inet_ntoa_buf
         cleanup_stdcall(cpu, memory, 4)
 
-    def _gethostbyname(cpu: "CPU") -> None:
+    def _gethostbyname(cpu: CPU) -> None:
         """gethostbyname(name) -> HOSTENT* (into a static emulator buffer)."""
         global _wsa_last_error
         lp_name = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
@@ -924,13 +923,13 @@ def register_wsock32_handlers(
         cpu.regs[EAX] = _hostent_buf
         cleanup_stdcall(cpu, memory, 4)
 
-    def _gethostbyaddr(cpu: "CPU") -> None:
+    def _gethostbyaddr(cpu: CPU) -> None:
         """gethostbyaddr(addr, len, type) -> HOSTENT*."""
         logger.error("handlers", "[UNIMPLEMENTED] gethostbyaddr — halting")
         cpu.halted = True
         cpu.fatal_halt = True
 
-    def _gethostname(cpu: "CPU") -> None:
+    def _gethostname(cpu: CPU) -> None:
         """gethostname(name, namelen) -> int."""
         lp_name  = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         name_len = memory.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
@@ -953,47 +952,47 @@ def register_wsock32_handlers(
             cpu.regs[EAX] = 0  # 0 = success
         cleanup_stdcall(cpu, memory, 8)
 
-    def _getservbyname(cpu: "CPU") -> None:
+    def _getservbyname(cpu: CPU) -> None:
         """getservbyname(name, proto) -> SERVENT*."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _getservbyport(cpu: "CPU") -> None:
+    def _getservbyport(cpu: CPU) -> None:
         """getservbyport(port, proto) -> SERVENT*."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 8)
 
-    def _getprotobyname(cpu: "CPU") -> None:
+    def _getprotobyname(cpu: CPU) -> None:
         """getprotobyname(name) -> PROTOENT*."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
-    def _getprotobynumber(cpu: "CPU") -> None:
+    def _getprotobynumber(cpu: CPU) -> None:
         """getprotobynumber(number) -> PROTOENT*."""
         cpu.regs[EAX] = 0
         cleanup_stdcall(cpu, memory, 4)
 
     # ── Byte-order conversion (must be correct — used in packet construction) ──
 
-    def _htonl(cpu: "CPU") -> None:
+    def _htonl(cpu: CPU) -> None:
         """htonl(hostlong) -> u_long (host-to-network 32-bit byte swap)."""
         v = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = struct.unpack(">I", struct.pack("<I", v))[0]
         cleanup_stdcall(cpu, memory, 4)
 
-    def _htons(cpu: "CPU") -> None:
+    def _htons(cpu: CPU) -> None:
         """htons(hostshort) -> u_short (host-to-network 16-bit byte swap)."""
         v = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
         cpu.regs[EAX] = struct.unpack(">H", struct.pack("<H", v))[0]
         cleanup_stdcall(cpu, memory, 4)
 
-    def _ntohl(cpu: "CPU") -> None:
+    def _ntohl(cpu: CPU) -> None:
         """ntohl(netlong) -> u_long (network-to-host 32-bit byte swap)."""
         v = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = struct.unpack("<I", struct.pack(">I", v))[0]
         cleanup_stdcall(cpu, memory, 4)
 
-    def _ntohs(cpu: "CPU") -> None:
+    def _ntohs(cpu: CPU) -> None:
         """ntohs(netshort) -> u_short (network-to-host 16-bit byte swap)."""
         v = memory.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF) & 0xFFFF
         cpu.regs[EAX] = struct.unpack("<H", struct.pack(">H", v))[0]

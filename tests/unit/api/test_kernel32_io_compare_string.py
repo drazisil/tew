@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import pytest
 
-from tew.api._state import CRTState, TEB_BASE
+from tew.api._state import TEB_BASE, CRTState
 from tew.api.kernel32_io import register_kernel32_io_handlers
 from tew.api.win32_errors import Win32Error
-from tew.hardware.memory import Memory
 from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.memory import Memory
 
 
 class _StubHandlers:

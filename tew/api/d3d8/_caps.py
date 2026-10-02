@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from tew.hardware.memory import Memory
 
 
-def _fill_d3d_caps8(p_caps: int, memory: "Memory") -> None:
+def _fill_d3d_caps8(p_caps: int, memory: Memory) -> None:
     """Fill D3DCAPS8 for a virtual HAL device (GeForce4-class, Vulkan-backed).
 
     All values are per the D3D8 SDK spec for a D3DDEVTYPE_HAL device.
@@ -177,7 +177,7 @@ def _fill_d3d_caps8(p_caps: int, memory: "Memory") -> None:
     memory.write32(p_caps + 208, 0x3F800000)
 
 
-def _fill_adapter_identifier(p_ident: int, memory: "Memory") -> None:
+def _fill_adapter_identifier(p_ident: int, memory: Memory) -> None:
     """Write D3DADAPTER_IDENTIFIER8 struct (1068 bytes) into emulator memory.
 
     Layout (D3D8 SDK):

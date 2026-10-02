@@ -1,6 +1,7 @@
 """Tests for tew.hardware.memory.Memory."""
 
 import pytest
+
 from tew.hardware.memory import Memory
 
 

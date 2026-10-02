@@ -10,8 +10,8 @@ import pytest
 
 from tew.api._state import CRTState
 from tew.api.win32_handlers import Win32Handlers
+from tew.hardware.cpu_zig import EBP, ESP, FatalHaltError, ZigCPU
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ESP, EBP, FatalHaltError
 from tew.kernel import exception_diagnostics as ed
 
 MEM_SIZE = 0x00400000
@@ -174,7 +174,7 @@ class TestDumpCrtMemoryLeaksFatalHalt:
 
         stubs = Win32Handlers(mem)
 
-        def _fake_unimplemented(c: "ZigCPU") -> None:
+        def _fake_unimplemented(c: ZigCPU) -> None:
             c.halted = True
             c.fatal_halt = True
 

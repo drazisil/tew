@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from tew.api.crt_handlers import register_crt_handlers
 from tew.api.win32_handlers import Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU as CPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP
+from tew.hardware.cpu_zig import ZigCPU as CPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 96 * 1024 * 1024

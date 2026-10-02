@@ -1,15 +1,22 @@
 """Import resolver — builds and populates the Import Address Table."""
 
 from __future__ import annotations
-from typing import Callable, TYPE_CHECKING
 
-from tew.loader.dll_loader import DLLLoader, LoadedDLL, patch_iat_entry, should_invoke_dependency_dllmain
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from tew.loader.dll_loader import (
+    DLLLoader,
+    LoadedDLL,
+    patch_iat_entry,
+    should_invoke_dependency_dllmain,
+)
 from tew.logger import logger
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.memory import Memory
     from tew.pe.import_table import ImportTable
-    from tew.api.win32_handlers import Win32Handlers
 
 
 class ImportResolver:
@@ -17,16 +24,16 @@ class ImportResolver:
         self._dll_loader = DLLLoader(dll_search_paths)
         # iat_rva -> {dll_name, function_name, real_addr}
         self._iat_map: dict[int, dict] = {}
-        self._memory: "Memory | None" = None
+        self._memory: Memory | None = None
 
-    def set_memory(self, memory: "Memory") -> None:
+    def set_memory(self, memory: Memory) -> None:
         self._memory = memory
 
     def build_iat_map(
         self,
-        import_table: "ImportTable | None",
+        import_table: ImportTable | None,
         image_base: int,
-        on_dependency_loaded: "Callable[[LoadedDLL], None] | None" = None,
+        on_dependency_loaded: Callable[[LoadedDLL], None] | None = None,
     ) -> None:
         """Resolve the main EXE's own direct imports.
 
@@ -69,10 +76,10 @@ class ImportResolver:
 
     def write_iat_handlers(
         self,
-        memory: "Memory",
+        memory: Memory,
         image_base: int,
-        import_table: "ImportTable | None",
-        win32_handlers: "Win32Handlers | None" = None,
+        import_table: ImportTable | None,
+        win32_handlers: Win32Handlers | None = None,
     ) -> None:
         if not import_table:
             return

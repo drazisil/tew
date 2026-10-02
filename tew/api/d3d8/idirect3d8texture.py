@@ -45,15 +45,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from tew.api.win32_handlers import Win32Handlers
     from tew.hardware.cpu_zig import ZigCPU as CPU
     from tew.hardware.memory import Memory
-    from tew.api.win32_handlers import Win32Handlers
 
+from tew.api.d3d8 import _state
+from tew.api.d3d8._helpers import _alloc_registry, _com_stub, _set_eax
+from tew.api.d3d8._layout import D3DDEV_OBJ, D3DERR_NOTAVAIL, S_OK
+from tew.api.d3d8.idirect3d8resource import _add_ref, _ref_counts, _release
 from tew.hardware.cpu_zig import EAX, ESP
-from tew.api.d3d8._layout import D3DDEV_OBJ, S_OK, D3DERR_NOTAVAIL
-from tew.api.d3d8._helpers import _com_stub, _set_eax, _alloc_registry
-from tew.api.d3d8.idirect3d8resource import _add_ref, _release, _ref_counts
-import tew.api.d3d8._state as _state
 
 # D3DSURFACE_DESC field offsets (matches idirect3d8surface.py)
 _DESC_FORMAT      = 0
@@ -82,7 +82,7 @@ _SURF_HEIGHT  = 16
 _SURF_FORMAT  = 20
 
 
-def _get_surface_ptr(this: int, level: int, mem: "Memory") -> int:
+def _get_surface_ptr(this: int, level: int, mem: Memory) -> int:
     """Return the IDirect3DSurface8* stored at texture_obj[+28 + level*4]."""
     level_count = mem.read32((this + _OBJ_LEVELCOUNT) & 0xFFFFFFFF)
     if level >= level_count:
@@ -90,14 +90,14 @@ def _get_surface_ptr(this: int, level: int, mem: "Memory") -> int:
     return mem.read32((this + _OBJ_SURF_BASE + level * 4) & 0xFFFFFFFF)
 
 
-def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
+def make_vtable(stubs: Win32Handlers, memory: Memory) -> list[int]:
     """Return the 18 trampoline addresses for the IDirect3DTexture8 vtable."""
 
     from tew.logger import logger as _log
     _qi_seen: set = set()
 
     # [0] QueryInterface
-    def _query_interface(cpu: "CPU", mem: "Memory") -> None:
+    def _query_interface(cpu: CPU, mem: Memory) -> None:
         riid_ptr = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         ppv      = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
         try:
@@ -117,19 +117,19 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = 0x80004002  # E_NOINTERFACE
 
     # [3] GetDevice
-    def _get_device(cpu: "CPU", mem: "Memory") -> None:
+    def _get_device(cpu: CPU, mem: Memory) -> None:
         pp_device = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         if pp_device:
             mem.write32(pp_device, D3DDEV_OBJ)
         cpu.regs[EAX] = S_OK
 
     # [13] GetLevelCount() -> DWORD
-    def _get_level_count(cpu: "CPU", mem: "Memory") -> None:
+    def _get_level_count(cpu: CPU, mem: Memory) -> None:
         this = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         cpu.regs[EAX] = mem.read32((this + _OBJ_LEVELCOUNT) & 0xFFFFFFFF)
 
     # [14] GetLevelDesc(UINT Level, D3DSURFACE_DESC* pDesc)
-    def _get_level_desc(cpu: "CPU", mem: "Memory") -> None:
+    def _get_level_desc(cpu: CPU, mem: Memory) -> None:
         this   = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         level  = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         p_desc = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -153,7 +153,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [15] GetSurfaceLevel(UINT Level, IDirect3DSurface8** ppSurfaceLevel)
-    def _get_surface_level(cpu: "CPU", mem: "Memory") -> None:
+    def _get_surface_level(cpu: CPU, mem: Memory) -> None:
         this    = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         level   = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         pp_surf = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -174,7 +174,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
         cpu.regs[EAX] = S_OK
 
     # [16] LockRect(UINT Level, D3DLOCKED_RECT* pLockedRect, CONST RECT* pRect, DWORD Flags)
-    def _lock_rect(cpu: "CPU", mem: "Memory") -> None:
+    def _lock_rect(cpu: CPU, mem: Memory) -> None:
         this     = mem.read32((cpu.regs[ESP] + 4)  & 0xFFFFFFFF)
         level    = mem.read32((cpu.regs[ESP] + 8)  & 0xFFFFFFFF)
         p_locked = mem.read32((cpu.regs[ESP] + 12) & 0xFFFFFFFF)
@@ -196,7 +196,7 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
     # Destroys and replaces any previous image for this surface, so a
     # texture that's locked/updated more than once (animation, streaming)
     # doesn't leak a VkImage per update.
-    def _unlock_rect(cpu: "CPU", mem: "Memory") -> None:
+    def _unlock_rect(cpu: CPU, mem: Memory) -> None:
         this  = mem.read32((cpu.regs[ESP] + 4) & 0xFFFFFFFF)
         level = mem.read32((cpu.regs[ESP] + 8) & 0xFFFFFFFF)
         surf = _get_surface_ptr(this, level, mem)
@@ -214,8 +214,9 @@ def make_vtable(stubs: "Win32Handlers", memory: "Memory") -> list[int]:
             f"UnlockRect this=0x{this:08x} level={level} surf=0x{surf:08x} "
             f"w={w} h={h} uploading real Vulkan image")
 
-        from tew.api.d3d8._pipeline import upload_texture_image
         import vulkan as vk
+
+        from tew.api.d3d8._pipeline import upload_texture_image
         entry = _alloc_registry.get(surf)
         if entry is not None and entry.get("vk_image") is not None:
             old_img, old_mem, old_view = entry["vk_image"]

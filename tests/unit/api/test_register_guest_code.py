@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tew.api.win32_handlers import HANDLER_SIZE, Win32Handlers
-from tew.hardware.cpu_zig import ZigCPU, EAX, ESP
+from tew.hardware.cpu_zig import EAX, ESP, ZigCPU
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 0x00400000

@@ -28,11 +28,6 @@ diffuse color (white * color == color).
 from __future__ import annotations
 
 import struct
-import ctypes
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 from tew.logger import logger
 

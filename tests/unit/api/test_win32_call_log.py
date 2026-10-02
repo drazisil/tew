@@ -1,7 +1,7 @@
 """Tests for Win32Handlers' recent-call log (dedupe counter, eviction, formatting)."""
 from __future__ import annotations
 
-from tew.api.win32_handlers import Win32Handlers, HANDLER_BASE, HANDLER_SIZE
+from tew.api.win32_handlers import HANDLER_BASE, HANDLER_SIZE, Win32Handlers
 from tew.hardware.memory import Memory
 
 MEM_SIZE = 16 * 1024 * 1024

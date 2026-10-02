@@ -10,27 +10,25 @@ SDL_RenderPresent() to display the result.
 
 from __future__ import annotations
 
-import ctypes
 from sdl2 import (
-    SDL_SetRenderDrawColor,
-    SDL_RenderClear,
-    SDL_RenderPresent,
-    SDL_RenderFillRect,
-    SDL_RenderDrawRect,
-    SDL_RenderDrawLine,
-    SDL_RenderCopy,
     SDL_Rect,
+    SDL_RenderClear,
+    SDL_RenderCopy,
+    SDL_RenderDrawLine,
+    SDL_RenderDrawRect,
+    SDL_RenderFillRect,
+    SDL_RenderPresent,
+    SDL_SetRenderDrawColor,
 )
 
-from tew.logger import logger
 from tew.api.window_manager import (
-    WindowManager,
+    TITLE_BAR_H,
     WindowEntry,
+    WindowManager,
     du_to_px_x,
     du_to_px_y,
-    TITLE_BAR_H,
 )
-
+from tew.logger import logger
 
 # ── Color palette (Windows XP Classic theme) ──────────────────────────────────
 

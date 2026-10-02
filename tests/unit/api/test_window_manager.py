@@ -8,7 +8,7 @@ _windows by hand, bypassing initialize()/create_dialog() entirely -- same
 spirit as test_pe_resources.py's hand-verified dialog-114 layout.
 """
 
-from tew.api.window_manager import WindowManager, WindowEntry, WM_COMMAND
+from tew.api.window_manager import WM_COMMAND, WindowEntry, WindowManager
 
 DLG_HWND = 0x1000
 BUTTON_HWND = 0x1001

@@ -1,7 +1,18 @@
 """Black-box arithmetic opcode tests against ZigCPU."""
 import pytest
+
+from tew.hardware.cpu_zig import (
+    CF_BIT,
+    EAX,
+    EBX,
+    ECX,
+    EDX,
+    ESP,
+    SF_BIT,
+    ZF_BIT,
+    ZigCPU,
+)
 from tew.hardware.memory import Memory
-from tew.hardware.cpu_zig import ZigCPU, EAX, ECX, EDX, EBX, ESP, CF_BIT, ZF_BIT, SF_BIT, OF_BIT
 
 
 @pytest.fixture
