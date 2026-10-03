@@ -3,6 +3,7 @@
 One line per fix, newest first. Full write-ups (investigation steps, probe
 addresses) are in git history: `git log -p -- memory/changelog.md`.
 
+- 2026-10-03 — PERF: cpu 0.3.4 (single load/store for in-bounds 16/32-bit accesses, bulk rep stosd for the debug-build frame fills: 146M fills/run, 60% exactly 17 dwords); test-drive load ~70s -> ~64s, ~9% over 0.3.2
 - 2026-10-02 — D3D8: DrawPrimitive draws PrimType 6 (triangle fan), expanded to a triangle list; ~17,000 fan draws/minute in the cockpit were skipped, which left the roof, windshield frame and most of the world missing
 - 2026-10-02 — keyboard in the race: the game fills its key table (`_kstate`, read by Input_keyPressed) from the scancode in WM_KEYDOWN/KEYUP lParam bits 16-23, and tew posted lParam=0 and dropped keys entirely when no control had focus, so arrows never reached the car. Keys now post to the SDL window's hwnd with a real lParam (repeat, scancode, extended, previous-state, transition)
 - 2026-10-02 — D3D8 heap exhausted ~2 min into the test drive: `GetBackBuffer` allocated a fresh 800x600x4 surface per call (dx8z.dll calls it repeatedly; 51 x 1,920,000 bytes). Now returns the one canonical back buffer, AddRef'd, shared with GetRenderTarget; heap breakdown also labels surfaces by creating method + guest caller
