@@ -3,12 +3,34 @@
 Open items only, a few lines each. Done work goes in changelog.md (one line);
 detail lives in git history.
 
-## Perf (remaining after tasks 1-4)
-- D3D8 `UnlockRect` -> `_convert_to_bgra8`: ~30% inclusive once textures load.
-- `simple_alloc` (`tew/api/_state.py`): free list is never coalesced or
-  trimmed, so every alloc walks a growing list.
-- sprintf / `_write_cstring` / write8 write byte by byte (use bulk
-  write_bytes); `eip`/`eflags`/`get_flag` crossings ~3% each.
+## Perf (profiles of 2026-10-03; cockpit, ReleaseFast)
+Time split: ~52% libcpu (cpu_run dispatch 19%, ModRM decode ~7%, rep stosd 5%,
+FPU ~2.5%), ~35% Python, ~10% ctypes/libffi/ld.so crossing. Baselines worth
+keeping: first click trigger ~60s, test-drive load ~67s, HUD at ~368s.
+- Decoded-instruction cache (decode once per address, invalidate on code
+  writes): attacks the dispatch + ModRM ~25%. Biggest, riskiest.
+- `rep stosd` / `rep movs` bulk path (guest debug prologues fill locals with
+  0xCCCCCCCC); only after memory fast paths (tew-cpu 0.3.3).
+- Lazy EFLAGS; fused cmp+jcc and push/pop pairs; direct-threaded dispatch.
+- Texture path (~15% Python): `UnlockRect` -> `_convert_to_bgra8` per-pixel
+  loop (vectorise), Vulkan staging memory allocated/freed per upload (reuse).
+- `simple_alloc` free list never coalesced (~4.7%).
+- Hot Win32 APIs (heap, TLS, critical sections) in Zig to cut Python crossings
+  (~10%); detect guest spin-waits and fast-forward the clock.
+- Long term: a block JIT (the only route to 5-10x).
+- sprintf / `_write_cstring` / write8 write byte by byte (use bulk write_bytes).
+
+## Timed regression tests ("did it get slower?")
+Record a baseline per machine and compare later runs, like VCR/snapshot tests.
+- Debug-build guard: export the libcpu optimize mode from Zig and fail a test
+  if it isn't ReleaseFast (a stray 37MB Debug lib made runs ~5x slower).
+- CPU micro-benchmark with pytest-benchmark (`--benchmark-save` /
+  `--benchmark-compare-fail=mean:...`): fixed guest code mix, steps/sec, best of
+  N, marked `perf` (not in the default suite). Baseline JSON keeps machine_info;
+  compare only when CPU/Python match, otherwise warn and re-record.
+- End-to-end milestones (first click trigger, HUD time, guest steps, host
+  instructions via `perf stat -e instructions:u`): counts are far steadier than
+  seconds. Script + baseline file, manual or nightly, not a CI gate.
 
 ## Nested `_invoke_emulated_proc` callers still rewind on step exhaustion
 `DispatchMessageA` moved to a stack trampoline (PR #31). Still nested with a
