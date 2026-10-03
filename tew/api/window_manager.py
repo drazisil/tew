@@ -798,6 +798,20 @@ class WindowManager:
             round(y * entry.phys_h / entry.logical_h),
         )
 
+    def _post_unfocused_key(self, key, is_up: bool) -> None:
+        """Post WM_KEYDOWN/WM_KEYUP to the SDL window's own hwnd when no control has focus."""
+        hwnd = self._sdl_window_id_to_hwnd.get(key.windowID, 0)
+        if hwnd == 0:
+            logger.warn("window",
+                f"[WindowManager] key event for unknown SDL window id {key.windowID} dropped "
+                f"(scancode={key.keysym.scancode})")
+            return
+        from tew.api.dinput_handlers import key_message_lparam
+        vk = _sdl_sym_to_vk(key.keysym.sym)
+        lparam = key_message_lparam(key.keysym.scancode, is_up=is_up,
+                                    is_repeat=bool(key.repeat) and not is_up)
+        self._message_queue.append((hwnd, WM_KEYUP if is_up else WM_KEYDOWN, vk, lparam))
+
     def _handle_sdl_event(self, event: SDL_Event) -> None:
         """Convert a single SDL event to Win32 message(s) and post them."""
         etype = event.type
@@ -875,6 +889,10 @@ class WindowManager:
             key = event.key
             hwnd = self._focused_hwnd
             if hwnd == 0:
+                # No focused control (the normal case while the game's main window is
+                # active): still deliver the key to the window the SDL event belongs
+                # to -- the game's window procedure fills its key table from it.
+                self._post_unfocused_key(key, is_up=False)
                 return
             sym = key.keysym.sym
             vk  = _sdl_sym_to_vk(sym)
@@ -912,15 +930,20 @@ class WindowManager:
                     entry.title = ""
 
             # Post WM_KEYDOWN for every key so hooks and wndprocs receive it
-            self._message_queue.append((hwnd, WM_KEYDOWN, vk, 0))
+            from tew.api.dinput_handlers import key_message_lparam
+            self._message_queue.append((hwnd, WM_KEYDOWN, vk, key_message_lparam(
+                key.keysym.scancode, is_up=False, is_repeat=bool(key.repeat))))
 
         elif etype == SDL_KEYUP:
             key = event.key
             hwnd = self._focused_hwnd
             if hwnd == 0:
+                self._post_unfocused_key(key, is_up=True)
                 return
             vk = _sdl_sym_to_vk(key.keysym.sym)
-            self._message_queue.append((hwnd, WM_KEYUP, vk, 0))
+            from tew.api.dinput_handlers import key_message_lparam
+            self._message_queue.append((hwnd, WM_KEYUP, vk, key_message_lparam(
+                key.keysym.scancode, is_up=True)))
 
         elif etype == SDL_TEXTINPUT:
             hwnd = self._focused_hwnd

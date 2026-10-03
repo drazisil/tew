@@ -4,6 +4,7 @@ One line per fix, newest first. Full write-ups (investigation steps, probe
 addresses) are in git history: `git log -p -- memory/changelog.md`.
 
 - 2026-10-02 — D3D8: DrawPrimitive draws PrimType 6 (triangle fan), expanded to a triangle list; ~17,000 fan draws/minute in the cockpit were skipped, which left the roof, windshield frame and most of the world missing
+- 2026-10-02 — keyboard in the race: the game fills its key table (`_kstate`, read by Input_keyPressed) from the scancode in WM_KEYDOWN/KEYUP lParam bits 16-23, and tew posted lParam=0 and dropped keys entirely when no control had focus, so arrows never reached the car. Keys now post to the SDL window's hwnd with a real lParam (repeat, scancode, extended, previous-state, transition)
 - 2026-10-02 — D3D8 heap exhausted ~2 min into the test drive: `GetBackBuffer` allocated a fresh 800x600x4 surface per call (dx8z.dll calls it repeatedly; 51 x 1,920,000 bytes). Now returns the one canonical back buffer, AddRef'd, shared with GetRenderTarget; heap breakdown also labels surfaces by creating method + guest caller
 - 2026-10-02 — baked-in clicks extended: Racing menu, Test Drive item, TEST DRIVE button; a plain run now reaches the in-car test drive (~550s). Slow-run cause recorded in status.md: Debug libcpu.so
 - 2026-10-02 — RunEngSim zero torque was tew x87 bugs (m80 store/load, DC E0..FF operand order, FCMOVNcc, FCOMI PF, faults for FLDENV/FNSTENV/FRSTOR/FNSAVE/FBLD/FBSTP); bumped cpu to tew-cpu 0.3.2

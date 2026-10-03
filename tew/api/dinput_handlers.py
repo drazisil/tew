@@ -106,6 +106,30 @@ def _build_scancode_table() -> dict[int, int]:
     return t
 
 
+def key_message_lparam(sdl_scancode: int, is_up: bool, is_repeat: bool = False) -> int:
+    """lParam for WM_KEYDOWN / WM_KEYUP, as Windows builds it: bits 0-15 repeat
+    count (1), 16-23 PC set-1 scancode, 24 extended-key flag, 30 previous key
+    state (set for repeats and releases), 31 transition (set for releases).
+
+    The game's window procedure reads the scancode from bits 16-23 to fill its
+    own key-state table (`_kstate`, behind Input_keyPressed), which is what the
+    in-race controls poll; an lParam of 0 files every key under scancode 0.
+    DIK_* codes are the PC set-1 scancodes, with extended keys (arrows,
+    navigation cluster, right ctrl/alt) numbered as scancode | 0x80.
+    """
+    if not _SDL_SCANCODE_TO_DIK:
+        _SDL_SCANCODE_TO_DIK.update(_build_scancode_table())
+    dik = _SDL_SCANCODE_TO_DIK.get(sdl_scancode, 0)
+    lparam = 1 | ((dik & 0x7F) << 16)
+    if dik & 0x80:
+        lparam |= 1 << 24
+    if is_up or is_repeat:
+        lparam |= 1 << 30
+    if is_up:
+        lparam |= 1 << 31
+    return lparam
+
+
 # Real, event-driven mouse state (2026-09-13 redesign). Previously this
 # module polled SDL_GetMouseState() on demand from inside GetDeviceState/
 # GetDeviceData -- which meant that if the game never called either of
