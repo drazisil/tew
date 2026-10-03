@@ -36,11 +36,12 @@ car), cull mode, alpha test. `DrawPrimitive` still skips PrimType 6 (fan,
 logged and skipped (no render pass to clear a sub-rect in).
 
 ## Rendering gaps
-- In-game 3D is badly warped: the track and pit-lane ground are sheared wedges
-  with black voids, the grandstand roof is faceted, the hood/car body has
-  misplaced polygons. Changes with camera angle, so suspect projection/clipping
-  or missing depth test, not the skipped `PrimType` 2/6 draws (those leave
-  holes). Trace one large ground triangle's vertices through DrawPrimitive.
+- In-game 3D is still wrong after triangle fans: no depth buffer (the game
+  sets ZENABLE=1 ZWRITE=1 ZFUNC=LESSEQUAL on ~40k draws/min; the pipeline has
+  no depth attachment), no perspective-correct textures (`w` is hardcoded 1;
+  RHW is ignored, ground texture smears), and `PrimType` 2 (line lists) is
+  skipped. All vertices are pre-transformed XYZRHW (FVF 0x1C4, stride 32);
+  positions, RHW and Z are sane, so it is missing features, not bad input.
 - In-game Options (Controls > Assign Functions) panel has no background: the
   car and track show through, so the controller-mapping list text is unreadable.
   Same family as the FEUI dialog backgrounds below.

@@ -196,6 +196,21 @@ def _d3dcolor_to_rgba(dif: int) -> tuple[float, float, float, float]:
     return r, g, b, a
 
 
+D3DPT_TRIANGLELIST = 4
+D3DPT_TRIANGLEFAN = 6
+
+
+def _triangle_vertex_indices(prim_type: int, prim_count: int) -> list[int] | None:
+    """Source-vertex index (relative to StartVertex) for each corner of the
+    triangle list DrawPrimitive uploads, or None for a primitive type tew does
+    not draw. A fan of N triangles reads N+2 vertices and shares vertex 0."""
+    if prim_type == D3DPT_TRIANGLELIST:
+        return list(range(prim_count * 3))
+    if prim_type == D3DPT_TRIANGLEFAN:
+        return [v for t in range(prim_count) for v in (0, t + 1, t + 2)]
+    return None
+
+
 def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowManager) -> list[int]:
     """Return the 97 trampoline addresses for the IDirect3DDevice8 vtable."""
 
@@ -1323,10 +1338,14 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
             cpu.fatal_halt = True
             return
 
-        D3DPT_TRIANGLELIST = 4
-        if prim_type != D3DPT_TRIANGLELIST:
+        vert_indices = _triangle_vertex_indices(prim_type, prim_count)
+        if vert_indices is None:
             logger.warn("d3d8",
                 f"DrawPrimitive: unsupported PrimType={prim_type}, skipping")
+            cpu.regs[EAX] = S_OK
+            return
+
+        if not vert_indices:
             cpu.regs[EAX] = S_OK
             return
 
@@ -1338,7 +1357,7 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
         import vulkan as vk
 
         stride  = _state._draw_stream_stride
-        n_verts = prim_count * 3
+        n_verts = len(vert_indices)
         src_off = _state._draw_stream_ptr + start_vert * stride
         # Normalize against the game's own logical resolution, not the
         # (possibly WINDOW_SCALE-enlarged) physical swapchain -- the game
@@ -1354,7 +1373,7 @@ def make_vtable(stubs: Win32Handlers, memory: Memory, window_manager: WindowMana
         out_verts = bytearray(n_verts * 40)
         flat = mem._buffer   # raw bytearray for fast access
         for i in range(n_verts):
-            base = src_off + i * stride
+            base = src_off + vert_indices[i] * stride
             x,   = _struct.unpack_from('<f', flat, base)
             y,   = _struct.unpack_from('<f', flat, base + 4)
             z,   = _struct.unpack_from('<f', flat, base + 8)
