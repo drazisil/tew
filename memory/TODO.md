@@ -4,13 +4,18 @@ Open items only, a few lines each. Done work goes in changelog.md (one line);
 detail lives in git history.
 
 ## Perf (profiles of 2026-10-03; cockpit, ReleaseFast)
-Time split: ~52% libcpu (cpu_run dispatch 19%, ModRM decode ~7%, rep stosd 5%,
-FPU ~2.5%), ~35% Python, ~10% ctypes/libffi/ld.so crossing. Baselines worth
-keeping: first click trigger ~60s, test-drive load ~67s, HUD at ~368s.
+Time split (before 0.3.3/0.3.4): ~52% libcpu (cpu_run dispatch 19%, ModRM decode ~7%,
+rep stosd 5%, FPU ~2.5%), ~35% Python, ~10% ctypes/libffi/ld.so crossing. Baselines worth
+keeping: test-drive load (TEST DRIVE click -> HUD) ~64s; the first click trigger
+(~60s) is limited by fixed waits, not CPU, so it is a poor speed metric.
 - Decoded-instruction cache (decode once per address, invalidate on code
   writes): attacks the dispatch + ModRM ~25%. Biggest, riskiest.
-- `rep stosd` / `rep movs` bulk path (guest debug prologues fill locals with
-  0xCCCCCCCC); only after memory fast paths (tew-cpu 0.3.3).
+- Done in tew-cpu 0.3.3/0.3.4: single load/store for in-bounds 16/32-bit
+  accesses, bulk `rep stosd` (146M debug frame fills/run, 60% exactly 17
+  dwords). Together ~9% on the test-drive load (~70s -> ~64s). `rep movs` is
+  0.13% of the profile; skip it.
+- `cpu_run` checks 8 logpoint slots and the breakpoint table before every
+  instruction even when nothing is armed: add an "anything armed?" flag.
 - Lazy EFLAGS; fused cmp+jcc and push/pop pairs; direct-threaded dispatch.
 - Texture path (~15% Python): `UnlockRect` -> `_convert_to_bgra8` per-pixel
   loop (vectorise), Vulkan staging memory allocated/freed per upload (reuse).
